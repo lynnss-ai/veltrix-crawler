@@ -1,0 +1,68 @@
+[package]
+name = "veltrix-crawler"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "veltrix_crawler_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 抽出的不依赖 Tauri 的共享后端库(配置 / 错误 / 数据库 / HTTP API)
+veltrix-core = { path = "../crates/core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 异步运行时:采集调度与并发请求依赖 tokio
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "net",
+] }
+# HTTP 采集器;用 rustls 避免在 Windows 上引入 openssl 编译依赖
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "gzip",
+    "brotli",
+    "cookies",
+    "stream",
+    "rustls-tls",
+] }
+anyhow = "1"
+thiserror = "2"
+# 适配器 trait 需要 async 方法且作为 trait object 注册,原生 async fn in trait 不满足 dyn 安全
+async-trait = "0.1"
+# ORM:运行时按连接串二选一支持 SQLite / PostgreSQL;rustls 与 reqwest 保持一致避免引入 openssl
+sea-orm = { version = "1", default-features = false, features = [
+    "sqlx-sqlite",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 对外 HTTP API:版本化路由 + 统一响应;与现有 tokio / SeaORM 栈一致
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+# JWT 接口鉴权
+jsonwebtoken = "9"
+# 密码哈希
+argon2 = "0.5"
+
