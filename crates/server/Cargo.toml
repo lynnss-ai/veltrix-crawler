@@ -1,0 +1,14 @@
+[package]
+name = "veltrix-server"
+version = "0.1.0"
+edition = "2021"
+description = "Veltrix 独立 Web API 服务:复用 veltrix-core 的 Axum API,可单独部署"
+
+[[bin]]
+name = "veltrix-server"
+path = "src/main.rs"
+
+[dependencies]
+veltrix-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

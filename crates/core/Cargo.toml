@@ -1,0 +1,43 @@
+[package]
+name = "veltrix-core"
+version = "0.1.0"
+edition = "2021"
+description = "Veltrix 采集后端共享库:配置 / 错误 / 数据库 / HTTP API,不依赖 Tauri"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 异步运行时:db 连接、HTTP API、文件读写依赖 tokio,与 src-tauri 保持一致的 features
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "net",
+] }
+# error.rs 通过 #[from] reqwest::Error 携带 HTTP 采集错误;rustls 避免引入 openssl
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "gzip",
+    "brotli",
+    "cookies",
+    "stream",
+    "rustls-tls",
+] }
+thiserror = "2"
+# ORM:运行时按连接串二选一支持 SQLite / PostgreSQL;rustls 与 reqwest 保持一致
+sea-orm = { version = "1", default-features = false, features = [
+    "sqlx-sqlite",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+# 对外 HTTP API:版本化路由 + 统一响应
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+# JWT 接口鉴权
+jsonwebtoken = "9"
