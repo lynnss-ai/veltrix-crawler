@@ -36,8 +36,24 @@ sea-orm = { version = "1", default-features = false, features = [
 ] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-# 对外 HTTP API:版本化路由 + 统一响应
-axum = "0.8"
+# 对外 HTTP API:版本化路由 + 统一响应;ws feature 用于阶段 2/3 实时通道
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# WS 拆 sink/stream 用,以及流式 select
+futures-util = "0.3"
+# WsHub 连接注册表(单节点 MVP,后续多节点改 Redis pub/sub)
+dashmap = "6"
 # JWT 接口鉴权
 jsonwebtoken = "9"
+# 云端中转模式用:配对码 / 设备绑定 / 设备状态全部走 Redis(时效数据,无需 RDB)
+# 仅在 VELTRIX_MODE=cloud 时实际连接,桌面端不强依赖
+redis = { version = "0.27", default-features = false, features = [
+    "tokio-rustls-comp",
+] }
+bb8 = "0.8"
+bb8-redis = "0.17"
+# 生成 6 位配对码 + pair_id
+rand = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+# /auth/login 走 argon2 校验密码哈希(与桌面端一致)
+argon2 = "0.5"

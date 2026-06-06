@@ -16,12 +16,17 @@
 // 拦截响应部分字段待解析链路接入,暂保留
 #![allow(dead_code)]
 
+pub mod native_intercept;
 pub mod pool;
 
+use veltrix_core::config::RpaStep;
 use veltrix_core::error::{CrawlerError, Result};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::oneshot;
 
 /// 一条被拦截的接口响应。`body` 为响应文本(通常是 JSON),由适配器解析。
 #[derive(Debug, Clone)]
@@ -80,6 +85,89 @@ impl InterceptChannel {
     }
 }
 
+/// 一次 RPA 运行的执行结果,由页面脚本经 `rpa_done` 回传。
+#[derive(Debug, Clone)]
+pub struct RpaOutcome {
+    pub ok: bool,
+    /// 失败步骤下标;成功为 -1。
+    pub failed_step: i64,
+    pub message: String,
+}
+
+/// RPA 运行通道:为每次拟人 RPA 运行分配 run_id,并以 oneshot 等待页面回传结果。
+///
+/// 与持续推送的 [`InterceptChannel`] 不同,一次运行只回传一次结果(成功/失败),故用
+/// oneshot;接收端因超时被 drop 后,迟到的 `complete` 安全忽略。run_id 区分并发的多账号运行。
+#[derive(Default)]
+pub struct RpaChannel {
+    seq: AtomicU64,
+    /// run_id -> 结果发送端。
+    pending: Mutex<HashMap<u64, oneshot::Sender<RpaOutcome>>>,
+}
+
+impl RpaChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 开启一次运行,返回 run_id 与结果接收端。
+    pub fn open_run(&self) -> Result<(u64, oneshot::Receiver<RpaOutcome>)> {
+        let run_id = self.seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .map_err(|_| CrawlerError::Sign("RPA 通道锁异常".into()))?
+            .insert(run_id, tx);
+        Ok((run_id, rx))
+    }
+
+    /// 页面回传一次运行结果。run_id 未登记或已完成(超时)则忽略。
+    pub fn complete(&self, run_id: u64, outcome: RpaOutcome) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(tx) = pending.remove(&run_id) {
+                // 接收端已 drop(超时)时 send 返回 Err,忽略即可
+                let _ = tx.send(outcome);
+            }
+        }
+    }
+}
+
+/// 采集中断控制:HUD「结束」按钮经 `stop_collect` 命令登记 session_id,
+/// 采集循环每轮检查到即**优雅停止**(保留已采内容、作为正常完成),而非报错中断。
+#[derive(Default)]
+pub struct CollectControl {
+    /// 被请求停止的 session_id 集合。
+    stopping: Mutex<std::collections::HashSet<u64>>,
+}
+
+impl CollectControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 请求停止某会话。
+    pub fn request_stop(&self, session_id: u64) {
+        if let Ok(mut set) = self.stopping.lock() {
+            set.insert(session_id);
+        }
+    }
+
+    /// 该会话是否被请求停止。
+    pub fn is_stopping(&self, session_id: u64) -> bool {
+        self.stopping
+            .lock()
+            .map(|set| set.contains(&session_id))
+            .unwrap_or(false)
+    }
+
+    /// 会话结束后清理标志,避免 session_id 复用时误判。
+    pub fn clear(&self, session_id: u64) {
+        if let Ok(mut set) = self.stopping.lock() {
+            set.remove(&session_id);
+        }
+    }
+}
+
 /// 构造注入到页面的早期拦截脚本(作为 `initialization_script`)。
 ///
 /// `patterns` 为该平台需拦截的接口 URL 特征(子串)。脚本在页面最早期挂上
@@ -94,6 +182,9 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
   var PATTERNS = {patterns};
   window.__veltrixSession = null;
   window.__veltrixBuf = [];
+  window.__veltrixSeen = [];    // 调试:hook 看到的所有请求 URL(不只命中 patterns 的)
+  window.__veltrixPushOk = 0;   // 调试:invoke 回传成功次数
+  window.__veltrixPushErr = 0;  // 调试:invoke 回传失败次数(>0 且 Ok=0 = 桥被拒)
 
   function matched(url) {{
     if (!url) return false;
@@ -107,9 +198,13 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
     if (s === null) {{ window.__veltrixBuf.push({{ url: url, body: body }}); return; }}
     try {{
       window.__TAURI_INTERNALS__.invoke('intercept_push', {{ sessionId: s, url: url, body: body }});
-    }} catch (e) {{ console.error('[veltrix] intercept bridge unavailable', e); }}
+      window.__veltrixPushOk++;
+    }} catch (e) {{ window.__veltrixPushErr++; console.error('[veltrix] intercept bridge unavailable', e); }}
   }}
-  function report(url, body) {{ if (matched(url)) emit(url, body); }}
+  function report(url, body) {{
+    if (window.__veltrixSeen.length < 300) window.__veltrixSeen.push(url);
+    if (matched(url)) emit(url, body);
+  }}
 
   window.__veltrixSetSession = function (s) {{
     window.__veltrixSession = s;
@@ -176,4 +271,603 @@ pub fn build_search_eval(template: &str, keyword: &str) -> String {
         "(function () {{ var kw = encodeURIComponent('{kw}'); \
          window.location.assign('{tpl}'.replace('{{keyword}}', kw)); }})();"
     )
+}
+
+/// 注入脚本里回传 RPA 执行结果的命令名;与 Rust 端 `#[tauri::command] rpa_done` 对应。
+pub const RPA_DONE_COMMAND: &str = "rpa_done";
+
+/// 构造「拟人 RPA 步骤执行器」注入脚本。
+///
+/// `steps` 序列化为 JS 数组后,在页面内 async 自驱动执行:逐字输入、hover→点击、
+/// 轮询等待节点、分段随机滚动、随机停顿——节奏由节点状态 + 随机化驱动而非固定计时,
+/// 以贴近真人、降低风控。整段跑完(或某步失败)经 `rpa_done` 回传成败,Rust 据此编排。
+///
+/// 用占位替换而非 `format!`,规避脚本内大量 `{}` 的转义噪声;`__STEPS__` / `__KW__`
+/// 不会作为合法标识符出现在脚本中,替换安全。keyword 的 `{keyword}` 占位在页面侧替换。
+pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> String {
+    let steps_json = serde_json::to_string(steps).unwrap_or_else(|_| "[]".to_string());
+    let kw_json = serde_json::to_string(keyword).unwrap_or_else(|_| "\"\"".to_string());
+
+    const TEMPLATE: &str = r#"(function () {
+  var STEPS = __STEPS__;
+  var KW = __KW__;
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function subst(s) { return (s == null ? '' : String(s)).split('{keyword}').join(KW); }
+
+  // 轮询等待节点出现;命中或超时(返回 null)后 resolve
+  function waitFor(sel, timeout) {
+    return new Promise(function (resolve) {
+      var start = Date.now();
+      (function poll() {
+        var el = document.querySelector(sel);
+        if (el) return resolve(el);
+        if (Date.now() - start > timeout) return resolve(null);
+        setTimeout(poll, rand(180, 360));
+      })();
+    });
+  }
+
+  // React 受控组件:必须用原生 value setter 再派发 input,框架才感知到输入
+  function setNativeValue(el, value) {
+    var proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  async function typeHuman(el, text) {
+    el.focus();
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
+      setNativeValue(el, text.slice(0, i + 1));
+      el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
+      await sleep(rand(80, 200)); // 逐字随机节奏,模拟打字
+    }
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  async function clickHuman(el) {
+    el.scrollIntoView({ block: 'center' });
+    await sleep(rand(150, 400));
+    var r = el.getBoundingClientRect();
+    var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    el.dispatchEvent(new MouseEvent('mouseover', o));
+    await sleep(rand(120, 350)); // hover 后短暂停顿再按下
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+  }
+
+  function pressEnter(el) {
+    el.focus();
+    var ev = { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
+    el.dispatchEvent(new KeyboardEvent('keydown', ev));
+    el.dispatchEvent(new KeyboardEvent('keyup', ev));
+  }
+
+  // 找主滚动容器:整页 + 所有内部可滚容器里,取「内容最高」的那个(= 主内容区,
+  // 避免误选某个小的内部滚动容器导致很快「到底」)。
+  function findMainScroller() {
+    var docEl = document.scrollingElement || document.documentElement;
+    var best = docEl, bestH = docEl ? docEl.scrollHeight : 0;
+    var all = document.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var st = getComputedStyle(el);
+      if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 100) {
+        if (el.scrollHeight > bestH) { bestH = el.scrollHeight; best = el; }
+      }
+    }
+    return best;
+  }
+
+  // maxRounds 为最大轮数上限;持续滚动直到内容高度连续多轮不再增长(真·到底)才停。
+  // 多管齐下触发懒加载:scrollBy + 把末尾元素滚入视口(命中 IntersectionObserver 哨兵) + 派发 scroll 事件。
+  async function scrollHuman(maxRounds) {
+    var scroller = findMainScroller();
+    var lastHeight = 0, stagnant = 0;
+    for (var i = 0; i < maxRounds; i++) {
+      scroller.scrollBy({ top: rand(600, 1100) });
+      var kids = scroller.children;
+      if (kids && kids.length) {
+        try { kids[kids.length - 1].scrollIntoView({ block: 'end' }); } catch (e) {}
+      }
+      // 兼容「监听 scroll 事件才加载」的页面
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      window.dispatchEvent(new Event('scroll'));
+      await sleep(rand(1000, 2000)); // 等懒加载补内容
+
+      var h = scroller.scrollHeight;
+      if (h <= lastHeight + 10) {
+        stagnant++;
+        if (stagnant >= 6) break; // 更有耐心:连续 6 轮不涨才认为到底
+        await sleep(rand(1000, 2000)); // 没涨就多等,给慢加载机会
+      } else {
+        stagnant = 0;
+      }
+      lastHeight = h;
+      if (Math.random() < 0.2) { // 偶尔回滚一点,更像人
+        scroller.scrollBy({ top: -rand(80, 200) });
+        await sleep(rand(300, 700));
+      }
+    }
+  }
+
+  function done(ok, idx, msg) {
+    try {
+      // 失败时附带当前 URL,日志可看出卡在首页/登录页/结果页哪一步
+      var detail = ok ? (msg || '') : ((msg || '') + ' @ ' + location.href);
+      window.__TAURI_INTERNALS__.invoke('rpa_done', { runId: __RUNID__, ok: ok, failedStep: idx, message: detail });
+    } catch (e) { console.error('[veltrix] rpa_done bridge unavailable', e); }
+  }
+
+  (async function run() {
+    for (var i = 0; i < STEPS.length; i++) {
+      var s = STEPS[i];
+      try {
+        if (s.action === 'waitFor') {
+          if (!await waitFor(subst(s.selector), s.timeoutMs || 8000)) {
+            return done(false, i, 'waitFor 超时: ' + s.selector);
+          }
+        } else if (s.action === 'click') {
+          var ec = await waitFor(subst(s.selector), 5000);
+          if (!ec) return done(false, i, 'click 节点缺失: ' + s.selector);
+          await clickHuman(ec);
+        } else if (s.action === 'type') {
+          var et = await waitFor(subst(s.selector), 5000);
+          if (!et) return done(false, i, 'type 节点缺失: ' + s.selector);
+          await typeHuman(et, subst(s.text));
+        } else if (s.action === 'pressEnter') {
+          var ep = await waitFor(subst(s.selector), 5000);
+          if (!ep) return done(false, i, 'pressEnter 节点缺失: ' + s.selector);
+          pressEnter(ep);
+        } else if (s.action === 'scroll') {
+          await scrollHuman(s.segments || 4);
+        } else if (s.action === 'pause') {
+          await sleep(rand(s.minMs || 300, s.maxMs || 800));
+        }
+        await sleep(rand(200, 600)); // 步骤间自然间隔
+      } catch (e) {
+        return done(false, i, String(e));
+      }
+    }
+    done(true, -1, '');
+  })();
+})();"#;
+
+    TEMPLATE
+        .replace("__STEPS__", &steps_json)
+        .replace("__KW__", &kw_json)
+        .replace("__RUNID__", &run_id.to_string())
+}
+
+// ---- 采集日志:窗口内 HUD 浮层 + 前端事件 ----
+
+/// 前端监听的采集日志事件名;TaskDetailPage 据此订阅并按 task_id 过滤展示。
+pub const COLLECT_LOG_EVENT: &str = "collect-log";
+
+/// 一条采集日志。同一条既经 `app.emit` 推给前端面板,也经窗口 HUD 实时展示。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectLog {
+    pub task_id: String,
+    /// 产生时间(Unix 秒)。
+    pub ts: i64,
+    /// 级别:info / warn / error,前端与 HUD 按级别着色。
+    pub level: String,
+    pub message: String,
+}
+
+/// 向前端推送一条采集日志。emit 失败仅忽略(无前端监听时不应影响采集)。
+pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: impl Into<String>) {
+    let log = CollectLog {
+        task_id: task_id.to_string(),
+        ts: chrono::Utc::now().timestamp(),
+        level: level.to_string(),
+        message: message.into(),
+    };
+    let _ = app.emit(COLLECT_LOG_EVENT, log);
+}
+
+/// 构造「更新 HUD 一条日志」的 eval 脚本。时间由页面侧生成,避免跨端时钟差。
+pub fn build_hud_log_eval(level: &str, message: &str) -> String {
+    let payload = serde_json::json!({ "level": level, "message": message });
+    format!("window.__veltrixHud&&window.__veltrixHud.log({payload});")
+}
+
+/// 构造「更新 HUD 状态条」的 eval 脚本。running 控制状态点颜色/呼吸。
+pub fn build_hud_status_eval(text: &str, running: bool) -> String {
+    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__veltrixHud&&window.__veltrixHud.status({text_json},{running});")
+}
+
+/// 构造「切到关键字 tab」的 eval 脚本。每轮采集前调用,使后续日志按关键字分组到独立 tab。
+pub fn build_hud_keyword_eval(keyword: &str) -> String {
+    let kw_json = serde_json::to_string(keyword).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__veltrixHud&&window.__veltrixHud.beginKeyword({kw_json});")
+}
+
+/// 构造「绑定当前采集会话 id」的 eval 脚本,供 HUD「结束」按钮回传以停止本次采集。
+pub fn build_hud_session_eval(session_id: u64) -> String {
+    format!("window.__veltrixHud&&window.__veltrixHud.bindSession({session_id});")
+}
+
+/// 构造注入采集窗口的 HUD 浮层脚本(作为 `initialization_script`)。
+///
+/// 每次文档加载自动重建浮层,并从 `sessionStorage` 恢复历史日志,
+/// 因此 legacy 路径的整页导航不会清空 HUD。脚本对页面只读、`pointer-events:none`,
+/// 不干扰平台页面自身的交互与采集 hook。
+pub fn build_hud_init_script() -> String {
+    r#"(function () {
+  if (window.__veltrixHudReady) return;
+  window.__veltrixHudReady = true;
+  var KEY = '__veltrix_hud_logs';
+  var POS_KEY = '__veltrix_hud_pos';
+  var COLLAPSE_KEY = '__veltrix_hud_collapsed';
+  var CUR_KEY = '__veltrix_hud_cur';
+  var TAB_KEY = '__veltrix_hud_tab';
+  var RUN_KEY = '__veltrix_hud_running';
+  var DEFAULT_KW = '日志';
+  var SID_KEY = '__veltrix_hud_sid';
+  // 状态色:绿=正常采集 / 红=遇到问题(风控、错误)/ 灰=空闲
+  var COLOR_OK = '#22c55e', COLOR_ERR = '#ef4444', COLOR_IDLE = '#9ca3af';
+  // 记住最近一次状态色,收起时据此画发光环
+  var lastColor = COLOR_IDLE, lastGlow = false;
+
+  // currentKeyword:后端经 beginKeyword 标记的「正在采集」关键字;activeTab:HUD 当前查看的 tab。
+  // 二者都落 sessionStorage,因为 legacy 翻页是整页导航,脚本会重跑、闭包变量会丢。
+  var currentKeyword = '';
+  var activeTab = '';
+  try { currentKeyword = sessionStorage.getItem(CUR_KEY) || ''; } catch (e) {}
+  try { activeTab = sessionStorage.getItem(TAB_KEY) || ''; } catch (e) {}
+
+  function getLogs() {
+    try { return JSON.parse(sessionStorage.getItem(KEY) || '[]'); } catch (e) { return []; }
+  }
+  // 按出现顺序提取去重关键字列表,作为 tab 顺序
+  function keywordsOf(logs) {
+    var seen = {}, list = [];
+    for (var i = 0; i < logs.length; i++) {
+      var k = logs[i].keyword || DEFAULT_KW;
+      if (!seen[k]) { seen[k] = 1; list.push(k); }
+    }
+    return list;
+  }
+
+  function ensureRoot() {
+    if (!document.body) return null;
+    var root = document.getElementById('veltrix-hud');
+    if (root) return root;
+    root = document.createElement('div');
+    root.id = 'veltrix-hud';
+    root.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;width:720px;max-height:92vh;background:rgba(17,24,39,.92);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.45);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
+    var head = document.createElement('div');
+    head.id = 'veltrix-hud-head';
+    head.style.cssText = 'padding:8px 11px;font-weight:600;background:rgba(255,255,255,.06);display:flex;align-items:center;gap:7px;flex:0 0 auto;cursor:move;user-select:none;';
+    var dot = document.createElement('span');
+    dot.id = 'veltrix-hud-dot';
+    dot.style.cssText = 'width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:0 0 auto;';
+    var title = document.createElement('span');
+    title.textContent = 'HUD日志';
+    title.style.cssText = 'flex:0 0 auto;font-weight:600;';
+    var status = document.createElement('span');
+    status.id = 'veltrix-hud-status';
+    status.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400;font-size:11px;color:#9ca3af;';
+    head.appendChild(dot); head.appendChild(title); head.appendChild(status);
+
+    var toggleBtn = document.createElement('span');
+    toggleBtn.id = 'veltrix-hud-toggle';
+    toggleBtn.setAttribute('data-hud-btn', '1');
+    toggleBtn.textContent = '收起';
+    toggleBtn.style.cssText = 'cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(255,255,255,.18);border-radius:5px;color:#cbd5e1;flex:0 0 auto;';
+    toggleBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setCollapsed(true);
+    });
+
+    var copyBtn = document.createElement('span');
+    copyBtn.setAttribute('data-hud-btn', '1');
+    copyBtn.textContent = '复制';
+    copyBtn.style.cssText = 'cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(255,255,255,.18);border-radius:5px;color:#cbd5e1;flex:0 0 auto;';
+    copyBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      // 只复制当前 tab(关键字)的日志
+      var logs = getLogs().filter(function (it) { return (it.keyword || DEFAULT_KW) === activeTab; });
+      var text = logs.map(function (it) { return (it.time || '') + '  ' + (it.message || ''); }).join('\n');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () {
+          copyBtn.textContent = '已复制';
+          setTimeout(function () { copyBtn.textContent = '复制'; }, 1200);
+        }).catch(function () {});
+      }
+    });
+    // 手动结束:仅采集中显示;点击通知后端优雅停止本次采集(保留已采内容,正常完成)
+    var stopBtn = document.createElement('span');
+    stopBtn.id = 'veltrix-hud-stop';
+    stopBtn.setAttribute('data-hud-btn', '1');
+    stopBtn.textContent = '结束';
+    stopBtn.title = '手动结束本次采集(保留已采内容)';
+    stopBtn.style.cssText = 'display:none;cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(239,68,68,.5);border-radius:5px;color:#fca5a5;flex:0 0 auto;';
+    stopBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var sid = null;
+      try { sid = sessionStorage.getItem(SID_KEY); } catch (err) {}
+      if (sid === null || sid === '') return;
+      try {
+        window.__TAURI_INTERNALS__.invoke('stop_collect', { sessionId: Number(sid) });
+      } catch (err) { console.error('[veltrix] stop_collect 调用失败', err); }
+      stopBtn.textContent = '结束中…';
+      stopBtn.style.pointerEvents = 'none';
+    });
+    head.appendChild(stopBtn); head.appendChild(toggleBtn); head.appendChild(copyBtn);
+
+    // 多关键字时显示的 tab 条;单关键字隐藏
+    var tabs = document.createElement('div');
+    tabs.id = 'veltrix-hud-tabs';
+    tabs.style.cssText = 'display:none;gap:4px;padding:6px 9px 0;overflow-x:auto;flex:0 0 auto;';
+
+    var body = document.createElement('div');
+    body.id = 'veltrix-hud-logs';
+    body.style.cssText = 'padding:6px 11px 8px;overflow-y:auto;flex:1 1 auto;user-select:text;cursor:text;';
+
+    // 收起态:整个浮层缩成一个图标,点击展开;图标颜色随采集状态(绿=正常/红=问题/灰=空闲)
+    var icon = document.createElement('div');
+    icon.id = 'veltrix-hud-icon';
+    icon.title = '展开 HUD 日志';
+    // 收起态整块填充状态色 + 白色波形图标,深色页面上也足够醒目
+    icon.style.cssText = 'display:none;width:100%;height:100%;align-items:center;justify-content:center;cursor:pointer;background:#9ca3af;';
+    icon.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg>';
+
+    root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
+    document.body.appendChild(root);
+
+    // 恢复上次拖动的位置(跨导航保留)
+    try {
+      var pos = JSON.parse(sessionStorage.getItem(POS_KEY) || 'null');
+      if (pos && typeof pos.left === 'number') {
+        root.style.left = pos.left + 'px';
+        root.style.top = pos.top + 'px';
+        root.style.right = 'auto';
+      }
+    } catch (e) {}
+
+    // 拖动:按住标题栏或收起图标移动浮层(按钮除外),松手把位置存入 sessionStorage。
+    // dragMoved 供图标的 click 判断:刚拖动过的那次点击不应触发展开。
+    var dragMoved = false;
+    (function () {
+      var dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+      function onDown(e) {
+        if (e.target.closest && e.target.closest('[data-hud-btn]')) return;
+        var rect = root.getBoundingClientRect();
+        root.style.left = rect.left + 'px';
+        root.style.top = rect.top + 'px';
+        root.style.right = 'auto';
+        dragging = true; dragMoved = false; sx = e.clientX; sy = e.clientY; ox = rect.left; oy = rect.top;
+        e.preventDefault();
+      }
+      head.addEventListener('mousedown', onDown);
+      icon.addEventListener('mousedown', onDown);
+      document.addEventListener('mousemove', function (e) {
+        if (!dragging) return;
+        dragMoved = true;
+        var nx = ox + (e.clientX - sx), ny = oy + (e.clientY - sy);
+        nx = Math.max(0, Math.min(nx, window.innerWidth - root.offsetWidth));
+        ny = Math.max(0, Math.min(ny, window.innerHeight - root.offsetHeight));
+        root.style.left = nx + 'px';
+        root.style.top = ny + 'px';
+      });
+      document.addEventListener('mouseup', function () {
+        if (!dragging) return;
+        dragging = false;
+        try {
+          sessionStorage.setItem(POS_KEY, JSON.stringify({ left: parseInt(root.style.left, 10), top: parseInt(root.style.top, 10) }));
+        } catch (e) {}
+      });
+    })();
+
+    // 点击收起图标展开(拖动结束的那次点击不触发)
+    icon.addEventListener('click', function () {
+      if (dragMoved) { dragMoved = false; return; }
+      setCollapsed(false);
+    });
+
+    // 选定初始 tab:上次查看的 → 正在采集的 → 第一个
+    var kws = keywordsOf(getLogs());
+    if (!activeTab || kws.indexOf(activeTab) < 0) {
+      activeTab = currentKeyword || kws[0] || '';
+    }
+    renderTabs();
+    renderBody();
+    applyCollapsed(isCollapsed());
+    setStateColor(isRunning() ? COLOR_OK : COLOR_IDLE, isRunning());
+    updateStopBtn();
+    return root;
+  }
+
+  function isCollapsed() {
+    try { return sessionStorage.getItem(COLLAPSE_KEY) === '1'; } catch (e) { return false; }
+  }
+  function applyCollapsed(collapsed) {
+    var root = document.getElementById('veltrix-hud');
+    if (!root) return;
+    var head = document.getElementById('veltrix-hud-head');
+    var tabs = document.getElementById('veltrix-hud-tabs');
+    var body = document.getElementById('veltrix-hud-logs');
+    var icon = document.getElementById('veltrix-hud-icon');
+    if (collapsed) {
+      // 收起:藏掉标题栏 / tab / 日志,整体缩成方形图标
+      if (head) head.style.display = 'none';
+      if (tabs) tabs.style.display = 'none';
+      if (body) body.style.display = 'none';
+      if (icon) {
+        icon.style.display = 'flex';
+        icon.style.background = lastColor; // 收起即用当前状态色,绿/红/灰一眼可辨
+      }
+      root.style.width = '46px';
+      root.style.height = '46px';
+      root.style.maxHeight = '46px';
+      root.style.border = 'none'; // 收起态不要边框线,整块纯色更干净
+      root.style.boxShadow = (lastGlow ? '0 0 14px ' + lastColor + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
+    } else {
+      // 展开:恢复成完整面板(尺寸与初始 cssText 保持一致)
+      if (head) head.style.display = 'flex';
+      if (icon) icon.style.display = 'none';
+      if (body) body.style.display = '';
+      if (tabs) tabs.style.display = keywordsOf(getLogs()).length < 2 ? 'none' : 'flex';
+      root.style.width = '720px';
+      root.style.height = '';
+      root.style.maxHeight = '92vh';
+      root.style.border = '1px solid rgba(255,255,255,.12)';
+      root.style.boxShadow = '0 10px 30px rgba(0,0,0,.45)';
+      // 收起图标常贴在屏幕边缘,展开后面板会从该位置向右下扩展而超出视口;
+      // 这里按恢复后的实际尺寸把位置拉回可视范围,避免只露出一部分要手动拖。
+      if (root.style.left) {
+        var maxLeft = Math.max(0, window.innerWidth - root.offsetWidth);
+        var maxTop = Math.max(0, window.innerHeight - root.offsetHeight);
+        var nl = Math.max(0, Math.min(parseInt(root.style.left, 10) || 0, maxLeft));
+        var nt = Math.max(0, Math.min(parseInt(root.style.top, 10) || 0, maxTop));
+        root.style.left = nl + 'px';
+        root.style.top = nt + 'px';
+        try { sessionStorage.setItem(POS_KEY, JSON.stringify({ left: nl, top: nt })); } catch (e) {}
+      }
+    }
+  }
+  function setCollapsed(collapsed) {
+    try { sessionStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0'); } catch (e) {}
+    applyCollapsed(collapsed);
+  }
+
+  function renderTabs() {
+    var tabs = document.getElementById('veltrix-hud-tabs');
+    if (!tabs) return;
+    var kws = keywordsOf(getLogs());
+    tabs.innerHTML = '';
+    for (var i = 0; i < kws.length; i++) {
+      (function (kw) {
+        var on = kw === activeTab;
+        var t = document.createElement('span');
+        t.textContent = kw;
+        t.style.cssText = 'padding:3px 9px;border-radius:6px 6px 0 0;cursor:pointer;white-space:nowrap;font-size:11px;' + (on ? 'background:rgba(255,255,255,.10);color:#e5e7eb;' : 'color:#9ca3af;');
+        t.addEventListener('click', function () {
+          activeTab = kw;
+          try { sessionStorage.setItem(TAB_KEY, kw); } catch (e) {}
+          renderTabs();
+          renderBody();
+        });
+        tabs.appendChild(t);
+      })(kws[i]);
+    }
+    tabs.style.display = (isCollapsed() || kws.length < 2) ? 'none' : 'flex';
+  }
+
+  function renderBody() {
+    var body = document.getElementById('veltrix-hud-logs');
+    if (!body) return;
+    body.innerHTML = '';
+    var logs = getLogs().filter(function (it) { return (it.keyword || DEFAULT_KW) === activeTab; });
+    for (var i = 0; i < logs.length; i++) appendLine(logs[i]);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function appendLine(item) {
+    var body = document.getElementById('veltrix-hud-logs');
+    if (!body) return;
+    var line = document.createElement('div');
+    var color = item.level === 'error' ? '#f87171' : (item.level === 'warn' ? '#fbbf24' : '#9ca3af');
+    line.style.cssText = 'white-space:pre-wrap;word-break:break-all;color:' + color + ';';
+    line.textContent = (item.time || '') + '  ' + (item.message || '');
+    body.appendChild(line);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  // 是否处于采集中(status running 落 sessionStorage,跨导航恢复)
+  function isRunning() {
+    try { return sessionStorage.getItem(RUN_KEY) === '1'; } catch (e) { return false; }
+  }
+  // 结束按钮仅采集中可见
+  function updateStopBtn() {
+    var b = document.getElementById('veltrix-hud-stop');
+    if (b) b.style.display = isRunning() ? 'inline-block' : 'none';
+  }
+  // 统一设置状态色:同时作用于标题栏状态点与收起图标;glow 控制辉光
+  function setStateColor(c, glow) {
+    lastColor = c; lastGlow = glow;
+    var d = document.getElementById('veltrix-hud-dot');
+    if (d) {
+      d.style.background = c;
+      d.style.boxShadow = glow ? '0 0 6px ' + c : 'none';
+    }
+    // 收起态整块填充状态色(白色波形不变),一眼可辨绿/红/灰
+    var icon = document.getElementById('veltrix-hud-icon');
+    if (icon) icon.style.background = c;
+    // 收起时整块外发光,远比细图标醒目
+    var root = document.getElementById('veltrix-hud');
+    if (root && isCollapsed()) {
+      root.style.boxShadow = (glow ? '0 0 14px ' + c + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
+    }
+  }
+
+  window.__veltrixHud = {
+    // 后端每轮采集前调用,后续 log 自动归到该关键字 tab 并切到它
+    beginKeyword: function (kw) {
+      kw = kw || DEFAULT_KW;
+      currentKeyword = kw;
+      activeTab = kw;
+      try { sessionStorage.setItem(CUR_KEY, kw); } catch (e) {}
+      try { sessionStorage.setItem(TAB_KEY, kw); } catch (e) {}
+      ensureRoot();
+      renderTabs();
+      renderBody();
+      applyCollapsed(isCollapsed());
+    },
+    log: function (item) {
+      item = item || {};
+      item.time = new Date().toLocaleTimeString();
+      item.keyword = item.keyword || currentKeyword || DEFAULT_KW;
+      ensureRoot();
+      var hadTab = keywordsOf(getLogs()).indexOf(item.keyword) >= 0;
+      try {
+        var saved = getLogs();
+        saved.push(item);
+        if (saved.length > 400) saved = saved.slice(-400);
+        sessionStorage.setItem(KEY, JSON.stringify(saved));
+      } catch (e) {}
+      if (!hadTab) renderTabs();
+      if (item.keyword === activeTab) appendLine(item);
+      // warn/error 视为「遇到问题」置红;info 恢复正常态(采集中绿 / 空闲灰)
+      if (item.level === 'error' || item.level === 'warn') {
+        setStateColor(COLOR_ERR, true);
+      } else {
+        setStateColor(isRunning() ? COLOR_OK : COLOR_IDLE, isRunning());
+      }
+    },
+    status: function (text, running) {
+      ensureRoot();
+      var s = document.getElementById('veltrix-hud-status');
+      if (s && text) s.textContent = text;
+      try { sessionStorage.setItem(RUN_KEY, running ? '1' : '0'); } catch (e) {}
+      setStateColor(running ? COLOR_OK : COLOR_IDLE, running);
+      updateStopBtn();
+    },
+    // 绑定当前采集会话 id(供「结束」按钮回传);整页导航会丢 window 变量,故存 sessionStorage
+    bindSession: function (sid) {
+      try { sessionStorage.setItem(SID_KEY, String(sid)); } catch (e) {}
+      ensureRoot();
+      var b = document.getElementById('veltrix-hud-stop');
+      if (b) { b.textContent = '结束'; b.style.pointerEvents = ''; }
+      updateStopBtn();
+    }
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensureRoot);
+  } else {
+    ensureRoot();
+  }
+})();"#
+        .to_string()
 }

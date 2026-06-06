@@ -22,6 +22,10 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_SCROLL_ROUNDS: u32 = 5;
 /// 默认每轮滚动后的等待(毫秒),给接口返回与页面渲染留出时间。
 const DEFAULT_SCROLL_INTERVAL_MS: u64 = 1500;
+/// 默认等待节点出现的超时(毫秒);超时即判定该 RPA 步骤失败。
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 8000;
+/// 默认拟人滚动分段数:一次翻页拆成多段小幅滚动,比一次到底更接近真人。
+const DEFAULT_SCROLL_SEGMENTS: u32 = 4;
 /// 默认数据库连接池上限。
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 8;
 
@@ -65,6 +69,10 @@ pub struct CollectConfig {
     /// 每轮滚动后的等待毫秒。
     #[serde(default = "default_scroll_interval_ms")]
     pub scroll_interval_ms: u64,
+    /// 拟人 RPA 步骤序列。非空时取代内置「改 URL + 盲滚」逻辑,改为节点级模拟操作
+    /// (在搜索框逐字输入、点击、等待结果、分段滚动等),更贴近真人行为以降低风控。
+    #[serde(default)]
+    pub rpa_steps: Vec<RpaStep>,
 }
 
 fn default_scroll_rounds() -> u32 {
@@ -73,6 +81,81 @@ fn default_scroll_rounds() -> u32 {
 
 fn default_scroll_interval_ms() -> u64 {
     DEFAULT_SCROLL_INTERVAL_MS
+}
+
+fn default_wait_timeout_ms() -> u64 {
+    DEFAULT_WAIT_TIMEOUT_MS
+}
+
+fn default_scroll_segments() -> u32 {
+    DEFAULT_SCROLL_SEGMENTS
+}
+
+/// 拟人 RPA 单步。声明式描述「在页面上做什么」,由注入脚本按拟人节奏解释执行。
+/// `selector` / `text` 中的 `{keyword}` 占位在执行前由本次采集关键词替换。
+///
+/// 设计取向:节奏由「节点状态 + 随机化」驱动,而非固定计时——真人是看到元素才动作,
+/// 盲等固定时长恰是风控最易识别的机器特征。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum RpaStep {
+    /// 轮询等待节点出现,超时即判定该步失败(页面结构变化或被风控拦截)。
+    WaitFor {
+        selector: String,
+        #[serde(default = "default_wait_timeout_ms")]
+        timeout_ms: u64,
+    },
+    /// 拟人点击:滚动到可见 → hover → 随机停顿 → 派发完整鼠标事件序列。
+    Click { selector: String },
+    /// 拟人逐字输入:聚焦后按随机节奏键入,用原生 setter 兼容 React 受控组件。
+    Type { selector: String, text: String },
+    /// 在节点上派发回车键,触发搜索提交。
+    PressEnter { selector: String },
+    /// 拟人分段滚动:分多段小幅下滑触发分页,每段距离/间隔随机,偶尔回滚,段间停顿。
+    Scroll {
+        #[serde(default = "default_scroll_segments")]
+        segments: u32,
+    },
+    /// 随机停顿,模拟阅读 / 思考节奏。
+    Pause { min_ms: u64, max_ms: u64 },
+}
+
+/// 各平台内置拟人 RPA 步骤(v0 联调起点)。
+///
+/// ⚠️ 选择器(搜索框 placeholder、结果项 class)均为**推测值**,需本机 `bun tauri dev`
+/// 打开真实页面用 DevTools 校准后修正;校准前可能 `waitFor` 超时。未列平台返回空 = 走旧逻辑。
+fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
+    match platform_id {
+        // 小红书:首页搜索框逐字输入 → 回车 → 等结果列表 → 分段滚动翻页
+        "xhs" => vec![
+            RpaStep::WaitFor {
+                selector: "#search-input".into(),
+                timeout_ms: 10_000,
+            },
+            RpaStep::Click {
+                selector: "#search-input".into(),
+            },
+            RpaStep::Type {
+                selector: "#search-input".into(),
+                text: "{keyword}".into(),
+            },
+            RpaStep::Pause {
+                min_ms: 400,
+                max_ms: 900,
+            },
+            RpaStep::PressEnter {
+                selector: "#search-input".into(),
+            },
+            RpaStep::WaitFor {
+                // 搜索结果页特有的频道栏(全部/图文/视频/用户),首页没有,可靠判断「已进入结果页」
+                selector: "#channel-container".into(),
+                timeout_ms: 12_000,
+            },
+            // 作为最大滚动轮数上限;实际滚到底(内容不再增长)自动停
+            RpaStep::Scroll { segments: 40 },
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// 单个平台的完整配置。新增平台 = 往 `platforms` 里加一项 + 注册同名适配器。
@@ -133,7 +216,8 @@ pub struct MediaConfig {
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
-            enable_audio_extract: false,
+            // 默认开启视频转音频(下载视频 → ffmpeg 转音频 → 删视频),符合「只留音频」诉求
+            enable_audio_extract: true,
             ffmpeg_path: None,
             audio_format: "mp3".to_string(),
             output_dir: "media".to_string(),
@@ -266,6 +350,8 @@ impl AppConfig {
                         rpa_script: None,
                         scroll_rounds: DEFAULT_SCROLL_ROUNDS,
                         scroll_interval_ms: DEFAULT_SCROLL_INTERVAL_MS,
+                        // 节点级拟人步骤:小红书已填 v0 起点,其余平台留空走内置滚动逻辑
+                        rpa_steps: default_rpa_steps(id),
                     },
                     extra: serde_json::Value::Null,
                 },

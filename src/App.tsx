@@ -1,14 +1,15 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import {
   AppSidebar,
   getPageBreadcrumb,
   getWorkspaceDefaultPage,
   type PageKey,
-  type RemoteStatus,
   type Workspace,
 } from "@/components/app-sidebar";
+import { type RemoteStatus } from "@/components/RemoteConnect";
 import { api, type UserView } from "@/lib/api";
 import { SiteHeader } from "@/components/site-header";
+import { TitleBar } from "@/components/TitleBar";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { CollectPage } from "@/pages/CollectPage";
@@ -17,6 +18,7 @@ import { PlatformsPage } from "@/pages/PlatformsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
 import { CustomersPage } from "@/pages/CustomersPage";
+import { ContentLibraryPage } from "@/pages/ContentLibraryPage";
 import { UsersPage } from "@/pages/UsersPage";
 import { PlaceholderPage } from "@/pages/PlaceholderPage";
 import { LoginPage } from "@/pages/LoginPage";
@@ -84,26 +86,11 @@ function renderPage(active: PageKey, currentUser: string): ReactNode {
         />
       );
     case "assets-all":
-      return (
-        <PlaceholderPage
-          title="全量库"
-          description="采集到的全部原始数据汇总。需后端将拦截响应解析落库 + 提供分页查询命令后接入。"
-        />
-      );
+      return <ContentLibraryPage title="全量库" />;
     case "assets-content":
-      return (
-        <PlaceholderPage
-          title="内容库"
-          description="结构化后的内容(视频 / 图文 / 笔记)。需平台适配器 parse 实现 + 内容表与查询命令。"
-        />
-      );
+      return <ContentLibraryPage title="内容库" />;
     case "assets-image":
-      return (
-        <PlaceholderPage
-          title="图片库"
-          description="采集内容中的图片资产。需后端下载落地图片 + 媒体表后接入。"
-        />
-      );
+      return <ContentLibraryPage title="图片库" onlyImages />;
     default:
       return null;
   }
@@ -152,6 +139,16 @@ function App() {
   }
   // 远程上报连接状态;后端 RemoteConfig 上报模块就绪前先占位为未连接
   const [remoteStatus] = useState<RemoteStatus>("disconnected");
+
+  // 侧栏按窗口宽度自动展开/收起:窄屏(<1024px) 收起腾出表格空间;用户可手动覆盖
+  const [sidebarOpen, setSidebarOpen] = useState(
+    typeof window !== "undefined" ? window.innerWidth >= 1024 : true,
+  );
+  useEffect(() => {
+    const onResize = () => setSidebarOpen(window.innerWidth >= 1024);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
   // 启动引导:loading 加载中,setup 走初始化向导(无任何用户),login 登录页
   const [bootState, setBootState] = useState<"loading" | "setup" | "login">(
     "loading",
@@ -180,49 +177,73 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 已有登录态但后端会话尚未就绪:渲染加载占位,阻止页面提前发 list 请求
+  // 主体内容随登录/初始化状态切换;标题栏始终常驻,登录态才显示侧栏开关
+  const loadingBody = (
+    <div className="flex h-full items-center justify-center bg-background text-sm text-muted-foreground">
+      加载中…
+    </div>
+  );
+
+  let body: ReactNode;
+  let showSidebarTrigger = false;
   if (loggedUser && !sessionReady) {
-    return (
-      <div className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground">
-        加载中…
-      </div>
+    // 已有登录态但后端会话尚未就绪:加载占位,阻止页面提前发 list 请求
+    body = loadingBody;
+  } else if (!loggedUser) {
+    if (bootState === "loading") {
+      body = loadingBody;
+    } else if (bootState === "setup") {
+      body = <SetupWizard onComplete={handleAuthed} />;
+    } else {
+      body = <LoginPage onSuccess={handleAuthed} />;
+    }
+  } else {
+    showSidebarTrigger = true;
+    const breadcrumb = getPageBreadcrumb(active);
+    body = (
+      <SidebarProvider
+        open={sidebarOpen}
+        onOpenChange={setSidebarOpen}
+        className="h-full min-h-0"
+        style={{ "--sidebar-width": "14rem" } as CSSProperties}
+      >
+        <AppSidebar
+          workspace={workspace}
+          onWorkspaceChange={handleWorkspaceChange}
+          active={active}
+          onChange={setActive}
+          user={loggedUser.username}
+          onLogout={handleLogout}
+        />
+        {/* min-w-0 让里面的 DataTable 横向滚动归自己处理,不溢出到窗口 */}
+        <SidebarInset className="min-w-0">
+          <SiteHeader
+            group={breadcrumb.group}
+            page={breadcrumb.page}
+            remoteStatus={remoteStatus}
+          />
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
+            {renderPage(active, loggedUser.username)}
+          </div>
+        </SidebarInset>
+      </SidebarProvider>
     );
   }
 
-  if (!loggedUser) {
-    if (bootState === "loading") {
-      return (
-        <div className="flex min-h-svh items-center justify-center bg-background text-sm text-muted-foreground">
-          加载中…
-        </div>
-      );
-    }
-    if (bootState === "setup") {
-      return <SetupWizard onComplete={handleAuthed} />;
-    }
-    return <LoginPage onSuccess={handleAuthed} />;
-  }
-
-  const breadcrumb = getPageBreadcrumb(active);
-
+  // 无边框窗口:最外层纵向布局 = 标题栏 + 主体;--titlebar-h 供侧栏定位复用
   return (
-    <SidebarProvider>
-      <AppSidebar
-        workspace={workspace}
-        onWorkspaceChange={handleWorkspaceChange}
-        active={active}
-        onChange={setActive}
-        user={loggedUser.username}
-        onLogout={handleLogout}
-        remoteStatus={remoteStatus}
+    <div
+      className="flex h-svh flex-col overflow-hidden"
+      style={{ "--titlebar-h": "2.25rem" } as CSSProperties}
+    >
+      <TitleBar
+        showSidebarTrigger={showSidebarTrigger}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        onOpenSettings={() => setActive("system-config")}
       />
-      <SidebarInset>
-        <SiteHeader group={breadcrumb.group} page={breadcrumb.page} />
-        <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-          {renderPage(active, loggedUser.username)}
-        </div>
-      </SidebarInset>
-    </SidebarProvider>
+      <div className="relative min-h-0 flex-1">{body}</div>
+    </div>
   );
 }
 

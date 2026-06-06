@@ -21,9 +21,11 @@ import {
   Plus,
   Search,
   Settings2,
+  Smartphone,
   Sparkles,
   Trash2,
   TriangleAlert,
+  Unplug,
   X,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -33,7 +35,12 @@ import { RefreshButton } from "@/components/RefreshButton";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { FieldError } from "@/components/FieldError";
 import { toast } from "sonner";
-import { api, type AppConfig } from "@/lib/api";
+import {
+  api,
+  type AppConfig,
+  type CloudConfigView,
+  type CloudConnectionState,
+} from "@/lib/api";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -90,7 +97,10 @@ import {
 const SECTION_GROUPS = [
   {
     title: "基础设置",
-    items: [{ key: "general", label: "常规", icon: Settings2 }],
+    items: [
+      { key: "general", label: "常规", icon: Settings2 },
+      { key: "remote-control", label: "远程控制", icon: Smartphone },
+    ],
   },
   {
     title: "AI 配置",
@@ -321,6 +331,7 @@ export function SettingsPage() {
             {active === "general" && (
               <GeneralSection cfg={cfg} onClearData={() => setClearOpen(true)} />
             )}
+            {active === "remote-control" && <RemoteControlSection />}
             {active === "transcription" && (
               <TranscriptionSection providers={providers} />
             )}
@@ -534,6 +545,184 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
+// 远程控制配置:云端中转服务地址 + 登录态 + 实时连接状态。
+// 管理员级配置:URL 通常在部署时一次性配好;手机端配对在侧栏「远程控制」弹窗发起
+function RemoteControlSection() {
+  const [cfg, setCfg] = useState<CloudConfigView | null>(null);
+  const [state, setState] = useState<CloudConnectionState | null>(null);
+  const [baseUrlInput, setBaseUrlInput] = useState("");
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPwd, setLoginPwd] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
+
+  const refresh = async () => {
+    try {
+      const [c, s] = await Promise.all([
+        api.cloudGetConfig(),
+        api.cloudGetStatus(),
+      ]);
+      setCfg(c);
+      setState(s);
+      setBaseUrlInput(c.base_url);
+    } catch (e) {
+      toast.error(`加载远程配置失败: ${e}`);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    // 连接态可能因 WS 重连变化,轻量轮询;后续可换 Tauri Event 推
+    const t = setInterval(() => {
+      api.cloudGetStatus().then(setState).catch(() => {});
+    }, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const urlDirty = baseUrlInput !== (cfg?.base_url ?? "");
+  const loggedIn = !!cfg?.user_token;
+  const paired = !!cfg?.pc_token;
+
+  async function saveBaseUrl() {
+    const url = baseUrlInput.trim();
+    if (url && !/^https?:\/\//i.test(url)) {
+      toast.error("云端地址必须以 http(s):// 开头");
+      return;
+    }
+    try {
+      await api.cloudSaveBaseUrl(url);
+      toast.success("云端地址已保存");
+      await refresh();
+    } catch (e) {
+      toast.error(`保存失败: ${e}`);
+    }
+  }
+
+  async function doLogin(e: FormEvent) {
+    e.preventDefault();
+    if (!loginUser || !loginPwd) return;
+    setLoggingIn(true);
+    try {
+      await api.cloudLogin(loginUser, loginPwd);
+      setLoginPwd("");
+      toast.success("登录成功");
+      await refresh();
+    } catch (e) {
+      toast.error(`登录失败: ${e}`);
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  async function disconnect() {
+    try {
+      await api.cloudDisconnect();
+      toast.success("已断开远程连接");
+      await refresh();
+    } catch (e) {
+      toast.error(`断开失败: ${e}`);
+    }
+  }
+
+  return (
+    <>
+      <SettingsCard
+        title="云端地址"
+        description="中转服务部署后填写一次;PC 通过此地址注册与上报状态。"
+        dirty={urlDirty}
+        onSave={saveBaseUrl}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="cloud-base-url">中转服务 URL</Label>
+          <Input
+            id="cloud-base-url"
+            placeholder="https://veltrix.example.com"
+            value={baseUrlInput}
+            onChange={(e) => setBaseUrlInput(e.target.value)}
+          />
+          {cfg?.device_id && (
+            <p className="text-xs text-muted-foreground">
+              本机设备 ID:
+              <span className="ml-1 font-mono">{cfg.device_id}</span>
+            </p>
+          )}
+        </div>
+      </SettingsCard>
+
+      <SettingsCard
+        title="云端账号"
+        description="登录后即可在侧栏「远程控制」中发起手机配对。"
+      >
+        {!cfg?.base_url ? (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
+            请先配置云端地址。
+          </div>
+        ) : loggedIn ? (
+          <dl className="space-y-3">
+            <Row label="登录状态">
+              <span className="inline-flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
+                <Check className="size-4" />
+                已登录
+              </span>
+            </Row>
+            <Row label="手机配对">
+              {paired ? "已配对" : "未配对(到侧栏「远程控制」扫码绑定)"}
+            </Row>
+            <Row label="WS 连接">
+              {state?.connected ? (
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  在线
+                </span>
+              ) : (
+                <span className="text-muted-foreground">离线</span>
+              )}
+            </Row>
+            {state?.last_report_at && (
+              <Row label="上次上报">
+                {new Date(state.last_report_at * 1000).toLocaleString()}
+              </Row>
+            )}
+            {state?.last_error && (
+              <Row label="最近错误">
+                <span className="text-destructive">{state.last_error}</span>
+              </Row>
+            )}
+            <div className="flex gap-2 pt-1">
+              <Button variant="outline" onClick={disconnect}>
+                <Unplug />
+                断开并清除凭证
+              </Button>
+            </div>
+          </dl>
+        ) : (
+          <form className="space-y-3" onSubmit={doLogin}>
+            <div className="space-y-1.5">
+              <Label htmlFor="cloud-user">账号</Label>
+              <Input
+                id="cloud-user"
+                value={loginUser}
+                onChange={(e) => setLoginUser(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="cloud-pwd">密码</Label>
+              <Input
+                id="cloud-pwd"
+                type="password"
+                value={loginPwd}
+                onChange={(e) => setLoginPwd(e.target.value)}
+              />
+            </div>
+            <Button type="submit" disabled={loggingIn}>
+              {loggingIn && <Loader2 className="size-4 animate-spin" />}
+              登录云端
+            </Button>
+          </form>
+        )}
+      </SettingsCard>
+    </>
+  );
+}
+
 function GeneralSection({
   cfg,
   onClearData,
@@ -572,6 +761,10 @@ function GeneralSection({
       setDbUrl(url);
       setMaxConn(conn);
       setDbBaseline({ url, maxConn: conn });
+      // 存储路径初值取自已保存的素材输出目录(为空表示用应用默认数据目录)
+      const storage = cfg.media?.output_dir ?? "";
+      setStoragePath(storage);
+      setStorageBaseline(storage);
     }
   }, [cfg]);
 
@@ -617,9 +810,13 @@ function GeneralSection({
         description="采集数据与媒体文件的本地落地目录。"
         dirty={storageDirty}
         onSave={() => {
-          // TODO: invoke("set_storage_path", { path: storagePath })
-          setStorageBaseline(storagePath);
-          toast.success("存储配置已保存(待接后端)");
+          api
+            .setStoragePath(storagePath.trim())
+            .then(() => {
+              setStorageBaseline(storagePath);
+              toast.success("存储路径已保存");
+            })
+            .catch((e) => toast.error(String(e)));
         }}
       >
         <div className="space-y-1.5">

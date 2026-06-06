@@ -7,6 +7,8 @@ import {
 } from "react";
 import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
 import {
+  ChevronLeft,
+  Filter,
   LogIn,
   MoreVertical,
   Network,
@@ -15,6 +17,8 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
+import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import {
   api,
   formatTimestamp,
@@ -84,6 +88,7 @@ function generateAccountId(): string {
 
 // 账号管理(主从):左侧平台、右侧该平台账号。接真实后端 API。
 export function AccountsPage({ currentUser }: { currentUser: string }) {
+  const [sbCollapsed, setSbCollapsed] = useResponsiveCollapse();
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   const [selectedPlatform, setSelectedPlatform] = useState("");
   const [accounts, setAccounts] = useState<AccountView[]>([]);
@@ -283,10 +288,21 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       <div className="flex min-h-0 flex-1 gap-4">
-        {/* 左侧:平台 */}
+        {/* 左侧:平台(可收起,窄屏自动收起) */}
+        {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
-          <div className="border-b px-4 py-3">
+          <div className="flex items-center justify-between border-b px-4 py-3">
             <span className="text-sm font-semibold">平台</span>
+            <SimpleTooltip content="收起">
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="cursor-pointer"
+                onClick={() => setSbCollapsed(true)}
+              >
+                <ChevronLeft />
+              </Button>
+            </SimpleTooltip>
           </div>
           <div className="flex-1 space-y-0.5 overflow-auto p-2">
             {platforms.length === 0 && (
@@ -318,8 +334,24 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
             })}
           </div>
         </div>
+        )}
 
-        {/* 右侧:选中平台的账号 */}
+        {/* 右侧:数据表(展开按钮在 toolbar 内,与搜索框对齐)/ 占位 */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+          {sbCollapsed && !selected && (
+            <div>
+              <SimpleTooltip content="展开平台筛选">
+                <Button
+                  variant="outline"
+                  className="cursor-pointer"
+                  onClick={() => setSbCollapsed(false)}
+                >
+                  <Filter />
+                  平台
+                </Button>
+              </SimpleTooltip>
+            </div>
+          )}
         {selected ? (
           <DataTable
             columns={columns}
@@ -343,6 +375,18 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
             renderToolbar={(table) => (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-1 items-center gap-2">
+                  {sbCollapsed && (
+                    <SimpleTooltip content="展开平台筛选">
+                      <Button
+                        variant="outline"
+                        className="cursor-pointer"
+                        onClick={() => setSbCollapsed(false)}
+                      >
+                        <Filter />
+                        平台
+                      </Button>
+                    </SimpleTooltip>
+                  )}
                   <div className="relative w-full sm:max-w-xs">
                     <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
@@ -380,6 +424,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
             请先在左侧选择一个平台
           </div>
         )}
+        </div>
       </div>
 
       <AccountFormSheet

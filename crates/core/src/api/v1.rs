@@ -1,26 +1,58 @@
 //! API v1 路由与示例 handler。新增业务接口在 `routes()` 内追加。
+//!
+//! Cloud / Desktop 模式共享 /health /auth/login /stats;/pair 和 /devices 仅 Cloud 装配。
 
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::Argon2;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
     routing::{get, post},
 };
-use sea_orm::{EntityTrait, PaginatorTrait};
+use bb8_redis::redis::AsyncCommands;
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
-use super::auth::{AuthUser, encode_token};
-use super::{ApiResponse, ApiState, AppError};
+use super::auth::{AuthUser, encode_user_token};
+use super::{ApiResponse, ApiState, AppError, ServerMode, commands, devices, pair, ws};
 use crate::db::entity;
 
-pub fn routes() -> Router<ApiState> {
-    Router::new()
-        // 公开接口
+/// 登录限流:Cloud 模式同 IP 5 分钟内失败 > N 次拒绝
+const LOGIN_MAX_FAILS: u32 = 8;
+const LOGIN_RATE_WINDOW_SECS: u64 = 300;
+
+fn client_ip(headers: &HeaderMap, fallback: SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| fallback.ip().to_string())
+}
+
+pub fn routes(mode: ServerMode) -> Router<ApiState> {
+    let mut r = Router::new()
         .route("/health", get(health))
         .route("/auth/login", post(login))
-        // 受保护接口:handler 参数带 AuthUser 即需 JWT。后续可:
-        //   .nest("/users", users::routes())
-        //   .nest("/customers", customers::routes())
-        .route("/stats", get(stats))
+        .route("/stats", get(stats));
+
+    // 云端中转才暴露配对与设备状态接口;桌面端不挂(避免本地 127.0.0.1 也意外开放)
+    if mode == ServerMode::Cloud {
+        r = r
+            .merge(pair::routes())
+            .merge(devices::routes())
+            .merge(commands::routes())
+            .merge(ws::routes());
+    }
+    r
 }
 
 #[derive(Serialize)]
@@ -29,7 +61,6 @@ struct Health {
     version: &'static str,
 }
 
-/// 健康检查(公开)。
 async fn health() -> ApiResponse<Health> {
     ApiResponse::ok(Health {
         status: "ok",
@@ -49,16 +80,83 @@ struct LoginResp {
     token_type: &'static str,
 }
 
-/// 登录签发 token(占位:接 users 表 + 密码哈希校验后替换,并读取该用户 data_scope)。
+/// 登录:按 username 查 users,argon2 校验密码,成功后签发带 data_scope 的 token。
+/// 失败错误信息统一为「用户名或密码错误」,避免用户枚举。
+/// Cloud 模式 IP 限频:5 分钟内失败 > 8 次直接拒。
 async fn login(
     State(state): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<ApiResponse<LoginResp>, AppError> {
-    if req.username.trim().is_empty() || req.password.is_empty() {
-        return Err(AppError::BadRequest("用户名或密码为空".into()));
+    let username = req.username.trim();
+    if username.is_empty() || req.password.is_empty() {
+        return Err(AppError::Unauthorized("用户名或密码错误".into()));
     }
-    // TODO: 查 users 表校验 password_hash,取出该用户的 data_scope 写入 token
-    let token = encode_token(&state.jwt_secret, req.username.trim(), "self")?;
+
+    // Cloud 模式:先查 IP 失败计数
+    let ip = client_ip(&headers, addr);
+    let fail_key = format!("login:fail:{ip}");
+    if let Some(pool) = state.redis.as_ref() {
+        if let Ok(mut conn) = pool.get().await {
+            let fails: u32 = conn
+                .get::<_, Option<u32>>(&fail_key)
+                .await
+                .unwrap_or(None)
+                .unwrap_or(0);
+            if fails >= LOGIN_MAX_FAILS {
+                return Err(AppError::Unauthorized(
+                    "尝试次数过多,请稍后再试".into(),
+                ));
+            }
+        }
+    }
+
+    // 统一失败处理:Redis 自增 + 返回 401
+    let auth_fail = || async {
+        if let Some(pool) = state.redis.as_ref() {
+            if let Ok(mut conn) = pool.get().await {
+                if let Ok(new_count) = conn.incr::<_, _, u32>(&fail_key, 1u32).await {
+                    if new_count == 1 {
+                        let _: Result<(), _> =
+                            conn.expire(&fail_key, LOGIN_RATE_WINDOW_SECS as i64).await;
+                    }
+                }
+            }
+        }
+        AppError::Unauthorized("用户名或密码错误".into())
+    };
+
+    let model = match entity::user::Entity::find()
+        .filter(entity::user::Column::Username.eq(username))
+        .filter(entity::user::Column::DeletedAt.eq(0))
+        .one(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("查询用户失败: {e}")))?
+    {
+        Some(m) if m.status == "enabled" => m,
+        _ => return Err(auth_fail().await),
+    };
+
+    let parsed = match PasswordHash::new(&model.password_hash) {
+        Ok(p) => p,
+        Err(_) => return Err(auth_fail().await),
+    };
+    if Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed)
+        .is_err()
+    {
+        return Err(auth_fail().await);
+    }
+
+    // 登录成功 → 清失败计数
+    if let Some(pool) = state.redis.as_ref() {
+        if let Ok(mut conn) = pool.get().await {
+            let _: Result<(), _> = conn.del(&fail_key).await;
+        }
+    }
+
+    let token = encode_user_token(&state.jwt_secret, &model.username, &model.data_scope)?;
     Ok(ApiResponse::ok(LoginResp {
         token,
         token_type: "Bearer",
@@ -72,7 +170,6 @@ struct Stats {
     users: u64,
 }
 
-/// 受保护示例:AuthUser 自动校验 JWT(失败 401),并用现有 SeaORM 连接统计行数。
 async fn stats(
     AuthUser(claims): AuthUser,
     State(state): State<ApiState>,

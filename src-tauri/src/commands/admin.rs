@@ -14,8 +14,11 @@ use argon2::Argon2;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, QuerySelect, Set,
 };
+
+/// 单次 list 接口最多返回 N 行,防 IPC 噎住;数据量超出应改分页接口
+const LIST_HARD_CAP: u64 = 1000;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -83,6 +86,7 @@ pub async fn list_users(state: State<'_, AppState>) -> Result<Vec<UserView>> {
     let rows = user::Entity::find()
         .filter(user::Column::DeletedAt.eq(0))
         .order_by_asc(user::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询用户失败: {e}")))?;
@@ -231,6 +235,20 @@ pub struct ProviderDto {
     pub models: String,
 }
 
+/// api_key 列表展示用打码:保留尾部 4 位,前面打码
+fn mask_api_key(key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    let tail: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    if tail.chars().count() < key.chars().count() {
+        format!("••••••{tail}")
+    } else {
+        // 4 字符及以下,全部打码
+        "••••".to_string()
+    }
+}
+
 impl From<provider::Model> for ProviderDto {
     fn from(m: provider::Model) -> Self {
         Self {
@@ -238,7 +256,7 @@ impl From<provider::Model> for ProviderDto {
             code: m.code,
             name: m.name,
             api_url: m.api_url,
-            api_key: m.api_key,
+            api_key: mask_api_key(&m.api_key),
             models: m.models,
         }
     }
@@ -248,6 +266,7 @@ impl From<provider::Model> for ProviderDto {
 pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderDto>> {
     let rows = provider::Entity::find()
         .order_by_asc(provider::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?;
@@ -274,11 +293,19 @@ pub async fn upsert_provider(state: State<'_, AppState>, provider: ProviderDto) 
         .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?;
     match existing {
         Some(model) => {
+            // 前端只看到打码后的 api_key;若提交的就是打码占位串,说明用户没改密钥 → 保留原值
+            let api_key_to_save = if provider.api_key.starts_with("••")
+                || provider.api_key.is_empty()
+            {
+                model.api_key.clone()
+            } else {
+                provider.api_key
+            };
             let mut am = model.into_active_model();
             am.code = Set(provider.code);
             am.name = Set(provider.name);
             am.api_url = Set(provider.api_url);
-            am.api_key = Set(provider.api_key);
+            am.api_key = Set(api_key_to_save);
             am.models = Set(provider.models);
             am.updated_at = Set(now);
             am.update(db)
@@ -339,6 +366,7 @@ impl From<prompt::Model> for PromptDto {
 pub async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<PromptDto>> {
     let rows = prompt::Entity::find()
         .order_by_asc(prompt::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询提示词失败: {e}")))?;
@@ -478,6 +506,7 @@ pub async fn list_customers(state: State<'_, AppState>) -> Result<Vec<CustomerVi
         }
     }
     let rows = query
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询客户失败: {e}")))?;
@@ -605,6 +634,7 @@ pub struct IndustryInput {
 pub async fn list_industries(state: State<'_, AppState>) -> Result<Vec<IndustryView>> {
     let rows = industry::Entity::find()
         .order_by_asc(industry::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询行业失败: {e}")))?;
@@ -701,6 +731,7 @@ pub async fn list_keywords(
     let rows = keyword::Entity::find()
         .filter(keyword::Column::IndustryId.eq(industry_id))
         .order_by_asc(keyword::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询关键词失败: {e}")))?;
@@ -823,6 +854,7 @@ pub async fn list_apis(state: State<'_, AppState>, platform_id: String) -> Resul
     let rows = platform_api::Entity::find()
         .filter(platform_api::Column::PlatformId.eq(platform_id))
         .order_by_asc(platform_api::Column::CreatedAt)
+        .limit(LIST_HARD_CAP)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询平台 API 失败: {e}")))?;

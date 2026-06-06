@@ -38,11 +38,18 @@ export interface DatabaseConfig {
   max_connections: number;
 }
 
+export interface MediaConfig {
+  enable_audio_extract: boolean;
+  ffmpeg_path: string | null;
+  audio_format: string;
+  output_dir: string;
+}
+
 export interface AppConfig {
   platforms: Record<string, PlatformConfig>;
   database: DatabaseConfig;
   report: unknown;
-  media: unknown;
+  media: MediaConfig;
 }
 
 export interface AccountInput {
@@ -181,6 +188,108 @@ export interface ApiInput {
   remark: string;
 }
 
+// 采集任务
+export interface TaskView {
+  id: string;
+  name: string;
+  industry: string;
+  platform: string;
+  keywords: string[];
+  trigger: "once-now" | "daily" | "watching";
+  scheduledAt: string | null;
+  watchIntervalMin: number | null;
+  sortMode: "synthetic" | "hottest" | "latest";
+  timeRange: "any" | "1d" | "1w" | "6m";
+  perKeywordLimit: number;
+  minLikes: number;
+  aiExtract: boolean;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
+  progress: number;
+  contentCount: number;
+  commentCount: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  errorMessage: string | null;
+  owner: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskInput {
+  id: string;
+  name: string;
+  industry: string;
+  platform: string;
+  keywords: string[];
+  trigger: "once-now" | "daily" | "watching";
+  scheduledAt?: string | null;
+  watchIntervalMin?: number | null;
+  sortMode: "synthetic" | "hottest" | "latest";
+  timeRange: "any" | "1d" | "1w" | "6m";
+  perKeywordLimit: number;
+  minLikes: number;
+  aiExtract: boolean;
+}
+
+export interface TaskStatusPatch {
+  id: string;
+  status: TaskView["status"];
+  startedAt?: number | null;
+  finishedAt?: number | null;
+}
+
+// 全量库:采集落库的内容(对应后端 ContentView / contents 表)
+export interface ContentView {
+  id: string;
+  taskId: string;
+  platform: string;
+  industry: string;
+  contentId: string;
+  keyword: string;
+  kind: "video" | "image" | "article" | "unknown";
+  title: string | null;
+  desc: string | null;
+  authorUid: string;
+  authorNickname: string;
+  authorAvatar: string | null;
+  likeCount: number | null;
+  commentCount: number | null;
+  collectCount: number | null;
+  shareCount: number | null;
+  playCount: number | null;
+  publishedAt: number | null;
+  videoUrl: string | null;
+  coverUrl: string | null;
+  imageUrls: string[];
+  duration: number | null;
+  topics: string[];
+  owner: string;
+  collectedAt: number;
+}
+
+// 云端连接相关
+export interface CloudConfigView {
+  base_url: string;
+  user_token: string | null;
+  pc_token: string | null;
+  device_id: string;
+}
+
+export interface CloudConnectionState {
+  connected: boolean;
+  paired: boolean;
+  last_report_at: number | null;
+  last_error: string | null;
+}
+
+export interface CloudPairView {
+  code: string;
+  manual_code: string;
+  qr_payload: string;
+  expires_in: number;
+  base_url: string;
+}
+
 export const api = {
   listPlatforms: () => invoke<PlatformConfig[]>("list_platforms"),
   upsertPlatform: (platform: PlatformConfig) =>
@@ -194,6 +303,8 @@ export const api = {
     invoke<void>("test_database_connection", { url }),
   setDatabaseConfig: (url: string, maxConnections: number) =>
     invoke<void>("set_database_config", { url, maxConnections }),
+  setStoragePath: (path: string) =>
+    invoke<void>("set_storage_path", { path }),
   saveTextFile: (path: string, content: string) =>
     invoke<void>("save_text_file", { path, content }),
 
@@ -263,6 +374,29 @@ export const api = {
     invoke<ApiView[]>("list_apis", { platformId }),
   upsertApi: (item: ApiInput) => invoke<void>("upsert_api", { item }),
   removeApi: (id: string) => invoke<void>("remove_api", { id }),
+
+  // 采集任务
+  listTasks: () => invoke<TaskView[]>("list_tasks"),
+  upsertTask: (input: TaskInput) => invoke<void>("upsert_task", { input }),
+  updateTaskStatus: (patch: TaskStatusPatch) =>
+    invoke<void>("update_task_status", { patch }),
+  removeTask: (id: string) => invoke<void>("remove_task", { id }),
+  // 启动任务采集:后端选账号 + 后台遍历关键词(自动开窗 + 拟人 RPA),立即返回
+  runTask: (taskId: string) => invoke<void>("run_task", { taskId }),
+  // 全量库:列出采集落库的全部内容(按采集时间倒序)
+  listContents: () => invoke<ContentView[]>("list_contents"),
+  // 删除一条采集内容
+  removeContent: (id: string) => invoke<void>("remove_content", { id }),
+
+  // 云端连接(远程控制)
+  cloudGetConfig: () => invoke<CloudConfigView>("cloud_get_config"),
+  cloudGetStatus: () => invoke<CloudConnectionState>("cloud_get_status"),
+  cloudSaveBaseUrl: (baseUrl: string) =>
+    invoke<void>("cloud_save_base_url", { baseUrl }),
+  cloudLogin: (username: string, password: string) =>
+    invoke<void>("cloud_login", { username, password }),
+  cloudPairInit: () => invoke<CloudPairView>("cloud_pair_init"),
+  cloudDisconnect: () => invoke<void>("cloud_disconnect"),
 };
 
 // Unix 秒 -> 本地时间字符串;0 视为「未使用过」

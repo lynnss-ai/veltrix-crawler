@@ -15,7 +15,7 @@ use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, QuerySelect, Set,
 };
 
 /// 风控后冷却时长(秒)。期间该账号不被轮换选中,到期自动恢复。
@@ -153,35 +153,54 @@ impl CookiePool {
     ///
     /// 选取规则:平台匹配 + (状态 active,或冷却已到期)→ 取 last_used_at 最小者。
     /// 冷却到期的账号在此顺带恢复为 active。
+    ///
+    /// 并发安全:候选选出后用 `last_used_at = old_last_used_at` 做乐观 CAS,
+    /// 更新影响 0 行表示其他线程已抢走,重试到 MAX_RETRIES 上限。
     pub async fn acquire(&self, platform: &str) -> Result<Account> {
+        const MAX_RETRIES: usize = 5;
         let now = Utc::now().timestamp();
-        let model = AccountEntity::find()
-            .filter(account::Column::Platform.eq(platform))
-            .filter(
-                Condition::any()
-                    .add(account::Column::Status.eq(AccountStatus::Active.as_str()))
-                    .add(
-                        Condition::all()
-                            .add(account::Column::Status.eq(AccountStatus::Cooldown.as_str()))
-                            .add(account::Column::CooldownUntil.lte(now)),
-                    ),
-            )
-            .order_by_asc(account::Column::LastUsedAt)
-            .one(&self.db)
-            .await
-            .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
-            .ok_or_else(|| CrawlerError::Account(format!("平台 {platform} 无可用账号")))?;
+        for _ in 0..MAX_RETRIES {
+            let model = AccountEntity::find()
+                .filter(account::Column::Platform.eq(platform))
+                .filter(
+                    Condition::any()
+                        .add(account::Column::Status.eq(AccountStatus::Active.as_str()))
+                        .add(
+                            Condition::all()
+                                .add(account::Column::Status.eq(AccountStatus::Cooldown.as_str()))
+                                .add(account::Column::CooldownUntil.lte(now)),
+                        ),
+                )
+                .order_by_asc(account::Column::LastUsedAt)
+                .one(&self.db)
+                .await
+                .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
+                .ok_or_else(|| CrawlerError::Account(format!("平台 {platform} 无可用账号")))?;
 
-        // 先留存返回快照,再用 ActiveModel 写回占用状态
-        let account: Account = model.clone().into();
-        let mut am: account::ActiveModel = model.into();
-        am.status = Set(AccountStatus::Active.as_str().to_string());
-        am.cooldown_until = Set(0);
-        am.last_used_at = Set(now);
-        am.update(&self.db)
-            .await
-            .map_err(|e| CrawlerError::Account(format!("占用账号失败: {e}")))?;
-        Ok(account)
+            let snapshot_last_used = model.last_used_at;
+            let snapshot: Account = model.clone().into();
+
+            // 乐观 CAS:只在 last_used_at 仍是候选时刻的值时更新
+            let res = AccountEntity::update_many()
+                .col_expr(
+                    account::Column::Status,
+                    sea_orm::sea_query::Expr::value(AccountStatus::Active.as_str()),
+                )
+                .col_expr(account::Column::CooldownUntil, sea_orm::sea_query::Expr::value(0i64))
+                .col_expr(account::Column::LastUsedAt, sea_orm::sea_query::Expr::value(now))
+                .filter(account::Column::Id.eq(model.id.clone()))
+                .filter(account::Column::LastUsedAt.eq(snapshot_last_used))
+                .exec(&self.db)
+                .await
+                .map_err(|e| CrawlerError::Account(format!("占用账号失败: {e}")))?;
+            if res.rows_affected == 1 {
+                return Ok(snapshot);
+            }
+            // 0 行 = 已被其他线程抢走,重新挑下一个
+        }
+        Err(CrawlerError::Account(
+            "并发争用激烈,获取账号失败,请稍后重试".into(),
+        ))
     }
 
     /// 反馈该账号触发风控:累加计数,达阈值判失效,否则进入冷却。
@@ -245,9 +264,12 @@ impl CookiePool {
 
     /// 列出某平台全部账号,供前端账号管理界面展示。
     pub async fn list(&self, platform: &str) -> Result<Vec<Account>> {
+        // 单平台最多 1000 个账号,超出走分页接口
+        const HARD_CAP: u64 = 1000;
         let models = AccountEntity::find()
             .filter(account::Column::Platform.eq(platform))
             .order_by_asc(account::Column::CreatedAt)
+            .limit(HARD_CAP)
             .all(&self.db)
             .await
             .map_err(|e| CrawlerError::Account(format!("列出账号失败: {e}")))?;

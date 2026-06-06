@@ -36,6 +36,8 @@ interface DataTableProps<TData, TValue> {
   getRowId?: (row: TData, index: number) => string;
   renderToolbar?: (table: TanstackTable<TData>) => ReactNode;
   emptyState?: ReactNode;
+  /// 每页默认条数(不传默认 10)
+  defaultPageSize?: number;
 }
 
 export function DataTable<TData, TValue>({
@@ -46,6 +48,7 @@ export function DataTable<TData, TValue>({
   getRowId,
   renderToolbar,
   emptyState,
+  defaultPageSize = 10,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -69,7 +72,7 @@ export function DataTable<TData, TValue>({
     getPaginationRowModel: getPaginationRowModel(),
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
-    initialState: { pagination: { pageSize: 10 } },
+    initialState: { pagination: { pageSize: defaultPageSize } },
   });
 
   return (
@@ -77,21 +80,35 @@ export function DataTable<TData, TValue>({
       {renderToolbar?.(table)}
 
       <Card className="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden py-0">
-        <CardContent className="min-h-0 flex-1 overflow-auto px-0">
-          <Table>
-            <TableHeader className="sticky top-0 z-10 bg-muted [&_th]:font-semibold [&_th]:text-muted-foreground">
+        {/* 不在此层滚动:滚动交给 Table 内的 table-container,thead 的 sticky 才能吸顶 */}
+        <CardContent className="min-h-0 flex-1 overflow-hidden px-0">
+          {/* min-w-max 让表宽随列内容扩展,table-container 的 overflow-auto 提供横向/纵向滚动 */}
+          <Table className="min-w-max">
+            {/* sticky 下放到每个 th(而非 thead):避免 sticky 嵌套导致最后一列横向 sticky 失效。
+                普通列只吸顶(top-0),最后一列同时吸顶+吸右(top-0 right-0),角落 z 最高 */}
+            <TableHeader className="[&_th]:font-semibold [&_th]:text-muted-foreground">
               {table.getHeaderGroups().map((headerGroup) => (
                 <TableRow key={headerGroup.id}>
-                  {headerGroup.headers.map((header) => (
-                    <TableHead key={header.id} className="last:pr-6">
-                      {header.isPlaceholder
-                        ? null
-                        : flexRender(
-                            header.column.columnDef.header,
-                            header.getContext(),
-                          )}
-                    </TableHead>
-                  ))}
+                  {headerGroup.headers.map((header, idx) => {
+                    const isLast = idx === headerGroup.headers.length - 1;
+                    return (
+                      <TableHead
+                        key={header.id}
+                        className={
+                          isLast
+                            ? "sticky right-0 top-0 z-20 bg-muted pr-6 shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.06)]"
+                            : "sticky top-0 z-10 bg-muted"
+                        }
+                      >
+                        {header.isPlaceholder
+                          ? null
+                          : flexRender(
+                              header.column.columnDef.header,
+                              header.getContext(),
+                            )}
+                      </TableHead>
+                    );
+                  })}
                 </TableRow>
               ))}
             </TableHeader>
@@ -112,14 +129,24 @@ export function DataTable<TData, TValue>({
                     key={row.id}
                     data-state={row.getIsSelected() ? "selected" : undefined}
                   >
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell key={cell.id} className="last:pr-6">
-                        {flexRender(
-                          cell.column.columnDef.cell,
-                          cell.getContext(),
-                        )}
-                      </TableCell>
-                    ))}
+                    {row.getVisibleCells().map((cell, idx, arr) => {
+                      const isLast = idx === arr.length - 1;
+                      return (
+                        <TableCell
+                          key={cell.id}
+                          className={
+                            isLast
+                              ? "sticky right-0 z-10 bg-card pr-6 shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.06)]"
+                              : ""
+                          }
+                        >
+                          {flexRender(
+                            cell.column.columnDef.cell,
+                            cell.getContext(),
+                          )}
+                        </TableCell>
+                      );
+                    })}
                   </TableRow>
                 ))
               )}

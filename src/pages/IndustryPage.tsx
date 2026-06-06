@@ -11,7 +11,9 @@ import {
 } from "@tanstack/react-table";
 import {
   Check,
+  ChevronLeft,
   Copy,
+  Filter,
   MoreVertical,
   Pencil,
   Plus,
@@ -20,6 +22,8 @@ import {
   Tags,
   Trash2,
 } from "lucide-react";
+import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import {
   api,
   type IndustryInput,
@@ -81,6 +85,7 @@ const keywordFilterFn: FilterFn<KeywordDto> = (row, _columnId, value) =>
   row.original.word.toLowerCase().includes(String(value).toLowerCase());
 
 export function IndustryPage() {
+  const [sbCollapsed, setSbCollapsed] = useResponsiveCollapse();
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [keywords, setKeywords] = useState<KeywordDto[]>([]);
   // 各行业关键词数量(左侧列表角标),按需异步加载
@@ -284,14 +289,27 @@ export function IndustryPage() {
       >
         <ErrorBanner message={error} onClose={() => setError(null)} />
         <div className="flex min-h-0 flex-1 gap-4">
-          {/* 左侧:行业类别 */}
+          {/* 左侧:行业类别(可收起) */}
+        {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
           <div className="flex items-center justify-between border-b px-4 py-3">
             <span className="text-sm font-semibold">行业类别</span>
-            <Button size="icon-sm" variant="ghost" onClick={openCreateIndustry}>
-              <Plus />
-              <span className="sr-only">新增行业</span>
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button size="icon-sm" variant="ghost" onClick={openCreateIndustry}>
+                <Plus />
+                <span className="sr-only">新增行业</span>
+              </Button>
+              <SimpleTooltip content="收起">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="cursor-pointer"
+                  onClick={() => setSbCollapsed(true)}
+                >
+                  <ChevronLeft />
+                </Button>
+              </SimpleTooltip>
+            </div>
           </div>
           <div className="flex-1 space-y-0.5 overflow-auto p-2">
             {industries.length === 0 && (
@@ -352,8 +370,25 @@ export function IndustryPage() {
             })}
           </div>
         </div>
+        )}
 
-        {/* 右侧:选中行业的关键词 */}
+        {/* 右侧:数据表(展开按钮在 toolbar 内,与搜索框对齐)/ 占位 */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+          {/* 占位态下没有 DataTable toolbar,这里也放一个展开按钮 */}
+          {sbCollapsed && !selectedIndustry && (
+            <div>
+              <SimpleTooltip content="展开行业筛选">
+                <Button
+                  variant="outline"
+                  className="cursor-pointer"
+                  onClick={() => setSbCollapsed(false)}
+                >
+                  <Filter />
+                  行业
+                </Button>
+              </SimpleTooltip>
+            </div>
+          )}
         {selectedIndustry ? (
           <DataTable
             columns={columns}
@@ -376,14 +411,28 @@ export function IndustryPage() {
             }
             renderToolbar={(table) => (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="relative w-full sm:max-w-xs">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    placeholder={`搜索「${selectedIndustry.name}」的关键词`}
-                    className="pl-9"
-                    value={(table.getState().globalFilter as string) ?? ""}
-                    onChange={(e) => table.setGlobalFilter(e.target.value)}
-                  />
+                <div className="flex items-center gap-2">
+                  {sbCollapsed && (
+                    <SimpleTooltip content="展开行业筛选">
+                      <Button
+                        variant="outline"
+                        className="cursor-pointer"
+                        onClick={() => setSbCollapsed(false)}
+                      >
+                        <Filter />
+                        行业
+                      </Button>
+                    </SimpleTooltip>
+                  )}
+                  <div className="relative w-full sm:w-72">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      placeholder={`搜索「${selectedIndustry.name}」的关键词`}
+                      className="pl-9"
+                      value={(table.getState().globalFilter as string) ?? ""}
+                      onChange={(e) => table.setGlobalFilter(e.target.value)}
+                    />
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <RefreshButton onClick={() => loadKeywords(selectedId)} />
@@ -405,6 +454,7 @@ export function IndustryPage() {
             请先在左侧选择或新增一个行业类别
           </div>
         )}
+        </div>
         </div>
       </div>
 

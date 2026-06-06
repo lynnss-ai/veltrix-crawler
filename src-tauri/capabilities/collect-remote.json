@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "collect-remote",
+  "description": "采集 WebView(veltrix-*)加载的是外部平台页面(小红书/抖音/快手),属于远程 origin。Tauri 默认禁止远程页面 invoke 命令,这里显式授权这些域名,使注入脚本能回传拦截响应(intercept_push)与 RPA 结果(rpa_done)。",
+  "windows": ["veltrix-*"],
+  "remote": {
+    "urls": [
+      "https://*.xiaohongshu.com",
+      "https://*.douyin.com",
+      "https://*.kuaishou.com"
+    ]
+  },
+  "permissions": ["core:default"]
+}

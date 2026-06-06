@@ -1,6 +1,7 @@
 import * as React from "react"
 
-const MOBILE_BREAKPOINT = 768
+// 真正的手机端断点(手机端走 Sheet 覆盖),平板/小窗笔记本走常规可折叠图标侧栏
+const MOBILE_BREAKPOINT = 480
 
 export function useIsMobile() {
   const [isMobile, setIsMobile] = React.useState<boolean | undefined>(undefined)

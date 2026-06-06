@@ -115,21 +115,135 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::platform_api::Entity, "platform_apis").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
+    create_table(db, &schema, entity::task::Entity, "tasks").await?;
+    create_table(db, &schema, entity::content::Entity, "contents").await?;
+    create_table(db, &schema, entity::comment::Entity, "comments").await?;
 
-    // 兼容旧版 accounts 表:补充新增列(列已存在时忽略错误)。
-    // ALTER TABLE ADD COLUMN 在 SQLite / PostgreSQL 通用。
+    // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
-    for ddl in [
-        "ALTER TABLE accounts ADD COLUMN code TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE accounts ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE accounts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+    for (col, ddl) in [
+        ("code", "ALTER TABLE accounts ADD COLUMN code TEXT NOT NULL DEFAULT ''"),
+        ("remark", "ALTER TABLE accounts ADD COLUMN remark TEXT NOT NULL DEFAULT ''"),
+        ("owner", "ALTER TABLE accounts ADD COLUMN owner TEXT NOT NULL DEFAULT ''"),
     ] {
-        let _ = db
+        if !column_exists(db, "accounts", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER accounts.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 contents 表:补 keyword 列(全量库按采集关键词筛选)
+    if !column_exists(db, "contents", "keyword").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE contents ADD COLUMN keyword TEXT NOT NULL DEFAULT ''".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER contents.keyword 失败(忽略): {e}");
+        }
+    }
+
+    // 兼容已建的 contents 表:补 cover_url 列(封面下载与展示)
+    if !column_exists(db, "contents", "cover_url").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE contents ADD COLUMN cover_url TEXT".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER contents.cover_url 失败(忽略): {e}");
+        }
+    }
+
+    // 兼容已建的 contents 表:补 duration(视频时长秒)与 topics(话题 JSON)列
+    if !column_exists(db, "contents", "duration").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE contents ADD COLUMN duration BIGINT".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER contents.duration 失败(忽略): {e}");
+        }
+    }
+    if !column_exists(db, "contents", "topics").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE contents ADD COLUMN topics TEXT NOT NULL DEFAULT '[]'".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER contents.topics 失败(忽略): {e}");
+        }
+    }
+
+    // 二级索引:覆盖高频查询字段。CREATE INDEX IF NOT EXISTS 跨 SQLite/PG 通用,重启无副作用。
+    for ddl in [
+        "CREATE INDEX IF NOT EXISTS idx_accounts_platform_last_used ON accounts(platform, last_used_at)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_owner_updated ON tasks(owner, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        "CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_keywords_industry ON keywords(industry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_platform_apis_platform ON platform_apis(platform_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)",
+        "CREATE INDEX IF NOT EXISTS idx_contents_task ON contents(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_content ON comments(content_id)",
+    ] {
+        if let Err(e) = db
             .execute(Statement::from_string(backend, ddl.to_owned()))
-            .await;
+            .await
+        {
+            tracing::warn!("创建索引失败(忽略): {ddl} → {e}");
+        }
     }
 
     Ok(())
+}
+
+/// 检查指定表的指定列是否存在。SQLite 用 `PRAGMA table_info`,PG 走 `information_schema`。
+/// 任何查询错误一律返回 false(让上层照常尝试 ALTER,失败也被忽略)。
+async fn column_exists(db: &DatabaseConnection, table: &str, column: &str) -> bool {
+    use sea_orm::DatabaseBackend;
+    let backend = db.get_database_backend();
+    let stmt = match backend {
+        DatabaseBackend::Sqlite => Statement::from_string(
+            backend,
+            format!("PRAGMA table_info({table})"),
+        ),
+        DatabaseBackend::Postgres => Statement::from_sql_and_values(
+            backend,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 LIMIT 1",
+            [table.into(), column.into()],
+        ),
+        // MySQL 暂不支持
+        _ => return false,
+    };
+    let rows = match db.query_all(stmt).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if matches!(backend, DatabaseBackend::Postgres) {
+        return !rows.is_empty();
+    }
+    // SQLite: 遍历找 name 列
+    for row in rows {
+        let name: String = row.try_get("", "name").unwrap_or_default();
+        if name == column {
+            return true;
+        }
+    }
+    false
 }
 
 /// 用实体建表(若不存在)。

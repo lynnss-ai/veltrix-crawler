@@ -1,11 +1,11 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   Bot,
-  Boxes,
   CalendarClock,
   ChevronsUpDown,
   Clapperboard,
   Contact,
+  Database,
   FileStack,
   FolderKanban,
   Grip,
@@ -17,13 +17,9 @@ import {
   LogOut,
   Network,
   Radar,
-  RefreshCw,
-  Info,
-  Loader2,
+  Rocket,
   Settings,
-  Smartphone,
   Tags,
-  Unplug,
   UserCog,
   Users,
   type LucideIcon,
@@ -49,13 +45,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   Sheet,
   SheetContent,
   SheetDescription,
@@ -67,7 +56,6 @@ import { FieldError } from "@/components/FieldError";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
@@ -109,13 +97,12 @@ const MENU_GROUPS: MenuGroup[] = [
     title: "采集中心",
     items: [
       { key: "collect-tasks", label: "任务调度", icon: CalendarClock },
-      { key: "accounts", label: "账号管理", icon: Users },
     ],
   },
   {
     title: "内容资产",
     items: [
-      { key: "assets-all", label: "全量库", icon: Boxes },
+      { key: "assets-all", label: "全量库", icon: Database },
       { key: "assets-content", label: "内容库", icon: FileStack },
       { key: "assets-image", label: "图片库", icon: Images },
     ],
@@ -125,6 +112,7 @@ const MENU_GROUPS: MenuGroup[] = [
     items: [
       { key: "industry", label: "行业类别", icon: Tags },
       { key: "platforms", label: "平台管理", icon: Network },
+      { key: "accounts", label: "平台账号", icon: Users },
       { key: "customers", label: "客户管理", icon: Contact },
     ],
   },
@@ -144,9 +132,10 @@ const PRODUCT_PLATFORMS: {
   icon: LucideIcon;
   current?: boolean;
 }[] = [
-  { key: "crawler", name: "数据挖掘", icon: Radar, current: true },
-  { key: "video", name: "AI 短视频生成", icon: Clapperboard },
-  { key: "image", name: "AI 图片生成", icon: Image },
+  { key: "crawler", name: "协作平台", icon: Radar, current: true },
+  { key: "video", name: "视频创作", icon: Clapperboard },
+  { key: "image", name: "图片创作", icon: Image },
+  { key: "publish", name: "发布服务", icon: Rocket },
 ];
 
 // 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(协作);后两者暂为占位
@@ -200,18 +189,6 @@ export function getPageBreadcrumb(key: PageKey): {
   return { group: "", page: "" };
 }
 
-// 远程上报连接状态;后端 RemoteConfig 就绪后由上报模块驱动
-export type RemoteStatus = "connected" | "disconnected" | "failed";
-
-const REMOTE_STATUS_META: Record<
-  RemoteStatus,
-  { label: string; className: string }
-> = {
-  connected: { label: "远程已连接", className: "text-emerald-500" },
-  disconnected: { label: "远程未连接", className: "text-muted-foreground" },
-  failed: { label: "远程连接失败", className: "text-destructive" },
-};
-
 interface AppSidebarProps {
   workspace: Workspace;
   onWorkspaceChange: (workspace: Workspace) => void;
@@ -219,7 +196,6 @@ interface AppSidebarProps {
   onChange: (key: PageKey) => void;
   user: string;
   onLogout: () => void;
-  remoteStatus: RemoteStatus;
 }
 
 export function AppSidebar({
@@ -229,14 +205,16 @@ export function AppSidebar({
   onChange,
   user,
   onLogout,
-  remoteStatus,
 }: AppSidebarProps) {
   const [changePwdOpen, setChangePwdOpen] = useState(false);
-  const [remoteOpen, setRemoteOpen] = useState(false);
-  const remoteMeta = REMOTE_STATUS_META[remoteStatus];
 
   return (
-    <Sidebar collapsible="icon">
+    // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
+    // 这里按标题栏高度 --titlebar-h 下移并缩高,使其从标题栏下方开始
+    <Sidebar
+      collapsible="icon"
+      className="top-(--titlebar-h)! h-[calc(100svh-var(--titlebar-h))]!"
+    >
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem className="flex items-center gap-1">
@@ -274,20 +252,27 @@ export function AppSidebar({
                 <DropdownMenuSeparator />
                 {PRODUCT_PLATFORMS.map((product) => {
                   const Icon = product.icon;
+                  const isCurrent = !!product.current;
                   return (
                     <DropdownMenuItem
                       key={product.key}
-                      disabled={product.current}
+                      disabled={isCurrent}
+                      // disabled 默认会半透明,这里强制保留全不透明,让颜色高亮更明显
+                      className={
+                        isCurrent
+                          ? "data-[disabled]:opacity-100 text-primary focus:text-primary bg-primary/10"
+                          : ""
+                      }
                       onClick={() => {
-                        if (!product.current) {
+                        if (!isCurrent) {
                           toast.info(`${product.name} 即将上线`);
                         }
                       }}
                     >
-                      <Icon />
+                      <Icon className={isCurrent ? "text-primary" : ""} />
                       <span className="flex-1">{product.name}</span>
-                      {product.current && (
-                        <span className="text-xs text-muted-foreground">
+                      {isCurrent && (
+                        <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                           当前
                         </span>
                       )}
@@ -319,7 +304,7 @@ export function AppSidebar({
         </div>
       </SidebarHeader>
 
-      <SidebarContent>
+      <SidebarContent className="group-data-[collapsible=icon]:overflow-y-auto">
         {WORKSPACE_MENUS[workspace].map((group) => (
           <SidebarGroup key={group.title}>
             <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
@@ -371,7 +356,7 @@ export function AppSidebar({
                 side="top"
                 align="start"
                 sideOffset={8}
-                className="w-[calc(var(--radix-dropdown-menu-trigger-width)_+_3.5rem)] p-2"
+                className="w-[var(--radix-dropdown-menu-trigger-width)] p-2"
               >
                 <DropdownMenuLabel className="p-0 font-normal">
                   <div className="flex items-center gap-2.5 px-1.5 py-2">
@@ -388,38 +373,30 @@ export function AppSidebar({
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator className="my-1.5" />
                 <DropdownMenuItem
-                  className="gap-2.5 py-2"
+                  className="gap-2.5 py-2 cursor-pointer"
                   onClick={() => setChangePwdOpen(true)}
                 >
                   <KeyRound />
                   修改密码
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  className="gap-2.5 py-2"
+                  className="gap-2.5 py-2 cursor-pointer"
                   onClick={() => onChange("system-config")}
                 >
                   <Settings />
                   系统设置
                 </DropdownMenuItem>
                 <DropdownMenuSeparator className="my-1.5" />
-                <DropdownMenuItem className="gap-2.5 py-2" onClick={onLogout}>
+                <DropdownMenuItem
+                  className="gap-2.5 py-2 cursor-pointer text-destructive focus:text-destructive focus:bg-destructive/10 [&_svg]:text-destructive"
+                  onClick={onLogout}
+                >
                   <LogOut />
                   退出登录
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
 
-            {/* 远程手机控制:独立于个人中心(不被其点击区覆盖),手机远程控制状态 */}
-            <SimpleTooltip content={remoteMeta.label}>
-              <button
-                type="button"
-                onClick={() => setRemoteOpen(true)}
-                className={`flex size-12 shrink-0 items-center justify-center rounded-lg border bg-sidebar transition-colors hover:bg-sidebar-accent group-data-[collapsible=icon]:hidden ${remoteMeta.className}`}
-              >
-                <Smartphone className="size-5" />
-                <span className="sr-only">{remoteMeta.label}</span>
-              </button>
-            </SimpleTooltip>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
@@ -427,12 +404,6 @@ export function AppSidebar({
       <ChangePasswordSheet
         open={changePwdOpen}
         onOpenChange={setChangePwdOpen}
-      />
-
-      <RemoteConnectDialog
-        open={remoteOpen}
-        onOpenChange={setRemoteOpen}
-        status={remoteStatus}
       />
     </Sidebar>
   );
@@ -566,168 +537,3 @@ function ChangePasswordSheet({
   );
 }
 
-// 远程连接二维码占位:确定性伪随机图案 + 三个定位角,仅作示意。
-// 真实二维码待后端生成含一次性连接 token 的内容后替换。
-function QrPlaceholder({
-  seed = 0,
-  className = "size-44",
-}: {
-  seed?: number;
-  className?: string;
-}) {
-  const SIZE = 21;
-  const dots: ReactNode[] = [];
-  for (let row = 0; row < SIZE; row += 1) {
-    for (let col = 0; col < SIZE; col += 1) {
-      const inFinder =
-        (row < 7 && col < 7) ||
-        (row < 7 && col >= SIZE - 7) ||
-        (row >= SIZE - 7 && col < 7);
-      if (inFinder) continue;
-      // 基于坐标 + seed 的确定性散列;seed 变化即重新生成图案(刷新二维码)
-      if ((row * 31 + col * 17 + row * col + seed * 13) % 3 === 0) {
-        dots.push(
-          <rect key={`${row}-${col}`} x={col} y={row} width="1" height="1" />,
-        );
-      }
-    }
-  }
-  const finders: [number, number][] = [
-    [0, 0],
-    [SIZE - 7, 0],
-    [0, SIZE - 7],
-  ];
-  return (
-    <svg
-      viewBox="0 0 21 21"
-      shapeRendering="crispEdges"
-      className={`${className} text-slate-900`}
-    >
-      <rect width="21" height="21" fill="white" />
-      <g fill="currentColor">{dots}</g>
-      {finders.map(([x, y]) => (
-        <g key={`${x}-${y}`} fill="currentColor">
-          <rect x={x} y={y} width="7" height="7" />
-          <rect x={x + 1} y={y + 1} width="5" height="5" fill="white" />
-          <rect x={x + 2} y={y + 2} width="3" height="3" />
-        </g>
-      ))}
-    </svg>
-  );
-}
-
-// 远程连接弹窗:手机 App 扫码连接,远程查看 / 监控本机数据采集。仅允许一台设备。
-// 连接态由后端 RemoteConfig 上报驱动;扫码绑定 / 断开当前为前端占位。
-function RemoteConnectDialog({
-  open,
-  onOpenChange,
-  status,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  status: RemoteStatus;
-}) {
-  const isConnected = status === "connected";
-  // 连接二维码刷新种子;变化即重新生成图案(真实场景为重新申请一次性连接 token)
-  const [qrSeed, setQrSeed] = useState(0);
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Smartphone className="size-5" />
-            远程控制
-          </DialogTitle>
-          <DialogDescription>
-            使用 Veltrix 手机 App 扫码连接,随时随地远程查看与监控本机的数据采集情况。
-          </DialogDescription>
-        </DialogHeader>
-
-        {isConnected ? (
-          <div className="space-y-3">
-            <div className="flex items-center gap-3 rounded-lg border bg-card p-3">
-              <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10">
-                <Smartphone className="size-5 text-emerald-500" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5 font-medium">
-                  <span className="truncate">已绑定设备</span>
-                  <span className="size-2 shrink-0 rounded-full bg-emerald-500" />
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  在线 · 远程监控中
-                </div>
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                className="flex-1"
-                onClick={() => {
-                  // TODO: invoke("remote_reconnect"),重新建立远程会话
-                  toast.success("正在刷新重连…(待接后端)");
-                }}
-              >
-                <RefreshCw />
-                刷新重连
-              </Button>
-              <Button
-                variant="destructive"
-                className="flex-1"
-                onClick={() => {
-                  // TODO: invoke("remote_disconnect"),断开会话并更新上报状态
-                  toast.success("已断开远程连接(待接后端)");
-                  onOpenChange(false);
-                }}
-              >
-                <Unplug />
-                断开连接
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <div className="flex flex-col items-center gap-3">
-            <div className="rounded-xl border bg-white p-3 shadow-sm">
-              <QrPlaceholder seed={qrSeed} />
-            </div>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" />
-              打开手机 App「扫一扫」完成连接
-            </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                // TODO: invoke("remote_refresh_token"),重新申请连接二维码
-                setQrSeed((s) => s + 1);
-                toast.success("二维码已刷新");
-              }}
-            >
-              <RefreshCw />
-              刷新二维码
-            </Button>
-          </div>
-        )}
-
-        {/* App 下载入口:扫码下载手机端 */}
-        <div className="flex items-center gap-3 rounded-lg border bg-muted/30 p-3">
-          <div className="shrink-0 rounded-md border bg-white p-1.5">
-            <QrPlaceholder seed={99} className="size-16" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium">下载 Veltrix 手机 App</div>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              扫码下载,支持 iOS / Android
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-start gap-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-          <Info className="mt-0.5 size-3.5 shrink-0" />
-          出于数据安全考虑,同一时间仅允许一台设备远程连接。
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}

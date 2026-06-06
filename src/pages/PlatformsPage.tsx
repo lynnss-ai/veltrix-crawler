@@ -6,7 +6,17 @@ import {
   type FormEvent,
 } from "react";
 import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
-import { MoreVertical, Pencil, Plus, Search, Trash2 } from "lucide-react";
+import {
+  ChevronLeft,
+  Filter,
+  MoreVertical,
+  Pencil,
+  Plus,
+  Search,
+  Trash2,
+} from "lucide-react";
+import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import {
   api,
   type PlatformConfig,
@@ -71,6 +81,7 @@ const apiFilterFn: FilterFn<ApiItem> = (row, _columnId, value) => {
 
 // 平台管理(主从):左侧平台(名称/链接/启用,真实 API),右侧该平台的 API 列表(占位)。
 export function PlatformsPage() {
+  const [sbCollapsed, setSbCollapsed] = useResponsiveCollapse();
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   const [selectedId, setSelectedId] = useState("");
   // 当前选中平台的 API 子列表(真实持久化)
@@ -263,14 +274,27 @@ export function PlatformsPage() {
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       <div className="flex min-h-0 flex-1 gap-4">
-        {/* 左侧:平台 */}
+        {/* 左侧:平台(可收起) */}
+        {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
           <div className="flex items-center justify-between border-b px-4 py-3">
             <span className="text-sm font-semibold">平台</span>
-            <Button size="icon-sm" variant="ghost" onClick={openCreatePlatform}>
-              <Plus />
-              <span className="sr-only">新增平台</span>
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button size="icon-sm" variant="ghost" onClick={openCreatePlatform}>
+                <Plus />
+                <span className="sr-only">新增平台</span>
+              </Button>
+              <SimpleTooltip content="收起">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="cursor-pointer"
+                  onClick={() => setSbCollapsed(true)}
+                >
+                  <ChevronLeft />
+                </Button>
+              </SimpleTooltip>
+            </div>
           </div>
           <div className="flex-1 space-y-0.5 overflow-auto p-2">
             {platforms.length === 0 && (
@@ -338,8 +362,24 @@ export function PlatformsPage() {
             })}
           </div>
         </div>
+        )}
 
-        {/* 右侧:选中平台的 API */}
+        {/* 右侧:数据表(展开按钮在 toolbar 内)/ 占位 */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+          {sbCollapsed && !selected && (
+            <div>
+              <SimpleTooltip content="展开平台筛选">
+                <Button
+                  variant="outline"
+                  className="cursor-pointer"
+                  onClick={() => setSbCollapsed(false)}
+                >
+                  <Filter />
+                  平台
+                </Button>
+              </SimpleTooltip>
+            </div>
+          )}
         {selected ? (
           <DataTable
             columns={columns}
@@ -359,14 +399,28 @@ export function PlatformsPage() {
             }
             renderToolbar={(table) => (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="relative w-full sm:max-w-xs">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    placeholder={`搜索「${selected.name}」的 API`}
-                    className="pl-9"
-                    value={(table.getState().globalFilter as string) ?? ""}
-                    onChange={(e) => table.setGlobalFilter(e.target.value)}
-                  />
+                <div className="flex items-center gap-2">
+                  {sbCollapsed && (
+                    <SimpleTooltip content="展开平台筛选">
+                      <Button
+                        variant="outline"
+                        className="cursor-pointer"
+                        onClick={() => setSbCollapsed(false)}
+                      >
+                        <Filter />
+                        平台
+                      </Button>
+                    </SimpleTooltip>
+                  )}
+                  <div className="relative w-full sm:w-72">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      placeholder={`搜索「${selected.name}」的 API`}
+                      className="pl-9"
+                      value={(table.getState().globalFilter as string) ?? ""}
+                      onChange={(e) => table.setGlobalFilter(e.target.value)}
+                    />
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <RefreshButton onClick={() => loadApis(selectedId)} />
@@ -388,6 +442,7 @@ export function PlatformsPage() {
             请先在左侧选择或新增一个平台
           </div>
         )}
+        </div>
       </div>
 
       <PlatformFormSheet

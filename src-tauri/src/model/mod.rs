@@ -69,7 +69,13 @@ pub struct Content {
     pub published_at: Option<i64>,
     /// 无水印视频地址(若为视频且解析成功),供阶段5「视频转音频」使用。
     pub video_url: Option<String>,
+    /// 封面图地址:视频取视频封面,图文取首图。供采集后下载封面素材。
+    pub cover_url: Option<String>,
     pub image_urls: Vec<String>,
+    /// 视频时长(秒);图文为 None。
+    pub duration: Option<i64>,
+    /// 话题标签(# 开头)。从平台结构化字段提取(抖音 text_extra.hashtag_name)。
+    pub topics: Vec<String>,
     /// 采集时间(Unix 秒)。
     pub collected_at: i64,
     #[serde(default)]

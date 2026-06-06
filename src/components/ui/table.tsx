@@ -8,7 +8,9 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
     <div
       data-slot="table-container"
-      className="relative w-full overflow-x-auto"
+      // h-full + overflow-auto:让纵向滚动发生在本层,thead 的 sticky 才相对真正滚动容器吸顶。
+      // 非限高父级下 h-full 退化为 auto、不影响普通表格。
+      className="relative h-full w-full overflow-auto"
     >
       <table
         data-slot="table"

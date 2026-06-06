@@ -9,6 +9,9 @@
 // 适配器系统为渐进接入的脚手架,部分接口/方法暂未接主流程
 #![allow(dead_code)]
 
+pub mod douyin;
+pub mod xhs;
+
 use veltrix_core::error::{CrawlerError, Result};
 use crate::model::{Comment, Content, TaskKind};
 use crate::webview::InterceptedResponse;

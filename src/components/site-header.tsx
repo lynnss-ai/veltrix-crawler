@@ -1,5 +1,5 @@
-// 顶部栏:侧栏触发器 + 两级面包屑(所属分组 › 当前页) + 右侧主题切换。
-import { SidebarTrigger } from "@/components/ui/sidebar";
+// 顶部栏:两级面包屑(所属分组 › 当前页) + 右侧主题切换 / 远程控制。
+// 侧栏收起/展开开关已上移到窗口标题栏(TitleBar)。
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -8,12 +8,23 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import { ModeToggle } from "@/components/mode-toggle";
+import {
+  RemoteConnectButton,
+  type RemoteStatus,
+} from "@/components/RemoteConnect";
 
-export function SiteHeader({ group, page }: { group: string; page: string }) {
+export function SiteHeader({
+  group,
+  page,
+  remoteStatus,
+}: {
+  group: string;
+  page: string;
+  remoteStatus: RemoteStatus;
+}) {
   return (
     <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4 lg:px-6">
-      <SidebarTrigger className="-ml-1" />
-      <Breadcrumb className="ml-1">
+      <Breadcrumb>
         <BreadcrumbList>
           {group && (
             <>
@@ -28,7 +39,8 @@ export function SiteHeader({ group, page }: { group: string; page: string }) {
           </BreadcrumbItem>
         </BreadcrumbList>
       </Breadcrumb>
-      <div className="ml-auto">
+      <div className="ml-auto flex items-center gap-1.5">
+        <RemoteConnectButton status={remoteStatus} />
         <ModeToggle />
       </div>
     </header>
