@@ -52,6 +52,12 @@ pub struct Model {
     pub owner: String,
     /// 采集时间(Unix 秒)
     pub collected_at: i64,
+    /// 素材下载状态:pending(待处理) / success(成功) / failed(失败)。None=旧数据,未跑过下载
+    pub media_status: Option<String>,
+    /// 音频是否提取成功:仅「视频 + 开启音频提取」时有意义,其余为 None
+    pub audio_extracted: Option<bool>,
+    /// 素材失败原因(视频 403 / ffmpeg 转码失败等),供前端展示与失败重试判断
+    pub media_error: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

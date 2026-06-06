@@ -158,6 +158,7 @@ pub fn run() {
             commands::set_database_config,
             commands::set_storage_path,
             commands::save_text_file,
+            commands::clear_business_data,
             // 鉴权 / 初始化
             commands::admin::has_users,
             commands::admin::login,
@@ -214,6 +215,7 @@ pub fn run() {
             commands::task::remove_task,
             commands::task::list_contents,
             commands::task::remove_content,
+            commands::retry_content_media,
             // 云端连接(配对 / WS / 远程指令)
             commands::cloud::cloud_get_config,
             commands::cloud::cloud_get_status,

@@ -186,6 +186,23 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 兼容已建的 contents 表:补素材状态列(下载/音频提取结果与失败重试)。
+    // 均可空,旧行 None 表示「未跑过下载」,前端按未知态展示。
+    for (col, ddl) in [
+        ("media_status", "ALTER TABLE contents ADD COLUMN media_status TEXT"),
+        ("audio_extracted", "ALTER TABLE contents ADD COLUMN audio_extracted BOOLEAN"),
+        ("media_error", "ALTER TABLE contents ADD COLUMN media_error TEXT"),
+    ] {
+        if !column_exists(db, "contents", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER contents.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
     // 二级索引:覆盖高频查询字段。CREATE INDEX IF NOT EXISTS 跨 SQLite/PG 通用,重启无副作用。
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_accounts_platform_last_used ON accounts(platform, last_used_at)",

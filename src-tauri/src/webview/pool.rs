@@ -29,11 +29,13 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder}
 const STAGNANT_LIMIT: u32 = 2;
 /// 连续 N 轮无新增仍未恢复 → 自动结束本次采集(保留已采内容),不再无限等待。
 const STAGNANT_STOP: u32 = 8;
-/// 每次滚动后的拟人停顿区间(毫秒):1~5 秒随机,避免匀速快速滚动触发风控。
-const SCROLL_PAUSE_MIN_MS: u64 = 1000;
+/// 每次滚动后的拟人停顿区间(毫秒):2~6 秒随机,避免匀速快速滚动触发风控。
+/// 下限取 2s:信息流接口往返常需 ~2s,停顿过短会在数据返回前就读快照,
+/// 表现为「新增 0 条」空转,并连带误报风控。
+const SCROLL_PAUSE_MIN_MS: u64 = 2000;
 const SCROLL_PAUSE_SPAN_MS: u64 = 4000;
 
-/// 生成 1~5 秒的随机滚动停顿。无 rand 依赖,用系统时间纳秒做廉价熵源,拟人足够。
+/// 生成 2~6 秒的随机滚动停顿。无 rand 依赖,用系统时间纳秒做廉价熵源,拟人足够。
 fn random_scroll_pause() -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -512,7 +514,11 @@ impl CollectBridge {
         let max_rounds = cfg.collect.scroll_rounds; // 仅非智能模式用作固定轮数
 
         let mut seen: HashSet<String> = HashSet::new();
+        // stagnant:接口有响应却无新内容(疑似风控/到底)的连续轮数;
+        // waiting:接口响应未增长(请求尚未返回)的连续轮数,二者分开计避免短停顿误报风控。
         let mut stagnant: u32 = 0;
+        let mut waiting: u32 = 0;
+        let mut prev_resp_count: usize = 0;
         let _ = window.eval(&build_hud_log_eval(
             "info",
             &if smart {
@@ -537,7 +543,7 @@ impl CollectBridge {
             window.eval(&build_scroll_eval()).map_err(|e| {
                 CrawlerError::Config(format!("执行滚动失败(采集窗口可能已关闭): {e}"))
             })?;
-            // 拟人:每次滚动后随机停顿 1~5 秒,不匀速快速滚动
+            // 拟人:每次滚动后随机停顿 2~6 秒,不匀速快速滚动
             let mut pause = random_scroll_pause();
             // 风控等待期间:每多等一轮,停顿额外 +5s 逐轮拉长,降低请求频率给手动验证留时间
             if stagnant >= STAGNANT_LIMIT {
@@ -545,14 +551,18 @@ impl CollectBridge {
                 pause += Duration::from_secs(extra_s);
             }
             let pause_ms = pause.as_millis();
+            // 先打印「已下拉 + 即将停顿」再 sleep:让日志里的停顿值描述「接下来」的等待,
+            // 与画面观感一致(此前在 sleep 后才打印,看起来「说停顿却马上滚」)。
+            let scroll_log = if smart {
+                format!("↓ 第 {round} 轮 · 已下拉,拟人停顿 {pause_ms}ms 等待接口返回")
+            } else {
+                format!("↓ 翻页 {round}/{max_rounds} · 已下拉,拟人停顿 {pause_ms}ms")
+            };
+            let _ = window.eval(&build_hud_log_eval("info", &scroll_log));
             tokio::time::sleep(pause).await;
 
             // 非智能模式:固定轮数盲滚
             if !smart {
-                let _ = window.eval(&build_hud_log_eval(
-                    "info",
-                    &format!("↓ 翻页 {round}/{max_rounds} 完成 · 拟人停顿 {pause_ms}ms"),
-                ));
                 if round >= max_rounds {
                     break;
                 }
@@ -601,7 +611,7 @@ impl CollectBridge {
             let _ = window.eval(&build_hud_log_eval(
                 "info",
                 &format!(
-                    "↓ 第 {round} 轮翻页 · 新增 {added} 条 · 累计 {now}/{target_count}({progress_pct}%)· 接口响应 {resp_count} 条 · 拟人停顿 {pause_ms}ms"
+                    "  └ 新增 {added} 条 · 累计 {now}/{target_count}({progress_pct}%)· 接口响应 {resp_count} 条"
                 ),
             ));
 
@@ -614,10 +624,16 @@ impl CollectBridge {
                 break;
             }
 
-            // 连续无新增:疑似风控 → 预警并继续重试;达 STAGNANT_STOP 轮仍无新增则自动结束
-            if added == 0 {
+            // 无新增时区分两种停滞,避免把「停顿短导致请求没回来」误判成风控:
+            //   ① 接口有新响应却无新内容(resp 增长、added=0):内容到底或重复,
+            //      计 stagnant,达 LIMIT 预警(疑似风控/需验证),达 STAGNANT_STOP 自动结束;
+            //   ② 接口响应未增长(resp 持平):请求尚未返回(网络慢/极端短停顿),
+            //      不算风控,仅计 waiting 防卡死,达 STAGNANT_STOP 也结束。
+            if added > 0 {
+                stagnant = 0;
+                waiting = 0;
+            } else if resp_count > prev_resp_count {
                 stagnant += 1;
-                // 达上限:自动结束本次采集,保留已采内容
                 if stagnant >= STAGNANT_STOP {
                     let _ = window.eval(&build_hud_log_eval(
                         "warn",
@@ -631,7 +647,7 @@ impl CollectBridge {
                     let _ = window.eval(&build_hud_log_eval(
                         "warn",
                         &format!(
-                            "⚠ 风控预警 · 连续 {STAGNANT_LIMIT} 轮无新增内容 · 疑似触发平台风控。请在采集窗口手动完成验证(验证码 / 登录等);程序将继续重试,连续 {STAGNANT_STOP} 轮仍无新增则自动结束。"
+                            "⚠ 风控预警 · 连续 {STAGNANT_LIMIT} 轮接口有响应却无新增内容 · 疑似触发平台风控或已采到底。请在采集窗口手动完成验证(验证码 / 登录等);程序将继续重试,连续 {STAGNANT_STOP} 轮仍无新增则自动结束。"
                         ),
                     ));
                 } else if stagnant > STAGNANT_LIMIT {
@@ -643,8 +659,19 @@ impl CollectBridge {
                     ));
                 }
             } else {
-                stagnant = 0;
+                // 接口请求尚未返回:不计风控,继续等下一轮;连续多轮无响应才兜底结束
+                waiting += 1;
+                if waiting >= STAGNANT_STOP {
+                    let _ = window.eval(&build_hud_log_eval(
+                        "warn",
+                        &format!(
+                            "■ 连续 {STAGNANT_STOP} 轮接口无响应 · 自动结束(网络异常或已无更多数据,已采 {now} 条)"
+                        ),
+                    ));
+                    break;
+                }
             }
+            prev_resp_count = resp_count;
         }
         Ok(())
     }

@@ -266,6 +266,12 @@ pub struct ContentView {
     pub topics: Vec<String>,
     pub owner: String,
     pub collected_at: i64,
+    /// 素材下载状态:pending / success / failed;None=旧数据未跑过下载
+    pub media_status: Option<String>,
+    /// 音频是否提取成功(仅视频且开启提取时有意义)
+    pub audio_extracted: Option<bool>,
+    /// 素材失败原因(403 / ffmpeg 失败等)
+    pub media_error: Option<String>,
 }
 
 impl From<content::Model> for ContentView {
@@ -303,6 +309,9 @@ impl From<content::Model> for ContentView {
             topics,
             owner: m.owner,
             collected_at: m.collected_at,
+            media_status: m.media_status,
+            audio_extracted: m.audio_extracted,
+            media_error: m.media_error,
         }
     }
 }

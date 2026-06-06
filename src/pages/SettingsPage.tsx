@@ -178,6 +178,9 @@ export function SettingsPage() {
   const [clearOpen, setClearOpen] = useState(false);
   const [clearText, setClearText] = useState("");
   const [clearPassword, setClearPassword] = useState("");
+  const [clearing, setClearing] = useState(false);
+  // 清空成功后自增,作为 GeneralSection 重新拉取数据库大小的触发器
+  const [generalRefreshKey, setGeneralRefreshKey] = useState(0);
   const [promptForm, setPromptForm] = useState<Prompt | null>(null);
   const [isPromptFormOpen, setIsPromptFormOpen] = useState(false);
   const [promptDeleteTarget, setPromptDeleteTarget] = useState<Prompt | null>(
@@ -199,6 +202,23 @@ export function SettingsPage() {
       .listPrompts()
       .then(setPrompts)
       .catch((e) => setError(String(e)));
+  }
+
+  async function handleClearData() {
+    setClearing(true);
+    try {
+      await api.clearBusinessData(clearPassword);
+      setClearOpen(false);
+      setClearText("");
+      setClearPassword("");
+      setGeneralRefreshKey((key) => key + 1);
+      toast.success("业务数据已清空");
+    } catch (e) {
+      // 密码错误等后端校验失败:保留对话框,提示原因供用户重试
+      toast.error(`清空失败: ${e}`);
+    } finally {
+      setClearing(false);
+    }
   }
   useEffect(() => {
     api
@@ -329,7 +349,11 @@ export function SettingsPage() {
             className="min-h-0 min-w-0 flex-1 space-y-4 overflow-auto p-0.5 duration-200 animate-in fade-in-50"
           >
             {active === "general" && (
-              <GeneralSection cfg={cfg} onClearData={() => setClearOpen(true)} />
+              <GeneralSection
+                cfg={cfg}
+                refreshKey={generalRefreshKey}
+                onClearData={() => setClearOpen(true)}
+              />
             )}
             {active === "remote-control" && <RemoteControlSection />}
             {active === "transcription" && (
@@ -425,21 +449,21 @@ export function SettingsPage() {
             </div>
           </div>
           <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={clearing}>取消</AlertDialogCancel>
             <AlertDialogAction
               disabled={
+                clearing ||
                 clearText.trim() !== CLEAR_CONFIRM_TEXT ||
                 clearPassword.length === 0
               }
-              onClick={() => {
-                // TODO: invoke("clear_business_data", { password: clearPassword })
-                //       后端校验密码后:清空业务表 + 递归删除存储路径下的文件
-                setClearOpen(false);
-                setClearText("");
-                setClearPassword("");
+              onClick={(e) => {
+                // 阻止 AlertDialog 默认的点击即关闭:校验失败时需保留对话框供重试
+                e.preventDefault();
+                void handleClearData();
               }}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
+              {clearing && <Loader2 className="size-4 animate-spin" />}
               确认清空
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -725,9 +749,11 @@ function RemoteControlSection() {
 
 function GeneralSection({
   cfg,
+  refreshKey,
   onClearData,
 }: {
   cfg: AppConfig | null;
+  refreshKey: number;
   onClearData: () => void;
 }) {
   const [storagePath, setStoragePath] = useState("");
@@ -753,7 +779,8 @@ function GeneralSection({
       .getDataDir()
       .then(setDataDir)
       .catch(() => setDataDir(""));
-  }, []);
+    // refreshKey 变化(清空数据后)重新拉取数据库大小,数字即时反映清空结果
+  }, [refreshKey]);
   useEffect(() => {
     if (cfg) {
       const url = cfg.database.url ?? "";

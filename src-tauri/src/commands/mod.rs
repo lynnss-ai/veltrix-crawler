@@ -10,7 +10,7 @@ use veltrix_core::config::{AppConfig, PlatformConfig};
 use crate::cookie::{Account, AccountStatus, CookiePool};
 use veltrix_core::error::{CrawlerError, Result};
 use crate::adapter::{FetchContext, FetchOutput};
-use crate::model::{Comment, Content, ContentKind, TaskKind};
+use crate::model::{Author, Comment, Content, ContentKind, TaskKind};
 use crate::webview::pool::{CollectBridge, CollectRequest, WebviewPool};
 use crate::webview::{emit_collect_log, CollectControl, InterceptChannel, RpaChannel, RpaOutcome};
 use chrono::Utc;
@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 
@@ -213,6 +213,78 @@ pub fn save_text_file(
     }
     std::fs::write(&target, content)
         .map_err(|e| CrawlerError::Config(format!("保存文件失败: {e}")))
+}
+
+/// 清空业务数据(系统配置「危险操作」)。不可恢复:
+/// 1. 用当前登录用户名 + 传入密码做 argon2 二次校验,未登录或密码错直接拒绝;
+/// 2. 按逻辑外键依赖顺序删空 comments → contents → tasks(无物理级联,手动顺序);
+/// 3. 递归清空媒体素材根目录下所有文件(保留目录本身)。
+///
+/// 平台 / 账号 / 用户 / 客户 / 行业 / 厂商 / 提示词等配置类数据一律保留。
+#[tauri::command]
+pub async fn clear_business_data(state: State<'_, AppState>, password: String) -> Result<()> {
+    use veltrix_core::db::entity::{
+        comment as comment_entity, content as content_entity, task as task_entity,
+    };
+
+    // 必须已登录:以会话用户名校验密码,杜绝无身份直接清库
+    let user =
+        current_user(&state).ok_or_else(|| CrawlerError::Auth("未登录,禁止清空数据".into()))?;
+    admin::verify_user_password(&state.db, &user.name, &password).await?;
+
+    // 先取媒体根目录(临界区内拿配置即释放锁,不跨 await 持锁)
+    let media_root = {
+        let cfg = lock_config(&state)?;
+        crate::media::media_root(&state.config_dir, &cfg.media)
+    };
+
+    let db = &state.db;
+    // 先删子表(评论 / 内容)再删父表(任务),与逻辑外键依赖方向一致
+    comment_entity::Entity::delete_many()
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("清空评论失败: {e}")))?;
+    content_entity::Entity::delete_many()
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("清空内容失败: {e}")))?;
+    task_entity::Entity::delete_many()
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("清空任务失败: {e}")))?;
+
+    clear_dir_contents(&media_root)?;
+    Ok(())
+}
+
+/// 递归删除目录下全部条目但保留目录本身;目录不存在视为已清空(无素材可删)。
+/// 安全护栏:拒绝对盘符根 / 无父级的路径动手,避免存储路径误配成根目录时连带清空系统盘。
+fn clear_dir_contents(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if dir.parent().is_none() {
+        return Err(CrawlerError::Config(format!(
+            "拒绝清空疑似根目录: {}",
+            dir.display()
+        )));
+    }
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| CrawlerError::Config(format!("读取素材目录失败: {e}")))?
+    {
+        let entry =
+            entry.map_err(|e| CrawlerError::Config(format!("遍历素材目录失败: {e}")))?;
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| {
+            CrawlerError::Config(format!("删除素材 {} 失败: {e}", path.display()))
+        })?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -608,6 +680,8 @@ pub async fn run_task(
         let mut seen_contents: HashSet<String> = HashSet::new();
         let mut seen_comments: HashSet<String> = HashSet::new();
         let mut intercepted_total: i64 = 0;
+        // 是否出现过关键词采集失败:用于结尾区分终态(零产出且有错 → failed,否则 completed)
+        let mut had_error = false;
         // 本次任务解析出的全部内容,采集主流程结束后统一下载素材(去重后避免重复下载)
         let mut contents_for_media: Vec<Content> = Vec::new();
 
@@ -674,6 +748,7 @@ pub async fn run_task(
                         )
                         .await;
                     if let Err(e) = &collect_result {
+                        had_error = true;
                         tracing::error!(keyword = %keyword, "采集失败: {e}");
                         emit_collect_log(
                             &app,
@@ -747,6 +822,7 @@ pub async fn run_task(
                     {
                         Ok(responses) => responses,
                         Err(e) => {
+                            had_error = true;
                             tracing::error!(keyword = %keyword, "采集失败: {e}");
                             emit_collect_log(
                                 &app,
@@ -765,22 +841,32 @@ pub async fn run_task(
             write_task_progress(&db, &task_id, progress, content_count, comment_count).await;
         }
 
-        // 采集落库后统一下载素材:封面 / 头像 / 图文图片 / 视频转音频。
-        // 放主流程末尾顺序下载,避免穿插阻塞下一个关键词的采集节奏;按 content_id 去重防重复下载。
-        download_media_for_contents(&app, &task_id, &config_dir, &media_cfg, contents_for_media)
-            .await;
+        // 采集主体结束 → 先落终态,让任务调度页即时翻转(不再被后续素材下载拖在「运行中」):
+        //   零产出且出现过采集失败 → failed;否则 completed。
+        let total_contents = seen_contents.len();
+        let total_comments = seen_comments.len();
+        if total_contents == 0 && had_error {
+            write_task_failed(&db, &task_id, "采集未获取到任何内容").await;
+            emit_collect_log(
+                &app,
+                &task_id,
+                "error",
+                "任务失败 · 未采集到内容,请检查账号登录态 / 风控".to_string(),
+            );
+        } else {
+            write_task_done(&db, &task_id).await;
+            emit_collect_log(
+                &app,
+                &task_id,
+                "info",
+                format!("采集完成,共 {total_contents} 内容 / {total_comments} 评论 · 转入素材下载"),
+            );
+        }
 
-        write_task_done(&db, &task_id).await;
-        emit_collect_log(
-            &app,
-            &task_id,
-            "info",
-            format!(
-                "任务完成,共 {} 内容 / {} 评论",
-                seen_contents.len(),
-                seen_comments.len()
-            ),
-        );
+        // 素材下载(封面 / 头像 / 图文 / 视频转音频)作为已完成任务的后台副产品:
+        // 此刻任务已是终态,下载耗时长或失败都不再影响任务状态。按 content_id 去重防重复下载。
+        download_media_for_contents(&app, &db, &task_id, &config_dir, &media_cfg, contents_for_media)
+            .await;
     });
 
     Ok(())
@@ -812,9 +898,10 @@ async fn write_task_progress(
 }
 
 /// 采集落库后下载内容素材。按 content_id 去重避免重复下载;
-/// 单条失败已在 media::process_content 内部吞为告警,这里只负责遍历与日志汇总。
+/// 副产品失败已在 media::process_content 内部吞为告警,主素材成败回写到 contents 表。
 async fn download_media_for_contents(
     app: &AppHandle,
+    db: &DatabaseConnection,
     task_id: &str,
     config_dir: &PathBuf,
     media_cfg: &veltrix_core::config::MediaConfig,
@@ -826,20 +913,131 @@ async fn download_media_for_contents(
     let root = crate::media::media_root(config_dir, media_cfg);
     let mut downloaded: HashSet<String> = HashSet::new();
     let mut count = 0usize;
+    let mut failed = 0usize;
     for content in &contents {
         // 跨关键词同一内容只下一次
         if !downloaded.insert(content.content_id.clone()) {
             continue;
         }
-        crate::media::process_content(content, &root, media_cfg).await;
+        let outcome = crate::media::process_content(content, &root, media_cfg).await;
+        let id = format!("{task_id}-{}-{}", content.platform, content.content_id);
+        if !is_media_ok(&outcome) {
+            failed += 1;
+        }
+        record_media_outcome(db, &id, &outcome).await;
         count += 1;
     }
     emit_collect_log(
         app,
         task_id,
         "info",
-        format!("素材下载完成,共处理 {count} 条内容,输出目录: {}", root.display()),
+        format!(
+            "素材下载完成,共处理 {count} 条内容(失败 {failed} 条),输出目录: {}",
+            root.display()
+        ),
     );
+}
+
+/// 素材是否整体成功:主素材就绪且音频提取未失败(开启提取时)。
+fn is_media_ok(outcome: &crate::media::MediaOutcome) -> bool {
+    outcome.ok && outcome.audio_extracted != Some(false)
+}
+
+/// 把素材处理结果回写到 contents 表(仅更新状态相关三列,不触碰其它字段)。
+async fn record_media_outcome(db: &DatabaseConnection, id: &str, outcome: &crate::media::MediaOutcome) {
+    use veltrix_core::db::entity::content as content_entity;
+    let status = if is_media_ok(outcome) { "success" } else { "failed" };
+    let am = content_entity::ActiveModel {
+        id: Set(id.to_string()),
+        media_status: Set(Some(status.to_string())),
+        audio_extracted: Set(outcome.audio_extracted),
+        media_error: Set(outcome.error.clone()),
+        ..Default::default()
+    };
+    if let Err(e) = am.update(db).await {
+        tracing::warn!(content_id = %id, "回写素材状态失败: {e}");
+    }
+}
+
+/// contents 实体 → model::Content,供失败重试时重跑素材下载。
+/// 只填下载所需字段(链接/形态/作者头像),统计等无关字段走 Default。
+fn content_from_model(m: &veltrix_core::db::entity::content::Model) -> Content {
+    let kind = match m.kind.as_str() {
+        "video" => ContentKind::Video,
+        "image" => ContentKind::Image,
+        "article" => ContentKind::Article,
+        _ => ContentKind::Unknown,
+    };
+    let image_urls: Vec<String> = serde_json::from_str(&m.image_urls).unwrap_or_default();
+    let avatar = serde_json::from_str::<serde_json::Value>(&m.author_json)
+        .ok()
+        .and_then(|v| v.get("avatar").and_then(|a| a.as_str()).map(str::to_string));
+    Content {
+        platform: m.platform.clone(),
+        content_id: m.content_id.clone(),
+        kind,
+        title: m.title.clone(),
+        desc: m.desc.clone(),
+        author: Author {
+            platform: m.platform.clone(),
+            uid: m.author_uid.clone(),
+            nickname: m.author_nickname.clone(),
+            avatar,
+            ..Default::default()
+        },
+        video_url: m.video_url.clone(),
+        cover_url: m.cover_url.clone(),
+        image_urls,
+        duration: m.duration,
+        ..Default::default()
+    }
+}
+
+/// 单条内容素材状态视图:retry_content_media 返回最新状态,前端就地刷新该行。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaStatusView {
+    pub id: String,
+    pub media_status: Option<String>,
+    pub audio_extracted: Option<bool>,
+    pub media_error: Option<String>,
+}
+
+/// 失败重试:对单条内容重跑素材下载并回写状态。
+///
+/// 注意:平台视频直链多为带时效签名的 CDN 地址(douyinvod 等),过期后重试仍会 403。
+/// 此时需重新发起采集刷新链接——本命令只能用库里已有链接重试,无法起死回生。
+#[tauri::command]
+pub async fn retry_content_media(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<MediaStatusView> {
+    use veltrix_core::db::entity::content as content_entity;
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let row = content_entity::Entity::find_by_id(id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("内容不存在".into()))?;
+    // 数据归属:self 用户只能操作自己的内容
+    if me.scope == "self" && row.owner != me.name {
+        return Err(CrawlerError::Config("无权操作该内容".into()));
+    }
+
+    // clone 出媒体配置,避免跨 await 持有配置锁
+    let media_cfg = { lock_config(&state)?.media.clone() };
+    let root = crate::media::media_root(&state.config_dir, &media_cfg);
+    let content = content_from_model(&row);
+    let outcome = crate::media::process_content(&content, &root, &media_cfg).await;
+    record_media_outcome(&state.db, &id, &outcome).await;
+
+    let status = if is_media_ok(&outcome) { "success" } else { "failed" };
+    Ok(MediaStatusView {
+        id,
+        media_status: Some(status.to_string()),
+        audio_extracted: outcome.audio_extracted,
+        media_error: outcome.error,
+    })
 }
 
 /// 把适配器解析出的内容/评论落库。调用方维护跨关键词去重集合,
@@ -965,6 +1163,10 @@ fn content_to_active(
         extra: Set(to_json_text(&c.extra)),
         owner: Set(owner.to_string()),
         collected_at: Set(c.collected_at),
+        // 初始置「待处理」,素材下载完成后由 record_media_outcome 回写成败
+        media_status: Set(Some("pending".to_string())),
+        audio_extracted: Set(None),
+        media_error: Set(None),
     }
 }
 
@@ -1007,6 +1209,23 @@ async fn write_task_done(db: &DatabaseConnection, task_id: &str) {
         am.updated_at = Set(now);
         if let Err(e) = am.update(db).await {
             tracing::warn!("标记任务完成失败: {e}");
+        }
+    }
+}
+
+/// 标记任务失败(status=failed, finished_at, error_message)。
+/// 采集零产出且过程出错时调用,避免失败任务被误标「已完成」。
+async fn write_task_failed(db: &DatabaseConnection, task_id: &str, message: &str) {
+    use veltrix_core::db::entity::task as task_entity;
+    if let Ok(Some(m)) = task_entity::Entity::find_by_id(task_id.to_string()).one(db).await {
+        let now = Utc::now().timestamp();
+        let mut am = m.into_active_model();
+        am.status = Set("failed".to_string());
+        am.finished_at = Set(Some(now));
+        am.error_message = Set(Some(message.to_string()));
+        am.updated_at = Set(now);
+        if let Err(e) = am.update(db).await {
+            tracing::warn!("标记任务失败状态失败: {e}");
         }
     }
 }

@@ -13,8 +13,8 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 /// 单次 list 接口最多返回 N 行,防 IPC 噎住;数据量超出应改分页接口
@@ -29,6 +29,28 @@ fn hash_password(pw: &str) -> Result<String> {
         .hash_password(pw.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| CrawlerError::Config(format!("密码哈希失败: {e}")))
+}
+
+/// 校验某用户名的明文密码(argon2)。用户不存在 / 已删 / 密码不符一律返回 Auth 错误,
+/// 不区分原因以免被探测用户是否存在。供危险操作(如清空数据)前的二次身份确认复用。
+pub(crate) async fn verify_user_password(
+    db: &DatabaseConnection,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let model = user::Entity::find()
+        .filter(user::Column::Username.eq(username))
+        .filter(user::Column::DeletedAt.eq(0))
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询用户失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Auth("密码错误".into()))?;
+    let parsed = PasswordHash::new(&model.password_hash)
+        .map_err(|_| CrawlerError::Auth("密码错误".into()))?;
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .map_err(|_| CrawlerError::Auth("密码错误".into()))?;
+    Ok(())
 }
 
 // ===================== 用户 =====================

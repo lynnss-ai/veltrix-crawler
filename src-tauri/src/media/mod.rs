@@ -12,6 +12,26 @@ use std::path::{Path, PathBuf};
 use veltrix_core::config::MediaConfig;
 use veltrix_core::error::{CrawlerError, Result};
 
+/// 单条内容的素材处理结果。回写到 contents 表,供前端展示与失败重试。
+/// 只反映「主素材」:视频内容 = 视频下载 + 音频提取;图文内容 = 图片下载。
+/// 封面 / 头像属副产品,失败仅告警,不影响这里的成败判定。
+#[derive(Debug, Clone)]
+pub struct MediaOutcome {
+    /// 主素材是否就绪(视频已下载 / 图片全部下载;无可下载素材也视为成功)
+    pub ok: bool,
+    /// 音频是否提取成功:仅「视频 + 开启提取」有意义,其余为 None
+    pub audio_extracted: Option<bool>,
+    /// 失败原因(下载/提取任一失败时记录,供前端提示)
+    pub error: Option<String>,
+}
+
+/// 视频子流程结果:下载是否成功、音频是否提取成功、失败原因。
+struct VideoOutcome {
+    downloaded: bool,
+    audio_extracted: Option<bool>,
+    error: Option<String>,
+}
+
 /// output_dir 为空时的回退子目录名(相对配置目录)。
 const FALLBACK_MEDIA_DIR: &str = "media";
 /// 视频形态目录名(目录「类目」按内容形态划分:视频 / 图文)。路径统一用英文。
@@ -94,8 +114,8 @@ fn sanitize_filename(raw: &str) -> String {
 
 /// 处理单条内容的全部素材:封面、作者头像、图文图片、视频转音频。
 /// 目录结构 `{root}/{platform}/{今天 YYYY-MM-DD}/{视频|图文}/`,文件名以 content_id 为前缀。
-/// 任一素材失败仅 `tracing::warn!`,不返回错误、不中断后续素材与其它内容。
-pub async fn process_content(content: &Content, root: &Path, media: &MediaConfig) {
+/// 副产品(封面/头像/图片)失败仅 `tracing::warn!`;主素材成败汇总进 `MediaOutcome` 返回供回写。
+pub async fn process_content(content: &Content, root: &Path, media: &MediaConfig) -> MediaOutcome {
     let kind_dir = if content.kind == ContentKind::Video {
         DIR_VIDEO
     } else {
@@ -106,7 +126,11 @@ pub async fn process_content(content: &Content, root: &Path, media: &MediaConfig
     let dir = root.join(&content.platform).join(today).join(kind_dir);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(content_id = %content.content_id, "创建素材目录失败,跳过该条: {e}");
-        return;
+        return MediaOutcome {
+            ok: false,
+            audio_extracted: None,
+            error: Some(format!("创建素材目录失败: {e}")),
+        };
     }
 
     let prefix = sanitize_filename(&content.content_id);
@@ -141,14 +165,33 @@ pub async fn process_content(content: &Content, root: &Path, media: &MediaConfig
         }
     }
 
+    // 主素材成败:视频内容以视频/音频为准,图文内容以图片为准
+    let mut outcome = MediaOutcome {
+        ok: true,
+        audio_extracted: None,
+        error: None,
+    };
+
     // 视频:下载 → 转音频 → 删除视频(用户决策:只留音频)
     if content.kind == ContentKind::Video {
-        if let Some(video_url) = content.video_url.as_deref().filter(|s| !s.is_empty()) {
-            process_video(content, &dir, &prefix, video_url, media).await;
+        match content.video_url.as_deref().filter(|s| !s.is_empty()) {
+            Some(video_url) => {
+                let video = process_video(content, &dir, &prefix, video_url, media).await;
+                outcome.ok = video.downloaded;
+                outcome.audio_extracted = video.audio_extracted;
+                outcome.error = video.error;
+            }
+            None => {
+                // 视频内容却无直链:多为详情解析失败,标记失败(重试需重新采集刷新链接)
+                outcome.ok = false;
+                outcome.error = Some("无视频直链".to_string());
+            }
         }
     }
 
-    // 图文图片:逐张下载
+    // 图文图片:逐张下载。任一张失败即记失败,供重试。
+    let mut image_failed = false;
+    let mut image_error: Option<String> = None;
     for (idx, img_url) in content.image_urls.iter().enumerate() {
         if img_url.is_empty() {
             continue;
@@ -156,8 +199,17 @@ pub async fn process_content(content: &Content, root: &Path, media: &MediaConfig
         let path = dir.join(format!("{prefix}_img{idx}.jpg"));
         if let Err(e) = download_to_file(img_url, &path).await {
             tracing::warn!(content_id = %content.content_id, index = idx, "下载图片失败: {e}");
+            image_failed = true;
+            image_error = Some(format!("下载图片失败: {e}"));
         }
     }
+    // 非视频内容(图文/文章/未知)以图片下载结果为准
+    if content.kind != ContentKind::Video {
+        outcome.ok = !image_failed;
+        outcome.error = image_error;
+    }
+
+    outcome
 }
 
 /// 视频子流程:下载到 mp4 → ffmpeg 转音频 → 删除 mp4。
@@ -168,16 +220,24 @@ async fn process_video(
     prefix: &str,
     video_url: &str,
     media: &MediaConfig,
-) {
+) -> VideoOutcome {
     let video_path = dir.join(format!("{prefix}.mp4"));
     if let Err(e) = download_to_file(video_url, &video_path).await {
         tracing::warn!(content_id = %content.content_id, "下载视频失败: {e}");
-        return;
+        return VideoOutcome {
+            downloaded: false,
+            audio_extracted: None,
+            error: Some(format!("下载视频失败: {e}")),
+        };
     }
 
     // 开关关闭时保留原视频、不转码——尊重配置,但素材照样落地
     if !media.enable_audio_extract {
-        return;
+        return VideoOutcome {
+            downloaded: true,
+            audio_extracted: None,
+            error: None,
+        };
     }
 
     let audio_format = if media.audio_format.trim().is_empty() {
@@ -202,12 +262,27 @@ async fn process_video(
             if let Err(e) = tokio::fs::remove_file(&video_path).await {
                 tracing::warn!(content_id = %content.content_id, "删除已转码视频失败: {e}");
             }
+            VideoOutcome {
+                downloaded: true,
+                audio_extracted: Some(true),
+                error: None,
+            }
         }
         Ok(Err(e)) => {
             tracing::warn!(content_id = %content.content_id, "视频转音频失败,保留原视频: {e}");
+            VideoOutcome {
+                downloaded: true,
+                audio_extracted: Some(false),
+                error: Some(format!("音频提取失败: {e}")),
+            }
         }
         Err(e) => {
             tracing::warn!(content_id = %content.content_id, "转码任务异常: {e}");
+            VideoOutcome {
+                downloaded: true,
+                audio_extracted: Some(false),
+                error: Some(format!("转码任务异常: {e}")),
+            }
         }
     }
 }

@@ -265,6 +265,20 @@ export interface ContentView {
   topics: string[];
   owner: string;
   collectedAt: number;
+  // 素材下载状态:pending(待处理)/success(成功)/failed(失败);null=旧数据未跑过下载
+  mediaStatus: "pending" | "success" | "failed" | null;
+  // 音频是否提取成功(仅视频且开启提取时有意义)
+  audioExtracted: boolean | null;
+  // 素材失败原因(403 / ffmpeg 失败等)
+  mediaError: string | null;
+}
+
+// 单条内容素材重试结果(对应后端 MediaStatusView)
+export interface MediaStatusView {
+  id: string;
+  mediaStatus: "pending" | "success" | "failed" | null;
+  audioExtracted: boolean | null;
+  mediaError: string | null;
 }
 
 // 云端连接相关
@@ -307,6 +321,9 @@ export const api = {
     invoke<void>("set_storage_path", { path }),
   saveTextFile: (path: string, content: string) =>
     invoke<void>("save_text_file", { path, content }),
+  // 清空业务数据(任务/内容/评论 + 媒体文件);需当前用户密码二次校验
+  clearBusinessData: (password: string) =>
+    invoke<void>("clear_business_data", { password }),
 
   listAccounts: (platform: string) =>
     invoke<AccountView[]>("list_accounts", { platform }),
@@ -387,6 +404,9 @@ export const api = {
   listContents: () => invoke<ContentView[]>("list_contents"),
   // 删除一条采集内容
   removeContent: (id: string) => invoke<void>("remove_content", { id }),
+  // 失败重试:重跑单条内容的素材下载(注意:视频直链可能已过期,仍会 403)
+  retryContentMedia: (id: string) =>
+    invoke<MediaStatusView>("retry_content_media", { id }),
 
   // 云端连接(远程控制)
   cloudGetConfig: () => invoke<CloudConfigView>("cloud_get_config"),

@@ -6,6 +6,7 @@ import { type ColumnDef } from "@tanstack/react-table";
 import {
   Bookmark,
   CalendarDays,
+  CheckCircle2,
   ChevronLeft,
   Clock,
   Eye,
@@ -14,12 +15,16 @@ import {
   Filter,
   Heart,
   Image as ImageIcon,
+  Loader2,
   MessageCircle,
   MoreHorizontal,
+  Music2,
+  RefreshCw,
   Search,
   Share2,
   Trash2,
   Video,
+  XCircle,
   X,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -133,6 +138,8 @@ export function ContentLibraryPage({
   const [createdRange, setCreatedRange] = useState<DateRange | undefined>();
   const [publishedRange, setPublishedRange] = useState<DateRange | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
+  // 正在重试素材下载的内容 id 集合(行级 loading,避免重复点击)
+  const [retrying, setRetrying] = useState<Set<string>>(new Set());
 
   const platformName = (id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id;
@@ -207,6 +214,43 @@ export function ContentLibraryPage({
       toast.success("已删除");
     } catch (e) {
       toast.error(`删除失败: ${e}`);
+    }
+  }
+
+  // 重新拉取素材:重跑下载并就地刷新该行状态。
+  // 视频直链可能已过期(403),重试不一定成功——失败时提示需重新采集。
+  async function handleRetry(c: ContentView) {
+    if (retrying.has(c.id)) return;
+    setRetrying((prev) => new Set(prev).add(c.id));
+    try {
+      const res = await api.retryContentMedia(c.id);
+      setContents((prev) =>
+        prev.map((x) =>
+          x.id === res.id
+            ? {
+                ...x,
+                mediaStatus: res.mediaStatus,
+                audioExtracted: res.audioExtracted,
+                mediaError: res.mediaError,
+              }
+            : x,
+        ),
+      );
+      if (res.mediaStatus === "success") {
+        toast.success("素材已重新拉取");
+      } else {
+        toast.error(
+          `重试仍失败${res.mediaError ? `: ${res.mediaError}` : ""} · 链接可能已过期,建议重新采集`,
+        );
+      }
+    } catch (e) {
+      toast.error(`重试失败: ${e}`);
+    } finally {
+      setRetrying((prev) => {
+        const next = new Set(prev);
+        next.delete(c.id);
+        return next;
+      });
     }
   }
 
@@ -305,6 +349,20 @@ export function ContentLibraryPage({
         ),
       },
       {
+        id: "media",
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} title="素材" />
+        ),
+        accessorKey: "mediaStatus",
+        cell: ({ row }) => (
+          <MediaStatusBadge
+            c={row.original}
+            retrying={retrying.has(row.original.id)}
+            onRetry={() => handleRetry(row.original)}
+          />
+        ),
+      },
+      {
         id: "actions",
         header: "操作",
         enableSorting: false,
@@ -326,6 +384,15 @@ export function ContentLibraryPage({
                   <Eye className="size-4" />
                   详情
                 </DropdownMenuItem>
+                {c.mediaStatus === "failed" && (
+                  <DropdownMenuItem
+                    disabled={retrying.has(c.id)}
+                    onClick={() => handleRetry(c)}
+                  >
+                    <RefreshCw className="size-4" />
+                    重新拉取素材
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   variant="destructive"
                   onClick={() => handleDelete(c.id)}
@@ -339,7 +406,9 @@ export function ContentLibraryPage({
         },
       },
     ],
-    [platforms],
+    // 依赖 retrying:行级重试态变化时重建列,徽章 loading / 禁用态才能刷新
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [platforms, retrying],
   );
 
   return (
@@ -588,6 +657,73 @@ function ContentCard({ c }: { c: ContentView }) {
       </div>
     </div>
   );
+}
+
+// 素材状态徽章:展示下载/音频提取结果。失败态可点击重新拉取。
+// 成功 + 视频已提取音频 → 额外音频标识;失败 → 红标 + tooltip 带原因。
+function MediaStatusBadge({
+  c,
+  retrying,
+  onRetry,
+}: {
+  c: ContentView;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  if (retrying) {
+    return (
+      <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-secondary px-2 py-0.5 text-[11px] font-medium text-secondary-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        拉取中
+      </span>
+    );
+  }
+
+  switch (c.mediaStatus) {
+    case "success": {
+      const hasAudio = c.kind === "video" && c.audioExtracted === true;
+      return (
+        <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+          <CheckCircle2 className="size-3.5" />
+          已下载
+          {hasAudio && (
+            <SimpleTooltip content="音频已成功提取">
+              <Music2 className="size-3" />
+            </SimpleTooltip>
+          )}
+        </span>
+      );
+    }
+    case "failed":
+      return (
+        <SimpleTooltip
+          content={
+            c.mediaError
+              ? `失败原因: ${c.mediaError} · 点击重试`
+              : "点击重新拉取素材"
+          }
+        >
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-md bg-rose-100 px-2 py-0.5 text-[11px] font-medium text-rose-700 transition-colors hover:bg-rose-200 dark:bg-rose-950/60 dark:text-rose-300 dark:hover:bg-rose-900/60"
+          >
+            <XCircle className="size-3.5" />
+            失败
+            <RefreshCw className="size-3" />
+          </button>
+        </SimpleTooltip>
+      );
+    case "pending":
+      return (
+        <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+          <Clock className="size-3.5" />
+          待处理
+        </span>
+      );
+    default:
+      return <span className="text-xs text-muted-foreground">—</span>;
+  }
 }
 
 // 筛选 chip:常规圆角矩形,选中高亮(与采集任务页平台筛选一致)
