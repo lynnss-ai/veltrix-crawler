@@ -691,6 +691,21 @@ pub fn stop_collect(state: State<'_, AppState>, session_id: u64) {
     state.collect_control.request_stop(session_id);
 }
 
+/// 采集窗口验证弹窗自检回传:页面检测到 / 解除安全验证弹窗时上报。
+/// 采集循环据此暂停 / 恢复滚动;并向前端推送 `collect-verify` 事件,便于主界面提示用户去窗口手动验证。
+#[tauri::command]
+pub fn report_collect_verify(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: u64,
+    present: bool,
+) {
+    use tauri::Emitter;
+    state.collect_control.set_verifying(session_id, present);
+    // 仅推送状态本身;前端据此弹/收全局提示条(具体任务在采集窗口 HUD 内已高亮)
+    let _ = app.emit("collect-verify", serde_json::json!({ "present": present }));
+}
+
 /// 拟人 RPA 执行器跑完(或某步失败)时回传结果。
 /// 字段与注入脚本一致(camelCase: runId/ok/failedStep/message)。
 #[tauri::command]

@@ -158,6 +158,9 @@ impl RpaChannel {
 pub struct CollectControl {
     /// 被请求停止的 session_id 集合。
     stopping: Mutex<std::collections::HashSet<u64>>,
+    /// 当前检测到安全验证弹窗的 session_id 集合(采集窗口自检脚本经 `report_collect_verify` 写入)。
+    /// 采集循环每轮检查到即暂停滚动,等弹窗消失(用户手动完成)再恢复。
+    verifying: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl CollectControl {
@@ -180,9 +183,31 @@ impl CollectControl {
             .unwrap_or(false)
     }
 
-    /// 会话结束后清理标志,避免 session_id 复用时误判。
+    /// 设置某会话的「安全验证弹窗」状态:present=true 标记弹出,false 清除(弹窗已消失)。
+    pub fn set_verifying(&self, session_id: u64, present: bool) {
+        if let Ok(mut set) = self.verifying.lock() {
+            if present {
+                set.insert(session_id);
+            } else {
+                set.remove(&session_id);
+            }
+        }
+    }
+
+    /// 该会话当前是否有安全验证弹窗待处理。
+    pub fn is_verifying(&self, session_id: u64) -> bool {
+        self.verifying
+            .lock()
+            .map(|set| set.contains(&session_id))
+            .unwrap_or(false)
+    }
+
+    /// 会话结束后清理标志,避免 session_id 复用时误判(停止标志 + 验证标志一并清)。
     pub fn clear(&self, session_id: u64) {
         if let Ok(mut set) = self.stopping.lock() {
+            set.remove(&session_id);
+        }
+        if let Ok(mut set) = self.verifying.lock() {
             set.remove(&session_id);
         }
     }
@@ -333,6 +358,82 @@ pub fn build_native_intercept_init_script_mac(patterns: &[String]) -> String {
 /// 构造「设置会话 ID 并回放缓冲」的注入脚本。导航到搜索页后调用。
 pub fn build_set_session_eval(session_id: u64) -> String {
     format!("window.__veltrixSetSession && window.__veltrixSetSession({session_id});")
+}
+
+/// 验证弹窗上报命令名;与 Rust 端 `#[tauri::command] report_collect_verify` 对应。
+pub const VERIFY_REPORT_COMMAND: &str = "report_collect_verify";
+
+/// 构造「安全验证弹窗自检」注入脚本(采集窗口用,导航到搜索页后 eval)。
+/// 每隔 ~1.5s 检测页面是否出现验证弹窗(命中选择器或文案),状态翻转时经
+/// `report_collect_verify` 回传 `{ sessionId, present }`,采集循环据此暂停 / 恢复。
+/// 选择器 / 文案为空时不安装(该平台未配置验证检测)。
+pub fn build_verify_check_eval(
+    session_id: u64,
+    verify_selectors: &[String],
+    verify_texts: &[String],
+) -> String {
+    if verify_selectors.is_empty() && verify_texts.is_empty() {
+        return String::new();
+    }
+    let sel = serde_json::to_string(verify_selectors).unwrap_or_else(|_| "[]".to_string());
+    let txt = serde_json::to_string(verify_texts).unwrap_or_else(|_| "[]".to_string());
+
+    const TEMPLATE: &str = r#"(function () {
+  // 会话每次采集都更新(窗口复用),检测脚本只装一次定时器
+  window.__veltrixVerifySession = __SESSION__;
+  if (window.__veltrixVerifyCheck) return;
+  window.__veltrixVerifyCheck = true;
+  var SEL = __SEL__;
+  var TXT = __TXT__;
+  var last = null;
+
+  function visible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  // 命中任一验证弹窗选择器(可见)
+  function bySelector() {
+    for (var i = 0; i < SEL.length; i++) {
+      try { if (visible(document.querySelector(SEL[i]))) return true; } catch (e) {}
+    }
+    return false;
+  }
+  // 页面可见文本含任一验证文案(限可见、较短的节点,降低误命中)
+  function byText() {
+    if (!TXT.length) return false;
+    var nodes = document.querySelectorAll('div,span,p,button,a,[role="dialog"]');
+    for (var i = 0; i < nodes.length; i++) {
+      if (!visible(nodes[i])) continue;
+      var t = (nodes[i].textContent || '').trim();
+      if (!t || t.length > 40) continue;
+      for (var j = 0; j < TXT.length; j++) {
+        if (t.indexOf(TXT[j]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+  function present() { return bySelector() || byText(); }
+
+  function tick() {
+    var p = present();
+    if (p !== last) {
+      last = p;
+      try {
+        window.__TAURI_INTERNALS__.invoke('report_collect_verify', {
+          sessionId: window.__veltrixVerifySession, present: p
+        });
+      } catch (e) {}
+    }
+  }
+  setTimeout(tick, 1200);
+  setInterval(tick, 1500);
+})();"#;
+
+    TEMPLATE
+        .replace("__SESSION__", &session_id.to_string())
+        .replace("__SEL__", &sel)
+        .replace("__TXT__", &txt)
 }
 
 /// 登录命令名;与 Rust 端 `#[tauri::command] login_status_report` 对应。

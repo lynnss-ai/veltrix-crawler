@@ -96,6 +96,15 @@ pub struct CollectConfig {
     /// 非空时每轮滚动后按文案点击翻页;按钮不存在/置灰时点击为空操作,由停滞判定兜底结束。
     #[serde(default)]
     pub next_page_texts: Vec<String>,
+    /// 安全验证弹窗的 CSS 选择器(querySelector)。采集窗口注入自检脚本,命中任一可见元素即
+    /// 判定「弹出验证」→ 暂停滚动、等用户手动完成、弹窗消失自动恢复。真实选择器需本机抓包核对
+    /// (如抖音 `.captcha_verify_container`、小红书滑块容器),空=不检测。
+    #[serde(default)]
+    pub verify_selectors: Vec<String>,
+    /// 安全验证弹窗的文案特征(节点 textContent 子串)。作为选择器的补充识别手段
+    /// (如「请完成安全验证」「拖动滑块」「向右滑动」)。空=不按文案检测。
+    #[serde(default)]
+    pub verify_texts: Vec<String>,
 }
 
 /// 登录态真实检测配置。在可见登录窗口内注入自检脚本周期性判断是否真的登录成功:
@@ -290,6 +299,35 @@ fn builtin_next_page_texts(id: &str) -> Vec<String> {
         // B站搜索结果页是分页按钮而非无限滚动,滚动后需点「下一页」才请求下一页数据
         "bilibili" => vec!["下一页".into()],
         _ => Vec::new(),
+    }
+}
+
+/// 各平台安全验证弹窗的检测特征 (选择器, 文案)。采集窗口据此识别「弹出验证」并暂停采集。
+/// 这里是抓包起点骨架:选择器以各平台验证码容器常见类名为初值,真实值需本机
+/// `bun run tauri dev` 触发风控后核对调整(代码与 search_url 等同属抓包依赖项)。
+fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>) {
+    match id {
+        // 抖音 / TikTok:secsdk 验证码容器(滑块 / 点选)
+        "douyin" | "tiktok" => (
+            vec![
+                ".captcha_verify_container".into(),
+                "#captcha-verify-image".into(),
+                ".captcha-verify-container".into(),
+            ],
+            vec!["完成安全验证".into(), "拖动下方滑块".into(), "向右滑动".into()],
+        ),
+        // 小红书:滑块验证容器
+        "xhs" => (
+            vec![".captcha-container".into(), ".red-captcha".into()],
+            vec!["滑动验证".into(), "请完成安全验证".into(), "向右滑动".into()],
+        ),
+        // 快手:验证码弹层
+        "kuaishou" => (
+            vec![".captcha-dialog".into(), ".slide-verify".into()],
+            vec!["拖动滑块".into(), "完成验证".into()],
+        ),
+        // 其余平台暂无骨架,留空(用户可在平台配置里补充后即时生效)
+        _ => (Vec::new(), Vec::new()),
     }
 }
 
@@ -641,6 +679,7 @@ impl AppConfig {
         ] {
             let (sort_query_key, sort_query_map, time_query_key, time_query_map) =
                 builtin_search_query(id);
+            let (verify_selectors, verify_texts) = builtin_verify_signals(id);
             // 搜索/评论拦截特征 + 画像接口特征合并(去重),作者补采复用同一套拦截
             let mut all_patterns: Vec<String> =
                 patterns.into_iter().map(str::to_string).collect();
@@ -673,6 +712,8 @@ impl AppConfig {
                         time_query_key,
                         time_query_map,
                         next_page_texts: builtin_next_page_texts(id),
+                        verify_selectors,
+                        verify_texts,
                     },
                     login_check: builtin_login_check(id),
                     extra: serde_json::Value::Null,

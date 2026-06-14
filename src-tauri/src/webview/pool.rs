@@ -36,6 +36,10 @@ const COMMENT_STAGNANT_STOP: u32 = 2;
 /// 「接口连响应都没有」(网络慢/请求未返回)连续 N 轮 → 兜底结束。与 STAGNANT_STOP 分开:
 /// 慢网络请求往返久,容忍更大轮数,避免网络抖动被误判成「没数据」而提前结束。
 const NO_RESPONSE_STOP: u32 = 8;
+/// 检测到安全验证弹窗后,等待用户手动完成的最长时长:超时仍未完成则结束本次采集(已采数据已保留)。
+const VERIFY_WAIT_MAX: Duration = Duration::from_secs(180);
+/// 验证弹窗等待期间的轮询间隔。
+const VERIFY_POLL: Duration = Duration::from_secs(2);
 /// 每次滚动后的拟人停顿区间(毫秒):2~6 秒随机,避免匀速快速滚动触发风控。
 /// 下限取 2s:信息流接口往返常需 ~2s,停顿过短会在数据返回前就读快照,
 /// 表现为「新增 0 条」空转,并连带误报风控。
@@ -832,6 +836,45 @@ impl CollectBridge {
     }
 
     /// 内置采集路径:URL 直达搜索页 + 盲滚翻页。用于未配置 `rpa_steps` 的平台。
+    /// 验证弹窗暂停期间轮询等待其消失(用户手动完成)。
+    /// 返回 true=已解除、继续采集;false=超时未完成 / 暂停期间被手动结束。每 ~15s 在 HUD 提示剩余等待。
+    async fn wait_verify_cleared(&self, window: &WebviewWindow, session_id: u64) -> bool {
+        let _ = window.eval(&build_hud_status_eval("⚠ 等待手动完成安全验证…", true));
+        let _ = window.eval(&build_hud_log_eval(
+            "warn",
+            "检测到安全验证弹窗 · 已暂停采集 · 请在本窗口手动完成验证,完成后自动恢复",
+        ));
+        let start = std::time::Instant::now();
+        let mut last_hint: u64 = 0;
+        while self.control.is_verifying(session_id) {
+            // 暂停期间用户点 HUD「结束」→ 视为放弃,交由上层结束(已采数据保留)
+            if self.control.is_stopping(session_id) {
+                return false;
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= VERIFY_WAIT_MAX {
+                let _ = window.eval(&build_hud_log_eval(
+                    "error",
+                    "安全验证超时未完成 · 结束本次采集(已采数据已保留)",
+                ));
+                return false;
+            }
+            let secs = elapsed.as_secs();
+            if secs.saturating_sub(last_hint) >= 15 {
+                last_hint = secs;
+                let remaining = VERIFY_WAIT_MAX.as_secs().saturating_sub(secs);
+                let _ = window.eval(&build_hud_log_eval(
+                    "warn",
+                    &format!("仍在等待手动完成安全验证 · 剩余约 {remaining}s"),
+                ));
+            }
+            tokio::time::sleep(VERIFY_POLL).await;
+        }
+        let _ = window.eval(&build_hud_log_eval("info", "安全验证已完成 · 恢复采集翻页"));
+        let _ = window.eval(&build_hud_status_eval("采集中(已恢复)", true));
+        true
+    }
+
     async fn run_legacy_scroll(
         &self,
         window: &WebviewWindow,
@@ -875,6 +918,16 @@ impl CollectBridge {
         window
             .eval(&build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
+        // 注入安全验证弹窗自检(平台配了验证特征时):检测到弹窗即经 report_collect_verify
+        // 回传,本循环据此暂停;脚本为空(未配特征)时 eval 空串无副作用
+        let verify_eval = crate::webview::build_verify_check_eval(
+            session_id,
+            &cfg.collect.verify_selectors,
+            &cfg.collect.verify_texts,
+        );
+        if !verify_eval.is_empty() {
+            let _ = window.eval(&verify_eval);
+        }
 
         // 智能停止:有适配器 + 原生缓冲 + 目标数量时,边滚边按「去重 content_id」计数,
         // 达标即停;若连续无新增疑似风控,则预警并继续重试,达 STAGNANT_STOP 轮仍无新增则自动结束,
@@ -910,6 +963,15 @@ impl CollectBridge {
                     "已手动结束 · 停止翻页 · 保留已采内容",
                 ));
                 break;
+            }
+            // 安全验证弹窗:检测到则暂停滚动,等用户在窗口手动完成、弹窗消失后自动恢复;
+            // 超时仍未完成 → 报错结束本次采集(已采数据已由增量通道 / 兜底解析保住)。
+            if self.control.is_verifying(session_id) {
+                if !self.wait_verify_cleared(window, session_id).await {
+                    return Err(CrawlerError::Config(
+                        "检测到安全验证未在限时内完成,采集中止(已保留已采数据)".into(),
+                    ));
+                }
             }
             // 滚动失败(常见于采集窗口被手动关闭)即终止本次采集
             window.eval(&build_scroll_eval()).map_err(|e| {

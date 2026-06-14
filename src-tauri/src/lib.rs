@@ -460,6 +460,7 @@ pub fn run() {
             // 采集:拦截回传与启动
             commands::intercept_push,
             commands::stop_collect,
+            commands::report_collect_verify,
             commands::rpa_done,
             commands::start_collect,
             commands::run_task,
