@@ -61,10 +61,17 @@ pub struct AppState {
     /// 同一窗口会互踩(导航 / 滚动 / 会话注入互相覆盖)。同账号串行,不同账号 / 平台并行。
     /// 惰性建锁、任务结束不移除(账号数有限,常驻无碍)。
     pub collect_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// 全局采集并发闸:限制同时占用 WebView 窗口的采集任务数。调度器同点拉起多个 daily/watching
+    /// 任务时,超出名额的在此排队,避免一次性弹出过多窗口耗尽 CPU / 内存 / 带宽并加剧风控。
+    pub collect_semaphore: Arc<tokio::sync::Semaphore>,
     /// account_id → 登录窗口内自检回传的最近登录态结论("in" / "out")。
     /// 登录窗口关闭时据此决定终态:最近为 "out"(仍明确未登录)→ invalid;其余 → 乐观 active。
     pub login_verdicts: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
+
+/// 全局同时进行的采集任务数上限(占用 WebView 窗口的阶段)。取 3:兼顾吞吐与资源占用,
+/// 不同账号 / 平台仍可并行,但不会因调度同点拉起一堆任务而一次性弹出过多窗口。
+pub const MAX_CONCURRENT_COLLECT: usize = 3;
 
 /// 取某「平台-账号」的采集互斥锁(惰性创建)。外层 std Mutex 仅做表查找,绝不跨 await 持有。
 fn account_collect_lock(
@@ -819,16 +826,12 @@ pub async fn run_task(
         return Err(CrawlerError::Config("任务未配置关键词".into()));
     }
 
-    // 选该平台一个可用账号;account_id 作为采集窗口的隔离 key(对应独立 WebView2 数据目录)
-    let account = state
-        .cookies
-        .list(&platform)
-        .await?
-        .into_iter()
-        .find(|a| matches!(a.status, AccountStatus::Active))
-        .ok_or_else(|| {
-            CrawlerError::Config(format!("平台 {platform} 无可用账号,请先在账号管理添加并登录"))
-        })?;
+    // 选该平台一个可用账号并占用(轮换「最久未用」+ 乐观 CAS,自动恢复冷却到期账号);
+    // account_id 作为采集窗口的隔离 key(对应独立 WebView2 数据目录)。
+    // 改用 acquire 替代「永远取第一个 active」,真正实现多账号负载分摊与风控分压。
+    let account = state.cookies.acquire(&platform).await.map_err(|_| {
+        CrawlerError::Config(format!("平台 {platform} 无可用账号,请先在账号管理添加并登录"))
+    })?;
     let account_id = account.id;
 
     // clone 出平台配置,避免把配置锁 guard 跨 await 持有
@@ -880,13 +883,134 @@ pub async fn run_task(
     let db = state.db.clone();
     let registry = state.registry.clone();
     let collect_locks = state.collect_locks.clone();
+    // 账号池:采集结束据产出回写账号健康度(成功 release_ok 清风控计数 / 整体失败 mark_risk 冷却)
+    let cookies = state.cookies.clone();
+    // 全局采集并发闸:限制同时占用 WebView 窗口的任务数,防调度同点拉起多任务时爆窗耗尽资源
+    let collect_semaphore = state.collect_semaphore.clone();
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
         state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
+    // panic 兜底所需:任务体 panic 时仍能把任务落终态(否则永久卡「运行中」)
+    let app_guard = app.clone();
+    let db_guard = db.clone();
+    let task_id_guard = task_id.clone();
     tauri::async_runtime::spawn(async move {
+        // 任务体整体包一层 catch_unwind:解析 / 落库 / eval 任一处 panic 不再让 future 静默消失、
+        // 任务永久停在「运行中」。捕获后统一落 failed,让调度页可见并允许重跑。
+        use futures_util::FutureExt;
+        let body = std::panic::AssertUnwindSafe(run_task_body(RunTaskCtx {
+            app: app.clone(),
+            db: db.clone(),
+            cookies,
+            collect_semaphore,
+            collect_locks,
+            bridge,
+            registry,
+            cfg,
+            account_id,
+            task_id: task_id.clone(),
+            owner,
+            keywords,
+            per_keyword_limit,
+            min_likes,
+            collect_comments,
+            comment_time_range,
+            comment_limit,
+            analyze_comment_intent,
+            ai_extract,
+            auto_sync_obsidian,
+            sort_mode,
+            time_range,
+            media_cfg,
+            config_dir,
+            intent_cfg,
+            transcription_cfg,
+            run_started_at: now,
+        }));
+        if body.catch_unwind().await.is_err() {
+            tracing::error!(task_id = %task_id_guard, "采集任务 panic,已落 failed");
+            write_task_failed(
+                &app_guard,
+                &db_guard,
+                &task_id_guard,
+                "采集任务内部错误(已中断),可重新运行",
+            )
+            .await;
+        }
+    });
+
+    Ok(())
+}
+
+/// `run_task` 后台任务体的入参集合。字段较多,聚成结构体避免超长函数签名。
+struct RunTaskCtx {
+    app: AppHandle,
+    db: DatabaseConnection,
+    cookies: Arc<CookiePool>,
+    collect_semaphore: Arc<tokio::sync::Semaphore>,
+    collect_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    bridge: CollectBridge,
+    registry: crate::adapter::AdapterRegistry,
+    cfg: veltrix_core::config::PlatformConfig,
+    account_id: String,
+    task_id: String,
+    owner: String,
+    keywords: Vec<String>,
+    per_keyword_limit: usize,
+    min_likes: i32,
+    collect_comments: bool,
+    comment_time_range: String,
+    comment_limit: usize,
+    analyze_comment_intent: bool,
+    ai_extract: bool,
+    auto_sync_obsidian: bool,
+    sort_mode: String,
+    time_range: String,
+    media_cfg: veltrix_core::config::MediaConfig,
+    config_dir: PathBuf,
+    intent_cfg: veltrix_core::config::CommentIntentConfig,
+    transcription_cfg: veltrix_core::config::TranscriptionConfig,
+    run_started_at: i64,
+}
+
+/// `run_task` 的后台采集主体。抽成独立 async fn 以便用 catch_unwind 包裹做 panic 兜底。
+async fn run_task_body(ctx: RunTaskCtx) {
+    let RunTaskCtx {
+        app,
+        db,
+        cookies,
+        collect_semaphore,
+        collect_locks,
+        bridge,
+        registry,
+        cfg,
+        account_id,
+        task_id,
+        owner,
+        keywords,
+        per_keyword_limit,
+        min_likes,
+        collect_comments,
+        comment_time_range,
+        comment_limit,
+        analyze_comment_intent,
+        ai_extract,
+        auto_sync_obsidian,
+        sort_mode,
+        time_range,
+        media_cfg,
+        config_dir,
+        intent_cfg,
+        transcription_cfg,
+        run_started_at: now,
+    } = ctx;
+    {
+        // 全局采集并发闸:先占一个名额再开窗,超过上限的任务在此排队,避免调度同点拉起多任务时
+        // 同时弹出过多 WebView 把资源打满。permit 与 collect_guard 同寿命,WebView 阶段结束即释放。
+        let collect_permit = collect_semaphore.acquire().await.ok();
         // 同账号采集互斥:占用 WebView 窗口的阶段(关键词采集 + 评论采集)串行,
         // 其他账号 / 平台的任务不受影响,可真正并行采集
         let account_lock =
@@ -1331,9 +1455,31 @@ pub async fn run_task(
             }
         }
 
-        // WebView 占用阶段(关键词采集 + 评论采集)已结束,释放同账号互斥锁;
-        // 后续意向分析(LLM)与素材下载(HTTP)不占窗口,其他任务可立即用该账号开采
+        // WebView 占用阶段(关键词采集 + 评论采集)已结束,释放同账号互斥锁与全局并发名额;
+        // 后续意向分析(LLM)与素材下载(HTTP)不占窗口,其他任务可立即用该账号 / 名额开采
         drop(collect_guard);
+        drop(collect_permit);
+
+        // 风控反馈闭环:据本次产出回写账号健康度。
+        //   采到内容 → release_ok 清零风控计数(账号健康);
+        //   零产出且采集过程报错 → mark_risk(累计冷却 1800s,达 5 次降级失效),下次 acquire 自动轮换到其他账号。
+        // 仅在「报错且零产出」时判风控,避免冷门关键词正常无结果被误冷却。
+        if total_contents > 0 {
+            if let Err(e) = cookies.release_ok(&account_id).await {
+                tracing::warn!(account_id = %account_id, "重置账号风控计数失败: {e}");
+            }
+        } else if had_error {
+            if let Err(e) = cookies.mark_risk(&account_id).await {
+                tracing::warn!(account_id = %account_id, "标记账号风控失败: {e}");
+            } else {
+                emit_collect_log(
+                    &app,
+                    &task_id,
+                    "warn",
+                    "账号零产出且采集报错 · 已标记风控冷却,下次将自动轮换账号".to_string(),
+                );
+            }
+        }
 
         // 评论意向分析:开启意向开关 + 评论采集 + 意向配置完整时,对本任务评论分批调 LLM 标注。
         // 放在评论采集之后、素材下载之前(评论刚落库即分析);失败仅告警,不影响任务终态。
@@ -1456,9 +1602,7 @@ pub async fn run_task(
                 }
             }
         }
-    });
-
-    Ok(())
+    }
 }
 
 /// 调度器:扫描到点的 daily / watching 任务并自动启动采集。lib.rs 后台循环每 30s 调一次。

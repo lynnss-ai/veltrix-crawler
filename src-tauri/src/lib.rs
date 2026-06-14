@@ -316,6 +316,9 @@ pub fn run() {
                 current_user: std::sync::Mutex::new(None),
                 cloud,
                 collect_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                collect_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    commands::MAX_CONCURRENT_COLLECT,
+                )),
                 login_verdicts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             });
 

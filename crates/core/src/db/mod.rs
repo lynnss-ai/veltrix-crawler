@@ -60,9 +60,25 @@ async fn try_connect(url: &str, max_connections: u32) -> Result<DatabaseConnecti
     opt.max_connections(max_connections)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .sqlx_logging(false);
-    Database::connect(opt)
+    let db = Database::connect(opt)
         .await
-        .map_err(|e| CrawlerError::Config(format!("连接数据库失败: {e}")))
+        .map_err(|e| CrawlerError::Config(format!("连接数据库失败: {e}")))?;
+    // SQLite 默认单写者、无忙等待:连接池有多条连接(默认 8)且采集期并发写库
+    // (增量入库 / 日志 writer / 进度回写 / 媒体回写)会立刻抛 "database is locked"。
+    // 开 WAL 让读写并发、设 busy_timeout 让写冲突自动重试,消除并发丢更新。
+    // PG 不走此分支(仅对 sqlite 连接串生效)。
+    if url.starts_with("sqlite") {
+        for pragma in [
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA busy_timeout=5000;",
+            "PRAGMA synchronous=NORMAL;",
+        ] {
+            if let Err(e) = db.execute_unprepared(pragma).await {
+                tracing::warn!("设置 SQLite PRAGMA 失败({pragma}): {e}");
+            }
+        }
+    }
+    Ok(db)
 }
 
 /// 默认本地 SQLite 连接串(应用数据目录下的文件)。
