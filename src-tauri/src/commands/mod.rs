@@ -2500,12 +2500,29 @@ async fn persist_collected(
                 // 恰好只统计本次新增内容,重复采到的已有内容(首次时间早)被排除。
             ])
             .to_owned();
-        if let Err(e) = content_entity::Entity::insert_many(contents)
-            .on_conflict(on_conflict)
+        // 先整批 upsert(快路径);整批失败时降级逐条 upsert,避免一条冲突 / 坏数据
+        // 拖垮整条 insert 语句、把本批已采内容全部丢弃(「采集失败也要保住已采数据」)。
+        if let Err(e) = content_entity::Entity::insert_many(contents.clone())
+            .on_conflict(on_conflict.clone())
             .exec(db)
             .await
         {
-            tracing::warn!("落库采集内容失败: {e}");
+            tracing::warn!("批量落库采集内容失败,降级逐条保存: {e}");
+            let (mut ok, mut lost) = (0usize, 0usize);
+            for am in contents {
+                match content_entity::Entity::insert(am)
+                    .on_conflict(on_conflict.clone())
+                    .exec(db)
+                    .await
+                {
+                    Ok(_) => ok += 1,
+                    Err(e2) => {
+                        lost += 1;
+                        tracing::warn!("逐条落库内容失败(跳过该条): {e2}");
+                    }
+                }
+            }
+            tracing::warn!("内容降级保存完成 · 成功 {ok} 条 · 丢弃 {lost} 条");
         }
     }
 
@@ -2529,12 +2546,28 @@ async fn persist_collected(
                 // 同 content:不刷新 collected_at,采集明细只统计本次新增、排除重复采到的已有评论
             ])
             .to_owned();
-        if let Err(e) = comment_entity::Entity::insert_many(comments)
-            .on_conflict(on_conflict)
+        // 同内容:整批失败降级逐条,保住其余已采评论
+        if let Err(e) = comment_entity::Entity::insert_many(comments.clone())
+            .on_conflict(on_conflict.clone())
             .exec(db)
             .await
         {
-            tracing::warn!("落库采集评论失败: {e}");
+            tracing::warn!("批量落库采集评论失败,降级逐条保存: {e}");
+            let (mut ok, mut lost) = (0usize, 0usize);
+            for am in comments {
+                match comment_entity::Entity::insert(am)
+                    .on_conflict(on_conflict.clone())
+                    .exec(db)
+                    .await
+                {
+                    Ok(_) => ok += 1,
+                    Err(e2) => {
+                        lost += 1;
+                        tracing::warn!("逐条落库评论失败(跳过该条): {e2}");
+                    }
+                }
+            }
+            tracing::warn!("评论降级保存完成 · 成功 {ok} 条 · 丢弃 {lost} 条");
         }
     }
 
