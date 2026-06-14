@@ -853,14 +853,17 @@ impl CollectBridge {
 
     /// 内置采集路径:URL 直达搜索页 + 盲滚翻页。用于未配置 `rpa_steps` 的平台。
     /// 验证暂停期间轮询等待其解除(用户手动完成)。返回 true=已解除、继续采集;
-    /// false=超时未完成 / 暂停期间被手动结束。每轮重注入自检脚本,使其在「跳转后的验证页」与
-    /// 「验证完回到的正常页」都能持续判定(从而在回到正常页时自动 report present=false 解除暂停);
-    /// 每 ~15s 在 HUD 提示剩余等待。verify_eval 为空(未配验证特征)时不重注入。
+    /// false=超时未完成 / 暂停期间被手动结束。两条解除路径:
+    /// ① overlay 弹窗(同源):重注入的自检脚本回到正常页报 present=false 解除;
+    /// ② 整页跳转验证(可能跨域,invoke 被拦):Rust 侧轮询 window.url(),「曾进验证页、现已离开」
+    ///    即判定完成解除——不依赖验证页内的 invoke,跨域也可靠。
+    /// 每轮重注入自检脚本兼顾 ①;每 ~15s 在 HUD 提示剩余等待。
     async fn wait_verify_cleared(
         &self,
         window: &WebviewWindow,
         session_id: u64,
         verify_eval: &str,
+        verify_url_patterns: &[String],
     ) -> bool {
         let _ = window.eval(&build_hud_status_eval("⚠ 等待手动完成安全验证…", true));
         let _ = window.eval(&build_hud_log_eval(
@@ -869,6 +872,8 @@ impl CollectBridge {
         ));
         let start = std::time::Instant::now();
         let mut last_hint: u64 = 0;
+        // 是否曾观察到窗口处于验证页(用于跳转式验证的「离开即解除」判定)
+        let mut saw_verify_page = false;
         while self.control.is_verifying(session_id) {
             // 暂停期间用户点 HUD「结束」→ 视为放弃,交由上层结束(已采数据保留)
             if self.control.is_stopping(session_id) {
@@ -882,10 +887,26 @@ impl CollectBridge {
                 ));
                 return false;
             }
-            // 重注入自检脚本:跳转到验证页后原页脚本已随导航销毁,需重装才能在新页判定;
-            // 回到正常页后它会 report present=false,从而解除本暂停。
+            // 重注入自检脚本:跳转到验证页后原页脚本随导航销毁,需重装才能在新页判定;
+            // 回到正常页后它会 report present=false,从而解除本暂停(同源 overlay 场景)。
             if !verify_eval.is_empty() {
                 let _ = window.eval(verify_eval);
+            }
+            // Rust 侧 URL 轮询(跨域跳转式验证的解除路径,不依赖页面 invoke):
+            // 曾进过验证页、现已离开 → 判定验证完成,主动清除验证态恢复采集。
+            if !verify_url_patterns.is_empty() {
+                if let Ok(u) = window.url() {
+                    let url = u.as_str().to_lowercase();
+                    let on_verify = verify_url_patterns
+                        .iter()
+                        .any(|p| !p.is_empty() && url.contains(&p.to_lowercase()));
+                    if on_verify {
+                        saw_verify_page = true;
+                    } else if saw_verify_page {
+                        self.control.set_verifying(session_id, false);
+                        break;
+                    }
+                }
             }
             let secs = elapsed.as_secs();
             if secs.saturating_sub(last_hint) >= 15 {
@@ -996,7 +1017,15 @@ impl CollectBridge {
             // 安全验证:检测到则暂停滚动,等用户在窗口手动完成、验证消失后自动恢复;
             // 超时仍未完成 → 报错结束本次采集(已采数据已由增量通道 / 兜底解析保住)。
             if self.control.is_verifying(session_id) {
-                if !self.wait_verify_cleared(window, session_id, &verify_eval).await {
+                if !self
+                    .wait_verify_cleared(
+                        window,
+                        session_id,
+                        &verify_eval,
+                        &cfg.collect.verify_url_patterns,
+                    )
+                    .await
+                {
                     return Err(CrawlerError::Config(
                         "检测到安全验证未在限时内完成,采集中止(已保留已采数据)".into(),
                     ));
@@ -1515,7 +1544,14 @@ impl CollectBridge {
             }
             // 安全验证:评论采集同样暂停等手动完成,验证消失后自动恢复;超时则结束本视频评论采集
             if self.control.is_verifying(session_id)
-                && !self.wait_verify_cleared(window, session_id, &verify_eval).await
+                && !self
+                    .wait_verify_cleared(
+                        window,
+                        session_id,
+                        &verify_eval,
+                        &cfg.collect.verify_url_patterns,
+                    )
+                    .await
             {
                 let _ = window.eval(&build_hud_log_eval(
                     "warn",
