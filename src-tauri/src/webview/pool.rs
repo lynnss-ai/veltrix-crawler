@@ -578,6 +578,23 @@ pub struct CollectBridge {
     control: Arc<CollectControl>,
 }
 
+/// 一次 `collect` 的结果。无论成败都带回出错前已拦截的响应,使调用方在失败路径也能
+/// 兜底解析落库 + 落媒体,不丢已采数据;`error` 为 `Some` 表示采集中途异常。
+pub struct CollectOutcome {
+    pub responses: Vec<InterceptedResponse>,
+    pub error: Option<CrawlerError>,
+}
+
+impl CollectOutcome {
+    /// 采集尚未拦截到任何响应即失败(如开窗 / 开会话失败):空响应 + 错误。
+    fn failed(e: CrawlerError) -> Self {
+        Self {
+            responses: Vec::new(),
+            error: Some(e),
+        }
+    }
+}
+
 /// 一次采集调用的参数。集中成结构体以遵守「参数 ≤ 4」。
 pub struct CollectRequest<'a> {
     pub account_id: &'a str,
@@ -667,11 +684,10 @@ impl CollectBridge {
     ///
     /// 流程:复用登录态窗口 → 导航到搜索结果页 → 注入会话 ID 并回放首屏缓冲 →
     /// 循环滚动触发分页接口 → 取走本次会话拦截到的全部响应。
-    pub async fn collect(
-        &self,
-        app: &AppHandle,
-        req: CollectRequest<'_>,
-    ) -> Result<Vec<InterceptedResponse>> {
+    ///
+    /// 返回 `CollectOutcome`:即便中途出错(窗口被关 / 导航失败等),`responses` 仍带回出错前
+    /// 已拦截的部分响应,`error` 标识是否异常。调用方据此「失败也兜底解析落库 + 落媒体」,不丢已采数据。
+    pub async fn collect(&self, app: &AppHandle, req: CollectRequest<'_>) -> CollectOutcome {
         let cfg = req.platform_cfg;
         let title = format!("{} - {}", cfg.name, req.account_id);
         let spec = WindowSpec {
@@ -684,7 +700,11 @@ impl CollectBridge {
             // 采集窗口不做登录自检(登录检测只在登录窗口)
             login_check_script: None,
         };
-        let window = self.pool.ensure_window(app, &spec)?;
+        // 开窗失败:此时尚无任何响应,直接带空响应 + 错误返回
+        let window = match self.pool.ensure_window(app, &spec) {
+            Ok(w) => w,
+            Err(e) => return CollectOutcome::failed(e),
+        };
 
         // 原生拦截缓冲:采集前清空,采集后取走本轮命中的响应(主通道,不依赖页面 invoke)
         let label = window_label(&cfg.id, req.account_id);
@@ -712,7 +732,10 @@ impl CollectBridge {
             ),
         );
 
-        let session_id = self.channel.open_session()?;
+        let session_id = match self.channel.open_session() {
+            Ok(s) => s,
+            Err(e) => return CollectOutcome::failed(e),
+        };
         // 把会话 id 绑给 HUD,「结束」按钮据此通知后端停止本次采集
         let _ = window.eval(&build_hud_session_eval(session_id));
 
@@ -754,13 +777,18 @@ impl CollectBridge {
                 responses.append(&mut buf);
             }
         }
+        // 清理本会话的停止标志,避免 session_id 复用时误判(成败都要清)
+        self.control.clear(session_id);
         if let Err(e) = run_result {
-            self.control.clear(session_id);
+            // 异常结束:仍把已拦截的部分响应带回,让调用方兜底解析落库 + 落媒体,保住已采数据
             let _ = window.eval(&build_hud_status_eval(
                 &format!("采集异常结束:{}", req.keyword),
                 false,
             ));
-            return Err(e);
+            return CollectOutcome {
+                responses,
+                error: Some(e),
+            };
         }
         self.log_step(
             app,
@@ -782,9 +810,10 @@ impl CollectBridge {
             ),
             false,
         ));
-        // 清理本会话的停止标志,避免 session_id 复用时误判
-        self.control.clear(session_id);
-        Ok(responses)
+        CollectOutcome {
+            responses,
+            error: None,
+        }
     }
 
     /// 记一条采集日志:更新窗口 HUD,并在有 task 上下文时推送前端事件(双端共用一条)。

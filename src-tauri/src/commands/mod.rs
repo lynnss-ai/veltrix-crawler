@@ -748,7 +748,7 @@ pub async fn start_collect(
         state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
-    let responses = bridge
+    let outcome = bridge
         .collect(
             &app,
             CollectRequest {
@@ -768,7 +768,12 @@ pub async fn start_collect(
                 min_likes: 0,
             },
         )
-        .await?;
+        .await;
+    // 联调单采:中途出错直接上报(此路径不落库,无需保留部分响应)
+    if let Some(e) = outcome.error {
+        return Err(e);
+    }
+    let responses = outcome.responses;
 
     let intercepted = responses.len();
     let urls = responses.iter().map(|r| r.url.clone()).collect();
@@ -1162,56 +1167,56 @@ async fn run_task_body(ctx: RunTaskCtx) {
                             },
                         )
                         .await;
-                    if let Err(e) = &collect_result {
+                    if let Some(e) = &collect_result.error {
                         had_error = true;
                         tracing::error!(keyword = %keyword, "采集失败: {e}");
                         emit_collect_log(
                             &app,
                             &task_id,
                             "error",
-                            format!("「{keyword}」采集失败: {e}"),
+                            format!("「{keyword}」采集中途出错(已保留已采数据): {e}"),
                         );
                     }
                     // 关闭发送端让消费任务退出;增量入库到此完成,结果忽略(只为实时显示)
                     drop(tx);
                     let _ = consumer.await;
 
-                    // 兜底:对 collect 返回的「全量响应」(原生拦截 + 页面 hook 合并)再整体解析一次,
+                    // 兜底:对 collect 带回的「全量响应」(原生拦截 + 页面 hook 合并)再整体解析一次,
                     // 补齐增量通道没覆盖的路径——run_human_rpa / 非 smart 模式不发 channel——以及评论。
-                    // 与主 seen 共用去重,persist_collected 是 on_conflict upsert,幂等不会重复落库;
-                    // media 以兜底全量内容为准,确保各路径都能下到素材。
-                    if let Ok(responses) = collect_result {
-                        if !responses.is_empty() {
-                            let ctx = FetchContext {
-                                keyword: keyword.clone(),
-                                responses,
-                            };
-                            match adapter_arc.parse(&TaskKind::Search, &ctx).await {
-                                Ok(mut output) => {
-                                    // 兜底解析同样按最低点赞数过滤,与增量通道口径一致(缺失放行)
-                                    if min_likes > 0 {
-                                        output.contents.retain(|c| {
-                                            c.stats
-                                                .like_count
-                                                .map(|likes| likes >= min_likes as i64)
-                                                .unwrap_or(true)
-                                        });
-                                    }
-                                    contents_for_media.extend(output.contents.iter().cloned());
-                                    persist_collected(
-                                        &db,
-                                        &task_id,
-                                        &owner,
-                                        keyword,
-                                        output,
-                                        &mut seen_contents,
-                                        &mut seen_comments,
-                                    )
-                                    .await;
+                    // 关键:即便采集中途出错,collect 也带回了出错前已拦截的响应,这里同样兜底解析落库 +
+                    // 落媒体,确保「失败也保住已采数据」(内容计数 / 素材下载都覆盖到)。
+                    // 与主 seen 共用去重,persist_collected 是 on_conflict upsert,幂等不重复落库。
+                    let responses = collect_result.responses;
+                    if !responses.is_empty() {
+                        let ctx = FetchContext {
+                            keyword: keyword.clone(),
+                            responses,
+                        };
+                        match adapter_arc.parse(&TaskKind::Search, &ctx).await {
+                            Ok(mut output) => {
+                                // 兜底解析同样按最低点赞数过滤,与增量通道口径一致(缺失放行)
+                                if min_likes > 0 {
+                                    output.contents.retain(|c| {
+                                        c.stats
+                                            .like_count
+                                            .map(|likes| likes >= min_likes as i64)
+                                            .unwrap_or(true)
+                                    });
                                 }
-                                Err(e) => {
-                                    tracing::warn!(keyword = %keyword, "兜底解析失败: {e}");
-                                }
+                                contents_for_media.extend(output.contents.iter().cloned());
+                                persist_collected(
+                                    &db,
+                                    &task_id,
+                                    &owner,
+                                    keyword,
+                                    output,
+                                    &mut seen_contents,
+                                    &mut seen_comments,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(keyword = %keyword, "兜底解析失败: {e}");
                             }
                         }
                     }
@@ -1229,7 +1234,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 None => {
                     // 未注册适配器:collect 不会发 channel(content_tx 传 None),
                     // 退化为原「仅统计拦截响应数」分支,明细不落库
-                    let responses = match bridge
+                    let outcome = bridge
                         .collect(
                             &app,
                             CollectRequest {
@@ -1246,22 +1251,19 @@ async fn run_task_body(ctx: RunTaskCtx) {
                                 min_likes,
                             },
                         )
-                        .await
-                    {
-                        Ok(responses) => responses,
-                        Err(e) => {
-                            had_error = true;
-                            tracing::error!(keyword = %keyword, "采集失败: {e}");
-                            emit_collect_log(
-                                &app,
-                                &task_id,
-                                "error",
-                                format!("「{keyword}」采集失败: {e}"),
-                            );
-                            Vec::new()
-                        }
-                    };
-                    intercepted_total += responses.len() as i64;
+                        .await;
+                    if let Some(e) = &outcome.error {
+                        had_error = true;
+                        tracing::error!(keyword = %keyword, "采集失败: {e}");
+                        emit_collect_log(
+                            &app,
+                            &task_id,
+                            "error",
+                            format!("「{keyword}」采集中途出错: {e}"),
+                        );
+                    }
+                    // 出错也把已拦截的部分响应计入(不丢已采)
+                    intercepted_total += outcome.responses.len() as i64;
                     (intercepted_total, 0)
                 }
             };
