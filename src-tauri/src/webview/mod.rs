@@ -363,20 +363,22 @@ pub fn build_set_session_eval(session_id: u64) -> String {
 /// 验证弹窗上报命令名;与 Rust 端 `#[tauri::command] report_collect_verify` 对应。
 pub const VERIFY_REPORT_COMMAND: &str = "report_collect_verify";
 
-/// 构造「安全验证弹窗自检」注入脚本(采集窗口用,导航到搜索页后 eval)。
-/// 每隔 ~1.5s 检测页面是否出现验证弹窗(命中选择器或文案),状态翻转时经
-/// `report_collect_verify` 回传 `{ sessionId, present }`,采集循环据此暂停 / 恢复。
-/// 选择器 / 文案为空时不安装(该平台未配置验证检测)。
+/// 构造「安全验证自检」注入脚本(采集窗口用,导航后 eval)。每隔 ~1.5s 检测当前页是否处于
+/// 安全验证状态:命中验证弹窗选择器/文案,或当前 location 命中验证页 URL 特征(整页跳转到
+/// 验证中心场景);状态翻转时经 `report_collect_verify` 回传 `{ sessionId, present }`,
+/// 采集循环据此暂停 / 恢复。三者皆空时不安装(该平台未配置验证检测)。
 pub fn build_verify_check_eval(
     session_id: u64,
     verify_selectors: &[String],
     verify_texts: &[String],
+    verify_url_patterns: &[String],
 ) -> String {
-    if verify_selectors.is_empty() && verify_texts.is_empty() {
+    if verify_selectors.is_empty() && verify_texts.is_empty() && verify_url_patterns.is_empty() {
         return String::new();
     }
     let sel = serde_json::to_string(verify_selectors).unwrap_or_else(|_| "[]".to_string());
     let txt = serde_json::to_string(verify_texts).unwrap_or_else(|_| "[]".to_string());
+    let url = serde_json::to_string(verify_url_patterns).unwrap_or_else(|_| "[]".to_string());
 
     const TEMPLATE: &str = r#"(function () {
   // 会话每次采集都更新(窗口复用),检测脚本只装一次定时器
@@ -385,6 +387,7 @@ pub fn build_verify_check_eval(
   window.__veltrixVerifyCheck = true;
   var SEL = __SEL__;
   var TXT = __TXT__;
+  var URLP = __URL__;
   var last = null;
 
   function visible(el) {
@@ -413,7 +416,17 @@ pub fn build_verify_check_eval(
     }
     return false;
   }
-  function present() { return bySelector() || byText(); }
+  // 当前 location 命中验证页 URL 特征(整页跳转到验证中心)
+  function byLocation() {
+    if (!URLP.length) return false;
+    var href = '';
+    try { href = (location.href || '').toLowerCase(); } catch (e) { return false; }
+    for (var i = 0; i < URLP.length; i++) {
+      if (href.indexOf(String(URLP[i]).toLowerCase()) !== -1) return true;
+    }
+    return false;
+  }
+  function present() { return bySelector() || byText() || byLocation(); }
 
   function tick() {
     var p = present();
@@ -434,6 +447,7 @@ pub fn build_verify_check_eval(
         .replace("__SESSION__", &session_id.to_string())
         .replace("__SEL__", &sel)
         .replace("__TXT__", &txt)
+        .replace("__URL__", &url)
 }
 
 /// 登录命令名;与 Rust 端 `#[tauri::command] login_status_report` 对应。

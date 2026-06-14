@@ -105,6 +105,12 @@ pub struct CollectConfig {
     /// (如「请完成安全验证」「拖动滑块」「向右滑动」)。空=不按文案检测。
     #[serde(default)]
     pub verify_texts: Vec<String>,
+    /// 安全验证接口 / 页面的 URL 特征(子串)。两处用途:① 响应侧检测——拦截到的接口响应
+    /// URL 命中即判定触发风控验证(覆盖「整页跳转到验证中心」这类 DOM 选择器抓不到的场景);
+    /// ② 注入脚本据此判断当前 location 是否停在验证页,使暂停在验证页保持、回到正常页即恢复。
+    /// 如抖音 `/captcha/`、`verify`,小红书 `/captcha`。空=不按 URL 检测。
+    #[serde(default)]
+    pub verify_url_patterns: Vec<String>,
 }
 
 /// 登录态真实检测配置。在可见登录窗口内注入自检脚本周期性判断是否真的登录成功:
@@ -302,12 +308,12 @@ fn builtin_next_page_texts(id: &str) -> Vec<String> {
     }
 }
 
-/// 各平台安全验证弹窗的检测特征 (选择器, 文案)。采集窗口据此识别「弹出验证」并暂停采集。
-/// 这里是抓包起点骨架:选择器以各平台验证码容器常见类名为初值,真实值需本机
-/// `bun run tauri dev` 触发风控后核对调整(代码与 search_url 等同属抓包依赖项)。
-fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>) {
+/// 各平台安全验证检测特征 (弹窗选择器, 弹窗文案, 验证 URL 子串)。采集窗口据此识别
+/// 「触发验证」并暂停采集。这里是抓包起点骨架:类名 / URL 以各平台验证码常见值为初值,
+/// 真实值需本机 `bun run tauri dev` 触发风控后核对调整(代码与 search_url 等同属抓包依赖项)。
+fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     match id {
-        // 抖音 / TikTok:secsdk 验证码容器(滑块 / 点选)
+        // 抖音 / TikTok:secsdk 验证码容器(滑块 / 点选)+ captcha 接口
         "douyin" | "tiktok" => (
             vec![
                 ".captcha_verify_container".into(),
@@ -315,19 +321,22 @@ fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>) {
                 ".captcha-verify-container".into(),
             ],
             vec!["完成安全验证".into(), "拖动下方滑块".into(), "向右滑动".into()],
+            vec!["/captcha/".into(), "verifycenter".into(), "secsdk".into()],
         ),
-        // 小红书:滑块验证容器
+        // 小红书:滑块验证容器 + captcha 接口
         "xhs" => (
             vec![".captcha-container".into(), ".red-captcha".into()],
             vec!["滑动验证".into(), "请完成安全验证".into(), "向右滑动".into()],
+            vec!["/captcha".into(), "/web/v1/verify".into()],
         ),
         // 快手:验证码弹层
         "kuaishou" => (
             vec![".captcha-dialog".into(), ".slide-verify".into()],
             vec!["拖动滑块".into(), "完成验证".into()],
+            vec!["/captcha".into(), "/rest/c/captcha".into()],
         ),
         // 其余平台暂无骨架,留空(用户可在平台配置里补充后即时生效)
-        _ => (Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -679,7 +688,7 @@ impl AppConfig {
         ] {
             let (sort_query_key, sort_query_map, time_query_key, time_query_map) =
                 builtin_search_query(id);
-            let (verify_selectors, verify_texts) = builtin_verify_signals(id);
+            let (verify_selectors, verify_texts, verify_url_patterns) = builtin_verify_signals(id);
             // 搜索/评论拦截特征 + 画像接口特征合并(去重),作者补采复用同一套拦截
             let mut all_patterns: Vec<String> =
                 patterns.into_iter().map(str::to_string).collect();
@@ -714,6 +723,7 @@ impl AppConfig {
                         next_page_texts: builtin_next_page_texts(id),
                         verify_selectors,
                         verify_texts,
+                        verify_url_patterns,
                     },
                     login_check: builtin_login_check(id),
                     extra: serde_json::Value::Null,

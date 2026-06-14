@@ -10,6 +10,8 @@ import { type RemoteStatus } from "@/components/RemoteConnect";
 import { api, type UserView } from "@/lib/api";
 import { TitleBar } from "@/components/TitleBar";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import { toast } from "sonner";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { CollectPage } from "@/pages/CollectPage";
@@ -157,6 +159,38 @@ function App() {
     const onResize = () => setSidebarOpen(window.innerWidth >= 1024);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // 采集安全验证提示:任一采集窗口检测到风控验证(collect-verify present=true)即全局置顶常驻提示,
+  // 提醒用户去采集窗口手动完成;该窗口验证解除(present=false)后移出,集合空则自动收起。
+  useEffect(() => {
+    const VERIFY_TOAST_ID = "collect-verify";
+    const pending = new Set<number>();
+    let unlisten: (() => void) | undefined;
+    void listen<{ present: boolean; sessionId: number }>(
+      "collect-verify",
+      (event) => {
+        const present = !!event.payload?.present;
+        const sessionId = event.payload?.sessionId ?? 0;
+        if (present) pending.add(sessionId);
+        else pending.delete(sessionId);
+        if (pending.size > 0) {
+          toast.warning("检测到安全验证 · 采集已暂停", {
+            id: VERIFY_TOAST_ID,
+            description: "请在采集窗口手动完成验证,完成后将自动恢复采集",
+            duration: Infinity,
+          });
+        } else {
+          toast.dismiss(VERIFY_TOAST_ID);
+        }
+      },
+    ).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+      toast.dismiss(VERIFY_TOAST_ID);
+    };
   }, []);
   // 启动引导:loading 加载中,setup 走初始化向导(无任何用户),login 登录页
   const [bootState, setBootState] = useState<"loading" | "setup" | "login">(

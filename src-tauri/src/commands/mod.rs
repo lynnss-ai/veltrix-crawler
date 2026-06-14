@@ -702,8 +702,11 @@ pub fn report_collect_verify(
 ) {
     use tauri::Emitter;
     state.collect_control.set_verifying(session_id, present);
-    // 仅推送状态本身;前端据此弹/收全局提示条(具体任务在采集窗口 HUD 内已高亮)
-    let _ = app.emit("collect-verify", serde_json::json!({ "present": present }));
+    // 推送状态 + sessionId;前端按 session 维护「待验证」集合,任一存在即显示全局提示条
+    let _ = app.emit(
+        "collect-verify",
+        serde_json::json!({ "present": present, "sessionId": session_id }),
+    );
 }
 
 /// 拟人 RPA 执行器跑完(或某步失败)时回传结果。

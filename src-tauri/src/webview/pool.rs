@@ -142,6 +142,22 @@ fn window_label(platform: &str, account_id: &str) -> String {
     format!("veltrix-{platform}-{account_id}")
 }
 
+/// 拦截到的响应里是否有 URL 命中验证特征(响应侧风控检测)。patterns 空时恒 false。
+fn response_hits_verify(
+    responses: &[crate::webview::InterceptedResponse],
+    patterns: &[String],
+) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    responses.iter().any(|r| {
+        let url = r.url.to_lowercase();
+        patterns
+            .iter()
+            .any(|p| !p.is_empty() && url.contains(&p.to_lowercase()))
+    })
+}
+
 /// 把 label 规整为文件系统安全的目录名。
 /// account_id 可能由用户自定义、含 `/` `:` 空格等非法路径字符,
 /// 直接拼路径会破坏多账号隔离(建目录失败或落到意外位置),故统一替换为下划线。
@@ -836,13 +852,20 @@ impl CollectBridge {
     }
 
     /// 内置采集路径:URL 直达搜索页 + 盲滚翻页。用于未配置 `rpa_steps` 的平台。
-    /// 验证弹窗暂停期间轮询等待其消失(用户手动完成)。
-    /// 返回 true=已解除、继续采集;false=超时未完成 / 暂停期间被手动结束。每 ~15s 在 HUD 提示剩余等待。
-    async fn wait_verify_cleared(&self, window: &WebviewWindow, session_id: u64) -> bool {
+    /// 验证暂停期间轮询等待其解除(用户手动完成)。返回 true=已解除、继续采集;
+    /// false=超时未完成 / 暂停期间被手动结束。每轮重注入自检脚本,使其在「跳转后的验证页」与
+    /// 「验证完回到的正常页」都能持续判定(从而在回到正常页时自动 report present=false 解除暂停);
+    /// 每 ~15s 在 HUD 提示剩余等待。verify_eval 为空(未配验证特征)时不重注入。
+    async fn wait_verify_cleared(
+        &self,
+        window: &WebviewWindow,
+        session_id: u64,
+        verify_eval: &str,
+    ) -> bool {
         let _ = window.eval(&build_hud_status_eval("⚠ 等待手动完成安全验证…", true));
         let _ = window.eval(&build_hud_log_eval(
             "warn",
-            "检测到安全验证弹窗 · 已暂停采集 · 请在本窗口手动完成验证,完成后自动恢复",
+            "检测到安全验证 · 已暂停采集 · 请在本窗口手动完成验证,完成后自动恢复",
         ));
         let start = std::time::Instant::now();
         let mut last_hint: u64 = 0;
@@ -859,6 +882,11 @@ impl CollectBridge {
                 ));
                 return false;
             }
+            // 重注入自检脚本:跳转到验证页后原页脚本已随导航销毁,需重装才能在新页判定;
+            // 回到正常页后它会 report present=false,从而解除本暂停。
+            if !verify_eval.is_empty() {
+                let _ = window.eval(verify_eval);
+            }
             let secs = elapsed.as_secs();
             if secs.saturating_sub(last_hint) >= 15 {
                 last_hint = secs;
@@ -870,7 +898,7 @@ impl CollectBridge {
             }
             tokio::time::sleep(VERIFY_POLL).await;
         }
-        let _ = window.eval(&build_hud_log_eval("info", "安全验证已完成 · 恢复采集翻页"));
+        let _ = window.eval(&build_hud_log_eval("info", "安全验证已完成 · 恢复采集"));
         let _ = window.eval(&build_hud_status_eval("采集中(已恢复)", true));
         true
     }
@@ -918,12 +946,13 @@ impl CollectBridge {
         window
             .eval(&build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
-        // 注入安全验证弹窗自检(平台配了验证特征时):检测到弹窗即经 report_collect_verify
+        // 注入安全验证自检(平台配了验证特征时):检测到弹窗 / 跳到验证页即经 report_collect_verify
         // 回传,本循环据此暂停;脚本为空(未配特征)时 eval 空串无副作用
         let verify_eval = crate::webview::build_verify_check_eval(
             session_id,
             &cfg.collect.verify_selectors,
             &cfg.collect.verify_texts,
+            &cfg.collect.verify_url_patterns,
         );
         if !verify_eval.is_empty() {
             let _ = window.eval(&verify_eval);
@@ -964,10 +993,10 @@ impl CollectBridge {
                 ));
                 break;
             }
-            // 安全验证弹窗:检测到则暂停滚动,等用户在窗口手动完成、弹窗消失后自动恢复;
+            // 安全验证:检测到则暂停滚动,等用户在窗口手动完成、验证消失后自动恢复;
             // 超时仍未完成 → 报错结束本次采集(已采数据已由增量通道 / 兜底解析保住)。
             if self.control.is_verifying(session_id) {
-                if !self.wait_verify_cleared(window, session_id).await {
+                if !self.wait_verify_cleared(window, session_id, &verify_eval).await {
                     return Err(CrawlerError::Config(
                         "检测到安全验证未在限时内完成,采集中止(已保留已采数据)".into(),
                     ));
@@ -1031,6 +1060,17 @@ impl CollectBridge {
                 .unwrap_or_default();
             snapshot.extend(self.channel.peek_session(session_id));
             let resp_count = snapshot.len();
+            // 响应侧风控检测:拦截到的接口 URL 命中验证特征(覆盖整页跳转到验证中心、DOM 选择器
+            // 抓不到的场景)→ 置验证态,下一轮顶部即暂停;清除交给注入脚本(回正常页报 present=false)。
+            if !self.control.is_verifying(session_id)
+                && response_hits_verify(&snapshot, &cfg.collect.verify_url_patterns)
+            {
+                self.control.set_verifying(session_id, true);
+                let _ = window.eval(&build_hud_log_eval(
+                    "warn",
+                    "接口返回命中安全验证特征 · 疑似触发风控 · 将暂停采集等待手动验证",
+                ));
+            }
             let before_seen = seen.len();
             let before_new = new_count;
             if let Some(adapter) = adapter {
@@ -1439,6 +1479,16 @@ impl CollectBridge {
         window
             .eval(&build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
+        // 评论详情页同样注入安全验证自检(覆盖评论采集路径)
+        let verify_eval = crate::webview::build_verify_check_eval(
+            session_id,
+            &cfg.collect.verify_selectors,
+            &cfg.collect.verify_texts,
+            &cfg.collect.verify_url_patterns,
+        );
+        if !verify_eval.is_empty() {
+            let _ = window.eval(&verify_eval);
+        }
 
         // limit>0 时按量停止,否则按配置固定轮数兜底(评论无目标时不宜无限滚)
         let smart = sink.is_some() && limit > 0;
@@ -1461,6 +1511,16 @@ impl CollectBridge {
             round += 1;
             if self.control.is_stopping(session_id) {
                 let _ = window.eval(&build_hud_log_eval("info", "已手动结束 · 停止评论采集"));
+                break;
+            }
+            // 安全验证:评论采集同样暂停等手动完成,验证消失后自动恢复;超时则结束本视频评论采集
+            if self.control.is_verifying(session_id)
+                && !self.wait_verify_cleared(window, session_id, &verify_eval).await
+            {
+                let _ = window.eval(&build_hud_log_eval(
+                    "warn",
+                    "安全验证未完成 · 结束本视频评论采集(已采评论已保留)",
+                ));
                 break;
             }
             // 评论区滚动:程序 scrollTo + Windows 真实滚轮兜底。
@@ -1504,6 +1564,16 @@ impl CollectBridge {
                 .unwrap_or_default();
             snapshot.extend(self.channel.peek_session(session_id));
             let resp_count = snapshot.len();
+            // 响应侧风控检测(同搜索路径):评论接口 URL 命中验证特征即置验证态,下一轮顶部暂停
+            if !self.control.is_verifying(session_id)
+                && response_hits_verify(&snapshot, &cfg.collect.verify_url_patterns)
+            {
+                self.control.set_verifying(session_id, true);
+                let _ = window.eval(&build_hud_log_eval(
+                    "warn",
+                    "评论接口命中安全验证特征 · 疑似触发风控 · 将暂停等待手动验证",
+                ));
+            }
             let before_seen = seen.len();
             let ctx = FetchContext {
                 keyword: content_id.to_string(),
