@@ -15,13 +15,12 @@ import {
   EyeOff,
   KeyRound,
   MoreVertical,
-  Pencil,
+  SquarePen,
   Plus,
   RefreshCw,
   Search,
   Trash2,
   Upload,
-  Users,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -37,6 +36,7 @@ import { generatePassword } from "@/lib/password";
 import { toast } from "sonner";
 import { Avatar } from "@/components/Avatar";
 import { DataTable } from "@/components/DataTable";
+import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
@@ -275,7 +275,7 @@ export function UsersPage() {
                       setIsFormOpen(true);
                     }}
                   >
-                    <Pencil />
+                    <SquarePen />
                     编辑
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setResetTarget(u)}>
@@ -301,15 +301,10 @@ export function UsersPage() {
   );
 
   const emptyState = (
-    <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
-      <div className="flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
-        <Users className="size-6" />
-      </div>
-      <p className="text-sm font-medium text-foreground">没有符合条件的用户</p>
-      <p className="text-xs text-muted-foreground">
-        调整搜索 / 筛选,或点击「新增用户」创建账号
-      </p>
-    </div>
+    <EmptyState
+      title="没有符合条件的用户"
+      description="调整搜索 / 筛选,或点击「新增用户」创建账号"
+    />
   );
 
   return (
@@ -324,7 +319,7 @@ export function UsersPage() {
         renderToolbar={(table) => (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 flex-wrap items-center gap-2">
-              <div className="relative w-full sm:max-w-xs">
+              <div className="relative w-full sm:max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   placeholder="搜索用户名 / 昵称 / 邮箱"
@@ -369,7 +364,7 @@ export function UsersPage() {
 
       <Sheet open={isFormOpen} onOpenChange={setIsFormOpen}>
         <SheetContent
-          className="flex w-full flex-col gap-0 p-0 sm:max-w-lg"
+          className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
           blockClose={isFormDirty}
         >
           <UserForm
@@ -441,7 +436,7 @@ function ResetPasswordSheet({
   return (
     <Sheet open={target !== null} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-md"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose
       >
         <SheetHeader className="border-b">
@@ -538,6 +533,8 @@ function UserForm({
   onDirtyChange: (dirty: boolean) => void;
 }) {
   const isEdit = initial !== null;
+  // 初始化创建的超级管理员:禁止停用 / 改数据级别(后端也会兜底强制)
+  const isSuperAdmin = initial?.isSuperAdmin ?? false;
   const [username, setUsername] = useState(initial?.username ?? "");
   // 新建用户默认随机生成初始密码(可查看/刷新/手动改);编辑不在此改密码,改用列表「重置密码」
   const [password, setPassword] = useState(() =>
@@ -823,12 +820,15 @@ function UserForm({
                   启用账号
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  停用后该账号无法登录后台
+                  {isSuperAdmin
+                    ? "初始化超级管理员不可停用"
+                    : "停用后该账号无法登录后台"}
                 </div>
               </div>
               <Switch
                 checked={status === "enabled"}
                 onCheckedChange={(v) => setStatus(v ? "enabled" : "disabled")}
+                disabled={isSuperAdmin}
               />
             </div>
             <div className="space-y-1.5">
@@ -836,6 +836,7 @@ function UserForm({
               <Select
                 value={dataScope}
                 onValueChange={(v) => setDataScope(v as DataScope)}
+                disabled={isSuperAdmin}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
@@ -846,7 +847,9 @@ function UserForm({
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                控制账号 / 任务 / 资产 / 客户等业务数据的可见范围
+                {isSuperAdmin
+                  ? "初始化超级管理员固定为全部数据"
+                  : "控制账号 / 任务 / 资产 / 客户等业务数据的可见范围"}
               </p>
             </div>
           </div>

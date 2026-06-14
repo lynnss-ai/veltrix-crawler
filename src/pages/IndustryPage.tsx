@@ -15,11 +15,11 @@ import {
   Copy,
   Filter,
   MoreVertical,
-  Pencil,
+  SquarePen,
   Plus,
   RefreshCw,
+  Radar,
   Search,
-  Tags,
   Trash2,
 } from "lucide-react";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
@@ -33,6 +33,7 @@ import {
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
+import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { RefreshButton } from "@/components/RefreshButton";
 import { Button } from "@/components/ui/button";
@@ -261,7 +262,7 @@ export function IndustryPage() {
                       setIsKeywordFormOpen(true);
                     }}
                   >
-                    <Pencil />
+                    <SquarePen />
                     编辑
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
@@ -292,7 +293,7 @@ export function IndustryPage() {
           {/* 左侧:行业类别(可收起) */}
         {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
-          <div className="flex items-center justify-between border-b px-4 py-3">
+          <div className="flex h-8 items-center justify-between border-b px-4">
             <span className="text-sm font-semibold">行业类别</span>
             <div className="flex items-center gap-1">
               <Button size="icon-sm" variant="ghost" onClick={openCreateIndustry}>
@@ -313,9 +314,12 @@ export function IndustryPage() {
           </div>
           <div className="flex-1 space-y-0.5 overflow-auto p-2">
             {industries.length === 0 && (
-              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                暂无行业,点击右上角 + 新增
-              </p>
+              <div className="flex flex-col items-center gap-2 px-2 py-8 text-center">
+                <Radar className="size-6 text-muted-foreground/50" />
+                <p className="text-xs text-muted-foreground">
+                  暂无行业,点击右上角 + 新增
+                </p>
+              </div>
             )}
             {industries.map((ind) => {
               const isActive = ind.id === selectedId;
@@ -352,7 +356,7 @@ export function IndustryPage() {
                           setIsIndustryFormOpen(true);
                         }}
                       >
-                        <Pencil />
+                        <SquarePen />
                         编辑
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
@@ -397,17 +401,10 @@ export function IndustryPage() {
             globalFilterFn={keywordFilterFn}
             getRowId={(k) => k.id}
             emptyState={
-              <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
-                <div className="flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                  <Tags className="size-6" />
-                </div>
-                <p className="text-sm font-medium text-foreground">
-                  「{selectedIndustry.name}」暂无关键词
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  点击右上角「新增关键词」添加
-                </p>
-              </div>
+              <EmptyState
+                title={`「${selectedIndustry.name}」暂无关键词`}
+                description="点击右上角「新增关键词」添加"
+              />
             }
             renderToolbar={(table) => (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -424,7 +421,7 @@ export function IndustryPage() {
                       </Button>
                     </SimpleTooltip>
                   )}
-                  <div className="relative w-full sm:w-72">
+                  <div className="relative w-full sm:w-80 lg:w-96">
                     <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       placeholder={`搜索「${selectedIndustry.name}」的关键词`}
@@ -450,8 +447,11 @@ export function IndustryPage() {
             )}
           />
         ) : (
-          <div className="flex min-h-0 flex-1 items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
-            请先在左侧选择或新增一个行业类别
+          <div className="flex min-h-0 flex-1 items-center justify-center rounded-xl border border-dashed">
+            <EmptyState
+              title="请选择行业类别"
+              description="在左侧选择或新增一个行业类别后查看关键词"
+            />
           </div>
         )}
         </div>
@@ -575,7 +575,7 @@ function IndustryFormSheet({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-md"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose={name !== (initial?.name ?? "") || remark !== (initial?.remark ?? "")}
       >
         <SheetHeader className="border-b">
@@ -716,7 +716,7 @@ function KeywordFormSheet({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-md"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose={isEdit ? word !== (initial?.word ?? "") : bulk.trim() !== ""}
       >
         <SheetHeader className="border-b">

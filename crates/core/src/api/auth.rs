@@ -73,11 +73,11 @@ pub fn jwt_secret(mode: super::ServerMode) -> Vec<u8> {
             tracing::warn!(
                 "未设置 VELTRIX_JWT_SECRET,使用临时随机密钥(重启后旧 token 失效);Desktop 开发模式可接受"
             );
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            format!("dev-secret-{seed}").into_bytes()
+            // 用 CSPRNG 生成 32 字节高熵密钥:时间戳种子可被猜测,伪造 token 即绕过整套 API 鉴权
+            use rand::RngCore;
+            let mut secret = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut secret);
+            secret
         }
     }
 }

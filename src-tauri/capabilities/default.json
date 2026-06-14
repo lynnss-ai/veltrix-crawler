@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "主窗口、新开的 app-* 窗口及所有 veltrix-* 采集 WebView 共用的默认权限。采集 WebView 需要 core:default,才能在外部页面内通过 __TAURI_INTERNALS__.invoke 回传拦截到的接口响应(intercept_push)。",
-  "windows": ["main", "app-*", "veltrix-*"],
+  "windows": ["main", "tray-popup", "app-*", "veltrix-*"],
   "permissions": [
     "core:default",
     "opener:default",

@@ -4,16 +4,14 @@
 // - 子任务 SubTask:一个关键词对应一个子任务,继承父任务的策略
 // - 执行历史 Execution:子任务每次跑生成一条;watching/daily 类任务会有很多条
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   CalendarClock,
-  Filter,
   Infinity as InfinityIcon,
   Zap,
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { listen } from "@tauri-apps/api/event";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,25 +24,34 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
-import { type TaskView } from "@/lib/api";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import {
+  api,
+  type CollectLogEntry,
+  type TaskRunView,
+  type TaskView,
+} from "@/lib/api";
 import { platformClass } from "@/lib/platforms";
 
-// 后端 collect-log 事件载荷(对应 src-tauri webview::CollectLog)
-interface CollectLogEntry {
-  taskId: string;
-  ts: number;
-  level: "info" | "warn" | "error";
-  message: string;
-}
-
-// 单次采集会话日志上限,防止长任务把内存撑爆
-const LOG_BUFFER_LIMIT = 500;
+// 采集日志条目类型见 @/lib/api 的 CollectLogEntry(含富条目 entry:头像/昵称/标题/序号)
 
 const LOG_LEVEL_CLASS: Record<CollectLogEntry["level"], string> = {
   info: "text-foreground",
   warn: "text-amber-600 dark:text-amber-400",
   error: "text-destructive",
 };
+
+// 日志时间统一 HH:mm:ss(定宽,便于时间列对齐)
+function fmtLogTime(ts: number): string {
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
 // ---- 触发 / 状态 视图 meta(平台见 @/lib/platforms) ----
 
@@ -79,6 +86,24 @@ const STATUS_META: Record<
       "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400",
     dot: "bg-slate-500",
   },
+  collecting_comments: {
+    label: "评论采集中",
+    className:
+      "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400",
+    dot: "bg-violet-500 animate-pulse",
+  },
+  analyzing_comments: {
+    label: "意向分析中",
+    className:
+      "border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-400",
+    dot: "bg-fuchsia-500 animate-pulse",
+  },
+  downloading_media: {
+    label: "素材下载中",
+    className:
+      "border-cyan-500/30 bg-cyan-500/10 text-cyan-600 dark:text-cyan-400",
+    dot: "bg-cyan-500 animate-pulse",
+  },
   completed: {
     label: "已完成",
     className: "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
@@ -108,20 +133,6 @@ interface SubTask {
   errorMessage: string | null;
 }
 
-interface Execution {
-  id: string;
-  subTaskId: string;
-  keyword: string;
-  startedAt: number;
-  finishedAt: number | null;
-  /// 本次新增内容数
-  contentDelta: number;
-  /// 本次新增评论数
-  commentDelta: number;
-  status: "running" | "success" | "failed" | "cancelled";
-  errorMessage: string | null;
-}
-
 // 从父任务派生子任务列表(每关键词一条);真实接入时替换为 api.listSubTasks
 function deriveSubTasks(task: TaskView): SubTask[] {
   return task.keywords.map((kw, idx) => ({
@@ -134,31 +145,6 @@ function deriveSubTasks(task: TaskView): SubTask[] {
     lastRunAt: task.startedAt ?? null,
     errorMessage: task.errorMessage,
   }));
-}
-
-// 生成 mock 执行历史(每个子任务最近 3 次运行)
-function deriveExecutions(subTasks: SubTask[]): Execution[] {
-  const list: Execution[] = [];
-  for (const sub of subTasks) {
-    if (!sub.lastRunAt) continue;
-    for (let i = 0; i < 3; i += 1) {
-      const startedAt = sub.lastRunAt - i * 3600;
-      const finishedAt = startedAt + 60 * (5 + Math.floor(Math.random() * 25));
-      list.push({
-        id: `${sub.id}-exec-${i}`,
-        subTaskId: sub.id,
-        keyword: sub.keyword,
-        startedAt,
-        finishedAt,
-        contentDelta: Math.floor(Math.random() * 30),
-        commentDelta: Math.floor(Math.random() * 80),
-        status: i === 0 && sub.status === "failed" ? "failed" : "success",
-        errorMessage: i === 0 ? sub.errorMessage : null,
-      });
-    }
-  }
-  // 最近的排前面
-  return list.sort((a, b) => b.startedAt - a.startedAt);
 }
 
 // ---- 工具 ----
@@ -188,50 +174,49 @@ export function TaskDetailPage({
   platformName: (id: string) => string;
   onBack: () => void;
 }) {
-  const [tab, setTab] = useState<"sub" | "history" | "logs">("sub");
-  const [subFilterId, setSubFilterId] = useState<string | null>(null);
-  const [logs, setLogs] = useState<CollectLogEntry[]>([]);
-  const logEndRef = useRef<HTMLDivElement>(null);
+  const [tab, setTab] = useState<"sub" | "history">("sub");
+  const [runs, setRuns] = useState<TaskRunView[]>([]);
+  // 查看日志:当前查看的运行 + 其采集日志(右侧抽屉显示)
+  const [viewRun, setViewRun] = useState<TaskRunView | null>(null);
+  const [runLogs, setRunLogs] = useState<CollectLogEntry[]>([]);
 
-  // 订阅后端采集日志,只收本任务的;卸载时取消监听避免泄漏
+  // 加载执行历史(每次运行一条);任务进行中时 2s 轮询刷新,拿最新运行状态 / 计数
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let timer: number | undefined;
     let cancelled = false;
-    listen<CollectLogEntry>("collect-log", (event) => {
-      if (event.payload.taskId !== task.id) return;
-      setLogs((prev) => {
-        const next = [...prev, event.payload];
-        return next.length > LOG_BUFFER_LIMIT
-          ? next.slice(-LOG_BUFFER_LIMIT)
-          : next;
-      });
-    })
-      .then((fn) => {
-        // 订阅就绪前组件已卸载则立即退订
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {});
+    const load = () => {
+      api
+        .listTaskRuns(task.id)
+        .then((rows) => {
+          if (!cancelled) setRuns(rows);
+        })
+        .catch(() => {});
+    };
+    load();
+    const inProgress =
+      task.status === "running" ||
+      task.status === "paused" ||
+      task.status === "collecting_comments" ||
+      task.status === "analyzing_comments" ||
+      task.status === "downloading_media";
+    if (inProgress) timer = window.setInterval(load, 2000);
     return () => {
       cancelled = true;
-      unlisten?.();
+      if (timer) clearInterval(timer);
     };
-  }, [task.id]);
+  }, [task.id, task.status]);
 
-  // 新日志到达时滚到底
-  useEffect(() => {
-    if (tab === "logs") logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs, tab]);
+  // 打开某次运行的采集日志(后端按该运行的时间范围从 collect_logs 切分)
+  const openRunLogs = (run: TaskRunView) => {
+    setViewRun(run);
+    setRunLogs([]);
+    api
+      .listRunLogs(run.id)
+      .then(setRunLogs)
+      .catch(() => {});
+  };
 
   const subTasks = useMemo(() => deriveSubTasks(task), [task]);
-  const executions = useMemo(() => deriveExecutions(subTasks), [subTasks]);
-  const filteredExecutions = useMemo(
-    () =>
-      subFilterId
-        ? executions.filter((e) => e.subTaskId === subFilterId)
-        : executions,
-    [executions, subFilterId],
-  );
 
   const statusMeta = STATUS_META[task.status];
   const TriggerIcon = TRIGGER_META[task.trigger].icon;
@@ -308,16 +293,13 @@ export function TaskDetailPage({
         id: "actions",
         header: () => <div className="text-right">操作</div>,
         enableSorting: false,
-        cell: ({ row }) => (
+        cell: () => (
           <div className="flex justify-end">
             <Button
               variant="ghost"
               size="sm"
               className="h-7 cursor-pointer px-2"
-              onClick={() => {
-                setSubFilterId(row.original.id);
-                setTab("history");
-              }}
+              onClick={() => setTab("history")}
             >
               查看执行历史
             </Button>
@@ -328,15 +310,8 @@ export function TaskDetailPage({
     [],
   );
 
-  const historyColumns = useMemo<ColumnDef<Execution>[]>(
+  const historyColumns = useMemo<ColumnDef<TaskRunView>[]>(
     () => [
-      {
-        id: "keyword",
-        accessorKey: "keyword",
-        header: "关键词",
-        enableSorting: false,
-        cell: ({ row }) => row.original.keyword,
-      },
       {
         id: "startedAt",
         accessorKey: "startedAt",
@@ -359,17 +334,17 @@ export function TaskDetailPage({
       },
       {
         id: "result",
-        header: "本次结果",
+        header: "本次新增",
         enableSorting: false,
         cell: ({ row }) => {
-          const e = row.original;
+          const r = row.original;
           return (
             <div className="text-xs">
-              <span className="text-muted-foreground">+内容</span>{" "}
-              <span className="font-mono font-medium">{e.contentDelta}</span>
+              <span className="text-muted-foreground">内容</span>{" "}
+              <span className="font-mono font-medium">{r.contentDelta}</span>
               {"  "}
-              <span className="text-muted-foreground">+评论</span>{" "}
-              <span className="font-mono font-medium">{e.commentDelta}</span>
+              <span className="text-muted-foreground">评论</span>{" "}
+              <span className="font-mono font-medium">{r.commentDelta}</span>
             </div>
           );
         },
@@ -381,15 +356,15 @@ export function TaskDetailPage({
         enableSorting: false,
         cell: ({ row }) => {
           const map: Record<
-            Execution["status"],
+            TaskRunView["status"],
             { label: string; className: string }
           > = {
             running: {
               label: "运行中",
               className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600",
             },
-            success: {
-              label: "成功",
+            completed: {
+              label: "已完成",
               className: "border-sky-500/30 bg-sky-500/10 text-sky-600",
             },
             failed: {
@@ -401,7 +376,7 @@ export function TaskDetailPage({
               className: "border-slate-500/30 bg-slate-500/10 text-slate-500",
             },
           };
-          const m = map[row.original.status];
+          const m = map[row.original.status] ?? map.completed;
           return (
             <span
               className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-xs font-medium ${m.className}`}
@@ -412,19 +387,25 @@ export function TaskDetailPage({
         },
       },
       {
-        id: "error",
-        header: "错误",
+        id: "actions",
+        header: () => <div className="text-right">操作</div>,
         enableSorting: false,
-        cell: ({ row }) =>
-          row.original.errorMessage ? (
-            <span className="text-xs text-destructive">
-              {row.original.errorMessage}
-            </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">—</span>
-          ),
+        cell: ({ row }) => (
+          <div className="flex justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 cursor-pointer px-2"
+              onClick={() => openRunLogs(row.original)}
+            >
+              查看日志
+            </Button>
+          </div>
+        ),
       },
     ],
+    // openRunLogs 仅用稳定的 setState/api,闭包捕获首次定义即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -519,6 +500,40 @@ export function TaskDetailPage({
           </div>
         )}
 
+        {task.status === "collecting_comments" && (
+          <div className="mt-3 flex items-center gap-2">
+            <Progress
+              value={
+                task.commentVideoTotal > 0
+                  ? Math.round(
+                      (task.commentVideoDone / task.commentVideoTotal) * 100,
+                    )
+                  : 0
+              }
+              className="h-1.5 flex-1"
+            />
+            <span className="font-mono text-xs text-muted-foreground">
+              评论 {task.commentVideoDone}/{task.commentVideoTotal} 视频
+            </span>
+          </div>
+        )}
+
+        {task.status === "downloading_media" && (
+          <div className="mt-3 flex items-center gap-2">
+            <Progress
+              value={
+                task.mediaTotal > 0
+                  ? Math.round((task.mediaDone / task.mediaTotal) * 100)
+                  : 0
+              }
+              className="h-1.5 flex-1"
+            />
+            <span className="font-mono text-xs text-muted-foreground">
+              素材 {task.mediaDone}/{task.mediaTotal}
+            </span>
+          </div>
+        )}
+
         {/* 策略参数 */}
         <div className="mt-3 flex flex-wrap gap-1 border-t pt-3 text-[11px] text-muted-foreground">
           <ParamChip label="排序" value={task.sortMode === "synthetic" ? "综合" : task.sortMode === "hottest" ? "最热" : "最新"} />
@@ -539,6 +554,31 @@ export function TaskDetailPage({
           {task.aiExtract && (
             <span className="rounded bg-primary/10 px-1.5 py-0.5 text-primary">
               AI 文案提取
+            </span>
+          )}
+          {task.collectComments && (
+            <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-600 dark:text-violet-400">
+              评论采集
+              {task.commentTimeRange && task.commentTimeRange !== "any"
+                ? ` · ${
+                    task.commentTimeRange === "3d"
+                      ? "3天内"
+                      : task.commentTimeRange === "7d"
+                        ? "7天内"
+                        : "14天内"
+                  }`
+                : ""}
+              {task.commentLimit ? ` · ≤${task.commentLimit}` : " · 不限"}
+            </span>
+          )}
+          {task.analyzeCommentIntent && (
+            <span className="rounded bg-fuchsia-500/10 px-1.5 py-0.5 text-fuchsia-600 dark:text-fuchsia-400">
+              意向分析
+            </span>
+          )}
+          {task.autoSyncObsidian && (
+            <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-600 dark:text-sky-400">
+              同步 Obsidian
             </span>
           )}
         </div>
@@ -567,29 +607,10 @@ export function TaskDetailPage({
             <TabsTrigger value="history">
               执行历史
               <Badge variant="secondary" className="ml-1.5">
-                {filteredExecutions.length}
+                {runs.length}
               </Badge>
             </TabsTrigger>
-            <TabsTrigger value="logs">
-              采集日志
-              {logs.length > 0 && (
-                <Badge variant="secondary" className="ml-1.5">
-                  {logs.length}
-                </Badge>
-              )}
-            </TabsTrigger>
           </TabsList>
-          {tab === "history" && subFilterId && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="cursor-pointer"
-              onClick={() => setSubFilterId(null)}
-            >
-              <Filter className="size-3.5" />
-              清除筛选
-            </Button>
-          )}
         </div>
 
         <TabsContent value="sub" className="mt-2 flex min-h-0 flex-1 flex-col">
@@ -606,36 +627,110 @@ export function TaskDetailPage({
         >
           <DataTable
             columns={historyColumns}
-            data={filteredExecutions}
+            data={runs}
             itemLabel="执行记录"
-            getRowId={(e) => e.id}
+            getRowId={(r) => r.id}
           />
         </TabsContent>
-        <TabsContent value="logs" className="mt-2 flex min-h-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border bg-muted/30 p-3 font-mono text-xs">
-            {logs.length === 0 ? (
+      </Tabs>
+
+      {/* 查看日志:某次运行的采集日志(后端按该运行时间范围切分) */}
+      <Sheet
+        open={viewRun !== null}
+        onOpenChange={(open) => {
+          if (!open) setViewRun(null);
+        }}
+      >
+        <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-2xl">
+          <SheetHeader className="border-b">
+            <SheetTitle className="flex flex-wrap items-baseline gap-x-2">
+              采集日志
+              {viewRun && (
+                <span className="text-xs font-normal text-muted-foreground">
+                  {formatTime(viewRun.startedAt)} · 新增内容 {viewRun.contentDelta} / 评论{" "}
+                  {viewRun.commentDelta}
+                </span>
+              )}
+            </SheetTitle>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto p-3 font-mono text-xs">
+            {runLogs.length === 0 ? (
               <div className="flex h-full items-center justify-center text-muted-foreground">
-                暂无采集日志,启动采集后实时显示
+                该次运行暂无日志
               </div>
             ) : (
-              <div className="space-y-0.5">
-                {logs.map((log, i) => (
-                  <div key={i} className="flex gap-2">
-                    <span className="shrink-0 text-muted-foreground">
-                      {new Date(log.ts * 1000).toLocaleTimeString()}
+              <div className="space-y-px">
+                {runLogs.map((log, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 rounded px-1.5 py-0.5 hover:bg-muted/50"
+                  >
+                    <span className="w-[58px] shrink-0 tabular-nums text-muted-foreground">
+                      {fmtLogTime(log.ts)}
                     </span>
-                    <span className={LOG_LEVEL_CLASS[log.level] ?? "text-foreground"}>
-                      {log.message}
-                    </span>
+                    {log.entry ? (
+                      <CollectEntryLine entry={log.entry} />
+                    ) : (
+                      <span
+                        className={`min-w-0 flex-1 break-all ${LOG_LEVEL_CLASS[log.level] ?? "text-foreground"}`}
+                      >
+                        {log.message}
+                      </span>
+                    )}
                   </div>
                 ))}
-                <div ref={logEndRef} />
               </div>
             )}
           </div>
-        </TabsContent>
-      </Tabs>
+        </SheetContent>
+      </Sheet>
     </div>
+  );
+}
+
+// 富日志条目行:序号 + 类型徽章 + 头像 + 昵称 + 标题/评论内容(已由后端截断)
+function CollectEntryLine({
+  entry,
+}: {
+  entry: NonNullable<CollectLogEntry["entry"]>;
+}) {
+  const isComment = entry.kind === "comment";
+  const typeLabel = isComment
+    ? "评论"
+    : entry.contentKind === "image"
+      ? "图文"
+      : entry.contentKind === "video"
+        ? "视频"
+        : "内容";
+  const typeClass = isComment
+    ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
+    : "bg-sky-500/15 text-sky-600 dark:text-sky-400";
+  return (
+    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+      <span className="shrink-0 font-mono text-muted-foreground">
+        #{entry.seq}
+      </span>
+      <span className={`shrink-0 rounded px-1 text-[10px] ${typeClass}`}>
+        {typeLabel}
+      </span>
+      {entry.avatar ? (
+        <img
+          src={entry.avatar}
+          alt=""
+          referrerPolicy="no-referrer"
+          className="size-4 shrink-0 rounded-full object-cover"
+          onError={(e) => {
+            (e.currentTarget as HTMLImageElement).style.display = "none";
+          }}
+        />
+      ) : null}
+      <span className="shrink-0 font-medium text-foreground">
+        {entry.nickname || "匿名"}
+      </span>
+      <span className="truncate text-muted-foreground">
+        {isComment ? `：${entry.title}` : `— ${entry.title}`}
+      </span>
+    </span>
   );
 }
 

@@ -243,6 +243,27 @@ impl CookiePool {
         Ok(())
     }
 
+    /// 标记账号已登录可用:扫码登录完成后置 active,清零风控计数与冷却,
+    /// 并把 last_used_at 更新为当前时间(「最近使用」以登录成功为准,而非仅采集占用)。
+    pub async fn mark_active(&self, account_id: &str) -> Result<()> {
+        if let Some(model) = AccountEntity::find_by_id(account_id)
+            .one(&self.db)
+            .await
+            .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
+        {
+            let now = Utc::now().timestamp();
+            let mut am: account::ActiveModel = model.into();
+            am.status = Set(AccountStatus::Active.as_str().to_string());
+            am.risk_count = Set(0);
+            am.cooldown_until = Set(0);
+            am.last_used_at = Set(now);
+            am.update(&self.db)
+                .await
+                .map_err(|e| CrawlerError::Account(format!("标记账号可用失败: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// 正常归还账号:成功采集后重置风控计数,体现账号「健康」。
     pub async fn release_ok(&self, account_id: &str) -> Result<()> {
         if let Some(model) = AccountEntity::find_by_id(account_id)
@@ -274,6 +295,15 @@ impl CookiePool {
             .await
             .map_err(|e| CrawlerError::Account(format!("列出账号失败: {e}")))?;
         Ok(models.into_iter().map(Into::into).collect())
+    }
+
+    /// 按 id 取单个账号(登录检测回写后取 platform 用于通知前端)。不存在返回 None。
+    pub async fn get(&self, account_id: &str) -> Result<Option<Account>> {
+        let model = AccountEntity::find_by_id(account_id)
+            .one(&self.db)
+            .await
+            .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?;
+        Ok(model.map(Into::into))
     }
 
     /// 删除账号。

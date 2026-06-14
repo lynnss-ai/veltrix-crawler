@@ -10,7 +10,7 @@
 //! 发布时间是 `corner_tag_info` 里 `MM-DD`(当年)/`YYYY-MM-DD` 文本。
 
 use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
-use crate::model::{Author, Content, ContentKind, Stats, TaskKind};
+use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
 use async_trait::async_trait;
 use chrono::{Datelike, NaiveDate, Utc};
 use serde_json::Value;
@@ -19,6 +19,10 @@ use veltrix_core::error::Result;
 const PLATFORM_ID: &str = "xhs";
 /// 搜索接口 URL 特征,与平台配置 intercept_patterns 对应。
 const SEARCH_PATH: &str = "/api/sns/web/v1/search/notes";
+/// 一级评论接口 URL 特征;真实路径需本机抓包核对。子评论接口路径不同(comment/sub/page)不会命中。
+const COMMENT_PATH: &str = "/api/sns/web/v2/comment/page";
+/// 作者主页用户信息接口 URL 特征(画像补采);真实路径需本机抓包核对。
+const PROFILE_PATH: &str = "/api/sns/web/v1/user/otherinfo";
 
 #[derive(Default)]
 pub struct XhsAdapter;
@@ -189,22 +193,11 @@ impl XhsAdapter {
         };
         Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
     }
-}
 
-#[async_trait]
-impl PlatformAdapter for XhsAdapter {
-    fn id(&self) -> &str {
-        PLATFORM_ID
-    }
-
-    fn supports(&self, kind: &TaskKind) -> bool {
-        matches!(kind, TaskKind::Search)
-    }
-
-    async fn parse(&self, _kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
+    /// 解析搜索接口响应为笔记内容列表(comments 恒空)。
+    fn parse_search(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
         let mut contents = Vec::new();
-
         for resp in &ctx.responses {
             if !resp.url.contains(SEARCH_PATH) {
                 continue;
@@ -225,10 +218,224 @@ impl PlatformAdapter for XhsAdapter {
                 }
             }
         }
-
-        Ok(FetchOutput {
+        FetchOutput {
             contents,
             comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
+
+    /// 中文计数容错:"1234" / "1.2万" / "3.4亿" → i64;不可解析返回 None。
+    fn parse_cn_count(text: &str) -> Option<i64> {
+        let t = text.trim().replace(',', "");
+        if t.is_empty() {
+            return None;
+        }
+        let numeric: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if numeric.is_empty() {
+            return None;
+        }
+        let base: f64 = numeric.parse().ok()?;
+        let rest = &t[numeric.len()..];
+        let mult = if rest.starts_with('万') {
+            1e4
+        } else if rest.starts_with('亿') {
+            1e8
+        } else {
+            1.0
+        };
+        Some((base * mult) as i64)
+    }
+
+    /// 解析作者主页画像(authors 仅一条;contents/comments 恒空)。
+    /// 主页请求 `/api/sns/web/v1/user/otherinfo`:基础信息在 `data.basic_info`
+    /// (nickname/images头像/desc签名/red_id小红书号/ip_location),粉丝/关注/获赞与收藏在
+    /// `data.interactions[]`(按 type=fans/follows/interaction 区分,count 为字符串可能带万/亿)。
+    /// uid 用导航时的 user_id(ctx.keyword)。
+    fn parse_profile(ctx: &FetchContext) -> FetchOutput {
+        let uid = ctx.keyword.clone();
+        let mut authors = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(PROFILE_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(data) = root.get("data") else {
+                continue;
+            };
+            let basic = data.get("basic_info");
+            let basic_str = |key: &str| {
+                basic
+                    .and_then(|b| b.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let (mut follower, mut following, mut favorited) = (None, None, None);
+            if let Some(arr) = data.get("interactions").and_then(Value::as_array) {
+                for it in arr {
+                    let count = it
+                        .get("count")
+                        .and_then(Value::as_str)
+                        .and_then(Self::parse_cn_count)
+                        .or_else(|| it.get("count").and_then(Value::as_i64));
+                    match it.get("type").and_then(Value::as_str) {
+                        Some("fans") => follower = count,
+                        Some("follows") => following = count,
+                        Some("interaction") => favorited = count,
+                        _ => {}
+                    }
+                }
+            }
+            authors.push(Author {
+                platform: PLATFORM_ID.to_string(),
+                uid: uid.clone(),
+                nickname: basic_str("nickname").unwrap_or_default(),
+                avatar: basic_str("images"),
+                signature: basic_str("desc"),
+                follower_count: follower,
+                following_count: following,
+                extra: serde_json::json!({
+                    "unique_id": basic_str("red_id"),
+                    "ip_location": basic_str("ip_location"),
+                    "total_favorited": favorited,
+                }),
+            });
+            break; // 一个主页只取一条画像
+        }
+        FetchOutput {
+            contents: Vec::new(),
+            comments: Vec::new(),
+            authors,
+        }
+    }
+
+    /// 解析一级评论接口响应为评论列表(contents 恒空)。
+    fn parse_comments(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut comments = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(COMMENT_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(items) = root
+                .get("data")
+                .and_then(|d| d.get("comments"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for item in items {
+                if let Some(comment) = Self::parse_comment(item, collected_at) {
+                    comments.push(comment);
+                }
+            }
+        }
+        FetchOutput {
+            contents: Vec::new(),
+            comments,
+            authors: Vec::new(),
+        }
+    }
+
+    /// 把单条评论解析为 Comment;缺 id 返回 None。只采一级评论,parent_id 恒为 None。
+    fn parse_comment(item: &Value, collected_at: i64) -> Option<Comment> {
+        let comment_id = item.get("id").and_then(Value::as_str)?.to_string();
+        if comment_id.is_empty() {
+            return None;
+        }
+        let content_id = item
+            .get("note_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // 互动数小红书多为字符串
+        let num = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse::<i64>().ok())
+                .or_else(|| item.get(key).and_then(Value::as_i64))
+        };
+        // create_time 小红书多为毫秒;>1e12 视为毫秒,统一转存秒
+        let created_at = item.get("create_time").and_then(Value::as_i64).map(|t| {
+            if t > 1_000_000_000_000 {
+                t / 1000
+            } else {
+                t
+            }
+        });
+        let user = item.get("user_info");
+        let author = Author {
+            platform: PLATFORM_ID.to_string(),
+            uid: user
+                .and_then(|u| u.get("user_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            nickname: user
+                .and_then(|u| u.get("nickname"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            avatar: user
+                .and_then(|u| u.get("image"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            signature: None,
+            follower_count: None,
+            following_count: None,
+            extra: Value::Null,
+        };
+        Some(Comment {
+            platform: PLATFORM_ID.to_string(),
+            content_id,
+            comment_id,
+            parent_id: None,
+            author,
+            text: item
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            like_count: num("like_count"),
+            reply_count: num("sub_comment_count"),
+            created_at,
+            collected_at,
+            extra: serde_json::json!({
+                "ip_location": item.get("ip_location").and_then(Value::as_str),
+            }),
         })
+    }
+}
+
+#[async_trait]
+impl PlatformAdapter for XhsAdapter {
+    fn id(&self) -> &str {
+        PLATFORM_ID
+    }
+
+    fn supports(&self, kind: &TaskKind) -> bool {
+        matches!(
+            kind,
+            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile
+        )
+    }
+
+    async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
+        // 按任务类型分流:评论任务解析一级评论,画像补采解析主页,其余按搜索笔记解析
+        let output = match kind {
+            TaskKind::Comments => Self::parse_comments(ctx),
+            TaskKind::UserProfile => Self::parse_profile(ctx),
+            _ => Self::parse_search(ctx),
+        };
+        Ok(output)
     }
 }

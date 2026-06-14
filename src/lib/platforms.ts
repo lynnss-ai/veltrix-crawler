@@ -15,6 +15,53 @@ const PALETTE: string[] = [
   "bg-slate-500/10 text-slate-700 dark:text-slate-300",
 ];
 
+// 实心调色板:与 PALETTE 同色相、同索引,但实底白字。用于叠在封面图等彩色背景上,保证高对比、明显
+const SOLID_PALETTE: string[] = [
+  "bg-rose-500 text-white",
+  "bg-amber-500 text-white",
+  "bg-emerald-500 text-white",
+  "bg-sky-500 text-white",
+  "bg-blue-500 text-white",
+  "bg-violet-500 text-white",
+  "bg-fuchsia-500 text-white",
+  "bg-slate-600 text-white",
+];
+
+// 内置平台官方主色调(全局统一,跨页面平台标一致):
+//   小红书 = 品牌红 #FF2442 / 快手 = 品牌橙 #FF6A00 / 抖音 = 品牌黑(随主题前景色:亮黑暗白)
+//   B站 = 品牌粉 #FB7299(蓝 #00AEEC 与 TikTok 青易混,取粉)/ YouTube = 品牌红 #FF0000
+//   TikTok = 品牌青体系(霓虹青 #25F4EE 做底,文字取加深青保证浅色主题可读)。
+// 抖音的红/青会与小红书红混淆,故用其最具辨识度的「黑」并随主题自适应,两个主题都清晰可读。
+// 其余未列平台仍按 id 哈希从 PALETTE 取色。
+const BRAND_TINT: Record<string, string> = {
+  xhs: "bg-[#FF2442]/10 text-[#FF2442]",
+  kuaishou: "bg-[#FF6A00]/10 text-[#FF6A00]",
+  douyin: "bg-foreground/10 text-foreground",
+  bilibili: "bg-[#FB7299]/10 text-[#FB7299]",
+  tiktok: "bg-[#25F4EE]/15 text-[#00A2B8] dark:text-[#25F4EE]",
+  youtube: "bg-[#FF0000]/10 text-[#E60000] dark:text-[#FF4444]",
+};
+const BRAND_SOLID: Record<string, string> = {
+  xhs: "bg-[#FF2442] text-white",
+  kuaishou: "bg-[#FF6A00] text-white",
+  douyin: "bg-foreground text-background",
+  bilibili: "bg-[#FB7299] text-white",
+  tiktok: "bg-[#25F4EE] text-black",
+  youtube: "bg-[#FF0000] text-white",
+};
+
+// 图表用品牌 HEX(SVG stroke/fill 需具体颜色)。抖音品牌黑在深色图表上不可见,
+// 故图表用其品牌青 #25F4EE(深浅背景都清晰);TikTok 为与抖音图表青区分,用加深青 #00A2B8;
+// 未列平台返回 null,由调用方回退自有调色板。
+const BRAND_HEX: Record<string, string> = {
+  xhs: "#FF2442",
+  kuaishou: "#FF6A00",
+  douyin: "#25F4EE",
+  bilibili: "#FB7299",
+  tiktok: "#00A2B8",
+  youtube: "#FF0000",
+};
+
 // 简单字符串哈希(FNV-1a 变体),把任意 id 稳定映射到 0..PALETTE.length
 function hashToIndex(id: string): number {
   let h = 2166136261;
@@ -25,8 +72,108 @@ function hashToIndex(id: string): number {
   return Math.abs(h) % PALETTE.length;
 }
 
-/** 按 platform id 取一个稳定的标签底色 className;空 id 回退中性色 */
+/** 按 platform id 取标签底色 className;三大平台用官方主色调,其余哈希取色,空 id 回退中性色 */
 export function platformClass(id: string): string {
   if (!id) return "bg-muted text-muted-foreground";
-  return PALETTE[hashToIndex(id)];
+  return BRAND_TINT[id] ?? PALETTE[hashToIndex(id)];
+}
+
+/** 任意文本标签的稳定底色 className(行业等动态枚举共用,同名同色);空值回退中性色 */
+export function labelBadgeClass(text: string): string {
+  if (!text) return "bg-muted text-muted-foreground";
+  return PALETTE[hashToIndex(text)];
+}
+
+/** 实心版平台标 className(实底白字);三大平台用官方主色调,用于叠在封面等彩色背景上需要高对比时 */
+export function platformSolidClass(id: string): string {
+  if (!id) return "bg-foreground/80 text-background";
+  return BRAND_SOLID[id] ?? SOLID_PALETTE[hashToIndex(id)];
+}
+
+/** 平台筛选 chip 的 className(全局统一):选中=品牌实色,未选=品牌浅色淡显。各页平台筛选共用,色彩一致。 */
+export function platformChipClass(id: string, active: boolean): string {
+  const base =
+    "cursor-pointer rounded-md border border-transparent px-3 py-1 text-xs font-medium transition-all";
+  return active
+    ? `${base} ${platformSolidClass(id)} shadow-sm`
+    : `${base} ${platformClass(id)} opacity-70 hover:opacity-100`;
+}
+
+/** 图表(趋势线 / 环形图)用的平台品牌 HEX;未列平台返回 null,调用方回退自有调色板。 */
+export function platformColorHex(id: string): string | null {
+  return BRAND_HEX[id] ?? null;
+}
+
+/** 内容详情页链接(点封面跳转);平台不支持或缺 id 返回 null,由调用方回退直链 */
+export function contentDetailUrl(
+  platform: string,
+  contentId: string | null | undefined,
+): string | null {
+  if (!contentId) return null;
+  switch (platform) {
+    case "douyin":
+      return `https://www.douyin.com/video/${contentId}`;
+    case "kuaishou":
+      return `https://www.kuaishou.com/short-video/${contentId}`;
+    case "bilibili":
+      return `https://www.bilibili.com/video/${contentId}`;
+    case "tiktok":
+      // 用户名段填占位 `_`,TikTok 按视频 id 重定向到规范地址
+      return `https://www.tiktok.com/@_/video/${contentId}`;
+    case "youtube":
+      return `https://www.youtube.com/watch?v=${contentId}`;
+    default:
+      return null;
+  }
+}
+
+/** 作者主页链接(点头像跳转);平台不支持或缺 uid 返回 null。
+ *  platformId 是平台号(@handle 等,作者档案的 platformId 字段):TikTok 主页只能用
+ *  @handle 拼(uid 是纯数字拼不出),有则传入,缺省时 TikTok 返回 null 走调用方回退 */
+export function authorProfileUrl(
+  platform: string,
+  uid: string | null | undefined,
+  platformId?: string | null,
+): string | null {
+  if (platform === "tiktok") {
+    return platformId ? `https://www.tiktok.com/@${platformId}` : null;
+  }
+  if (!uid) return null;
+  switch (platform) {
+    case "douyin":
+      return `https://www.douyin.com/user/${uid}`;
+    case "kuaishou":
+      return `https://www.kuaishou.com/profile/${uid}`;
+    case "bilibili":
+      return `https://space.bilibili.com/${uid}`;
+    case "youtube":
+      return `https://www.youtube.com/channel/${uid}`;
+    default:
+      return null;
+  }
+}
+
+// ===================== 平台展示顺序 =====================
+// 全局统一的平台排序:所有列出平台的地方(各库筛选 chip / 采集任务平台选择 / 看板 / 平台管理)
+// 都按此顺序展示,保证跨页面一致。未列入的平台排到末尾,彼此保持原有相对顺序。
+const PLATFORM_ORDER: string[] = [
+  "douyin", // 抖音
+  "xhs", // 小红书
+  "kuaishou", // 快手
+  "tiktok", // TikTok
+  "bilibili", // B站
+  "youtube", // YouTube
+];
+
+/** 平台 id 的展示排序权重;未列入的平台返回末位权重,排到最后。 */
+export function platformOrder(id: string): number {
+  const index = PLATFORM_ORDER.indexOf(id);
+  return index === -1 ? PLATFORM_ORDER.length : index;
+}
+
+/** 按平台规范顺序排序;getId 从元素取平台 id。Array.sort 稳定,未列平台保持原相对顺序。 */
+export function sortByPlatform<T>(list: T[], getId: (item: T) => string): T[] {
+  return [...list].sort(
+    (a, b) => platformOrder(getId(a)) - platformOrder(getId(b)),
+  );
 }

@@ -6,6 +6,7 @@ import {
   Copy,
   Info,
   Loader2,
+  MonitorSmartphone,
   RefreshCw,
   Smartphone,
   Unplug,
@@ -47,7 +48,7 @@ export function RemoteConnectButton({ status }: { status: RemoteStatus }) {
           onClick={() => setOpen(true)}
           className={`relative inline-flex size-8 shrink-0 items-center justify-center rounded-md text-foreground transition-colors hover:bg-accent ${meta.className}`}
         >
-          <Smartphone className="size-[1.1rem]" />
+          <MonitorSmartphone className="size-[1.1rem]" />
           {/* 状态点:连接 / 失败时高亮,未连接时省略 */}
           {status !== "disconnected" && (
             <span
@@ -131,7 +132,7 @@ function RemoteConnectDialog({
             远程控制
           </DialogTitle>
           <DialogDescription>
-            使用 Veltrix 手机 App 扫码连接,随时随地远程查看与监控本机的数据采集情况。
+            使用 VeltrixLoop 手机 App 扫码连接,随时随地远程查看与监控本机的数据采集情况。
           </DialogDescription>
         </DialogHeader>
 
@@ -268,7 +269,7 @@ function RemoteConnectDialog({
             <QrPlaceholder seed={99} className="size-16" />
           </div>
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium">下载 Veltrix 手机 App</div>
+            <div className="text-sm font-medium">下载 VeltrixLoop 手机 App</div>
             <div className="mt-0.5 text-xs text-muted-foreground">
               扫码下载,支持 iOS / Android
             </div>

@@ -35,6 +35,10 @@ pub struct Model {
     pub owner: String,
     /// 采集时间(Unix 秒)
     pub collected_at: i64,
+    /// AI 意向分析等级:high / medium / low / none;None=尚未分析
+    pub intent_level: Option<String>,
+    /// AI 意向分析理由;None=尚未分析
+    pub intent_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

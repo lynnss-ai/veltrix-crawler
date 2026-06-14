@@ -6,13 +6,16 @@ import {
   type FormEvent,
 } from "react";
 import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
+import { listen } from "@tauri-apps/api/event";
 import {
   ChevronLeft,
+  ExternalLink,
   Filter,
   LogIn,
+  LogOut,
   MoreVertical,
   Network,
-  Pencil,
+  SquarePen,
   Plus,
   Search,
   Trash2,
@@ -35,6 +38,7 @@ import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
 import { RefreshButton } from "@/components/RefreshButton";
+import { PlatformManagerSheet } from "@/components/platform-manager-sheet";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -100,6 +104,12 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
   const [editing, setEditing] = useState<AccountView | null>(null);
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
+  // 待确认清空登录状态的账号(null=未弹确认框)
+  const [clearLoginTarget, setClearLoginTarget] = useState<AccountView | null>(
+    null,
+  );
+  const [clearingLogin, setClearingLogin] = useState(false);
+  const [managerOpen, setManagerOpen] = useState(false);
 
   const loadAccounts = useCallback(async (platform: string) => {
     if (!platform) return;
@@ -136,6 +146,18 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
     loadAccounts(selectedPlatform);
   }, [selectedPlatform, loadAccounts]);
 
+  // 登录窗口关闭、账号转 active 后后端推送事件:刷新对应平台账号列表(免手动点刷新)
+  useEffect(() => {
+    const unlisten = listen<string>("account-login-updated", (event) => {
+      if (event.payload === selectedPlatform) {
+        loadAccounts(selectedPlatform);
+      }
+    });
+    return () => {
+      unlisten.then((dispose) => dispose());
+    };
+  }, [selectedPlatform, loadAccounts]);
+
   const selected = platforms.find((p) => p.id === selectedPlatform) ?? null;
 
   async function submitAccount(input: AccountInput) {
@@ -161,9 +183,31 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
 
   async function handleLogin(account: AccountView) {
     try {
-      await api.openLoginWindow(account.platform, account.id);
+      await api.openLoginWindow(
+        account.platform,
+        account.id,
+        account.label || account.id,
+      );
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // 清空登录状态(确认后执行):删除该账号 WebView 登录数据并置失效,刷新列表
+  async function confirmClearLogin() {
+    if (!clearLoginTarget) return;
+    setClearingLogin(true);
+    try {
+      await api.clearAccountLogin(
+        clearLoginTarget.platform,
+        clearLoginTarget.id,
+      );
+      await loadAccounts(clearLoginTarget.platform);
+      setClearLoginTarget(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClearingLogin(false);
     }
   }
 
@@ -198,7 +242,37 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
         filterFn: (row, id, value) =>
           (value as string[]).includes(row.getValue(id) as string),
         cell: ({ row }) => {
-          const meta = statusMetaOf(row.original.status);
+          const a = row.original;
+          // 登录态:active=已登录(可访问平台);invalid=登录失效(需重新扫码登录);
+          // 两者都打开该账号专属 WebView(带各自登录态),只是文案与图标不同。
+          if (a.status === "invalid") {
+            return (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 w-24 rounded-full text-xs border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={() => handleLogin(a)}
+              >
+                <LogIn className="size-3.5" />
+                去登录
+              </Button>
+            );
+          }
+          if (a.status === "active") {
+            return (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 w-24 rounded-full text-xs border-emerald-500/40 text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-600 dark:text-emerald-400"
+                onClick={() => handleLogin(a)}
+              >
+                <ExternalLink className="size-3.5" />
+                访问平台
+              </Button>
+            );
+          }
+          // 冷却中 / 停用:保留状态徽章
+          const meta = statusMetaOf(a.status);
           return <StatusBadge tone={meta.tone}>{meta.label}</StatusBadge>;
         },
       },
@@ -244,18 +318,18 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-36">
-                  <DropdownMenuItem onClick={() => handleLogin(a)}>
-                    <LogIn />
-                    登录(扫码)
-                  </DropdownMenuItem>
                   <DropdownMenuItem
                     onClick={() => {
                       setEditing(a);
                       setIsFormOpen(true);
                     }}
                   >
-                    <Pencil />
+                    <SquarePen />
                     编辑
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setClearLoginTarget(a)}>
+                    <LogOut />
+                    清空登录状态
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
@@ -291,7 +365,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
         {/* 左侧:平台(可收起,窄屏自动收起) */}
         {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
-          <div className="flex items-center justify-between border-b px-4 py-3">
+          <div className="flex h-8 items-center justify-between border-b px-4">
             <span className="text-sm font-semibold">平台</span>
             <SimpleTooltip content="收起">
               <Button
@@ -387,7 +461,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                       </Button>
                     </SimpleTooltip>
                   )}
-                  <div className="relative w-full sm:max-w-xs">
+                  <div className="relative w-full sm:max-w-sm">
                     <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       placeholder="搜索账号名称"
@@ -406,6 +480,10 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                   <RefreshButton
                     onClick={() => loadAccounts(selectedPlatform)}
                   />
+                  <Button variant="outline" onClick={() => setManagerOpen(true)}>
+                    <Network />
+                    管理平台
+                  </Button>
                   <Button
                     onClick={() => {
                       setEditing(null);
@@ -461,6 +539,51 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* 清空登录状态确认 */}
+      <AlertDialog
+        open={clearLoginTarget !== null}
+        onOpenChange={(open) => !open && setClearLoginTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              清空「{clearLoginTarget?.label || clearLoginTarget?.id}」的登录状态?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              将关闭该账号窗口并删除其登录数据(Cookie /
+              登录态),账号状态置为失效,需重新登录。账号记录与备注保留。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearingLogin}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={clearingLogin}
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmClearLogin();
+              }}
+              className="bg-destructive text-white hover:bg-destructive/90"
+            >
+              清空登录状态
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <PlatformManagerSheet
+        open={managerOpen}
+        onOpenChange={setManagerOpen}
+        onChanged={() => {
+          // 平台增删改后刷新左侧平台列表
+          api
+            .listPlatforms()
+            .then(setPlatforms)
+            .catch(() => {});
+        }}
+      />
     </div>
   );
 }
@@ -510,7 +633,7 @@ function AccountFormSheet({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-md"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose={
           label !== (initial?.label ?? "") ||
           remark !== (initial?.remark ?? "")

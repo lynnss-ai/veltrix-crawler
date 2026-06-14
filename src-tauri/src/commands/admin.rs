@@ -5,7 +5,7 @@
 
 use crate::commands::AppState;
 use veltrix_core::db::entity::{
-    customer, industry, keyword, platform_api, prompt, provider, user,
+    customer, industry, keyword, prompt, provider, user,
 };
 use veltrix_core::error::{CrawlerError, Result};
 use argon2::password_hash::rand_core::OsRng;
@@ -66,6 +66,8 @@ pub struct UserView {
     pub remark: String,
     pub status: String,
     pub data_scope: String,
+    /// 是否初始化创建的超级管理员(最早创建的用户);前端据此禁止禁用 / 改数据级别
+    pub is_super_admin: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -81,6 +83,7 @@ impl From<user::Model> for UserView {
             remark: m.remark,
             status: m.status,
             data_scope: m.data_scope,
+            is_super_admin: false,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -112,7 +115,29 @@ pub async fn list_users(state: State<'_, AppState>) -> Result<Vec<UserView>> {
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询用户失败: {e}")))?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    // 已按 created_at 升序,第一条即初始化创建的超级管理员
+    let views = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut v: UserView = m.into();
+            v.is_super_admin = i == 0;
+            v
+        })
+        .collect();
+    Ok(views)
+}
+
+/// 最早创建(未删)的用户 id —— 即初始化时创建的超级管理员
+async fn earliest_user_id(db: &sea_orm::DatabaseConnection) -> Option<String> {
+    user::Entity::find()
+        .filter(user::Column::DeletedAt.eq(0))
+        .order_by_asc(user::Column::CreatedAt)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.id)
 }
 
 #[tauri::command]
@@ -126,14 +151,24 @@ pub async fn upsert_user(state: State<'_, AppState>, user: UserInput) -> Result<
 
     match existing {
         Some(model) => {
+            // 初始化超级管理员(最早创建)强制保持启用 + 全部数据,防止前端被绕过禁用 / 降级
+            let is_super = earliest_user_id(db).await.as_deref() == Some(model.id.as_str());
             let mut am = model.into_active_model();
             am.username = Set(user.username);
             am.email = Set(user.email);
             am.nickname = Set(user.nickname);
             am.avatar = Set(user.avatar);
             am.remark = Set(user.remark);
-            am.status = Set(user.status);
-            am.data_scope = Set(user.data_scope);
+            am.status = Set(if is_super {
+                "enabled".to_string()
+            } else {
+                user.status
+            });
+            am.data_scope = Set(if is_super {
+                "all".to_string()
+            } else {
+                user.data_scope
+            });
             am.updated_at = Set(now);
             if !user.password.is_empty() {
                 am.password_hash = Set(hash_password(&user.password)?);
@@ -156,6 +191,8 @@ pub async fn upsert_user(state: State<'_, AppState>, user: UserInput) -> Result<
                 remark: Set(user.remark),
                 status: Set(user.status),
                 data_scope: Set(user.data_scope),
+                // Obsidian vault 由用户在系统设置单独配置,新建时留空
+                obsidian_vault_path: Set(String::new()),
                 created_at: Set(now),
                 updated_at: Set(now),
                 deleted_at: Set(0),
@@ -208,6 +245,24 @@ pub async fn reset_user_password(
     Ok(())
 }
 
+/// 校验本地恢复的登录态:用户仍存在且启用则返回其最新 dataScope,否则返回 None。
+/// 清库 / 删用户 / 禁用后,前端 localStorage 里的旧登录态必须据此作废,不能直接放行。
+#[tauri::command]
+pub async fn verify_session_user(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<Option<String>> {
+    let found = user::Entity::find()
+        .filter(user::Column::Username.eq(username))
+        .filter(user::Column::DeletedAt.eq(0))
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("校验用户失败: {e}")))?;
+    Ok(found
+        .filter(|u| u.status == "enabled")
+        .map(|u| u.data_scope))
+}
+
 /// 是否已存在任意用户(供前端判断首次启动是否走初始化向导)。
 #[tauri::command]
 pub async fn has_users(state: State<'_, AppState>) -> Result<bool> {
@@ -241,7 +296,10 @@ pub async fn login(
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| CrawlerError::Auth("用户名或密码错误".into()))?;
-    Ok(model.into())
+    let mut view: UserView = model.into();
+    view.is_super_admin =
+        earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
+    Ok(view)
 }
 
 // ===================== 模型厂商 =====================
@@ -832,98 +890,5 @@ pub async fn remove_keyword(state: State<'_, AppState>, id: String) -> Result<()
         .exec(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("删除关键词失败: {e}")))?;
-    Ok(())
-}
-
-// ===================== 平台 API =====================
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApiView {
-    pub id: String,
-    pub platform_id: String,
-    pub name: String,
-    pub url: String,
-    pub remark: String,
-    pub created_at: i64,
-}
-
-impl From<platform_api::Model> for ApiView {
-    fn from(m: platform_api::Model) -> Self {
-        Self {
-            id: m.id,
-            platform_id: m.platform_id,
-            name: m.name,
-            url: m.url,
-            remark: m.remark,
-            created_at: m.created_at,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApiInput {
-    pub id: String,
-    pub platform_id: String,
-    pub name: String,
-    pub url: String,
-    pub remark: String,
-}
-
-#[tauri::command]
-pub async fn list_apis(state: State<'_, AppState>, platform_id: String) -> Result<Vec<ApiView>> {
-    let rows = platform_api::Entity::find()
-        .filter(platform_api::Column::PlatformId.eq(platform_id))
-        .order_by_asc(platform_api::Column::CreatedAt)
-        .limit(LIST_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询平台 API 失败: {e}")))?;
-    Ok(rows.into_iter().map(Into::into).collect())
-}
-
-#[tauri::command]
-pub async fn upsert_api(state: State<'_, AppState>, item: ApiInput) -> Result<()> {
-    let db = &state.db;
-    let existing = platform_api::Entity::find_by_id(item.id.clone())
-        .one(db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询平台 API 失败: {e}")))?;
-    match existing {
-        Some(model) => {
-            // 更新仅改 name/url/remark,created_at 保留
-            let mut am = model.into_active_model();
-            am.name = Set(item.name);
-            am.url = Set(item.url);
-            am.remark = Set(item.remark);
-            am.update(db)
-                .await
-                .map_err(|e| CrawlerError::Config(format!("更新平台 API 失败: {e}")))?;
-        }
-        None => {
-            let am = platform_api::ActiveModel {
-                id: Set(item.id),
-                platform_id: Set(item.platform_id),
-                name: Set(item.name),
-                url: Set(item.url),
-                remark: Set(item.remark),
-                created_at: Set(Utc::now().timestamp()),
-            };
-            am.insert(db)
-                .await
-                .map_err(|e| CrawlerError::Config(format!("创建平台 API 失败: {e}")))?;
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn remove_api(state: State<'_, AppState>, id: String) -> Result<()> {
-    // platform_apis 无 deleted_at 字段,物理删除
-    platform_api::Entity::delete_by_id(id)
-        .exec(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("删除平台 API 失败: {e}")))?;
     Ok(())
 }

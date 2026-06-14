@@ -1,6 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
 import {
-  Bot,
   CalendarClock,
   ChevronsUpDown,
   Clapperboard,
@@ -15,12 +14,15 @@ import {
   KeyRound,
   LayoutDashboard,
   LogOut,
-  Network,
+  MoreHorizontal,
   Radar,
   Rocket,
   Settings,
+  SquarePen,
   Tags,
+  Trash2,
   UserCog,
+  UserRound,
   Users,
   type LucideIcon,
 } from "lucide-react";
@@ -58,6 +60,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
+import { useChat } from "@/components/chat-context";
+import { api, type ConversationView } from "@/lib/api";
 
 // 两级导航:分组 + 带图标子页面。
 export type PageKey =
@@ -67,8 +72,9 @@ export type PageKey =
   | "assets-all"
   | "assets-content"
   | "assets-image"
+  | "assets-comment"
+  | "assets-author"
   | "industry"
-  | "platforms"
   | "customers"
   | "users"
   | "system-config"
@@ -105,13 +111,14 @@ const MENU_GROUPS: MenuGroup[] = [
       { key: "assets-all", label: "全量库", icon: Database },
       { key: "assets-content", label: "内容库", icon: FileStack },
       { key: "assets-image", label: "图片库", icon: Images },
+      { key: "assets-comment", label: "评论库", icon: MessageSquare },
+      { key: "assets-author", label: "作者库", icon: UserRound },
     ],
   },
   {
     title: "基础设施",
     items: [
       { key: "industry", label: "行业类别", icon: Tags },
-      { key: "platforms", label: "平台管理", icon: Network },
       { key: "accounts", label: "平台账号", icon: Users },
       { key: "customers", label: "客户管理", icon: Contact },
     ],
@@ -141,8 +148,9 @@ const PRODUCT_PLATFORMS: {
 // 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(协作);后两者暂为占位
 export type Workspace = "management" | "chat" | "cowork";
 
-const WORKSPACES: { key: Workspace; label: string }[] = [
-  { key: "management", label: "管理" },
+// 工作区元数据(标签固定);展示顺序由 useWorkspaceOrder 控制,可在系统配置调整。
+export const WORKSPACES: { key: Workspace; label: string }[] = [
+  { key: "management", label: "营销" },
   { key: "chat", label: "对话" },
   { key: "cowork", label: "协作" },
 ];
@@ -150,13 +158,12 @@ const WORKSPACES: { key: Workspace; label: string }[] = [
 // 各工作区的导航菜单;management 沿用现有 MENU_GROUPS,其余先占位
 const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
   management: MENU_GROUPS,
+  // 对话工作区的会话列表改为侧栏动态渲染(见 ChatConversationList);
+  // 这里仅保留 chat-sessions 作为默认页/面包屑锚点
   chat: [
     {
       title: "对话",
-      items: [
-        { key: "chat-sessions", label: "会话", icon: MessageSquare },
-        { key: "chat-assistant", label: "智能助手", icon: Bot },
-      ],
+      items: [{ key: "chat-sessions", label: "会话", icon: MessageSquare }],
     },
   ],
   cowork: [
@@ -189,6 +196,159 @@ export function getPageBreadcrumb(key: PageKey): {
   return { group: "", page: "" };
 }
 
+// 把会话按最近更新时间分桶:今天 / 昨天 / 近 7 天 / 更早(后端已按 updatedAt 倒序,桶内保持有序)
+function groupConversationsByTime(
+  conversations: ConversationView[],
+): { label: string; items: ConversationView[] }[] {
+  const now = new Date();
+  const todayStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime() / 1000;
+  const yesterdayStart = todayStart - 86400;
+  const weekStart = todayStart - 6 * 86400;
+  const buckets: Record<string, ConversationView[]> = {
+    今天: [],
+    昨天: [],
+    "近 7 天": [],
+    更早: [],
+  };
+  for (const c of conversations) {
+    if (c.updatedAt >= todayStart) buckets["今天"].push(c);
+    else if (c.updatedAt >= yesterdayStart) buckets["昨天"].push(c);
+    else if (c.updatedAt >= weekStart) buckets["近 7 天"].push(c);
+    else buckets["更早"].push(c);
+  }
+  return ["今天", "昨天", "近 7 天", "更早"]
+    .map((label) => ({ label, items: buckets[label] }))
+    .filter((g) => g.items.length > 0);
+}
+
+// 对话工作区侧栏:新对话按钮 + 历史会话(按时间分组,数据来自 ChatProvider)。
+// 点会话切到对话页并设为当前;每项可重命名/删除。
+function ChatConversationList({
+  active,
+  onChange,
+}: {
+  active: PageKey;
+  onChange: (key: PageKey) => void;
+}) {
+  const { conversations, activeId, setActiveId, reload } = useChat();
+  const onChat = active === "chat-sessions";
+  const groups = groupConversationsByTime(conversations);
+
+  async function handleRename(c: ConversationView) {
+    const next = window.prompt("重命名会话", c.title);
+    if (next == null) return;
+    const title = next.trim();
+    if (!title || title === c.title) return;
+    try {
+      await api.renameConversation(c.id, title);
+      await reload();
+    } catch (e) {
+      toast.error(`重命名失败: ${e}`);
+    }
+  }
+
+  async function handleDelete(c: ConversationView) {
+    try {
+      await api.deleteConversation(c.id);
+      if (activeId === c.id) setActiveId(null);
+      await reload();
+      toast.success("已删除会话");
+    } catch (e) {
+      toast.error(`删除失败: ${e}`);
+    }
+  }
+
+  function renderItem(c: ConversationView) {
+    const isActive = onChat && activeId === c.id;
+    return (
+      <SidebarMenuItem key={c.id} className="group/conv">
+        <SidebarMenuButton
+          isActive={isActive}
+          tooltip={c.title}
+          onClick={() => {
+            setActiveId(c.id);
+            onChange("chat-sessions");
+          }}
+          className="pr-7 data-active:bg-primary/10 data-active:font-medium data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:[&_svg]:text-primary"
+        >
+          <MessageSquare />
+          <span className="truncate">{c.title}</span>
+        </SidebarMenuButton>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover/conv:opacity-100 data-[state=open]:opacity-100"
+            >
+              <MoreHorizontal className="size-4" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => handleRename(c)}>
+              <SquarePen className="size-4" />
+              重命名
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              variant="destructive"
+              onClick={() => handleDelete(c)}
+            >
+              <Trash2 className="size-4" />
+              删除
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarMenuItem>
+    );
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* 新对话:黑白低调菜单项(参考 Claude),悬停浅底,无彩色填充 */}
+      <div className="p-2 pb-1">
+        <button
+          type="button"
+          onClick={() => {
+            setActiveId(null);
+            onChange("chat-sessions");
+          }}
+          className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+        >
+          <SquarePen className="size-4" />
+          新对话
+        </button>
+      </div>
+
+      {/* 历史对话:按时间分组,滚动区 */}
+      <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto px-1 pb-2">
+        {conversations.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 px-2 py-10 text-center text-muted-foreground">
+            <MessageSquare className="size-6 opacity-40" />
+            <span className="text-xs">暂无历史对话</span>
+            <span className="text-[11px] opacity-70">
+              点「新对话」开始
+            </span>
+          </div>
+        ) : (
+          groups.map((g) => (
+            <SidebarGroup key={g.label} className="px-1 py-1">
+              <SidebarGroupLabel className="px-2 text-[11px]">
+                {g.label}
+              </SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>{g.items.map(renderItem)}</SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface AppSidebarProps {
   workspace: Workspace;
   onWorkspaceChange: (workspace: Workspace) => void;
@@ -207,6 +367,11 @@ export function AppSidebar({
   onLogout,
 }: AppSidebarProps) {
   const [changePwdOpen, setChangePwdOpen] = useState(false);
+  // 工作区切换标签的展示顺序(系统配置可调);按保存顺序排列,缺失项忽略
+  const [wsOrder] = useWorkspaceOrder();
+  const orderedWorkspaces = wsOrder
+    .map((key) => WORKSPACES.find((w) => w.key === key))
+    .filter((w): w is (typeof WORKSPACES)[number] => Boolean(w));
 
   return (
     // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
@@ -223,7 +388,7 @@ export function AppSidebar({
                 <Radar className="size-4" />
               </div>
               <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-semibold">Veltrix</span>
+                <span className="truncate font-semibold">VeltrixLoop</span>
                 <span className="truncate text-xs text-muted-foreground">
                   协作平台
                 </span>
@@ -284,9 +449,9 @@ export function AppSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
 
-        {/* 工作区分类切换:管理 / 对话 / 协作(折叠态隐藏) */}
+        {/* 工作区分类切换:营销 / 对话 / 协作(顺序可在系统配置调整,折叠态隐藏) */}
         <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
-          {WORKSPACES.map((ws) => (
+          {orderedWorkspaces.map((ws) => (
             <button
               key={ws.key}
               type="button"
@@ -294,7 +459,7 @@ export function AppSidebar({
               className={cn(
                 "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
                 workspace === ws.key
-                  ? "bg-background text-foreground shadow-sm"
+                  ? "bg-background text-primary shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
               )}
             >
@@ -305,7 +470,11 @@ export function AppSidebar({
       </SidebarHeader>
 
       <SidebarContent className="group-data-[collapsible=icon]:overflow-y-auto">
-        {WORKSPACE_MENUS[workspace].map((group) => (
+        {/* 对话工作区:侧栏渲染会话列表(新对话 + 历史),取代静态菜单 */}
+        {workspace === "chat" ? (
+          <ChatConversationList active={active} onChange={onChange} />
+        ) : (
+          WORKSPACE_MENUS[workspace].map((group) => (
           <SidebarGroup key={group.title}>
             <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
             <SidebarGroupContent>
@@ -318,6 +487,8 @@ export function AppSidebar({
                         isActive={active === item.key}
                         onClick={() => onChange(item.key)}
                         tooltip={item.label}
+                        // 选中态用主题色高亮(左侧色条 + 主色文字/图标),与未选中明显区分
+                        className="data-active:bg-primary/10 data-active:font-semibold data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:hover:bg-primary/15 data-active:hover:text-primary data-active:[&_svg]:text-primary"
                       >
                         <Icon />
                         <span>{item.label}</span>
@@ -328,7 +499,8 @@ export function AppSidebar({
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
-        ))}
+          ))
+        )}
       </SidebarContent>
 
       <SidebarFooter>

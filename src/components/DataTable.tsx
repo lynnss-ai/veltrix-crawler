@@ -36,7 +36,7 @@ interface DataTableProps<TData, TValue> {
   getRowId?: (row: TData, index: number) => string;
   renderToolbar?: (table: TanstackTable<TData>) => ReactNode;
   emptyState?: ReactNode;
-  /// 每页默认条数(不传默认 10)
+  /// 每页默认条数(不传默认 50)
   defaultPageSize?: number;
 }
 
@@ -48,7 +48,7 @@ export function DataTable<TData, TValue>({
   getRowId,
   renderToolbar,
   emptyState,
-  defaultPageSize = 10,
+  defaultPageSize = 50,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -128,6 +128,8 @@ export function DataTable<TData, TValue>({
                   <TableRow
                     key={row.id}
                     data-state={row.getIsSelected() ? "selected" : undefined}
+                    // 行分割线:虚线;主题 --border 偏淡,用 foreground/15 让虚线更清晰
+                    className="border-b border-dashed border-foreground/15"
                   >
                     {row.getVisibleCells().map((cell, idx, arr) => {
                       const isLast = idx === arr.length - 1;

@@ -6,7 +6,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
-import { Contact, MoreVertical, Pencil, Plus, Search, Trash2, X } from "lucide-react";
+import { MoreVertical, SquarePen, Plus, Search, Trash2, X } from "lucide-react";
 import {
   api,
   formatTimestamp,
@@ -17,6 +17,7 @@ import {
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
+import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
@@ -242,7 +243,7 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
                       setIsFormOpen(true);
                     }}
                   >
-                    <Pencil />
+                    <SquarePen />
                     编辑
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
@@ -280,7 +281,7 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
         renderToolbar={(table) => (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 flex-wrap items-center gap-2">
-              <div className="relative w-full sm:max-w-xs">
+              <div className="relative w-full sm:max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   placeholder="搜索姓名 / 电话 / 公司"
@@ -310,12 +311,10 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
           </div>
         )}
         emptyState={
-          <div className="flex flex-col items-center gap-3 py-12 text-center">
-            <Contact className="size-8 text-muted-foreground" />
-            <div className="text-sm text-muted-foreground">
-              暂无客户,点击右上角「新增客户」开始建立客户档案
-            </div>
-          </div>
+          <EmptyState
+            title="暂无客户"
+            description="点击右上角「新增客户」开始建立客户档案"
+          />
         }
       />
 
@@ -444,7 +443,7 @@ function CustomerFormSheet({
 
   return (
     <SheetContent
-      className="flex w-full flex-col gap-0 p-0 sm:max-w-lg"
+      className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
       blockClose={
         name !== (initial?.name ?? "") ||
         phone !== (initial?.phone ?? "") ||

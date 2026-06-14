@@ -24,8 +24,9 @@ use veltrix_core::error::{CrawlerError, Result};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 /// 一条被拦截的接口响应。`body` 为响应文本(通常是 JSON),由适配器解析。
@@ -65,14 +66,25 @@ impl InterceptChannel {
     pub fn push(&self, session_id: u64, url: String, body: String) {
         match self.sessions.lock() {
             Ok(mut sessions) => {
-                // 用 entry 兜底:即便 session 已被取走或未登记,也不致丢失到 panic
-                sessions
-                    .entry(session_id)
-                    .or_default()
-                    .push(InterceptedResponse { url, body });
+                // 只接受仍开启的会话:已结束(被取走)的会话若用 entry 重建,
+                // 迟到的回传会留下永远无人取走的缓冲,长期运行累积成内存泄漏
+                match sessions.get_mut(&session_id) {
+                    Some(buf) => buf.push(InterceptedResponse { url, body }),
+                    None => tracing::debug!(session_id, "会话已结束,丢弃迟到的拦截回传"),
+                }
             }
             Err(_) => tracing::warn!(session_id, "拦截通道锁异常,丢弃一条回传"),
         }
+    }
+
+    /// 非破坏性查看会话当前已拦截的响应(clone),供采集中途判断进度,不结束会话。
+    /// 与 `take_session` 区别:不移除,会话仍可继续累积。锁异常时返回空。
+    pub fn peek_session(&self, session_id: u64) -> Vec<InterceptedResponse> {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&session_id).cloned())
+            .unwrap_or_default()
     }
 
     /// 结束会话并取走全部已拦截响应。锁异常时返回空,由调度方按空结果处理。
@@ -128,6 +140,14 @@ impl RpaChannel {
                 // 接收端已 drop(超时)时 send 返回 Err,忽略即可
                 let _ = tx.send(outcome);
             }
+        }
+    }
+
+    /// 放弃一次运行(等待方超时后调用):页面 ack 永不回传时,
+    /// 不清理会让发送端条目在表里永久残留,长期运行累积泄漏。
+    pub fn cancel(&self, run_id: u64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&run_id);
         }
     }
 }
@@ -247,9 +267,161 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
     )
 }
 
+/// macOS 专用早期注入脚本:hook fetch / XHR,命中 `patterns` 的响应经
+/// `webkit.messageHandlers.veltrixNative` 直接回传 Rust(对应 Windows 的原生拦截)。
+///
+/// 与 [`build_intercept_init_script`] 并存:后者走 Tauri invoke 兜底,二者结果在采集结束时
+/// 合并、由适配器按 content_id 去重。`webkit.messageHandlers` 在任意页面恒可用、不受 Tauri
+/// capabilities 影响,故作为 mac 主拦截通道。回传体为 `{"u":url,"b":body}` JSON 字符串。
+pub fn build_native_intercept_init_script_mac(patterns: &[String]) -> String {
+    let patterns_json = serde_json::to_string(patterns).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(function () {{
+  if (window.__veltrixMacHooked) return;
+  window.__veltrixMacHooked = true;
+  var PATTERNS = {patterns};
+  function matched(u) {{
+    if (!u) return false;
+    for (var i = 0; i < PATTERNS.length; i++) {{
+      if (u.indexOf(PATTERNS[i]) !== -1) return true;
+    }}
+    return false;
+  }}
+  function post(u, b) {{
+    try {{
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.veltrixNative) {{
+        window.webkit.messageHandlers.veltrixNative.postMessage(JSON.stringify({{ u: u, b: b }}));
+      }}
+    }} catch (e) {{}}
+  }}
+  function report(u, b) {{ if (matched(u)) post(u, b); }}
+
+  var origFetch = window.fetch;
+  if (origFetch) {{
+    window.fetch = function () {{
+      var args = arguments;
+      var url = (args[0] && args[0].url) ? args[0].url : String(args[0]);
+      return origFetch.apply(this, args).then(function (resp) {{
+        try {{ resp.clone().text().then(function (t) {{ report(url, t); }}).catch(function () {{}}); }} catch (e) {{}}
+        return resp;
+      }});
+    }};
+  }}
+
+  var origOpen = XMLHttpRequest.prototype.open;
+  var origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url) {{
+    this.__veltrixMacUrl = url;
+    return origOpen.apply(this, arguments);
+  }};
+  XMLHttpRequest.prototype.send = function () {{
+    var self = this;
+    this.addEventListener('load', function () {{
+      try {{
+        var t = (self.responseType === '' || self.responseType === 'text')
+          ? self.responseText : JSON.stringify(self.response);
+        report(self.__veltrixMacUrl, t);
+      }} catch (e) {{}}
+    }});
+    return origSend.apply(this, arguments);
+  }};
+}})();"#,
+        patterns = patterns_json,
+    )
+}
+
 /// 构造「设置会话 ID 并回放缓冲」的注入脚本。导航到搜索页后调用。
 pub fn build_set_session_eval(session_id: u64) -> String {
     format!("window.__veltrixSetSession && window.__veltrixSetSession({session_id});")
+}
+
+/// 登录命令名;与 Rust 端 `#[tauri::command] login_status_report` 对应。
+pub const LOGIN_STATUS_COMMAND: &str = "login_status_report";
+
+/// 构造「登录态自检」注入脚本(登录窗口用)。页面内每隔数秒判断登录态,
+/// 结论变化时经 `login_status_report` 回传:`in`(已登录)/ `out`(明确未登录)。
+///
+/// 判定优先级:命中「已登录」DOM 特征 或 登录 Cookie → in;否则页面就绪且存在可见登录
+/// CTA → out;其余(加载中 / 不确定)不回传,保持沉默,避免误判。
+pub fn build_login_check_script(
+    account_id: &str,
+    logged_in_selectors: &[String],
+    logged_out_texts: &[String],
+    login_cookie_names: &[String],
+) -> String {
+    let account_json = serde_json::to_string(account_id).unwrap_or_else(|_| "\"\"".to_string());
+    let in_sel = serde_json::to_string(logged_in_selectors).unwrap_or_else(|_| "[]".to_string());
+    let out_text = serde_json::to_string(logged_out_texts).unwrap_or_else(|_| "[]".to_string());
+    let cookies = serde_json::to_string(login_cookie_names).unwrap_or_else(|_| "[]".to_string());
+
+    const TEMPLATE: &str = r#"(function () {
+  if (window.__veltrixLoginCheck) return;
+  window.__veltrixLoginCheck = true;
+  var ACCOUNT = __ACCOUNT__;
+  var IN_SEL = __IN_SEL__;
+  var OUT_TEXT = __OUT_TEXT__;
+  var COOKIES = __COOKIES__;
+  var last = '';
+
+  function visible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  // 命中任一「已登录」选择器(且元素可见)
+  function hasLoggedIn() {
+    for (var i = 0; i < IN_SEL.length; i++) {
+      try { if (visible(document.querySelector(IN_SEL[i]))) return true; } catch (e) {}
+    }
+    return false;
+  }
+  // document.cookie 含任一登录 Cookie 名
+  function hasLoginCookie() {
+    if (!COOKIES.length) return false;
+    var c = document.cookie || '';
+    for (var i = 0; i < COOKIES.length; i++) {
+      if (c.indexOf(COOKIES[i] + '=') !== -1) return true;
+    }
+    return false;
+  }
+  // 存在文本恰为登录 CTA、且可见的可点元素
+  function hasLoginCta() {
+    if (!OUT_TEXT.length) return false;
+    var nodes = document.querySelectorAll('button,a,div,span,[role="button"]');
+    for (var i = 0; i < nodes.length; i++) {
+      var t = (nodes[i].textContent || '').trim();
+      for (var j = 0; j < OUT_TEXT.length; j++) {
+        if (t === OUT_TEXT[j] && visible(nodes[i])) return true;
+      }
+    }
+    return false;
+  }
+
+  function verdict() {
+    if (document.readyState !== 'complete') return '';
+    if (hasLoggedIn() || hasLoginCookie()) return 'in';
+    if (hasLoginCta()) return 'out';
+    return ''; // 不确定:保持沉默
+  }
+
+  function tick() {
+    var v = verdict();
+    if (v && v !== last) {
+      last = v;
+      try {
+        window.__TAURI_INTERNALS__.invoke('login_status_report', { accountId: ACCOUNT, status: v });
+      } catch (e) {}
+    }
+  }
+  setTimeout(tick, 1500);   // 给首屏渲染留时间再首检
+  setInterval(tick, 2500);  // 持续自检,登录/登出即时反馈
+})();"#;
+
+    TEMPLATE
+        .replace("__ACCOUNT__", &account_json)
+        .replace("__IN_SEL__", &in_sel)
+        .replace("__OUT_TEXT__", &out_text)
+        .replace("__COOKIES__", &cookies)
 }
 
 /// 构造单轮滚动脚本:滚到底部以触发平台的分页加载接口。
@@ -260,17 +432,102 @@ pub fn build_scroll_eval() -> String {
     "window.scrollTo(0, document.body.scrollHeight);".to_string()
 }
 
+/// 非 Windows(主要是 macOS)的「真实滚轮」对等实现:向**内容最高的可滚容器**派发
+/// 一个 `WheelEvent` 并直接抬高 scrollTop,触发只认滚轮事件的页面(快手 / 小红书等)的
+/// 懒加载。Windows 走窗口消息级 `WM_MOUSEWHEEL`;mac 无需辅助功能权限、后台窗口也能滚,
+/// 但合成事件的可信度低于真实硬件滚轮,属当前可用的最佳近似(已标注待本机实测校准)。
+pub fn build_wheel_eval() -> String {
+    r#"(function () {
+  function findScroller() {
+    var docEl = document.scrollingElement || document.documentElement || document.body;
+    var best = docEl, bestH = docEl ? docEl.scrollHeight : 0;
+    var all = document.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      try {
+        var st = getComputedStyle(el);
+        if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 100 && el.scrollHeight > bestH) {
+          bestH = el.scrollHeight; best = el;
+        }
+      } catch (e) {}
+    }
+    return best;
+  }
+  try {
+    var sc = findScroller();
+    var r = sc.getBoundingClientRect ? sc.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+    var opt = {
+      bubbles: true, cancelable: true, deltaY: 600, deltaMode: 0,
+      clientX: r.left + r.width / 2, clientY: r.top + Math.min(r.height / 2, 300)
+    };
+    sc.dispatchEvent(new WheelEvent('wheel', opt));
+    if (typeof sc.scrollTop === 'number') sc.scrollTop += 600;
+    sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+    window.dispatchEvent(new Event('scroll'));
+  } catch (e) {}
+})();"#
+        .to_string()
+}
+
 /// 构造「按关键词导航到搜索结果页」的脚本。
 ///
 /// keyword 在页面侧用 `encodeURIComponent` 编码,避免中文 / 特殊字符破坏 URL;
 /// `assign` 触发一次正常导航,使 `initialization_script` 在新页面重新挂载 hook。
-pub fn build_search_eval(template: &str, keyword: &str) -> String {
+pub fn build_search_eval(template: &str, keyword: &str, extra_query: &str) -> String {
     let tpl = template.replace('\\', "\\\\").replace('\'', "\\'");
     let kw = keyword.replace('\\', "\\\\").replace('\'', "\\'");
+    let extra = extra_query.replace('\\', "\\\\").replace('\'', "\\'");
     format!(
         "(function () {{ var kw = encodeURIComponent('{kw}'); \
-         window.location.assign('{tpl}'.replace('{{keyword}}', kw)); }})();"
+         var url = '{tpl}'.replace('{{keyword}}', kw); \
+         var extra = '{extra}'; \
+         if (extra) {{ url += (url.indexOf('?') >= 0 ? '&' : '?') + extra; }} \
+         window.location.assign(url); }})();"
     )
+}
+
+/// 构造「按内容 ID 导航到详情页」的脚本(评论采集用)。`{id}` 替换为内容 ID,
+/// `{token}` 替换为鉴权 token(小红书 xsec_token;抖音无此占位,传空即可)。
+///
+/// 值经 `encodeURIComponent` 编码;`assign` 触发正常导航,使拦截 hook 在详情页重新挂载。
+pub fn build_detail_eval(template: &str, id: &str, token: &str) -> String {
+    let tpl = template.replace('\\', "\\\\").replace('\'', "\\'");
+    let id_esc = id.replace('\\', "\\\\").replace('\'', "\\'");
+    let token_esc = token.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        "(function () {{ var id = encodeURIComponent('{id_esc}'); \
+         var token = encodeURIComponent('{token_esc}'); \
+         window.location.assign('{tpl}'.replace('{{id}}', id).replace('{{token}}', token)); }})();"
+    )
+}
+
+/// 构造「按文案点击元素」的脚本(排序 / 时间筛选用)。在可点击元素里找 textContent
+/// 精确等于任一 label 的,派发鼠标事件点击第一个匹配。用文案而非 class 选择器:更稳
+/// (class 易变)、且无需逐平台抓包。labels 为空时不做任何操作(综合/不限即默认)。
+pub fn build_select_eval(labels: &[String]) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    const TEMPLATE: &str = r#"(function () {
+  var LABELS = __LABELS__;
+  if (!LABELS.length) return;
+  var nodes = document.querySelectorAll('button,a,span,div,li,[role="tab"],[role="button"]');
+  for (var i = 0; i < nodes.length; i++) {
+    var t = (nodes[i].textContent || '').trim();
+    for (var j = 0; j < LABELS.length; j++) {
+      if (t === LABELS[j]) {
+        try {
+          nodes[i].scrollIntoView({ block: 'center' });
+          var r = nodes[i].getBoundingClientRect();
+          var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+          nodes[i].dispatchEvent(new MouseEvent('mousedown', o));
+          nodes[i].dispatchEvent(new MouseEvent('mouseup', o));
+          nodes[i].dispatchEvent(new MouseEvent('click', o));
+        } catch (e) {}
+        return;
+      }
+    }
+  }
+})();"#;
+    TEMPLATE.replace("__LABELS__", &labels_json)
 }
 
 /// 注入脚本里回传 RPA 执行结果的命令名;与 Rust 端 `#[tauri::command] rpa_done` 对应。
@@ -450,6 +707,24 @@ pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> 
 /// 前端监听的采集日志事件名;TaskDetailPage 据此订阅并按 task_id 过滤展示。
 pub const COLLECT_LOG_EVENT: &str = "collect-log";
 
+/// 采集条目富信息(内容/评论)。前端日志面板据此渲染头像 + 昵称 + 标题 + 序号 + 类型。
+/// HUD 浮层为纯文本,不消费本字段(只显示 message)。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectEntry {
+    /// 条目类型:"content"(视频/图文)| "comment"(评论)。
+    pub kind: String,
+    /// 任务内序号(从 1 递增)。
+    pub seq: i64,
+    /// 作者头像 URL。
+    pub avatar: Option<String>,
+    pub nickname: String,
+    /// 内容标题/正文 或 评论文本(已截断)。
+    pub title: String,
+    /// 内容形态 video / image;评论为 None。
+    pub content_kind: Option<String>,
+}
+
 /// 一条采集日志。同一条既经 `app.emit` 推给前端面板,也经窗口 HUD 实时展示。
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -460,16 +735,55 @@ pub struct CollectLog {
     /// 级别:info / warn / error,前端与 HUD 按级别着色。
     pub level: String,
     pub message: String,
+    /// 采集条目富信息(内容/评论);普通日志为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<CollectEntry>,
 }
 
-/// 向前端推送一条采集日志。emit 失败仅忽略(无前端监听时不应影响采集)。
+/// 采集日志落库通道。lib.rs setup 初始化后,emit 时把日志副本发到此处由后台 writer 落库。
+static LOG_SINK: OnceLock<UnboundedSender<CollectLog>> = OnceLock::new();
+
+/// 初始化日志落库通道(进程启动时调用一次)。
+pub fn init_log_sink(sender: UnboundedSender<CollectLog>) {
+    let _ = LOG_SINK.set(sender);
+}
+
+/// 把日志副本送入落库通道;通道未初始化 / 已关闭时静默忽略,不影响采集。
+fn persist_log(log: &CollectLog) {
+    if let Some(sink) = LOG_SINK.get() {
+        let _ = sink.send(log.clone());
+    }
+}
+
+/// 向前端推送一条采集日志并落库持久化。emit 失败仅忽略(无前端监听时不应影响采集)。
 pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: impl Into<String>) {
     let log = CollectLog {
         task_id: task_id.to_string(),
         ts: chrono::Utc::now().timestamp(),
         level: level.to_string(),
         message: message.into(),
+        entry: None,
     };
+    persist_log(&log);
+    let _ = app.emit(COLLECT_LOG_EVENT, log);
+}
+
+/// 推送一条「采集条目」富日志(内容/评论),供前端日志面板渲染头像 + 昵称 + 标题 + 序号。
+/// message 仍填一句纯文本兜底(HUD 与不支持富渲染处显示)。
+pub fn emit_collect_entry(
+    app: &AppHandle,
+    task_id: &str,
+    message: impl Into<String>,
+    entry: CollectEntry,
+) {
+    let log = CollectLog {
+        task_id: task_id.to_string(),
+        ts: chrono::Utc::now().timestamp(),
+        level: "info".to_string(),
+        message: message.into(),
+        entry: Some(entry),
+    };
+    persist_log(&log);
     let _ = app.emit(COLLECT_LOG_EVENT, log);
 }
 
@@ -544,10 +858,10 @@ pub fn build_hud_init_script() -> String {
     if (root) return root;
     root = document.createElement('div');
     root.id = 'veltrix-hud';
-    root.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;width:720px;max-height:92vh;background:rgba(17,24,39,.92);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.45);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
+    root.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;height:33vh;background:rgba(17,24,39,.95);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border-top:1px solid rgba(255,255,255,.14);box-shadow:0 -8px 24px rgba(0,0,0,.45);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
     var head = document.createElement('div');
     head.id = 'veltrix-hud-head';
-    head.style.cssText = 'padding:8px 11px;font-weight:600;background:rgba(255,255,255,.06);display:flex;align-items:center;gap:7px;flex:0 0 auto;cursor:move;user-select:none;';
+    head.style.cssText = 'padding:8px 11px;font-weight:600;background:rgba(255,255,255,.06);display:flex;align-items:center;gap:7px;flex:0 0 auto;cursor:default;user-select:none;';
     var dot = document.createElement('span');
     dot.id = 'veltrix-hud-dot';
     dot.style.cssText = 'width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:0 0 auto;';
@@ -625,15 +939,7 @@ pub fn build_hud_init_script() -> String {
     root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
     document.body.appendChild(root);
 
-    // 恢复上次拖动的位置(跨导航保留)
-    try {
-      var pos = JSON.parse(sessionStorage.getItem(POS_KEY) || 'null');
-      if (pos && typeof pos.left === 'number') {
-        root.style.left = pos.left + 'px';
-        root.style.top = pos.top + 'px';
-        root.style.right = 'auto';
-      }
-    } catch (e) {}
+    // HUD 固定为底部栏(占满宽度、底部 1/3 高),不再恢复拖动位置
 
     // 拖动:按住标题栏或收起图标移动浮层(按钮除外),松手把位置存入 sessionStorage。
     // dragMoved 供图标的 click 判断:刚拖动过的那次点击不应触发展开。
@@ -649,8 +955,7 @@ pub fn build_hud_init_script() -> String {
         dragging = true; dragMoved = false; sx = e.clientX; sy = e.clientY; ox = rect.left; oy = rect.top;
         e.preventDefault();
       }
-      head.addEventListener('mousedown', onDown);
-      icon.addEventListener('mousedown', onDown);
+      // HUD 固定底部栏,禁用拖动(仅 icon 保留点击展开,不再绑 mousedown 拖动)
       document.addEventListener('mousemove', function (e) {
         if (!dragging) return;
         dragMoved = true;
@@ -707,9 +1012,14 @@ pub fn build_hud_init_script() -> String {
         icon.style.display = 'flex';
         icon.style.background = lastColor; // 收起即用当前状态色,绿/红/灰一眼可辨
       }
+      root.style.left = 'auto';
+      root.style.right = '12px';
+      root.style.top = 'auto';
+      root.style.bottom = '12px';
       root.style.width = '46px';
       root.style.height = '46px';
       root.style.maxHeight = '46px';
+      root.style.borderTop = 'none';
       root.style.border = 'none'; // 收起态不要边框线,整块纯色更干净
       root.style.boxShadow = (lastGlow ? '0 0 14px ' + lastColor + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
     } else {
@@ -718,22 +1028,17 @@ pub fn build_hud_init_script() -> String {
       if (icon) icon.style.display = 'none';
       if (body) body.style.display = '';
       if (tabs) tabs.style.display = keywordsOf(getLogs()).length < 2 ? 'none' : 'flex';
-      root.style.width = '720px';
-      root.style.height = '';
-      root.style.maxHeight = '92vh';
-      root.style.border = '1px solid rgba(255,255,255,.12)';
-      root.style.boxShadow = '0 10px 30px rgba(0,0,0,.45)';
-      // 收起图标常贴在屏幕边缘,展开后面板会从该位置向右下扩展而超出视口;
-      // 这里按恢复后的实际尺寸把位置拉回可视范围,避免只露出一部分要手动拖。
-      if (root.style.left) {
-        var maxLeft = Math.max(0, window.innerWidth - root.offsetWidth);
-        var maxTop = Math.max(0, window.innerHeight - root.offsetHeight);
-        var nl = Math.max(0, Math.min(parseInt(root.style.left, 10) || 0, maxLeft));
-        var nt = Math.max(0, Math.min(parseInt(root.style.top, 10) || 0, maxTop));
-        root.style.left = nl + 'px';
-        root.style.top = nt + 'px';
-        try { sessionStorage.setItem(POS_KEY, JSON.stringify({ left: nl, top: nt })); } catch (e) {}
-      }
+      // 展开:恢复成底部固定栏(占满宽度、底部 1/3 高)
+      root.style.left = '0';
+      root.style.right = '0';
+      root.style.top = 'auto';
+      root.style.bottom = '0';
+      root.style.width = 'auto';
+      root.style.height = '33vh';
+      root.style.maxHeight = '';
+      root.style.border = 'none';
+      root.style.borderTop = '1px solid rgba(255,255,255,.14)';
+      root.style.boxShadow = '0 -8px 24px rgba(0,0,0,.45)';
     }
   }
   function setCollapsed(collapsed) {

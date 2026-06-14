@@ -1,6 +1,7 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
   type ReactNode,
@@ -14,10 +15,12 @@ import {
   Eye,
   EyeOff,
   FolderOpen,
+  GripVertical,
   Loader2,
   MessageSquareText,
   MoreVertical,
-  Pencil,
+  NotebookPen,
+  SquarePen,
   Plus,
   Search,
   Settings2,
@@ -43,6 +46,8 @@ import {
 } from "@/lib/api";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
+import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
+import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CodeField, generateCode } from "@/components/CodeField";
 import { ErrorBanner } from "@/components/ErrorBanner";
@@ -50,6 +55,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Card,
@@ -100,6 +106,7 @@ const SECTION_GROUPS = [
     items: [
       { key: "general", label: "常规", icon: Settings2 },
       { key: "remote-control", label: "远程控制", icon: Smartphone },
+      { key: "obsidian", label: "Obsidian", icon: NotebookPen },
     ],
   },
   {
@@ -151,6 +158,15 @@ interface Provider {
   models: string; // 每行一个模型
 }
 
+// 模型厂商预设(code/name/apiUrl/asr)由后端 list_provider_capabilities 提供(单一真相源):
+// 新增厂商下拉、不可重复添加、语音转写按 ASR 过滤都据此,前端不再硬编码厂商清单。
+type ProviderPreset = {
+  code: string;
+  name: string;
+  apiUrl: string;
+  asr: boolean;
+};
+
 // 清空数据需输入的确认词
 const CLEAR_CONFIRM_TEXT = "清空数据";
 
@@ -174,10 +190,23 @@ export function SettingsPage() {
 
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
+  // 厂商预设 + 能力(code/name/apiUrl/chat/asr,后端单一真相源):
+  // 供新增厂商下拉与「语音转写」按 ASR 过滤
+  const [caps, setCaps] = useState<
+    {
+      code: string;
+      name: string;
+      apiUrl: string;
+      chat: boolean;
+      asr: boolean;
+    }[]
+  >([]);
 
   const [clearOpen, setClearOpen] = useState(false);
   const [clearText, setClearText] = useState("");
   const [clearPassword, setClearPassword] = useState("");
+  // 是否连同媒体资源文件一并清空(默认清,关掉则只清库、保留已下载素材)
+  const [clearMedia, setClearMedia] = useState(true);
   const [clearing, setClearing] = useState(false);
   // 清空成功后自增,作为 GeneralSection 重新拉取数据库大小的触发器
   const [generalRefreshKey, setGeneralRefreshKey] = useState(0);
@@ -207,7 +236,7 @@ export function SettingsPage() {
   async function handleClearData() {
     setClearing(true);
     try {
-      await api.clearBusinessData(clearPassword);
+      await api.clearBusinessData(clearPassword, clearMedia);
       setClearOpen(false);
       setClearText("");
       setClearPassword("");
@@ -227,6 +256,10 @@ export function SettingsPage() {
       .catch((e) => setError(String(e)));
     reloadProviders();
     reloadPrompts();
+    api
+      .listProviderCapabilities()
+      .then(setCaps)
+      .catch(() => {});
   }, []);
 
   function submitPrompt(prompt: Prompt) {
@@ -315,6 +348,7 @@ export function SettingsPage() {
             {active === "providers" && (
               <ProvidersSection
                 providers={providers}
+                presetCount={caps.length}
                 onCreate={() => {
                   setProviderForm(null);
                   setIsProviderFormOpen(true);
@@ -357,11 +391,20 @@ export function SettingsPage() {
             )}
             {active === "remote-control" && <RemoteControlSection />}
             {active === "transcription" && (
-              <TranscriptionSection providers={providers} />
+              <TranscriptionSection
+                providers={providers}
+                initial={cfg?.transcription}
+                caps={caps}
+              />
             )}
             {active === "intent" && (
-              <IntentSection providers={providers} prompts={prompts} />
+              <IntentSection
+                providers={providers}
+                prompts={prompts}
+                initial={cfg?.intent}
+              />
             )}
+            {active === "obsidian" && <ObsidianSection />}
           </div>
         )}
       </div>
@@ -378,6 +421,8 @@ export function SettingsPage() {
         key={isProviderFormOpen ? (providerForm?.id ?? "new-provider") : "idle"}
         open={isProviderFormOpen}
         initial={providerForm}
+        providers={providers}
+        presets={caps}
         onOpenChange={setIsProviderFormOpen}
         onSubmit={submitProvider}
       />
@@ -411,11 +456,21 @@ export function SettingsPage() {
                 数据库中的采集内容与统计
               </li>
               <li className="flex items-center gap-2">
-                <X className="size-3.5 shrink-0 text-destructive" />
+                {clearMedia ? (
+                  <X className="size-3.5 shrink-0 text-destructive" />
+                ) : (
+                  <Check className="size-3.5 shrink-0 text-emerald-500" />
+                )}
                 存储路径下的媒体 / 图片等文件
+                {!clearMedia && "(保留)"}
               </li>
             </ul>
-            <div className="mt-2.5 flex items-center gap-2 border-t border-destructive/15 pt-2.5 text-xs text-muted-foreground">
+            {/* 可选项:是否连同媒体资源文件一并清空 */}
+            <label className="mt-2.5 flex cursor-pointer items-center gap-2 border-t border-destructive/15 pt-2.5 text-xs text-muted-foreground">
+              <Switch checked={clearMedia} onCheckedChange={setClearMedia} />
+              同时清空媒体资源文件
+            </label>
+            <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
               <Check className="size-3.5 shrink-0 text-emerald-500" />
               平台与账号配置保留
             </div>
@@ -552,6 +607,100 @@ function SettingsCard({
       </CardHeader>
       <CardContent className="space-y-4">{children}</CardContent>
     </Card>
+  );
+}
+
+// 工作区顺序编辑:拖动调整侧栏顶部工作区切换标签的排列。
+// 用指针事件(pointer events)+ pointer capture 实现,不依赖 HTML5 drag API
+// (WebView2 里原生 DnD 不可靠);拖动期间用本地副本即时重排,松手才持久化一次。
+function WorkspaceOrderEditor() {
+  const [order, setOrder] = useWorkspaceOrder();
+  // 拖动期间的本地工作副本;非拖动态与 order 同步
+  const [items, setItems] = useState<Workspace[]>(order);
+  const [draggingKey, setDraggingKey] = useState<string | null>(null);
+  const draggingRef = useRef<string | null>(null);
+  const itemsRef = useRef<Workspace[]>(order);
+  const listRef = useRef<HTMLUListElement>(null);
+
+  // 外部改了顺序且当前不在拖动时,同步本地副本
+  useEffect(() => {
+    if (!draggingRef.current) {
+      setItems(order);
+      itemsRef.current = order;
+    }
+  }, [order]);
+
+  const labelOf = (key: string) =>
+    WORKSPACES.find((w) => w.key === key)?.label ?? key;
+
+  function startDrag(e: React.PointerEvent<HTMLLIElement>, key: string) {
+    if (e.button !== 0) return; // 仅左键
+    e.currentTarget.setPointerCapture(e.pointerId); // 后续 move/up 锁定到本行
+    draggingRef.current = key;
+    setDraggingKey(key);
+  }
+
+  function onMove(e: React.PointerEvent<HTMLLIElement>) {
+    const key = draggingRef.current;
+    const listEl = listRef.current;
+    if (!key || !listEl) return;
+    // 按指针 Y 命中目标行(过各行中线即换位)
+    const rows = Array.from(listEl.children) as HTMLElement[];
+    let target = rows.length - 1;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i].getBoundingClientRect();
+      if (e.clientY < (r.top + r.bottom) / 2) {
+        target = i;
+        break;
+      }
+    }
+    setItems((prev) => {
+      const from = prev.indexOf(key as Workspace);
+      if (from < 0 || from === target) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(target, 0, moved);
+      itemsRef.current = next;
+      return next;
+    });
+  }
+
+  function endDrag() {
+    if (draggingRef.current) {
+      // 顺序确有变化才持久化并提示(原地松手不打扰)
+      const changed = itemsRef.current.some((k, i) => k !== order[i]);
+      if (changed) {
+        setOrder(itemsRef.current);
+        toast.success("菜单顺序已更新");
+      }
+    }
+    draggingRef.current = null;
+    setDraggingKey(null);
+  }
+
+  return (
+    <ul ref={listRef} className="space-y-2 select-none">
+      {items.map((key, idx) => (
+        <li
+          key={key}
+          onPointerDown={(e) => startDrag(e, key)}
+          onPointerMove={onMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          className={`flex touch-none items-center gap-2 rounded-md border bg-card px-3 py-2 transition-colors ${
+            draggingKey === key
+              ? "cursor-grabbing border-primary bg-primary/5 shadow-sm"
+              : "cursor-grab"
+          }`}
+        >
+          <GripVertical className="size-4 shrink-0 text-muted-foreground" />
+          <span className="w-5 text-center font-mono text-xs text-muted-foreground">
+            {idx + 1}
+          </span>
+          <span className="flex-1 text-sm font-medium">{labelOf(key)}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -779,6 +928,14 @@ function GeneralSection({
       .getDataDir()
       .then(setDataDir)
       .catch(() => setDataDir(""));
+    // 存储路径展示完整绝对路径(默认 "media"/相对由后端 get_media_root 补全)
+    api
+      .getMediaRoot()
+      .then((p) => {
+        setStoragePath(p);
+        setStorageBaseline(p);
+      })
+      .catch(() => {});
     // refreshKey 变化(清空数据后)重新拉取数据库大小,数字即时反映清空结果
   }, [refreshKey]);
   useEffect(() => {
@@ -788,10 +945,6 @@ function GeneralSection({
       setDbUrl(url);
       setMaxConn(conn);
       setDbBaseline({ url, maxConn: conn });
-      // 存储路径初值取自已保存的素材输出目录(为空表示用应用默认数据目录)
-      const storage = cfg.media?.output_dir ?? "";
-      setStoragePath(storage);
-      setStorageBaseline(storage);
     }
   }, [cfg]);
 
@@ -832,6 +985,13 @@ function GeneralSection({
 
   return (
     <>
+      <SettingsCard
+        title="菜单顺序"
+        description="拖动调整侧边栏顶部工作区(营销 / 对话 / 协作)的排列顺序,松手即时生效。"
+      >
+        <WorkspaceOrderEditor />
+      </SettingsCard>
+
       <SettingsCard
         title="存储"
         description="采集数据与媒体文件的本地落地目录。"
@@ -1031,28 +1191,128 @@ function providerModels(provider: Provider | undefined): string[] {
     .filter(Boolean);
 }
 
-function TranscriptionSection({ providers }: { providers: Provider[] }) {
+// Obsidian vault 配置(每用户各自;采集内容同步为 Markdown 写入)
+function ObsidianSection() {
+  const [vault, setVault] = useState("");
+  const [baseline, setBaseline] = useState("");
+  useEffect(() => {
+    api
+      .getObsidianVault()
+      .then((v) => {
+        setVault(v);
+        setBaseline(v);
+      })
+      .catch(() => {});
+  }, []);
+  const dirty = vault.trim() !== baseline;
+  return (
+    <SettingsCard
+      title="Obsidian"
+      description="配置你的 Obsidian vault 根路径;采集内容可在内容库手动同步,或任务勾选采集完成后自动同步,写入该库的 Veltrix 目录。"
+      dirty={dirty}
+      onSave={() => {
+        const v = vault.trim();
+        api
+          .setObsidianVault(v)
+          .then(() => {
+            setBaseline(v);
+            setVault(v);
+            toast.success("Obsidian 配置已保存");
+          })
+          .catch((e) => toast.error(`保存失败: ${e}`));
+      }}
+    >
+      <div className="space-y-1.5">
+        <Label htmlFor="obsidian-vault">Vault 根路径</Label>
+        <div className="flex gap-2">
+          <Input
+            id="obsidian-vault"
+            placeholder="如 D:\Obsidian\MyVault"
+            value={vault}
+            onChange={(e) => setVault(e.target.value)}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            className="shrink-0"
+            onClick={async () => {
+              const selected = await open({ directory: true, multiple: false });
+              if (typeof selected === "string") setVault(selected);
+            }}
+          >
+            <FolderOpen />
+            选择
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className="shrink-0"
+            disabled={!vault.trim()}
+            onClick={() =>
+              openPath(vault.trim()).catch((e) =>
+                toast.error(`无法打开目录: ${e}`),
+              )
+            }
+          >
+            <ExternalLink />
+            打开
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          内容写入 vault 下的 Veltrix/ 目录,媒体存入 Veltrix/assets/。每个用户各自配置。
+        </p>
+      </div>
+    </SettingsCard>
+  );
+}
+
+function TranscriptionSection({
+  providers,
+  initial,
+  caps,
+}: {
+  providers: Provider[];
+  initial?: { provider_id: string; model: string };
+  caps: { code: string; asr: boolean }[];
+}) {
   const [value, setValue] = useState<TranscriptionConfig>(DEFAULT_TRANSCRIPTION);
   const [baseline, setBaseline] = useState<TranscriptionConfig>(
     DEFAULT_TRANSCRIPTION,
   );
+  // 配置异步加载完成后回填(后端 snake_case → 本地 camelCase)
+  useEffect(() => {
+    if (!initial) return;
+    const loaded: TranscriptionConfig = {
+      providerId: initial.provider_id ?? "",
+      model: initial.model ?? "",
+    };
+    setValue(loaded);
+    setBaseline(loaded);
+  }, [initial]);
   const dirty = JSON.stringify(value) !== JSON.stringify(baseline);
+  // 仅支持语音识别(ASR)的厂商可选(目前仅小米 MiMo);新增 ASR 厂商后端放开即自动出现
+  const asrCodes = new Set(caps.filter((c) => c.asr).map((c) => c.code));
+  const asrProviders = providers.filter((p) => asrCodes.has(p.code));
   const provider = providers.find((p) => p.id === value.providerId);
   const models = providerModels(provider);
 
   return (
     <SettingsCard
       title="语音转写"
-      description="在「模型厂商」中选择厂商与模型,用于音视频转写。"
+      description="选择支持语音识别的厂商与模型,采集完成后把视频音频转写为文案(目前仅小米 MiMo 支持 ASR)。"
       dirty={dirty}
       onSave={() => {
-        // TODO: invoke("set_transcription_config", value)
-        setBaseline(value);
-        toast.success("语音转写配置已保存(待接后端)");
+        api
+          .setTranscriptionConfig(value.providerId, value.model)
+          .then(() => {
+            setBaseline(value);
+            toast.success("语音转写配置已保存");
+          })
+          .catch((e) => toast.error(`保存失败: ${e}`));
       }}
     >
       <ProviderModelPicker
-        providers={providers}
+        providers={asrProviders}
         providerId={value.providerId}
         model={value.model}
         onProviderChange={(id) => setValue({ providerId: id, model: "" })}
@@ -1134,12 +1394,31 @@ function ProviderModelPicker({
 function IntentSection({
   providers,
   prompts,
+  initial,
 }: {
   providers: Provider[];
   prompts: Prompt[];
+  initial?: {
+    provider_id: string;
+    model: string;
+    prompt_id: string;
+    batch_size: number;
+  };
 }) {
   const [value, setValue] = useState<IntentConfig>(DEFAULT_INTENT);
   const [baseline, setBaseline] = useState<IntentConfig>(DEFAULT_INTENT);
+  // 配置异步加载完成后回填(后端 snake_case → 本地 camelCase)
+  useEffect(() => {
+    if (!initial) return;
+    const loaded: IntentConfig = {
+      providerId: initial.provider_id ?? "",
+      model: initial.model ?? "",
+      promptId: initial.prompt_id ?? "",
+      batchSize: String(initial.batch_size ?? 10),
+    };
+    setValue(loaded);
+    setBaseline(loaded);
+  }, [initial]);
   const dirty = JSON.stringify(value) !== JSON.stringify(baseline);
   const provider = providers.find((p) => p.id === value.providerId);
   const models = providerModels(provider);
@@ -1150,9 +1429,18 @@ function IntentSection({
       description="选择厂商、模型与提示词,调用大模型分析用户意向。"
       dirty={dirty}
       onSave={() => {
-        // TODO: invoke("set_intent_config", value)
-        setBaseline(value);
-        toast.success("意向分析配置已保存(待接后端)");
+        api
+          .setIntentConfig(
+            value.providerId,
+            value.model,
+            value.promptId,
+            Number(value.batchSize) || 0,
+          )
+          .then(() => {
+            setBaseline(value);
+            toast.success("意向分析配置已保存");
+          })
+          .catch((e) => toast.error(`保存失败: ${e}`));
       }}
     >
       <ProviderModelPicker
@@ -1280,7 +1568,7 @@ function PromptsSection({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-32">
                   <DropdownMenuItem onClick={() => onEdit(p)}>
-                    <Pencil />
+                    <SquarePen />
                     编辑
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
@@ -1318,7 +1606,7 @@ function PromptsSection({
       }
       renderToolbar={(table) => (
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="relative w-full sm:max-w-xs">
+          <div className="relative w-full sm:max-w-sm">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               placeholder="搜索名称 / 编码 / 内容"
@@ -1348,12 +1636,14 @@ const providerFilterFn: FilterFn<Provider> = (row, _columnId, value) =>
 
 function ProvidersSection({
   providers,
+  presetCount,
   onCreate,
   onEdit,
   onDelete,
   onReload,
 }: {
   providers: Provider[];
+  presetCount: number;
   onCreate: () => void;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
@@ -1447,7 +1737,7 @@ function ProvidersSection({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-32">
                   <DropdownMenuItem onClick={() => onEdit(p)}>
-                    <Pencil />
+                    <SquarePen />
                     编辑
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
@@ -1485,7 +1775,7 @@ function ProvidersSection({
       }
       renderToolbar={(table) => (
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="relative w-full sm:max-w-xs">
+          <div className="relative w-full sm:max-w-sm">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               placeholder="搜索名称 / API URL"
@@ -1496,10 +1786,23 @@ function ProvidersSection({
           </div>
           <div className="flex items-center gap-2">
             <RefreshButton onClick={onReload} />
-            <Button onClick={onCreate}>
-              <Plus />
-              新增
-            </Button>
+            <SimpleTooltip
+              content={
+                presetCount > 0 && providers.length >= presetCount
+                  ? "已添加全部支持的厂商"
+                  : "新增厂商"
+              }
+            >
+              <span>
+                <Button
+                  onClick={onCreate}
+                  disabled={presetCount > 0 && providers.length >= presetCount}
+                >
+                  <Plus />
+                  新增
+                </Button>
+              </span>
+            </SimpleTooltip>
           </div>
         </div>
       )}
@@ -1511,16 +1814,23 @@ function ProvidersSection({
 function ProviderFormSheet({
   open,
   initial,
+  providers,
+  presets,
   onOpenChange,
   onSubmit,
 }: {
   open: boolean;
   initial: Provider | null;
+  providers: Provider[];
+  presets: ProviderPreset[];
   onOpenChange: (open: boolean) => void;
   onSubmit: (provider: Provider) => void;
 }) {
   const isEdit = initial !== null;
-  const [code, setCode] = useState(initial?.code ?? generateCode("PRV"));
+  // 新增时厂商只能从「未添加的预设」里选,保证不可重复添加
+  const usedCodes = new Set(providers.map((p) => p.code));
+  const availablePresets = presets.filter((p) => !usedCodes.has(p.code));
+  const [code, setCode] = useState(initial?.code ?? "");
   const [name, setName] = useState(initial?.name ?? "");
   const [apiUrl, setApiUrl] = useState(initial?.apiUrl ?? "");
   const [apiKey, setApiKey] = useState(initial?.apiKey ?? "");
@@ -1532,7 +1842,7 @@ function ProviderFormSheet({
     event.preventDefault();
     setSubmitted(true);
     // 必填项为空时改为字段下方提示,不再用顶部红框
-    if (!name.trim() || !apiUrl.trim() || !apiKey.trim() || !models.trim()) {
+    if (!code || !name.trim() || !apiUrl.trim() || !apiKey.trim() || !models.trim()) {
       return;
     }
     onSubmit({
@@ -1555,7 +1865,7 @@ function ProviderFormSheet({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-lg"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose={isDirty}
       >
         <SheetHeader className="border-b">
@@ -1572,30 +1882,48 @@ function ProviderFormSheet({
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="provider-name">
-                  厂商名称 <RequiredMark />
+                  厂商 <RequiredMark />
                 </Label>
-                <Input
-                  id="provider-name"
-                  placeholder="如 OpenAI / DeepSeek"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  aria-invalid={submitted && !name.trim()}
-                  autoFocus
-                />
-                <FieldError
-                  show={submitted && !name.trim()}
-                  message="厂商名称不可为空"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="provider-code">编码</Label>
-                <CodeField
-                  id="provider-code"
-                  value={code}
-                  onRegenerate={() => setCode(generateCode("PRV"))}
-                />
+                {isEdit ? (
+                  // 编辑态厂商不可改(换厂商等于换一家,应删除后重建)
+                  <Input id="provider-name" value={name} disabled />
+                ) : (
+                  <Select
+                    value={code}
+                    onValueChange={(v) => {
+                      const preset = presets.find((p) => p.code === v);
+                      if (preset) {
+                        setCode(preset.code);
+                        setName(preset.name);
+                        setApiUrl(preset.apiUrl);
+                      }
+                    }}
+                  >
+                    <SelectTrigger
+                      id="provider-name"
+                      aria-invalid={submitted && !code}
+                    >
+                      <SelectValue placeholder="选择厂商" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {availablePresets.length === 0 ? (
+                        <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                          已添加全部支持的厂商
+                        </div>
+                      ) : (
+                        availablePresets.map((p) => (
+                          <SelectItem key={p.code} value={p.code}>
+                            {p.name}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                )}
+                <FieldError show={submitted && !code} message="请选择厂商" />
                 <p className="text-xs text-muted-foreground">
-                  系统自动生成,可刷新或复制
+                  仅支持 DeepSeek / 千问 Qwen / 小米 MiMo / 智谱 GLM /
+                  MiniMax,且每家只能添加一次
                 </p>
               </div>
             </div>
@@ -1614,6 +1942,7 @@ function ProviderFormSheet({
                   value={apiUrl}
                   onChange={(e) => setApiUrl(e.target.value)}
                   aria-invalid={submitted && !apiUrl.trim()}
+                  disabled={isEdit}
                 />
                 <FieldError
                   show={submitted && !apiUrl.trim()}
@@ -1738,7 +2067,7 @@ function PromptFormSheet({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-2xl"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
         blockClose={isDirty}
       >
         <SheetHeader className="border-b">

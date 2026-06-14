@@ -58,6 +58,25 @@ pub struct Model {
     pub audio_extracted: Option<bool>,
     /// 素材失败原因(视频 403 / ffmpeg 转码失败等),供前端展示与失败重试判断
     pub media_error: Option<String>,
+    /// 封面本地绝对路径(下载成功后回写):前端本地优先显示,None=未下载/失败回退外链
+    pub cover_path: Option<String>,
+    /// 作者头像本地绝对路径(下载成功/已存在后回写);None=未下载/失败回退外链
+    pub avatar_path: Option<String>,
+    /// 视频转出音频(mp3 等)本地绝对路径;仅「视频 + 音频提取成功」时有值,详情页播放用
+    pub audio_path: Option<String>,
+    /// 视频语音转写文本;仅视频且转写成功时有值,None=未转写/非视频/失败
+    pub transcript: Option<String>,
+    /// 转写失败原因(供前端区分「未转写」与「转写失败」)
+    pub transcript_error: Option<String>,
+    /// 视频文件是否下载成功(仅 video + ai_extract);None=非视频/未尝试
+    pub video_downloaded: Option<bool>,
+    /// 图文图片总数 / 已成功下载数(仅 image);None=非图文
+    pub image_total: Option<i32>,
+    pub image_done: Option<i32>,
+    /// 是否已采集评论(评论采集阶段后回写);None=未到评论阶段/未开评论采集
+    pub comment_collected: Option<bool>,
+    /// 是否已做意向分析(意向分析后回写);None=未分析
+    pub intent_analyzed: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -58,6 +58,13 @@ impl Default for RateLimitConfig {
 pub struct CollectConfig {
     /// 搜索结果页 URL 模板,用 `{keyword}` 占位。多数平台可直接 URL 进搜索页,省去填表单。
     pub search_url_template: String,
+    /// 内容详情页 URL 模板,用 `{id}` 占位(评论采集导航用)。空串表示该平台暂不支持详情页评论采集。
+    #[serde(default)]
+    pub detail_url_template: String,
+    /// 作者主页 URL 模板,用 `{id}` 占位(作者画像补采导航用),小红书另需 `{token}` 占位。
+    /// 空串表示该平台不支持主页画像补采(如抖音/TikTok 搜索响应已含完整画像,无需补采)。
+    #[serde(default)]
+    pub profile_url_template: String,
     /// 需拦截的接口 URL 特征(子串匹配)。页面发出的 fetch/XHR 命中任一即回传 Rust。
     #[serde(default)]
     pub intercept_patterns: Vec<String>,
@@ -73,6 +80,97 @@ pub struct CollectConfig {
     /// (在搜索框逐字输入、点击、等待结果、分段滚动等),更贴近真人行为以降低风控。
     #[serde(default)]
     pub rpa_steps: Vec<RpaStep>,
+    /// 排序方式追加到搜索 URL 的参数名(如抖音 sort_type);空则不加排序参数。
+    #[serde(default)]
+    pub sort_query_key: String,
+    /// sort_mode(synthetic/hottest/latest)→ 该参数值映射。
+    #[serde(default)]
+    pub sort_query_map: BTreeMap<String, String>,
+    /// 发布时间追加到搜索 URL 的参数名(如抖音 publish_time)。
+    #[serde(default)]
+    pub time_query_key: String,
+    /// time_range(any/1d/1w/6m)→ 该参数值映射。
+    #[serde(default)]
+    pub time_query_map: BTreeMap<String, String>,
+    /// 「下一页」按钮文案。分页型结果页(如 B站)滚动不触发翻页,
+    /// 非空时每轮滚动后按文案点击翻页;按钮不存在/置灰时点击为空操作,由停滞判定兜底结束。
+    #[serde(default)]
+    pub next_page_texts: Vec<String>,
+}
+
+/// 登录态真实检测配置。在可见登录窗口内注入自检脚本周期性判断是否真的登录成功:
+/// 命中「已登录」特征 → 实时置账号 active(列表即时变绿);关窗时仍清晰处于「未登录」
+/// (登录 CTA 仍在)→ 置 invalid;检测不确定则回退「关窗即视为已登录」的乐观行为(不误伤)。
+///
+/// ⚠️ 选择器 / 文案为开箱起点,真实页面结构需本机抓包核对后调整(同 search/rpa 待校准点)。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoginCheckConfig {
+    /// 「已登录」DOM 特征选择器:命中任一即视为已登录(如顶栏用户头像)。
+    #[serde(default)]
+    pub logged_in_selectors: Vec<String>,
+    /// 「未登录」按钮文案:页面存在可见、文本等于其一的可点元素即视为未登录(如「登录」)。
+    #[serde(default)]
+    pub logged_out_texts: Vec<String>,
+    /// 非 httpOnly 的登录态 Cookie 名:document.cookie 含任一即视为已登录(辅助信号)。
+    #[serde(default)]
+    pub login_cookie_names: Vec<String>,
+}
+
+impl LoginCheckConfig {
+    /// 是否配置了任何检测信号;全空时跳过真实检测,沿用乐观行为。
+    pub fn is_enabled(&self) -> bool {
+        !self.logged_in_selectors.is_empty()
+            || !self.logged_out_texts.is_empty()
+            || !self.login_cookie_names.is_empty()
+    }
+}
+
+/// 各平台内置登录检测配置(开箱起点)。登录 CTA 文案在中文平台间通用,
+/// 海外平台(TikTok / YouTube)追加英文文案;「已登录」头像选择器尽量宽松地
+/// 匹配顶栏头像;均需本机核对。
+fn builtin_login_check(platform_id: &str) -> LoginCheckConfig {
+    // 顶栏头像类元素(各平台命名不一,广撒网;含 data-e2e 与 class 含 avatar)
+    let mut logged_in_selectors: Vec<String> = [
+        "[data-e2e=\"live-avatar\"]",
+        "[data-e2e=\"user-info\"]",
+        ".avatar img",
+        ".user-avatar img",
+        "img[class*=\"avatar\" i]",
+        "[class*=\"avatar\" i] img",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // 未登录时页面会出现明显的登录入口文案
+    let mut logged_out_texts: Vec<String> = [
+        "登录",
+        "登录/注册",
+        "立即登录",
+        "扫码登录",
+        "手机号登录",
+        "登录抖音",
+        "登录小红书",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match platform_id {
+        "tiktok" => {
+            logged_out_texts.extend(["Log in", "Log in to TikTok"].map(String::from));
+        }
+        "youtube" => {
+            // YouTube 顶栏已登录头像按钮有稳定 id
+            logged_in_selectors.push("button#avatar-btn".into());
+            logged_out_texts.extend(["Sign in", "登录"].map(String::from));
+        }
+        _ => {}
+    }
+    LoginCheckConfig {
+        logged_in_selectors,
+        logged_out_texts,
+        // 默认不依赖 Cookie(关键登录态多为 httpOnly 不可读);需要时按本机抓包补充
+        login_cookie_names: Vec::new(),
+    }
 }
 
 fn default_scroll_rounds() -> u32 {
@@ -158,6 +256,72 @@ fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
     }
 }
 
+/// 内置平台的搜索 URL 排序/时间参数映射(目前仅抖音 URL 直达支持;小红书走 RPA 不经此)。
+/// 真实参数名/值需本机抓包核对(与 search_url / intercept_patterns 同属「骨架待抓包」)。
+fn builtin_search_query(
+    id: &str,
+) -> (String, BTreeMap<String, String>, String, BTreeMap<String, String>) {
+    let pair = |arr: &[(&str, &str)]| -> BTreeMap<String, String> {
+        arr.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    };
+    match id {
+        // 抖音搜索 URL:sort_type 0综合/1最多点赞/2最新;publish_time 0不限/1一天/7一周/180半年
+        "douyin" => (
+            "sort_type".into(),
+            pair(&[("synthetic", "0"), ("hottest", "1"), ("latest", "2")]),
+            "publish_time".into(),
+            pair(&[("any", "0"), ("1d", "1"), ("1w", "7"), ("6m", "180")]),
+        ),
+        // B站搜索 URL:order totalrank综合/click最多播放/pubdate最新发布;
+        // 时间筛选走 pubtime_begin_s/end_s 绝对时间戳,静态映射表达不了,留空不支持
+        "bilibili" => (
+            "order".into(),
+            pair(&[("synthetic", "totalrank"), ("hottest", "click"), ("latest", "pubdate")]),
+            String::new(),
+            BTreeMap::new(),
+        ),
+        _ => (String::new(), BTreeMap::new(), String::new(), BTreeMap::new()),
+    }
+}
+
+/// 各平台「下一页」按钮文案(分页型结果页专用)。无限滚动平台返回空。
+fn builtin_next_page_texts(id: &str) -> Vec<String> {
+    match id {
+        // B站搜索结果页是分页按钮而非无限滚动,滚动后需点「下一页」才请求下一页数据
+        "bilibili" => vec!["下一页".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// 各平台作者主页 URL 模板(画像补采导航用),`{id}`=作者 uid,`{token}`=鉴权 token。
+/// 仅「搜索响应缺画像」的平台需要:抖音/TikTok 搜索已含完整画像,返回空表示不支持补采。
+fn builtin_profile_url(id: &str) -> &'static str {
+    match id {
+        // 小红书主页需 xsec_token(由最近一条该作者内容的 author_xsec_token 提供)
+        "xhs" => "https://www.xiaohongshu.com/user/profile/{id}?xsec_token={token}&xsec_source=pc_search",
+        "kuaishou" => "https://www.kuaishou.com/profile/{id}",
+        "bilibili" => "https://space.bilibili.com/{id}",
+        "youtube" => "https://www.youtube.com/channel/{id}",
+        _ => "",
+    }
+}
+
+/// 各平台作者主页画像接口拦截特征(并入该平台 intercept_patterns)。
+/// 主页自己请求的用户信息接口,命中后由适配器 parse_profile 解析为画像。
+fn builtin_profile_patterns(id: &str) -> Vec<&'static str> {
+    match id {
+        // 小红书:主页加载时请求用户基础信息(粉丝/关注/获赞在 interactions)
+        "xhs" => vec!["/api/sns/web/v1/user/otherinfo"],
+        // 快手:主页画像走 GraphQL(visionProfile);/graphql 已在搜索特征里,无需重复
+        "kuaishou" => Vec::new(),
+        // B站:空间页请求名片接口(粉丝在 card.fans / 关注 card.friend)
+        "bilibili" => vec!["/x/web-interface/card"],
+        // YouTube:频道页走 InnerTube browse(订阅数在 header)
+        "youtube" => vec!["/youtubei/v1/browse"],
+        _ => Vec::new(),
+    }
+}
+
 /// 单个平台的完整配置。新增平台 = 往 `platforms` 里加一项 + 注册同名适配器。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformConfig {
@@ -176,6 +340,9 @@ pub struct PlatformConfig {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub collect: CollectConfig,
+    /// 登录态真实检测配置(登录窗口内自检);全空则跳过检测、沿用乐观行为。
+    #[serde(default)]
+    pub login_check: LoginCheckConfig,
     /// 平台特有的扩展配置,适配器自行解释,核心层不感知。
     #[serde(default)]
     pub extra: serde_json::Value,
@@ -204,6 +371,8 @@ fn default_batch_size() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaConfig {
     /// 是否启用视频转音频。
+    /// **已废弃**:视频是否转音频现由任务级 `ai_extract`(AI 文案提取)控制,
+    /// 本字段不再被 media::process_content 读取,仅为兼容旧配置文件保留。
     pub enable_audio_extract: bool,
     /// ffmpeg 可执行文件路径;为空时按 sidecar / 系统 PATH 查找。
     pub ffmpeg_path: Option<String>,
@@ -223,6 +392,36 @@ impl Default for MediaConfig {
             output_dir: "media".to_string(),
         }
     }
+}
+
+/// 评论意向分析配置(系统设置「意向分析」)。只存对 providers/prompts 表的 id 引用 +
+/// 模型名 + 批大小;api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommentIntentConfig {
+    /// 模型厂商 id(providers.id 逻辑引用),空表示未配置。
+    #[serde(default)]
+    pub provider_id: String,
+    /// 所选模型(provider.models 之一)。
+    #[serde(default)]
+    pub model: String,
+    /// 提示词 id(prompts.id 逻辑引用)。
+    #[serde(default)]
+    pub prompt_id: String,
+    /// 单批送入大模型的评论条数;<=0 时调用方回退默认值。
+    #[serde(default)]
+    pub batch_size: i32,
+}
+
+/// 语音转写配置(系统设置「语音转写」)。只存 providers 表 id 引用 + 模型名;
+/// api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。目前仅支持 ASR 的厂商(小米 MiMo)。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TranscriptionConfig {
+    /// 模型厂商 id(providers.id 逻辑引用),空表示未配置。
+    #[serde(default)]
+    pub provider_id: String,
+    /// 所选 ASR 模型(provider.models 之一,如 mimo-v2.5-asr)。
+    #[serde(default)]
+    pub model: String,
 }
 
 /// 数据库配置。运行时二选一:连接串决定后端(SQLite / PostgreSQL)。
@@ -261,6 +460,10 @@ pub struct AppConfig {
     pub report: ReportConfig,
     #[serde(default)]
     pub media: MediaConfig,
+    #[serde(default)]
+    pub intent: CommentIntentConfig,
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
 }
 
 impl AppConfig {
@@ -272,8 +475,11 @@ impl AppConfig {
             return Ok(Self::builtin_default());
         }
         let text = std::fs::read_to_string(&path)?;
-        let cfg: AppConfig = serde_json::from_str(&text)
+        let mut cfg: AppConfig = serde_json::from_str(&text)
             .map_err(|e| CrawlerError::Config(format!("解析 {CONFIG_FILE_NAME} 失败: {e}")))?;
+        // 兼容旧配置文件:补全内置平台后续新增的关键字段(detail_url_template / 内置拦截特征)。
+        // 「文件已存在则只读文件」会让老用户拿不到新增的内置配置(如评论采集所需),这里启动时补齐。
+        cfg.merge_builtin_platform_defaults();
         Ok(cfg)
     }
 
@@ -305,33 +511,144 @@ impl AppConfig {
         self.platforms.remove(id).is_some()
     }
 
+    /// 用内置默认补全已有平台缺失的关键字段。只补不覆盖用户自定义:
+    /// detail_url_template 仅在为空时填;intercept_patterns 并入内置缺失项(去重,保留用户已加的)。
+    /// 这样新增内置配置字段对老配置文件也即时生效,无需用户删档重建。
+    fn merge_builtin_platform_defaults(&mut self) {
+        let builtin = Self::builtin_default();
+        for (id, bp) in builtin.platforms {
+            let Some(p) = self.platforms.get_mut(&id) else {
+                // 缺失的内置平台整条补回,保证内置平台始终开箱可用
+                // (被删 / 配置被清空后,启动即恢复;老用户升级后也能直接拿到新增的内置平台)。
+                self.platforms.insert(id, bp);
+                continue;
+            };
+            // 已有平台:补全缺失的关键字段(不覆盖用户已自定义的值)
+            if p.name.is_empty() {
+                p.name = bp.name.clone();
+            }
+            if p.login_url.is_empty() {
+                p.login_url = bp.login_url.clone();
+            }
+            if p.collect.detail_url_template.is_empty() {
+                p.collect.detail_url_template = bp.collect.detail_url_template.clone();
+            }
+            if p.collect.profile_url_template.is_empty() {
+                p.collect.profile_url_template = bp.collect.profile_url_template.clone();
+            }
+            for pat in &bp.collect.intercept_patterns {
+                if !p.collect.intercept_patterns.contains(pat) {
+                    p.collect.intercept_patterns.push(pat.clone());
+                }
+            }
+            // 补全搜索 URL 排序/时间参数映射(老配置缺失时)
+            if p.collect.sort_query_key.is_empty() {
+                p.collect.sort_query_key = bp.collect.sort_query_key.clone();
+            }
+            if p.collect.sort_query_map.is_empty() {
+                p.collect.sort_query_map = bp.collect.sort_query_map.clone();
+            }
+            if p.collect.time_query_key.is_empty() {
+                p.collect.time_query_key = bp.collect.time_query_key.clone();
+            }
+            if p.collect.time_query_map.is_empty() {
+                p.collect.time_query_map = bp.collect.time_query_map.clone();
+            }
+            if p.collect.next_page_texts.is_empty() {
+                p.collect.next_page_texts = bp.collect.next_page_texts.clone();
+            }
+        }
+    }
+
     /// 内置三平台骨架配置。仅为开箱即用的起点,具体接口/签名在阶段1、2 完善。
     fn builtin_default() -> Self {
         let mut platforms = BTreeMap::new();
         // 搜索 URL 模板与拦截特征为「开箱起点」,真实路径需本机 `bun tauri dev` 抓包核对后调整
-        for (id, name, login_url, search_url, patterns) in [
+        for (id, name, login_url, search_url, detail_url, patterns) in [
             (
                 "douyin",
                 "抖音",
                 "https://www.douyin.com/",
                 "https://www.douyin.com/search/{keyword}",
-                vec!["/aweme/v1/web/general/search/", "/aweme/v1/web/search/item/"],
+                // 详情页 URL 模板,{id}=aweme_id,评论采集导航用;真实路径需本机抓包核对
+                "https://www.douyin.com/video/{id}",
+                vec![
+                    "/aweme/v1/web/general/search/",
+                    "/aweme/v1/web/search/item/",
+                    // 一级评论接口;真实路径需本机抓包核对
+                    "/aweme/v1/web/comment/list/",
+                ],
             ),
             (
                 "xhs",
                 "小红书",
                 "https://www.xiaohongshu.com/",
                 "https://www.xiaohongshu.com/search_result?keyword={keyword}",
-                vec!["/api/sns/web/v1/search/notes"],
+                // 笔记详情页:{id}=note_id,{token}=xsec_token(详情页鉴权必需);真实格式需抓包核对
+                "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_search",
+                vec![
+                    "/api/sns/web/v1/search/notes",
+                    // 一级评论接口;真实路径需抓包核对
+                    "/api/sns/web/v2/comment/page",
+                ],
             ),
             (
                 "kuaishou",
                 "快手",
                 "https://www.kuaishou.com/",
                 "https://www.kuaishou.com/search/video?searchKey={keyword}",
-                vec!["/graphql"],
+                // 详情页:{id}=photoId,评论采集导航用;真实路径需本机抓包核对
+                "https://www.kuaishou.com/short-video/{id}",
+                // 快手 Web 搜索实测走 REST(POST /rest/v/search/feed,feeds 在响应根级),
+                // 不是 GraphQL。两者都拦:搜索命中 REST,评论若仍走 graphql 也能拦到,
+                // 适配器按响应体字段(feeds / visionCommentList)区分。评论真实路径待抓包核对。
+                vec!["/rest/v/search/feed", "/graphql"],
+            ),
+            (
+                "bilibili",
+                "B站",
+                "https://www.bilibili.com/",
+                // 视频 tab(只出视频,解析最干净);搜索页为分页按钮,翻页靠 next_page_texts 点击
+                "https://search.bilibili.com/video?keyword={keyword}",
+                // 详情页:{id}=bvid,评论采集导航用
+                "https://www.bilibili.com/video/{id}",
+                // 搜索前缀同时覆盖 wbi/search/type(视频 tab)与 wbi/search/all/v2(综合 tab);
+                // /x/v2/reply 前缀覆盖评论的 wbi/main 与旧 main 变体。真实路径需本机抓包核对
+                vec!["/x/web-interface/wbi/search/", "/x/web-interface/search/", "/x/v2/reply"],
+            ),
+            (
+                "tiktok",
+                "TikTok",
+                "https://www.tiktok.com/",
+                "https://www.tiktok.com/search?q={keyword}",
+                // 详情页:用户名段填占位 `_`,TikTok 会按视频 id 重定向到规范地址;需本机核对
+                "https://www.tiktok.com/@_/video/{id}",
+                // 综合搜索 + 视频 tab 搜索 + 评论;接口结构与抖音同源(aweme 体系)。
+                // ⚠️ 大陆网络访问不了 TikTok,需本机代理可用
+                vec!["/api/search/general/full/", "/api/search/item/full/", "/api/comment/list/"],
+            ),
+            (
+                "youtube",
+                "YouTube",
+                "https://www.youtube.com/",
+                "https://www.youtube.com/results?search_query={keyword}",
+                "https://www.youtube.com/watch?v={id}",
+                // InnerTube:搜索分页走 /youtubei/v1/search,评论随观看页走 /youtubei/v1/next。
+                // ⚠️ 首屏结果内嵌在页面 ytInitialData 不走 XHR,首批 ~20 条采不到(滚动分页可采);
+                // 排序参数是 protobuf 编码的 sp=,静态映射表达不了,留空。需本机代理可用
+                vec!["/youtubei/v1/search", "/youtubei/v1/next"],
             ),
         ] {
+            let (sort_query_key, sort_query_map, time_query_key, time_query_map) =
+                builtin_search_query(id);
+            // 搜索/评论拦截特征 + 画像接口特征合并(去重),作者补采复用同一套拦截
+            let mut all_patterns: Vec<String> =
+                patterns.into_iter().map(str::to_string).collect();
+            for p in builtin_profile_patterns(id) {
+                if !all_patterns.iter().any(|x| x == p) {
+                    all_patterns.push(p.to_string());
+                }
+            }
             platforms.insert(
                 id.to_string(),
                 PlatformConfig {
@@ -343,16 +660,21 @@ impl AppConfig {
                     rate_limit: RateLimitConfig::default(),
                     collect: CollectConfig {
                         search_url_template: search_url.to_string(),
-                        intercept_patterns: patterns
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect(),
+                        detail_url_template: detail_url.to_string(),
+                        profile_url_template: builtin_profile_url(id).to_string(),
+                        intercept_patterns: all_patterns,
                         rpa_script: None,
                         scroll_rounds: DEFAULT_SCROLL_ROUNDS,
                         scroll_interval_ms: DEFAULT_SCROLL_INTERVAL_MS,
                         // 节点级拟人步骤:小红书已填 v0 起点,其余平台留空走内置滚动逻辑
                         rpa_steps: default_rpa_steps(id),
+                        sort_query_key,
+                        sort_query_map,
+                        time_query_key,
+                        time_query_map,
+                        next_page_texts: builtin_next_page_texts(id),
                     },
+                    login_check: builtin_login_check(id),
                     extra: serde_json::Value::Null,
                 },
             );
@@ -362,6 +684,8 @@ impl AppConfig {
             database: DatabaseConfig::default(),
             report: ReportConfig::default(),
             media: MediaConfig::default(),
+            intent: CommentIntentConfig::default(),
+            transcription: TranscriptionConfig::default(),
         }
     }
 }

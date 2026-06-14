@@ -118,7 +118,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   // 导出管理员账号信息为 txt(用 Tauri 保存对话框选路径 + 后端写文件,WebView 不支持 blob 下载)
   async function downloadAccountInfo() {
     const content = [
-      "Veltrix 协作平台 配置管理员账号信息",
+      "VeltrixLoop 配置管理员账号信息",
       "----------------------------------",
       `账号:     ${username}`,
       `昵称:     ${nickname}`,
@@ -215,7 +215,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
             <Radar className="size-5" />
           </div>
           <div className="leading-tight">
-            <div className="font-semibold">Veltrix 协作平台</div>
+            <div className="font-semibold">VeltrixLoop</div>
             <div className="text-xs text-muted-foreground">首次启动 · 初始化</div>
           </div>
         </div>

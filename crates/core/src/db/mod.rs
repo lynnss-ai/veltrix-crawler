@@ -112,12 +112,29 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::industry::Entity, "industries").await?;
     create_table(db, &schema, entity::keyword::Entity, "keywords").await?;
     create_table(db, &schema, entity::customer::Entity, "customers").await?;
-    create_table(db, &schema, entity::platform_api::Entity, "platform_apis").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
     create_table(db, &schema, entity::task::Entity, "tasks").await?;
     create_table(db, &schema, entity::content::Entity, "contents").await?;
     create_table(db, &schema, entity::comment::Entity, "comments").await?;
+    create_table(db, &schema, entity::collect_log::Entity, "collect_logs").await?;
+    create_table(db, &schema, entity::task_run::Entity, "task_runs").await?;
+    create_table(
+        db,
+        &schema,
+        entity::content_synced_user::Entity,
+        "content_synced_users",
+    )
+    .await?;
+    create_table(db, &schema, entity::author::Entity, "authors").await?;
+    create_table(
+        db,
+        &schema,
+        entity::chat_conversation::Entity,
+        "chat_conversations",
+    )
+    .await?;
+    create_table(db, &schema, entity::chat_message::Entity, "chat_messages").await?;
 
     // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
@@ -192,6 +209,16 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("media_status", "ALTER TABLE contents ADD COLUMN media_status TEXT"),
         ("audio_extracted", "ALTER TABLE contents ADD COLUMN audio_extracted BOOLEAN"),
         ("media_error", "ALTER TABLE contents ADD COLUMN media_error TEXT"),
+        ("cover_path", "ALTER TABLE contents ADD COLUMN cover_path TEXT"),
+        ("avatar_path", "ALTER TABLE contents ADD COLUMN avatar_path TEXT"),
+        ("audio_path", "ALTER TABLE contents ADD COLUMN audio_path TEXT"),
+        ("transcript", "ALTER TABLE contents ADD COLUMN transcript TEXT"),
+        ("transcript_error", "ALTER TABLE contents ADD COLUMN transcript_error TEXT"),
+        ("video_downloaded", "ALTER TABLE contents ADD COLUMN video_downloaded BOOLEAN"),
+        ("image_total", "ALTER TABLE contents ADD COLUMN image_total INTEGER"),
+        ("image_done", "ALTER TABLE contents ADD COLUMN image_done INTEGER"),
+        ("comment_collected", "ALTER TABLE contents ADD COLUMN comment_collected BOOLEAN"),
+        ("intent_analyzed", "ALTER TABLE contents ADD COLUMN intent_analyzed BOOLEAN"),
     ] {
         if !column_exists(db, "contents", col).await {
             if let Err(e) = db
@@ -203,6 +230,73 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 兼容已建的 tasks 表:补素材下载进度列(采集完成 → downloading_media 阶段统计)。
+    // NOT NULL DEFAULT 0,旧行回填 0,语义为「无素材待下载」。
+    for (col, ddl) in [
+        ("media_total", "ALTER TABLE tasks ADD COLUMN media_total INTEGER NOT NULL DEFAULT 0"),
+        ("media_done", "ALTER TABLE tasks ADD COLUMN media_done INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !column_exists(db, "tasks", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER tasks.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 tasks 表:补评论采集列(开关 / 过滤参数 / 评论采集阶段进度)。
+    // 布尔与整数 NOT NULL DEFAULT 0,文本默认 'any'(不限),旧行回填默认值语义为「未开评论采集」。
+    for (col, ddl) in [
+        ("collect_comments", "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT 0"),
+        ("comment_time_range", "ALTER TABLE tasks ADD COLUMN comment_time_range TEXT NOT NULL DEFAULT 'any'"),
+        ("comment_limit", "ALTER TABLE tasks ADD COLUMN comment_limit INTEGER NOT NULL DEFAULT 0"),
+        ("analyze_comment_intent", "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT 0"),
+        ("comment_video_total", "ALTER TABLE tasks ADD COLUMN comment_video_total INTEGER NOT NULL DEFAULT 0"),
+        ("comment_video_done", "ALTER TABLE tasks ADD COLUMN comment_video_done INTEGER NOT NULL DEFAULT 0"),
+        ("archived", "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"),
+        ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT 0"),
+    ] {
+        if !column_exists(db, "tasks", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER tasks.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 comments 表:补意向分析列(AI 标注,可空,旧行 None=未分析)
+    for (col, ddl) in [
+        ("intent_level", "ALTER TABLE comments ADD COLUMN intent_level TEXT"),
+        ("intent_reason", "ALTER TABLE comments ADD COLUMN intent_reason TEXT"),
+    ] {
+        if !column_exists(db, "comments", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER comments.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 users 表:补 Obsidian vault 路径列(每用户各自配置,空=未配置)
+    if !column_exists(db, "users", "obsidian_vault_path").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE users ADD COLUMN obsidian_vault_path TEXT NOT NULL DEFAULT ''"
+                    .to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER users.obsidian_vault_path 失败(忽略): {e}");
+        }
+    }
+
     // 二级索引:覆盖高频查询字段。CREATE INDEX IF NOT EXISTS 跨 SQLite/PG 通用,重启无副作用。
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_accounts_platform_last_used ON accounts(platform, last_used_at)",
@@ -211,11 +305,27 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
         "CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(owner)",
         "CREATE INDEX IF NOT EXISTS idx_keywords_industry ON keywords(industry_id)",
-        "CREATE INDEX IF NOT EXISTS idx_platform_apis_platform ON platform_apis(platform_id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)",
         "CREATE INDEX IF NOT EXISTS idx_contents_task ON contents(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_comments_content ON comments(content_id)",
+        "CREATE INDEX IF NOT EXISTS idx_collect_logs_task ON collect_logs(task_id, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_content_synced_users_user ON content_synced_users(synced_user)",
+        "CREATE INDEX IF NOT EXISTS idx_content_synced_users_content ON content_synced_users(content_id)",
+        "CREATE INDEX IF NOT EXISTS idx_authors_owner ON authors(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_authors_platform_uid ON authors(platform, uid)",
+        "CREATE INDEX IF NOT EXISTS idx_authors_monitored ON authors(is_monitored)",
+        // 复合索引:全量库/评论库按 owner 过滤 + collected_at 倒序的列表与趋势查询,
+        // 以及内容详情的作者维度聚合(owner+platform+author_uid)、意向客资筛选(intent_level)。
+        // 大库(十万行级)下这些查询无索引会退化为全表扫描 + 文件排序。
+        "CREATE INDEX IF NOT EXISTS idx_contents_owner_collected ON contents(owner, collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_contents_collected ON contents(collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_contents_owner_platform_author ON contents(owner, platform, author_uid)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_owner_collected ON comments(owner, collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_collected ON comments(collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_comments_intent ON comments(intent_level)",
+        "CREATE INDEX IF NOT EXISTS idx_chat_conversations_owner ON chat_conversations(owner, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id)",
     ] {
         if let Err(e) = db
             .execute(Statement::from_string(backend, ddl.to_owned()))

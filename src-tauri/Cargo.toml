@@ -1,6 +1,6 @@
 [package]
 name = "veltrix-crawler"
-version = "0.1.0"
+version = "1.0.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -20,9 +20,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # 抽出的不依赖 Tauri 的共享后端库(配置 / 错误 / 数据库 / HTTP API)
 veltrix-core = { path = "../crates/core" }
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# 自动更新:启动/手动检查 GitHub Releases 的 latest.json,验签后下载安装
+tauri-plugin-updater = "2"
+# relaunch:更新安装后重启应用
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 异步运行时:采集调度与并发请求依赖 tokio
@@ -70,6 +74,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+# 语音转写:把本地音频读出后 base64 内联进 MiMo input_audio 请求体
+base64 = "0.22"
 
 # Windows 真实滚轮:WebView2 窗口化宿主没有 SendMouseInput(那是合成宿主才有),
 # 改用 PostMessage WM_MOUSEWHEEL 给渲染子窗口投递真实滚轮消息触发懒加载;
@@ -83,4 +89,27 @@ windows = { version = "0.61", features = [
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"
+
+# macOS WKWebView 原生网络拦截 + 账号隔离:用 WKScriptMessageHandler 把页面 hook 到的
+# 接口响应直接回传 Rust(等价于 Windows 的 WebResourceResponseReceived),不走 Tauri invoke,
+# 规避外部页面 IPC 权限/注入时序问题。版本与 wry / tauri 内部 objc2 对齐,避免类型冲突。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# block2:WKWebsiteDataStore 清数据等异步方法的 completion handler 需要 block
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSDate",
+    "NSSet",
+    "NSUUID",
+] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "WKUserContentController",
+    "WKScriptMessage",
+    "WKScriptMessageHandler",
+    # 按 data_store_identifier 清空某账号登录态(对应 Windows 删数据目录)
+    "WKWebsiteDataStore",
+] }
 

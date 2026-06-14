@@ -2,13 +2,13 @@
 //!
 //! 解析网页搜索接口 `/aweme/v1/web/general/search/single/` 的响应:
 //! 响应体 `data` 数组每项含 `aweme_info`(视频/图文详情),抽取为统一 Content 模型。
-//! 搜索接口本身不含评论,故 comments 恒为空,评论需后续走专门的评论接口采集。
+//! 评论走独立的一级评论接口 `/aweme/v1/web/comment/list/`,由 `TaskKind::Comments` 分流解析(只采一级)。
 //!
 //! 解析全程用 `serde_json::Value` 按需取值(而非强类型反序列化),
 //! 任一字段缺失/改名只丢该字段,不会拖垮整条乃至整批解析。
 
 use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
-use crate::model::{Author, Content, ContentKind, Stats, TaskKind};
+use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
@@ -17,6 +17,8 @@ use veltrix_core::error::Result;
 const PLATFORM_ID: &str = "douyin";
 /// 搜索接口 URL 特征,与平台配置 intercept_patterns 对应。
 const SEARCH_PATH: &str = "/aweme/v1/web/general/search/";
+/// 一级评论接口 URL 特征,与平台配置 intercept_patterns 对应。
+const COMMENT_PATH: &str = "/aweme/v1/web/comment/list/";
 
 #[derive(Default)]
 pub struct DouyinAdapter;
@@ -155,6 +157,9 @@ impl DouyinAdapter {
             extra: serde_json::json!({
                 "unique_id": a.get("unique_id").and_then(Value::as_str),
                 "uid": a.get("uid").and_then(Value::as_str),
+                // 属地 / 作者获赞总数:搜索响应若带则存,供内容详情展示(缺失为 null)
+                "ip_location": a.get("ip_location").and_then(Value::as_str),
+                "total_favorited": a.get("total_favorited").and_then(Value::as_i64),
             }),
         }
     }
@@ -217,24 +222,48 @@ impl DouyinAdapter {
             "aweme_type": info.get("aweme_type").and_then(Value::as_i64),
         })
     }
-}
 
-#[async_trait]
-impl PlatformAdapter for DouyinAdapter {
-    fn id(&self) -> &str {
-        PLATFORM_ID
+    /// 把单条评论解析为 Comment;缺 cid 视为无效返回 None。本期只采一级评论,parent_id 恒为 None。
+    fn parse_comment(item: &Value, collected_at: i64) -> Option<Comment> {
+        let comment_id = item.get("cid").and_then(Value::as_str)?.to_string();
+        if comment_id.is_empty() {
+            return None;
+        }
+        // 评论自带所属 aweme_id;缺失时留空,落库仍可按 comment_id 去重
+        let content_id = item
+            .get("aweme_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Some(Comment {
+            platform: PLATFORM_ID.to_string(),
+            content_id,
+            comment_id,
+            parent_id: None,
+            author: Self::parse_author(item.get("user")),
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            like_count: item.get("digg_count").and_then(Value::as_i64),
+            reply_count: item.get("reply_comment_total").and_then(Value::as_i64),
+            created_at: item.get("create_time").and_then(Value::as_i64),
+            collected_at,
+            // 保留 IP 属地等少量平台特有字段,便于后续意图分析
+            extra: serde_json::json!({
+                "ip_label": item.get("ip_label").and_then(Value::as_str),
+            }),
+        })
     }
 
-    fn supports(&self, kind: &TaskKind) -> bool {
-        matches!(kind, TaskKind::Search)
-    }
-
-    async fn parse(&self, _kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
+    /// 解析搜索接口响应为内容列表(comments 恒空)。
+    fn parse_search(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
         let mut contents = Vec::new();
 
         for resp in &ctx.responses {
-            // 只认搜索接口;其余命中的接口结构不同,跳过不报错
+            // 只认搜索接口;其余命中的接口(如评论)结构不同,跳过不报错
             if !resp.url.contains(SEARCH_PATH) {
                 continue;
             }
@@ -259,9 +288,60 @@ impl PlatformAdapter for DouyinAdapter {
             }
         }
 
-        Ok(FetchOutput {
+        FetchOutput {
             contents,
             comments: Vec::new(),
-        })
+            authors: Vec::new(),
+        }
+    }
+
+    /// 解析一级评论接口响应为评论列表(contents 恒空)。
+    /// 只取一级评论接口,排除 URL 含 `reply` 的二级回复接口(本期只采一级)。
+    fn parse_comments(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut comments = Vec::new();
+
+        for resp in &ctx.responses {
+            if !resp.url.contains(COMMENT_PATH) || resp.url.contains("reply") {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(items) = root.get("comments").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                if let Some(comment) = Self::parse_comment(item, collected_at) {
+                    comments.push(comment);
+                }
+            }
+        }
+
+        FetchOutput {
+            contents: Vec::new(),
+            comments,
+            authors: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformAdapter for DouyinAdapter {
+    fn id(&self) -> &str {
+        PLATFORM_ID
+    }
+
+    fn supports(&self, kind: &TaskKind) -> bool {
+        matches!(kind, TaskKind::Search | TaskKind::Comments)
+    }
+
+    async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
+        // 按任务类型分流:评论任务解析一级评论,其余按搜索内容解析
+        let output = match kind {
+            TaskKind::Comments => Self::parse_comments(ctx),
+            _ => Self::parse_search(ctx),
+        };
+        Ok(output)
     }
 }

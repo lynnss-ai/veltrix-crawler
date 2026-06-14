@@ -8,21 +8,25 @@ import {
 } from "@/components/app-sidebar";
 import { type RemoteStatus } from "@/components/RemoteConnect";
 import { api, type UserView } from "@/lib/api";
-import { SiteHeader } from "@/components/site-header";
 import { TitleBar } from "@/components/TitleBar";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { CollectPage } from "@/pages/CollectPage";
 import { AccountsPage } from "@/pages/AccountsPage";
-import { PlatformsPage } from "@/pages/PlatformsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
 import { CustomersPage } from "@/pages/CustomersPage";
+import { AuthorLibraryPage } from "@/pages/AuthorLibraryPage";
+import { ChatPage } from "@/pages/ChatPage";
+import { ChatProvider } from "@/components/chat-context";
 import { ContentLibraryPage } from "@/pages/ContentLibraryPage";
+import { CommentLibraryPage } from "@/pages/CommentLibraryPage";
 import { UsersPage } from "@/pages/UsersPage";
 import { PlaceholderPage } from "@/pages/PlaceholderPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { SetupWizard } from "@/pages/SetupWizard";
+import { checkForUpdate, currentVersion } from "@/lib/updater";
 
 // 登录态持久化键:桌面端走 IPC、不发 token,登录用户存 localStorage,刷新 / 重开免登录
 const AUTH_STORAGE_KEY = "veltrix.auth.user";
@@ -47,8 +51,6 @@ function renderPage(active: PageKey, currentUser: string): ReactNode {
       return <CollectPage />;
     case "accounts":
       return <AccountsPage currentUser={currentUser} />;
-    case "platforms":
-      return <PlatformsPage />;
     case "system-config":
       return <SettingsPage />;
     case "users":
@@ -58,19 +60,7 @@ function renderPage(active: PageKey, currentUser: string): ReactNode {
     case "customers":
       return <CustomersPage currentUser={currentUser} />;
     case "chat-sessions":
-      return (
-        <PlaceholderPage
-          title="会话"
-          description="对话模块建设中。后续接入 AI 会话与历史记录。"
-        />
-      );
-    case "chat-assistant":
-      return (
-        <PlaceholderPage
-          title="智能助手"
-          description="对话模块建设中。后续接入智能助手与多轮问答。"
-        />
-      );
+      return <ChatPage />;
     case "cowork-space":
       return (
         <PlaceholderPage
@@ -85,12 +75,30 @@ function renderPage(active: PageKey, currentUser: string): ReactNode {
           description="协作模块建设中。后续接入成员与权限管理。"
         />
       );
+    // 三个库共用组件,必须用 key 强制各自独立挂载:
+    // 否则路由切换时 React 复用实例,上一个库的筛选/视图状态会带到下一个库
     case "assets-all":
-      return <ContentLibraryPage title="全量库" />;
+      return <ContentLibraryPage key="assets-all" title="全量库" />;
     case "assets-content":
-      return <ContentLibraryPage title="内容库" />;
+      return (
+        <ContentLibraryPage
+          key="assets-content"
+          title="内容库"
+          kindFilter="video"
+        />
+      );
     case "assets-image":
-      return <ContentLibraryPage title="图片库" onlyImages />;
+      return (
+        <ContentLibraryPage
+          key="assets-image"
+          title="图片库"
+          kindFilter="image"
+        />
+      );
+    case "assets-comment":
+      return <CommentLibraryPage />;
+    case "assets-author":
+      return <AuthorLibraryPage />;
     default:
       return null;
   }
@@ -139,6 +147,7 @@ function App() {
   }
   // 远程上报连接状态;后端 RemoteConfig 上报模块就绪前先占位为未连接
   const [remoteStatus] = useState<RemoteStatus>("disconnected");
+  const [appVersion, setAppVersion] = useState("");
 
   // 侧栏按窗口宽度自动展开/收起:窄屏(<1024px) 收起腾出表格空间;用户可手动覆盖
   const [sidebarOpen, setSidebarOpen] = useState(
@@ -160,8 +169,27 @@ function App() {
       .catch(() => setBootState("login"));
   }, []);
 
-  // 启动恢复登录态:从 storage 恢复出用户时,先同步后端当前用户再放行页面渲染;
-  // 无恢复用户(走登录 / 向导)则直接视为就绪,不阻塞登录页
+  // 启动后台静默检查软件更新(延迟 5s 避免与启动请求争抢);有新版弹原生确认框
+  useEffect(() => {
+    currentVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+    const timer = setTimeout(() => {
+      void checkForUpdate(true);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // 窗口启动隐藏(tauri.conf visible:false)以避免白屏,首帧渲染后再显示
+  useEffect(() => {
+    getCurrentWindow()
+      .show()
+      .catch(() => {});
+  }, []);
+
+  // 启动恢复登录态:先向后端校验该用户在数据库中仍存在且启用(清库 / 删用户 / 禁用后
+  // localStorage 里的旧登录态必须作废,否则会以幽灵身份进入主界面),有效才同步后端会话。
+  // 校验同时取回最新 dataScope,管理员改过权限也即时生效。
   useEffect(() => {
     const restored = loadStoredUser();
     if (!restored) {
@@ -169,9 +197,20 @@ function App() {
       return;
     }
     api
-      .setCurrentUser(restored.username, restored.dataScope)
-      .then(() => setSessionReady(true))
-      // 同步失败也放行(页面会在缺过滤上下文下退化为全部可见),避免卡死在加载页
+      .verifySessionUser(restored.username)
+      .then(async (scope) => {
+        if (scope == null) {
+          // 用户已不存在:作废本地登录态,回到登录页 / 初始化向导
+          localStorage.removeItem(AUTH_STORAGE_KEY);
+          sessionStorage.removeItem(AUTH_STORAGE_KEY);
+          setLoggedUser(null);
+          setSessionReady(true);
+          return;
+        }
+        await api.setCurrentUser(restored.username, scope);
+        setSessionReady(true);
+      })
+      // 校验异常(非 Tauri 调试环境等)放行,避免卡死在加载页
       .catch(() => setSessionReady(true));
     // 仅挂载时执行一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -201,6 +240,7 @@ function App() {
     showSidebarTrigger = true;
     const breadcrumb = getPageBreadcrumb(active);
     body = (
+      <ChatProvider>
       <SidebarProvider
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
@@ -217,16 +257,32 @@ function App() {
         />
         {/* min-w-0 让里面的 DataTable 横向滚动归自己处理,不溢出到窗口 */}
         <SidebarInset className="min-w-0">
-          <SiteHeader
-            group={breadcrumb.group}
-            page={breadcrumb.page}
-            remoteStatus={remoteStatus}
-          />
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
-            {renderPage(active, loggedUser.username)}
-          </div>
+          {/* 对话页整页即会话,不套标题与内边距外层;其余页保留标题 + 留白 */}
+          {active === "chat-sessions" ? (
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+              {renderPage(active, loggedUser.username)}
+            </div>
+          ) : (
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
+              <div className="flex shrink-0 items-center justify-between gap-3">
+                <h1 className="text-xl font-semibold text-foreground">
+                  {breadcrumb.page}
+                </h1>
+                {active === "dashboard" && (
+                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    当前版本
+                    <span className="font-mono font-medium text-foreground">
+                      v{appVersion || "—"}
+                    </span>
+                  </span>
+                )}
+              </div>
+              {renderPage(active, loggedUser.username)}
+            </div>
+          )}
         </SidebarInset>
       </SidebarProvider>
+      </ChatProvider>
     );
   }
 
@@ -240,7 +296,7 @@ function App() {
         showSidebarTrigger={showSidebarTrigger}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((open) => !open)}
-        onOpenSettings={() => setActive("system-config")}
+        remoteStatus={remoteStatus}
       />
       <div className="relative min-h-0 flex-1">{body}</div>
     </div>

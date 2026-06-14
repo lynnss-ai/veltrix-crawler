@@ -24,6 +24,9 @@ pub struct Model {
     pub status: String,
     /// 数据级别:all(全部数据) / self(仅自己)。
     pub data_scope: String,
+    /// 该用户的 Obsidian vault 根路径(每用户各自配置);空=未配置,不能同步
+    #[sea_orm(column_type = "Text")]
+    pub obsidian_vault_path: String,
     pub created_at: i64,
     pub updated_at: i64,
     /// 软删除标记,0 表示未删除。

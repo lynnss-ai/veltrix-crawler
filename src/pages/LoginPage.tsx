@@ -109,7 +109,7 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
             <Radar className="size-5" />
           </div>
           <div className="leading-tight">
-            <div className="font-semibold">Veltrix</div>
+            <div className="font-semibold">VeltrixLoop</div>
             <div className="text-xs text-muted-foreground">协作平台</div>
           </div>
         </div>
@@ -215,7 +215,7 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
         </div>
 
         <div className="text-center text-xs text-muted-foreground">
-          © 2026 Veltrix · 让团队协作更高效
+          © 2026 VeltrixLoop · 让团队协作更高效
         </div>
       </div>
 

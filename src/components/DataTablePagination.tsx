@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/select";
 
 // 表格分页栏(参考 shadcn dashboard-01):已选计数 + 每页行数 + 页码 + 首/上/下/末页。
-const DEFAULT_PAGE_SIZE_OPTIONS = [10, 20, 30, 40, 50];
+const DEFAULT_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
 
 interface DataTablePaginationProps<TData> {
   table: Table<TData>;
@@ -47,7 +47,13 @@ export function DataTablePagination<TData>({
             value={String(pageSize)}
             onValueChange={(v) => table.setPageSize(Number(v))}
           >
-            <SelectTrigger size="sm" id="rows-per-page" className="w-20">
+            {/* data-pagination:让页面级 FORM_CONTROL_SIZING 的 :not 排除它,保持紧凑 h-7 与翻页图标等高 */}
+            <SelectTrigger
+              size="sm"
+              id="rows-per-page"
+              data-pagination="true"
+              className="h-7 w-20"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent side="top">
@@ -59,7 +65,7 @@ export function DataTablePagination<TData>({
             </SelectContent>
           </Select>
         </div>
-        <div className="flex w-fit items-center justify-center text-sm font-medium">
+        <div className="flex h-7 w-fit items-center justify-center text-sm font-medium">
           第 {pageIndex + 1} / {pageCount} 页
         </div>
         <div className="flex items-center gap-2">

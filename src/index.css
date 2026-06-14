@@ -100,6 +100,40 @@ body {
     animation: veltrix-fade-up 0.4s ease-out both;
   }
 
+  /* 隐藏滚动条但保留滚动能力(含编程式 scrollTop) */
+  .veltrix-no-scrollbar {
+    scrollbar-width: none;
+  }
+  .veltrix-no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* 纤细滚动条:表格等大数据区用。6px 细条、默认淡色、悬停加深,不抢内容视觉 */
+  .veltrix-thin-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .veltrix-thin-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .veltrix-thin-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .veltrix-thin-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 9999px;
+  }
+  .veltrix-thin-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+  }
+
+  /* 表格专用:纵向滚动条轨道避开吸顶表头(表头 h-10 = 40px),
+     滑块只在数据行区域内活动,不压在表头上 */
+  .veltrix-table-scrollbar::-webkit-scrollbar-track {
+    margin-top: 40px;
+  }
+
   /* 细网格氛围背景:暗色更明显 */
   .veltrix-grid-bg {
     background-image:
@@ -181,7 +215,8 @@ body {
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --radius: 0.625rem;
+  /* 全局圆角基准:所有 radius token 按比例派生自此值;0.375rem(6px)比默认 10px 更利落 */
+  --radius: 0.375rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);

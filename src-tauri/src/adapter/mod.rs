@@ -9,11 +9,15 @@
 // 适配器系统为渐进接入的脚手架,部分接口/方法暂未接主流程
 #![allow(dead_code)]
 
+pub mod bilibili;
 pub mod douyin;
+pub mod kuaishou;
+pub mod tiktok;
 pub mod xhs;
+pub mod youtube;
 
 use veltrix_core::error::{CrawlerError, Result};
-use crate::model::{Comment, Content, TaskKind};
+use crate::model::{Author, Comment, Content, TaskKind};
 use crate::webview::InterceptedResponse;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -24,6 +28,8 @@ use std::sync::Arc;
 pub struct FetchOutput {
     pub contents: Vec<Content>,
     pub comments: Vec<Comment>,
+    /// 作者画像(仅 UserProfile 补采解析时填;搜索/评论解析恒空)。
+    pub authors: Vec<Author>,
 }
 
 /// 一次解析调用的输入上下文。
