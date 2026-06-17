@@ -645,6 +645,68 @@ pub fn build_select_eval(labels: &[String]) -> String {
     TEMPLATE.replace("__LABELS__", &labels_json)
 }
 
+// ===================== 浏览器 Agent 动作脚本(MVP:只发动作,不读结果) =====================
+//
+// 为何与采集的 build_*_eval 分开:浏览器 Agent 用独立 "agent" 窗口、不绑登录态/不注入采集 HUD;
+// 且 Tauri eval 是 fire-and-forget(取不到返回值),MVP 阶段只「发出动作」不回读 DOM——
+// 取 DOM / 截图需仿 RpaChannel 新建回传 channel(留待后续)。
+
+/// 构造「导航到指定 URL」脚本。url 经页面侧赋值给 location;只接受 http/https 由 Rust 侧先校验。
+pub fn build_navigate_eval(url: &str) -> String {
+    // 用 serde_json 生成安全的 JS 字符串字面量(完整转义换行/回车/引号等);
+    // 手工 replace 会漏掉换行 → 单引号字符串跨行 SyntaxError 使整段 eval 失效。
+    let url_lit = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
+    format!("(function () {{ window.location.assign({url_lit}); }})();")
+}
+
+/// 构造「按 CSS 选择器点击元素」脚本。命中第一个匹配元素并派发鼠标事件(mousedown/up/click);
+/// 找不到则空操作(MVP 不回读结果,失败不抛回 Rust)。
+pub fn build_click_eval(selector: &str) -> String {
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    const TEMPLATE: &str = r#"(function () {
+  var SEL = __SEL__;
+  if (!SEL) return;
+  var el;
+  try { el = document.querySelector(SEL); } catch (e) { return; }
+  if (!el) return;
+  try {
+    el.scrollIntoView({ block: 'center' });
+    var r = el.getBoundingClientRect();
+    var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+  } catch (e) {}
+})();"#;
+    TEMPLATE.replace("__SEL__", &sel_json)
+}
+
+/// 构造「向输入框写入文本」脚本。命中选择器对应的 input/textarea/contenteditable,聚焦后整体赋值
+/// 并派发 input/change 事件(触发框架的受控更新);找不到则空操作。MVP 不逐字模拟,只整体写入。
+pub fn build_type_eval(selector: &str, text: &str) -> String {
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    const TEMPLATE: &str = r#"(function () {
+  var SEL = __SEL__;
+  var TEXT = __TEXT__;
+  if (!SEL) return;
+  var el;
+  try { el = document.querySelector(SEL); } catch (e) { return; }
+  if (!el) return;
+  try {
+    el.focus();
+    if (el.isContentEditable) {
+      el.textContent = TEXT;
+    } else {
+      el.value = TEXT;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (e) {}
+})();"#;
+    TEMPLATE.replace("__SEL__", &sel_json).replace("__TEXT__", &text_json)
+}
+
 /// 注入脚本里回传 RPA 执行结果的命令名;与 Rust 端 `#[tauri::command] rpa_done` 对应。
 pub const RPA_DONE_COMMAND: &str = "rpa_done";
 
@@ -881,6 +943,15 @@ pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: im
     };
     persist_log(&log);
     let _ = app.emit(COLLECT_LOG_EVENT, log);
+}
+
+/// 给指定账号采集窗口的 HUD 追加一条日志;窗口已关 / 不存在则静默忽略。
+/// 供 commands 在 pool collect 返回后(入库完成等)向 HUD 补充提示。
+pub fn hud_log(app: &AppHandle, platform: &str, account_id: &str, level: &str, message: &str) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window(&pool::window_label(platform, account_id)) {
+        let _ = win.eval(&build_hud_log_eval(level, message));
+    }
 }
 
 /// 推送一条「采集条目」富日志(内容/评论),供前端日志面板渲染头像 + 昵称 + 标题 + 序号。

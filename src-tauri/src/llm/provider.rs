@@ -20,7 +20,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         code: "deepseek",
         name: "DeepSeek",
-        api_url: "https://api.deepseek.com/v1",
+        api_url: "https://api.deepseek.com/chat/completions",
         asr: false,
     },
     ProviderPreset {

@@ -53,14 +53,14 @@ export interface AppConfig {
   media: MediaConfig;
   // 意向分析配置(后端 snake_case,与 database/media 一致)
   intent: {
-    provider_id: string;
+    api_url: string;
     model: string;
-    prompt_id: string;
+    intent_prompt: string;
     batch_size: number;
   };
   // 语音转写配置(后端 snake_case,与 intent 一致)
   transcription: {
-    provider_id: string;
+    api_url: string;
     model: string;
   };
 }
@@ -114,14 +114,28 @@ export interface ProviderDto {
   models: string;
 }
 
+// 角色模型:杂活(分类/摘要/套用)可单独配便宜模型,主任务仍走会话模型。
+// 各字段值为 "providerId::model" 串或空串(空=回退会话模型)。
+export interface RoleModelConfig {
+  classifyModel: string;
+  summaryModel: string;
+  applyModel: string;
+}
+
 // AI 对话:会话
 export interface ConversationView {
   id: string;
   title: string;
   providerId: string;
   model: string;
+  // 场景类型:chat / coding / rpa(决定页面布局与发送走哪个 Agent)
+  agentType: string;
   createdAt: number;
   updatedAt: number;
+  // 是否归档(归档会话不在「最近对话」与对话页展示,仅对话记录页可见)
+  archived: boolean;
+  // 编程 Agent 分步计划(JSON 数组 [{title,done}] 字符串;空=无计划)。Plan 产出、Act 按其执行并勾选
+  planTodos: string;
 }
 
 // AI 对话:上传附件(发送时传给后端)
@@ -135,9 +149,41 @@ export interface ChatAttachment {
 export interface ChatMessageView {
   id: number;
   conversationId: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
+  // 工具往返(Agent 场景):assistant 的工具调用(JSON 字符串)/ tool 结果归属
+  toolCalls?: string | null;
+  toolCallId?: string | null;
+  toolName?: string | null;
   createdAt: number;
+}
+
+// 编程 Agent:开发服务器(预览-开发服务器模式)状态
+export interface DevServerStatus {
+  running: boolean;
+  port: number | null;
+  command: string;
+  logs: string[];
+  // dev server 是全局单实例,此字段标其归属会话,供前端按 activeId 隔离(切会话不串台)
+  conversationId: string;
+}
+
+// 编程 Agent:沙盒配置(默认 Docker;Docker 不可用时命令自动回退本机执行)
+export interface SandboxConfigView {
+  image: string;
+  container: string;
+  dockerAvailable: boolean; // false → 命令在本机执行(未隔离)
+  containerRunning: boolean;
+}
+
+// AI 对话:长期记忆(跨会话,按用户归属)
+export interface ChatMemoryView {
+  id: number;
+  content: string;
+  source: "auto" | "manual";
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // 提示词
@@ -375,6 +421,8 @@ export interface AuthorView {
   totalFavorited: number | null;
   location: string | null;
   isMonitored: boolean;
+  // 是否被拉黑:命中黑名单的作者在采集时被排除、不抓
+  isBlacklisted: boolean;
   firstCollectedAt: number;
   lastCollectedAt: number;
   // 该作者在库中的已采内容数
@@ -458,6 +506,8 @@ export interface CommentView {
   // 内容作者(视频/图文创作者,区别于评论者 author*)
   contentAuthorNickname: string | null;
   contentAuthorAvatar: string | null;
+  // 采集该内容时命中的关键词(从所属内容关联取;内容已删则为空串)
+  keyword: string;
 }
 
 // 采集日志条目(对应后端 collect-log 事件 / list_collect_logs)
@@ -608,8 +658,8 @@ export const api = {
   setStoragePath: (path: string) =>
     invoke<void>("set_storage_path", { path }),
   // 保存语音转写配置(系统设置「语音转写」)
-  setTranscriptionConfig: (providerId: string, model: string) =>
-    invoke<void>("set_transcription_config", { providerId, model }),
+  setTranscriptionConfig: (apiUrl: string, model: string, apiKey: string) =>
+    invoke<void>("set_transcription_config", { apiUrl, model, apiKey }),
   // 各厂商能力(chat / asr),供「语音转写」按 ASR 能力过滤厂商下拉
   listProviderCapabilities: () =>
     invoke<
@@ -621,21 +671,37 @@ export const api = {
         asr: boolean;
       }[]
     >("list_provider_capabilities"),
+  // 角色模型:读取 / 保存杂活角色的便宜模型映射(空值=回退会话模型)
+  getRoleModels: () => invoke<RoleModelConfig>("get_role_models"),
+  setRoleModels: (config: RoleModelConfig) =>
+    invoke<void>("set_role_models", { config }),
   // 保存意向分析配置(系统设置「意向分析」)
   setIntentConfig: (
-    providerId: string,
+    apiUrl: string,
     model: string,
-    promptId: string,
+    intentPrompt: string,
     batchSize: number,
+    apiKey: string,
   ) =>
     invoke<void>("set_intent_config", {
-      providerId,
+      apiUrl,
       model,
-      promptId,
+      intentPrompt,
       batchSize,
+      apiKey,
     }),
   saveTextFile: (path: string, content: string) =>
     invoke<void>("save_text_file", { path, content }),
+  saveBinaryFile: (path: string, contentBase64: string) =>
+    invoke<void>("save_binary_file", { path, contentBase64 }),
+  // 保存对话框 + 写文件:返回本地绝对路径(已保存)/ null(用户取消)
+  saveTextDialog: (content: string, fileName: string) =>
+    invoke<string | null>("save_text_dialog", { content, fileName }),
+  saveBinaryDialog: (contentBase64: string, fileName: string) =>
+    invoke<string | null>("save_binary_dialog", { contentBase64, fileName }),
+  // 下载历史:查文件是否仍存在 + 打开文件所在目录(存在则选中)
+  pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
+  revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   // 清空业务数据(任务/内容/评论 + 媒体文件);需当前用户密码二次校验
   // 清空业务数据;clearMedia=true 时连同存储路径下的媒体资源文件一并删除
   clearBusinessData: (password: string, clearMedia: boolean) =>
@@ -676,15 +742,93 @@ export const api = {
   resetUserPassword: (id: string, password: string) =>
     invoke<void>("reset_user_password", { id, password }),
 
+  // 个人中心:当前登录用户自助修改密码 / 资料
+  changePassword: (oldPassword: string, newPassword: string) =>
+    invoke<void>("change_password", { oldPassword, newPassword }),
+  updateProfile: (nickname: string, email: string, avatar: string, remark: string) =>
+    invoke<UserView>("update_profile", { nickname, email, avatar, remark }),
+
   // AI 对话
   listConversations: () =>
     invoke<ConversationView[]>("list_conversations"),
-  createConversation: (id: string, providerId: string, model: string) =>
-    invoke<ConversationView>("create_conversation", { id, providerId, model }),
+  createConversation: (
+    id: string,
+    providerId: string,
+    model: string,
+    agentType?: string,
+  ) =>
+    invoke<ConversationView>("create_conversation", {
+      id,
+      providerId,
+      model,
+      agentType: agentType ?? null,
+    }),
   renameConversation: (id: string, title: string) =>
     invoke<void>("rename_conversation", { id, title }),
+  archiveConversation: (id: string, archived: boolean) =>
+    invoke<void>("archive_conversation", { id, archived }),
+  updateConversationModel: (id: string, providerId: string, model: string) =>
+    invoke<ConversationView>("update_conversation_model", {
+      id,
+      providerId,
+      model,
+    }),
   deleteConversation: (id: string) =>
     invoke<void>("delete_conversation", { id }),
+  // 本会话滚动摘要(「本会话记忆」查看/编辑)
+  getConversationSummary: (conversationId: string) =>
+    invoke<string>("get_conversation_summary", { conversationId }),
+  updateConversationSummary: (conversationId: string, summary: string) =>
+    invoke<void>("update_conversation_summary", { conversationId, summary }),
+  // 编程 Agent:发送消息(驱动 ReAct 循环,过程经 "agent-step" 事件推进度,resolve 返回最终回复)
+  // mode:plan(只调研出方案)/ act(亲自动手执行),缺省 act
+  sendCodingMessage: (conversationId: string, content: string, mode?: string) =>
+    invoke<ChatMessageView>("send_coding_message", { conversationId, content, mode }),
+  // 浏览器 / RPA Agent:驱动 navigate/click/type 的 ReAct 循环(MVP,fire-and-forget)
+  sendBrowserMessage: (conversationId: string, content: string) =>
+    invoke<ChatMessageView>("send_browser_message", { conversationId, content }),
+  // 工作区路径:传 conversationId 返回该会话目录,否则返回根目录
+  getCodingWorkspace: (conversationId?: string) =>
+    invoke<string>("get_coding_workspace", {
+      conversationId: conversationId ?? null,
+    }),
+  setCodingWorkspace: (path: string) =>
+    invoke<void>("set_coding_workspace", { path }),
+  // 编程 Agent:开发服务器(常驻进程,预览-开发服务器模式)
+  startDevServer: (conversationId: string, command: string) =>
+    invoke<void>("start_dev_server", { conversationId, command }),
+  stopDevServer: () => invoke<void>("stop_dev_server"),
+  getDevServerStatus: () =>
+    invoke<DevServerStatus>("get_dev_server_status"),
+  // 用户在终端直接执行一条命令(该会话工作区 / 沙盒内,超时),返回输出文本
+  runWorkspaceCommand: (conversationId: string, command: string) =>
+    invoke<string>("run_workspace_command", { conversationId, command }),
+  // 回退:丢弃本轮 Agent 的文件改动,回到最近检查点(发送前状态)
+  checkpointRollback: (conversationId: string) =>
+    invoke<string>("checkpoint_rollback", { conversationId }),
+  // 文件面板:列出工作区真实文件树 / 读取某文件内容
+  listWorkspaceFiles: (conversationId: string) =>
+    invoke<string[]>("list_workspace_files", { conversationId }),
+  readWorkspaceFile: (conversationId: string, path: string) =>
+    invoke<string>("read_workspace_file", { conversationId, path }),
+  writeWorkspaceFile: (conversationId: string, path: string, content: string) =>
+    invoke<void>("write_workspace_file", { conversationId, path, content }),
+  // 编程沙盒(host / docker)配置与生命周期
+  getSandboxConfig: () => invoke<SandboxConfigView>("get_sandbox_config"),
+  setSandboxConfig: (image: string, container: string) =>
+    invoke<void>("set_sandbox_config", { image, container }),
+  sandboxStart: () => invoke<string>("sandbox_start"),
+  sandboxStop: () => invoke<void>("sandbox_stop"),
+  // 强制重建容器(删旧 + 正确挂载新建),用于旧容器挂载错误导致「文件不在沙盒」时一键修复。
+  sandboxRecreate: () => invoke<string>("sandbox_recreate"),
+  // 意图分类:首条消息判断该用哪个 Agent("chat" / "coding"),用于发送时自动切布局。
+  // 传入当前选中的厂商/模型,供 LLM 分类使用(关键词明显时后端不调 LLM)。
+  classifyAgentType: (text: string, providerId?: string, model?: string) =>
+    invoke<string>("classify_agent_type", {
+      text,
+      providerId: providerId ?? null,
+      model: model ?? null,
+    }),
   listChatMessages: (conversationId: string) =>
     invoke<ChatMessageView[]>("list_chat_messages", { conversationId }),
   sendChatMessage: (conversationId: string, content: string) =>
@@ -703,6 +847,32 @@ export const api = {
     }),
   transcribeChatAudio: (audioBase64: string, format: string) =>
     invoke<string>("transcribe_chat_audio", { audioBase64, format }),
+
+  // AI 对话:长期记忆(跨会话,设置页「AI 记忆」管理)
+  listChatMemories: () => invoke<ChatMemoryView[]>("list_chat_memories"),
+  addChatMemory: (content: string) =>
+    invoke<ChatMemoryView>("add_chat_memory", { content }),
+  updateChatMemory: (id: number, content: string, enabled: boolean) =>
+    invoke<void>("update_chat_memory", { id, content, enabled }),
+  deleteChatMemory: (id: number) =>
+    invoke<void>("delete_chat_memory", { id }),
+  clearChatMemories: () => invoke<void>("clear_chat_memories"),
+  getChatMemoryEnabled: () => invoke<boolean>("get_chat_memory_enabled"),
+  setChatMemoryEnabled: (enabled: boolean) =>
+    invoke<void>("set_chat_memory_enabled", { enabled }),
+  // 把某条已采集内容(资产)的本地视觉素材读成 base64 附件。
+  // coverOnly=true(图源=封面)只取封面;否则图文图片优先、无则退回封面。
+  // indices 给出时仅取这些「本地图片排序位置」(逐张挑选用)
+  buildContentAttachments: (
+    contentId: string,
+    coverOnly: boolean,
+    indices?: number[],
+  ) =>
+    invoke<ChatAttachment[]>("build_content_attachments", {
+      contentId,
+      coverOnly,
+      indices: indices ?? null,
+    }),
 
   // 系统配置:模型厂商
   listProviders: () => invoke<ProviderDto[]>("list_providers"),
@@ -793,6 +963,9 @@ export const api = {
   // 作者库的监控开关(按作者 id)
   setAuthorMonitoredById: (id: string, monitored: boolean) =>
     invoke<void>("set_author_monitored_by_id", { id, monitored }),
+  // 作者库的黑名单开关(按作者 id):加入黑名单后采集排除其内容
+  setAuthorBlacklistedById: (id: string, blacklisted: boolean) =>
+    invoke<void>("set_author_blacklisted_by_id", { id, blacklisted }),
   // 作者画像补采:逐个打开主页拦截画像接口,刷新粉丝/签名等档案(仅小红书/快手/B站/YouTube)
   enrichAuthors: (ids: string[]) =>
     invoke<EnrichSummary>("enrich_authors", { ids }),

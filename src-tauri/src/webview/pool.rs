@@ -70,8 +70,16 @@ fn random_comment_scroll_pause() -> Duration {
 /// 排序方式 → 结果页排序按钮文案候选(多候选覆盖平台差异)。synthetic(综合)默认不点。
 fn sort_labels(sort_mode: &str) -> Vec<String> {
     match sort_mode {
-        "hottest" => vec!["最热".into(), "最多点赞".into(), "最多收藏".into()],
-        "latest" => vec!["最新".into(), "最新发布".into()],
+        // hottest 各平台叫法不一:抖音/小红书「最多点赞」、B站「最多播放/点击」、快手「最热」、YouTube「最多观看」
+        "hottest" => vec![
+            "最热".into(),
+            "最多点赞".into(),
+            "最多收藏".into(),
+            "最多播放".into(),
+            "最多点击".into(),
+            "最多观看".into(),
+        ],
+        "latest" => vec!["最新".into(), "最新发布".into(), "最近发布".into()],
         _ => Vec::new(),
     }
 }
@@ -137,8 +145,12 @@ const RPA_RUN_TIMEOUT_MS: u64 = 180_000;
 /// RPA 跑完注入 session 回放页内缓冲后的收尾等待(毫秒),让回放的 `intercept_push` 到齐再取走。
 const REPLAY_SETTLE_MS: u64 = 1500;
 
+/// 详情补取:导航详情页并注入 session 后,等详情/feed 接口响应到达的额外等待(毫秒)。
+/// 详情接口随首屏发出,NAV_SETTLE 后多等一会确保响应入会话缓冲再取走。
+const DETAIL_FETCH_WAIT_MS: u64 = 3500;
+
 /// WebView 窗口标签拼装规则。统一前缀便于在 Tauri 端区分管理类窗口。
-fn window_label(platform: &str, account_id: &str) -> String {
+pub(crate) fn window_label(platform: &str, account_id: &str) -> String {
     format!("veltrix-{platform}-{account_id}")
 }
 
@@ -575,6 +587,32 @@ impl WebviewPool {
         Ok(window)
     }
 
+    /// 确保某浏览器 Agent 会话的可见窗口存在(已存在则复用)。
+    /// 用固定平台名 `"agent"` + 会话标识做 per-window data_directory 隔离,**不复用**采集的
+    /// per-account 窗口(那绑登录态 + 注入采集 HUD)。窗口不注入拦截 / HUD / 登录自检——
+    /// 浏览器 Agent 只发动作(navigate/click/type),MVP 不回读结果。
+    pub fn ensure_agent_window(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        initial_url: &str,
+    ) -> Result<WebviewWindow> {
+        let title = format!("浏览器 Agent - {session_id}");
+        let spec = WindowSpec {
+            platform: "agent",
+            account_id: session_id,
+            initial_url,
+            // 浏览器 Agent 不做接口拦截(只发动作),无拦截特征
+            patterns: &[],
+            // 不是采集窗口,不注入采集 HUD 浮层
+            with_hud: false,
+            title: &title,
+            // 不做登录态自检(浏览器 Agent 与账号登录态无关)
+            login_check_script: None,
+        };
+        self.ensure_window(app, &spec)
+    }
+
     /// 关闭并移除某窗口(账号被删除时调用,避免句柄泄漏)。
     pub fn drop_window(&self, platform: &str, account_id: &str) -> Result<()> {
         let label = window_label(platform, account_id);
@@ -645,6 +683,9 @@ pub struct CollectRequest<'a> {
     /// 最低点赞数:点赞数低于此值的内容不计入目标数、不增量发出、不落库(0=不限)。
     /// like_count 为 None(平台未返回点赞数)时放行,避免误删有效内容。
     pub min_likes: i32,
+    /// 黑名单作者 uid 集合(owner+platform 维度):命中的内容直接排除——不计目标数、不增量落库。
+    /// None=不过滤。
+    pub blacklisted_uids: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// 一次「单视频评论采集」调用的参数。集中成结构体以遵守「参数 ≤ 4」。
@@ -666,6 +707,20 @@ pub struct CommentCollectRequest<'a> {
     pub adapter: Arc<dyn PlatformAdapter>,
     /// 该内容所属采集关键词:评论日志归到对应关键词 HUD tab(评论不单独成 tab)。
     pub keyword: &'a str,
+    /// 当前是第几个视频(从 1 计)/ 视频总数:HUD 显示「第 X/Y 个视频」评论采集进度。
+    pub video_index: usize,
+    pub video_total: usize,
+}
+
+/// 一次「内容详情补取」调用的参数(补取/刷新视频直链用)。集中成结构体以遵守「参数 ≤ 4」。
+pub struct DetailFetchRequest<'a> {
+    pub account_id: &'a str,
+    /// 目标内容 ID(抖音 aweme_id / 小红书 note_id / 快手 photoId),导航详情页用。
+    pub content_id: &'a str,
+    /// 详情页鉴权 token(小红书 xsec_token;抖音/快手留空)。
+    pub xsec_token: &'a str,
+    /// 平台配置:提供详情页 URL 模板与拦截特征。
+    pub platform_cfg: &'a PlatformConfig,
 }
 
 /// 一次「作者主页画像补采」调用的参数。集中成结构体以遵守「参数 ≤ 4」。
@@ -776,6 +831,7 @@ impl CollectBridge {
                 req.sort_mode,
                 req.time_range,
                 req.min_likes,
+                req.blacklisted_uids,
             )
             .await
         } else {
@@ -941,6 +997,8 @@ impl CollectBridge {
         time_range: &str,
         // 最低点赞数:低于此值的内容不计入 target、不发增量(0=不限;点赞数缺失放行)
         min_likes: i32,
+        // 黑名单作者 uid 集合:命中的内容直接排除(不计 target、不增量落库);None=不过滤
+        blacklisted_uids: Option<&HashSet<String>>,
     ) -> Result<()> {
         // 导航到搜索结果页;新页面会重挂 hook,session 未就绪期间命中响应进页内缓冲
         let search_template = &cfg.collect.search_url_template;
@@ -978,6 +1036,29 @@ impl CollectBridge {
         if !verify_eval.is_empty() {
             let _ = window.eval(&verify_eval);
         }
+
+        // URL query 未覆盖的排序/时间维度,回退到结果页文案点击(快手等无 URL 参数的平台靠这条生效;
+        // B站时间走绝对时间戳 URL 表达不了,也靠点击)。综合/不限默认不点;抖音 URL 已覆盖则跳过避免重复。
+        let sort_covered = !cfg.collect.sort_query_key.is_empty()
+            && cfg
+                .collect
+                .sort_query_map
+                .get(sort_mode)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        let time_covered = !cfg.collect.time_query_key.is_empty()
+            && cfg
+                .collect
+                .time_query_map
+                .get(time_range)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        apply_sort_time(
+            window,
+            if sort_covered { "" } else { sort_mode },
+            if time_covered { "" } else { time_range },
+        )
+        .await;
 
         // 智能停止:有适配器 + 原生缓冲 + 目标数量时,边滚边按「去重 content_id」计数,
         // 达标即停;若连续无新增疑似风控,则预警并继续重试,达 STAGNANT_STOP 轮仍无新增则自动结束,
@@ -1113,6 +1194,13 @@ impl CollectBridge {
                     let mut fresh: Vec<crate::model::Content> = Vec::new();
                     for c in &output.contents {
                         if seen.insert(c.content_id.clone()) {
+                            // 黑名单作者:命中即排除——不发增量、不计目标数、不落库(uid 空则放行)
+                            let is_blacklisted = blacklisted_uids
+                                .map(|set| !c.author.uid.is_empty() && set.contains(&c.author.uid))
+                                .unwrap_or(false);
+                            if is_blacklisted {
+                                continue;
+                            }
                             // 最低点赞数过滤:低于阈值的不发增量、不计目标数,使
                             // 「目标数 / 进度 / 实际入库」三者口径一致(点赞数缺失放行)
                             let passes_likes = c
@@ -1160,10 +1248,21 @@ impl CollectBridge {
             let progress_pct = now * 100 / target_count;
             // 本轮新见内容里命中数据库已有的条数:重复内容,只更新点赞/评论等统计、不占新增配额
             let dup_existing = seen_added - added;
+            // 本批采集到的内容序号范围(累计有效新增口径),与主窗口逐条 #seq 呼应
+            let seq_range = if added > 0 {
+                let from = now - added + 1;
+                if added == 1 {
+                    format!("(第 {now} 条)")
+                } else {
+                    format!("(第 {from}~{now} 条)")
+                }
+            } else {
+                String::new()
+            };
             let _ = window.eval(&build_hud_log_eval(
                 "info",
                 &format!(
-                    "  新增 {added} · 重复 {dup_existing} · 累计 {now}/{target_count}({progress_pct}%)· 已加载 {resp_count} 批"
+                    "  新增 {added}{seq_range} · 重复 {dup_existing} · 累计 {now}/{target_count}({progress_pct}%)· 已加载 {resp_count} 批"
                 ),
             ));
 
@@ -1422,8 +1521,10 @@ impl CollectBridge {
         let session_id = self.channel.open_session()?;
         // 绑定会话给 HUD「结束」按钮,并置采集中状态
         let _ = window.eval(&build_hud_session_eval(session_id));
+        // HUD 状态/日志带上「第 X/Y 个视频」,让采集窗口能看出评论采集的整体进度
+        let progress = format!("第 {}/{} 个视频", req.video_index, req.video_total);
         let _ = window.eval(&build_hud_status_eval(
-            &format!("评论采集:{}", req.title),
+            &format!("评论采集 · {} · {}", progress, req.title),
             true,
         ));
         self.log_step(
@@ -1432,8 +1533,8 @@ impl CollectBridge {
             req.task_id,
             "info",
             &format!(
-                "采集评论 ·「{}」· 平台 {} · 上限 {} 条",
-                req.title, cfg.name, req.limit
+                "采集评论 · {} ·「{}」· 平台 {} · 上限 {} 条",
+                progress, req.title, cfg.name, req.limit
             ),
         );
 
@@ -1476,6 +1577,70 @@ impl CollectBridge {
             false,
         ));
         // 清理本会话停止标志,避免 session_id 复用误判
+        self.control.clear(session_id);
+        Ok(responses)
+    }
+
+    /// 在某账号的 WebView 内导航到内容详情页,取走详情/feed 接口响应(供补取/刷新视频直链)。
+    ///
+    /// 与评论采集不同:**不滚动**,只导航详情页 → 注入会话回放首屏 → 等详情接口返回 → 取走响应。
+    /// 详情卡比搜索卡多出视频流(小红书 video.media.stream / 抖音详情新鲜 play_addr),
+    /// 由调用方交适配器按 `TaskKind::ContentDetail` 解析。复用已登录窗口,不需重新登录。
+    pub async fn fetch_content_detail(
+        &self,
+        app: &AppHandle,
+        req: DetailFetchRequest<'_>,
+    ) -> Result<Vec<InterceptedResponse>> {
+        let cfg = req.platform_cfg;
+        if cfg.collect.detail_url_template.is_empty() {
+            return Err(CrawlerError::Config(format!(
+                "平台 {} 未配置 detail_url_template,无法补取直链",
+                cfg.id
+            )));
+        }
+        let title = format!("{} - {}", cfg.name, req.account_id);
+        let spec = WindowSpec {
+            platform: &cfg.id,
+            account_id: req.account_id,
+            initial_url: &cfg.login_url,
+            patterns: &cfg.collect.intercept_patterns,
+            with_hud: true,
+            title: &title,
+            login_check_script: None,
+        };
+        let window = self.pool.ensure_window(app, &spec)?;
+
+        // 原生拦截缓冲:采集前清空,采集后取走本次详情命中的响应
+        let label = window_label(&cfg.id, req.account_id);
+        let sink = self.pool.window_sink(&label);
+        if let Some(s) = &sink {
+            if let Ok(mut buf) = s.lock() {
+                buf.clear();
+            }
+        }
+
+        let session_id = self.channel.open_session()?;
+        // 导航详情页:新页面重挂 hook,session 未就绪期间命中的详情响应进页内缓冲
+        window
+            .eval(&build_detail_eval(
+                &cfg.collect.detail_url_template,
+                req.content_id,
+                req.xsec_token,
+            ))
+            .map_err(|e| CrawlerError::Config(format!("导航详情页失败: {e}")))?;
+        // 等导航与 hook 就绪后注入会话 ID,回放首屏(含详情接口响应)缓冲
+        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+        let _ = window.eval(&build_set_session_eval(session_id));
+        // 详情接口随首屏发出,多等一会确保响应入会话缓冲
+        tokio::time::sleep(Duration::from_millis(DETAIL_FETCH_WAIT_MS)).await;
+
+        // 原生拦截为主、页面 hook 兜底,合并后由适配器按 content_id 解析去重
+        let mut responses = self.channel.take_session(session_id);
+        if let Some(s) = &sink {
+            if let Ok(mut buf) = s.lock() {
+                responses.append(&mut buf);
+            }
+        }
         self.control.clear(session_id);
         Ok(responses)
     }
@@ -1622,9 +1787,20 @@ impl CollectBridge {
             }
             let added = seen.len() - before_seen;
             let now = seen.len();
+            // 本批采集到的评论序号范围(累计去重口径),与主窗口逐条 #seq 呼应
+            let seq_range = if added > 0 {
+                let from = now - added + 1;
+                if added == 1 {
+                    format!("(第 {now} 条)")
+                } else {
+                    format!("(第 {from}~{now} 条)")
+                }
+            } else {
+                String::new()
+            };
             let _ = window.eval(&build_hud_log_eval(
                 "info",
-                &format!("  评论 +{added} · 累计 {now}/{limit} · 已加载 {resp_count} 批"),
+                &format!("  评论 +{added}{seq_range} · 累计 {now}/{limit} · 已加载 {resp_count} 批"),
             ));
 
             // 达上限即停:落库由调用方对最终全部响应解析、按 limit 精确截断

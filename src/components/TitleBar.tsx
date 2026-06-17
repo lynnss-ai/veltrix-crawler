@@ -15,6 +15,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { checkForUpdate } from "@/lib/updater";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { ModeToggle } from "@/components/mode-toggle";
+import { DownloadHistory } from "@/components/DownloadHistory";
 import {
   RemoteConnectButton,
   type RemoteStatus,
@@ -99,39 +100,44 @@ export function TitleBar({
           </button>
           <span className="mx-1 h-4 w-px bg-border" />
           <RemoteConnectButton status={remoteStatus} />
-          {/* 刷新当前页面(替代 F5);放远程控制右边,WebView 内重载前端 */}
-          <SimpleTooltip content="刷新" side="bottom">
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              <RotateCw className="size-4" />
-              <span className="sr-only">刷新</span>
-            </button>
-          </SimpleTooltip>
         </div>
       )}
 
       {/* 中部:空白可拖拽区。data-tauri-drag-region 让整块响应拖动,双击触发最大化/还原 */}
       <div data-tauri-drag-region className="h-full flex-1" />
 
-      {/* 右侧:检查更新 + 主题切换 + 窗口控制按钮。不在拖拽区内,保证点击不被拖拽截获 */}
+      {/* 右侧:刷新 + 检查更新 + 主题切换 + 窗口控制按钮。不在拖拽区内,保证点击不被拖拽截获 */}
       <div className="flex h-full items-center">
-        {/* 检查更新放在主题切换左边;仅登录态显示 */}
-        {showSidebarTrigger && (
-          <SimpleTooltip content="检查软件更新" side="bottom">
-            <button
-              type="button"
-              onClick={() => checkForUpdate(false)}
-              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              <CircleArrowUp className="size-4" />
-              <span className="sr-only">检查更新</span>
-            </button>
-          </SimpleTooltip>
-        )}
-        <ModeToggle className="size-7" />
+        {/* 刷新 / 检查更新 / 切换主题 一组,间距放宽不挤;刷新在检查更新左边,二者仅登录态显示 */}
+        <div className="flex items-center gap-2 px-1.5">
+          {showSidebarTrigger && (
+            <SimpleTooltip content="刷新" side="bottom">
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <RotateCw className="size-4" />
+                <span className="sr-only">刷新</span>
+              </button>
+            </SimpleTooltip>
+          )}
+          {showSidebarTrigger && (
+            <SimpleTooltip content="检查软件更新" side="bottom">
+              <button
+                type="button"
+                onClick={() => checkForUpdate(false)}
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <CircleArrowUp className="size-4" />
+                <span className="sr-only">检查更新</span>
+              </button>
+            </SimpleTooltip>
+          )}
+          <ModeToggle className="size-7" />
+          {/* 历史下载记录:主题切换右侧,仅登录态显示 */}
+          {showSidebarTrigger && <DownloadHistory />}
+        </div>
         <span className="mx-1.5 h-4 w-px bg-border" />
         <button
           type="button"

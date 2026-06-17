@@ -113,6 +113,98 @@ const TIME_RANGE_META: Record<TimeRange, { label: string }> = {
   "6m": { label: "半年内" },
 };
 
+// 各平台支持的排序/时间筛选项(渐进方案:沿用通用值 synthetic/hottest/latest + any/1d/1w/6m,
+// 但每平台只列它真正支持的项,并用该平台的真实标签)。后端 legacy 路径对 URL 未覆盖的维度回退
+// 结果页文案点击应用(快手/B站时间等),小红书走 RPA 文案点击。未列平台回退 DEFAULT_FILTER_META。
+type FilterOpt<V> = { value: V; label: string };
+const DEFAULT_FILTER_META: {
+  sort: FilterOpt<SortMode>[];
+  time: FilterOpt<TimeRange>[];
+} = {
+  sort: [
+    { value: "synthetic", label: "综合" },
+    { value: "hottest", label: "最热" },
+    { value: "latest", label: "最新" },
+  ],
+  time: [
+    { value: "any", label: "不限" },
+    { value: "1d", label: "一天内" },
+    { value: "1w", label: "一周内" },
+    { value: "6m", label: "半年内" },
+  ],
+};
+const ALL_TIME: FilterOpt<TimeRange>[] = DEFAULT_FILTER_META.time;
+const PLATFORM_FILTER_META: Record<
+  string,
+  { sort: FilterOpt<SortMode>[]; time: FilterOpt<TimeRange>[] }
+> = {
+  douyin: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "hottest", label: "最多点赞" },
+      { value: "latest", label: "最新" },
+    ],
+    time: ALL_TIME,
+  },
+  xhs: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "latest", label: "最新" },
+      { value: "hottest", label: "最多点赞" },
+    ],
+    time: ALL_TIME,
+  },
+  kuaishou: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "latest", label: "最新" },
+    ],
+    time: ALL_TIME,
+  },
+  bilibili: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "hottest", label: "最多播放" },
+      { value: "latest", label: "最新发布" },
+    ],
+    time: ALL_TIME,
+  },
+  tiktok: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "latest", label: "最新" },
+    ],
+    time: ALL_TIME,
+  },
+  youtube: {
+    sort: [
+      { value: "synthetic", label: "综合" },
+      { value: "latest", label: "最新" },
+      { value: "hottest", label: "最多观看" },
+    ],
+    time: ALL_TIME,
+  },
+};
+
+function filterMetaFor(platform: string) {
+  return PLATFORM_FILTER_META[platform] ?? DEFAULT_FILTER_META;
+}
+// 列表/详情展示用:取平台标签,回退通用标签
+function sortLabelOf(platform: string, value: SortMode) {
+  return (
+    filterMetaFor(platform).sort.find((o) => o.value === value)?.label ??
+    SORT_MODE_META[value]?.label ??
+    value
+  );
+}
+function timeLabelOf(platform: string, value: TimeRange) {
+  return (
+    filterMetaFor(platform).time.find((o) => o.value === value)?.label ??
+    TIME_RANGE_META[value]?.label ??
+    value
+  );
+}
+
 type CommentTimeRange = NonNullable<TaskView["commentTimeRange"]>;
 
 const COMMENT_TIME_RANGE_META: Record<CommentTimeRange, { label: string }> = {
@@ -251,11 +343,12 @@ function CountdownCell({ t }: { t: TaskItem }) {
     );
   }
   const remain = next - Math.floor(Date.now() / 1000);
+  // 计划与倒计时分两行:倒计时换行显示,状态列可更窄
   return (
-    <span className="text-xs text-muted-foreground">
-      {plan}
+    <span className="flex flex-col text-xs text-muted-foreground">
+      <span>{plan}</span>
       <span
-        className={`ml-1.5 font-mono ${
+        className={`font-mono ${
           remain <= 0
             ? "text-emerald-600 dark:text-emerald-400"
             : "text-sky-600 dark:text-sky-400"
@@ -758,10 +851,10 @@ export function CollectPage() {
               {/* 第二行:基础采集策略(排序 / 时间 / 目标数 / 最低赞) */}
               <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                 <span className="rounded bg-muted px-1.5 py-0.5">
-                  {SORT_MODE_META[t.sortMode].label}
+                  {sortLabelOf(t.platform, t.sortMode)}
                 </span>
                 <span className="rounded bg-muted px-1.5 py-0.5">
-                  {TIME_RANGE_META[t.timeRange].label}
+                  {timeLabelOf(t.platform, t.timeRange)}
                 </span>
                 <span className="rounded bg-muted px-1.5 py-0.5">
                   ≤ {t.perKeywordLimit}
@@ -905,8 +998,8 @@ export function CollectPage() {
             <CountdownCell t={t} />
           ) : null;
           return (
-            <div className="flex max-w-[200px] flex-col gap-1 whitespace-normal">
-              <div className="flex items-center gap-2">
+            <div className="flex max-w-[150px] flex-col gap-1 whitespace-normal">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span
                   className={`inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium ${meta.className}`}
                 >
@@ -1359,6 +1452,18 @@ function TaskFormSheet({
   const [autoSyncObsidian, setAutoSyncObsidian] = useState(
     initial?.autoSyncObsidian ?? DEFAULT_STRATEGY.autoSyncObsidian,
   );
+  // 切换平台时:若当前排序/时间不在该平台支持项内,回退到该平台首项(综合/不限)
+  useEffect(() => {
+    const meta = filterMetaFor(platform);
+    if (!meta.sort.some((o) => o.value === sortMode)) {
+      setSortMode(meta.sort[0].value);
+    }
+    if (!meta.time.some((o) => o.value === timeRange)) {
+      setTimeRange(meta.time[0].value);
+    }
+    // 仅在平台变化时纠正,不依赖 sortMode/timeRange
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform]);
   // ffmpeg 安装检测:null=检测中,true/false=结果;已装则隐藏「点此下载」引导
   const [ffmpegAvailable, setFfmpegAvailable] = useState<boolean | null>(null);
   // Obsidian vault 是否已配置:未配置则禁用「自动同步」开关并强制关闭
@@ -1558,9 +1663,9 @@ function TaskFormSheet({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(Object.keys(SORT_MODE_META) as SortMode[]).map((k) => (
-                    <SelectItem key={k} value={k}>
-                      {SORT_MODE_META[k].label}
+                  {filterMetaFor(platform).sort.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {o.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1576,9 +1681,9 @@ function TaskFormSheet({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(Object.keys(TIME_RANGE_META) as TimeRange[]).map((k) => (
-                    <SelectItem key={k} value={k}>
-                      {TIME_RANGE_META[k].label}
+                  {filterMetaFor(platform).time.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {o.label}
                     </SelectItem>
                   ))}
                 </SelectContent>

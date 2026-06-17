@@ -7,30 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
-import {
-  AudioLines,
-  Bot,
-  Check,
-  ExternalLink,
-  Eye,
-  EyeOff,
-  FolderOpen,
-  GripVertical,
-  Loader2,
-  MessageSquareText,
-  MoreVertical,
-  NotebookPen,
-  SquarePen,
-  Plus,
-  Search,
-  Settings2,
-  Smartphone,
-  Sparkles,
-  Trash2,
-  TriangleAlert,
-  Unplug,
-  X,
-} from "lucide-react";
+import { AudioLines, Bot, Brain, Check, ExternalLink, Eye, EyeOff, FolderOpen, GripVertical, Layers, Loader2, MoreVertical, NotebookPen, SquarePen, Plus, Search, Settings2, Smartphone, Sparkles, Trash2, TriangleAlert, Unplug, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
@@ -38,18 +15,21 @@ import { RefreshButton } from "@/components/RefreshButton";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { FieldError } from "@/components/FieldError";
 import { toast } from "sonner";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   api,
   type AppConfig,
   type CloudConfigView,
   type CloudConnectionState,
+  type RoleModelConfig,
 } from "@/lib/api";
+import { ChatMemoryManager } from "@/components/chat-memory-manager";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { StatusBadge } from "@/components/StatusBadge";
-import { CodeField, generateCode } from "@/components/CodeField";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -113,41 +93,15 @@ const SECTION_GROUPS = [
     title: "AI 配置",
     items: [
       { key: "providers", label: "模型厂商", icon: Bot },
+      { key: "role-models", label: "角色模型", icon: Layers },
       { key: "transcription", label: "语音转写", icon: AudioLines },
       { key: "intent", label: "意向分析", icon: Sparkles },
-      { key: "prompts", label: "提示词", icon: MessageSquareText },
+      { key: "memory", label: "AI 记忆", icon: Brain },
     ],
   },
 ] as const;
 type SectionKey = (typeof SECTION_GROUPS)[number]["items"][number]["key"];
 
-interface TranscriptionConfig {
-  providerId: string;
-  model: string;
-}
-
-interface IntentConfig {
-  providerId: string;
-  model: string;
-  promptId: string;
-  batchSize: string;
-}
-
-const DEFAULT_TRANSCRIPTION: TranscriptionConfig = { providerId: "", model: "" };
-
-const DEFAULT_INTENT: IntentConfig = {
-  providerId: "",
-  model: "",
-  promptId: "",
-  batchSize: "10",
-};
-
-interface Prompt {
-  id: string;
-  code: string;
-  name: string;
-  content: string;
-}
 
 interface Provider {
   id: string;
@@ -188,7 +142,6 @@ export function SettingsPage() {
   const [cfg, setCfg] = useState<AppConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   // 厂商预设 + 能力(code/name/apiUrl/chat/asr,后端单一真相源):
   // 供新增厂商下拉与「语音转写」按 ASR 过滤
@@ -210,11 +163,6 @@ export function SettingsPage() {
   const [clearing, setClearing] = useState(false);
   // 清空成功后自增,作为 GeneralSection 重新拉取数据库大小的触发器
   const [generalRefreshKey, setGeneralRefreshKey] = useState(0);
-  const [promptForm, setPromptForm] = useState<Prompt | null>(null);
-  const [isPromptFormOpen, setIsPromptFormOpen] = useState(false);
-  const [promptDeleteTarget, setPromptDeleteTarget] = useState<Prompt | null>(
-    null,
-  );
   const [providerForm, setProviderForm] = useState<Provider | null>(null);
   const [isProviderFormOpen, setIsProviderFormOpen] = useState(false);
   const [providerDeleteTarget, setProviderDeleteTarget] =
@@ -224,12 +172,6 @@ export function SettingsPage() {
     api
       .listProviders()
       .then(setProviders)
-      .catch((e) => setError(String(e)));
-  }
-  function reloadPrompts() {
-    api
-      .listPrompts()
-      .then(setPrompts)
       .catch((e) => setError(String(e)));
   }
 
@@ -255,33 +197,11 @@ export function SettingsPage() {
       .then(setCfg)
       .catch((e) => setError(String(e)));
     reloadProviders();
-    reloadPrompts();
     api
       .listProviderCapabilities()
       .then(setCaps)
       .catch(() => {});
   }, []);
-
-  function submitPrompt(prompt: Prompt) {
-    api
-      .upsertPrompt(prompt)
-      .then(() => {
-        setIsPromptFormOpen(false);
-        reloadPrompts();
-      })
-      .catch((e) => toast.error(`保存失败: ${e}`));
-  }
-
-  function confirmDeletePrompt() {
-    if (!promptDeleteTarget) return;
-    api
-      .removePrompt(promptDeleteTarget.id)
-      .then(() => {
-        setPromptDeleteTarget(null);
-        reloadPrompts();
-      })
-      .catch((e) => toast.error(`删除失败: ${e}`));
-  }
 
   function submitProvider(provider: Provider) {
     api
@@ -340,7 +260,7 @@ export function SettingsPage() {
         </div>
 
         {/* 右侧:对应内容。模型厂商用整页 DataTable;其余分类为可滚动的卡片表单 */}
-        {active === "providers" || active === "prompts" ? (
+        {active === "providers" ? (
           <div
             key={active}
             className="flex min-h-0 min-w-0 flex-1 flex-col duration-200 animate-in fade-in-50"
@@ -361,21 +281,7 @@ export function SettingsPage() {
                 onReload={reloadProviders}
               />
             )}
-            {active === "prompts" && (
-              <PromptsSection
-                prompts={prompts}
-                onCreate={() => {
-                  setPromptForm(null);
-                  setIsPromptFormOpen(true);
-                }}
-                onEdit={(p) => {
-                  setPromptForm(p);
-                  setIsPromptFormOpen(true);
-                }}
-                onDelete={(p) => setPromptDeleteTarget(p)}
-                onReload={reloadPrompts}
-              />
-            )}
+            
           </div>
         ) : (
           <div
@@ -391,31 +297,21 @@ export function SettingsPage() {
             )}
             {active === "remote-control" && <RemoteControlSection />}
             {active === "transcription" && (
-              <TranscriptionSection
-                providers={providers}
-                initial={cfg?.transcription}
-                caps={caps}
-              />
+              <TranscriptionSection initial={cfg?.transcription} />
+            )}
+            {active === "role-models" && (
+              <RoleModelSection providers={providers} />
             )}
             {active === "intent" && (
-              <IntentSection
-                providers={providers}
-                prompts={prompts}
-                initial={cfg?.intent}
-              />
+              <IntentSection initial={cfg?.intent} />
             )}
+            {active === "memory" && <MemorySection />}
             {active === "obsidian" && <ObsidianSection />}
           </div>
         )}
       </div>
 
-      <PromptFormSheet
-        key={isPromptFormOpen ? (promptForm?.id ?? "new-prompt") : "idle"}
-        open={isPromptFormOpen}
-        initial={promptForm}
-        onOpenChange={setIsPromptFormOpen}
-        onSubmit={submitPrompt}
-      />
+      
 
       <ProviderFormSheet
         key={isProviderFormOpen ? (providerForm?.id ?? "new-provider") : "idle"}
@@ -525,30 +421,7 @@ export function SettingsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog
-        open={promptDeleteTarget !== null}
-        onOpenChange={(open) => !open && setPromptDeleteTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              删除提示词「{promptDeleteTarget?.name}」?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              删除后引用该提示词的分析任务需重新配置。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={confirmDeletePrompt}
-              className="bg-destructive text-white hover:bg-destructive/90"
-            >
-              删除
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      
 
       <AlertDialog
         open={providerDeleteTarget !== null}
@@ -1182,15 +1055,6 @@ function GeneralSection({
   );
 }
 
-// 提取某厂商的模型列表
-function providerModels(provider: Provider | undefined): string[] {
-  if (!provider) return [];
-  return provider.models
-    .split("\n")
-    .map((m) => m.trim())
-    .filter(Boolean);
-}
-
 // Obsidian vault 配置(每用户各自;采集内容同步为 Markdown 写入)
 function ObsidianSection() {
   const [vault, setVault] = useState("");
@@ -1265,228 +1129,79 @@ function ObsidianSection() {
     </SettingsCard>
   );
 }
+// 语音转写默认接入(未配置过时自动预填,用户只需补 API Key 即可保存生效)
+const DEFAULT_ASR_API_URL = "https://api.xiaomimimo.com/v1";
+const DEFAULT_ASR_MODEL = "mimo-v2.5-asr";
 
 function TranscriptionSection({
-  providers,
   initial,
-  caps,
 }: {
-  providers: Provider[];
-  initial?: { provider_id: string; model: string };
-  caps: { code: string; asr: boolean }[];
+  initial?: { api_url: string; model: string };
 }) {
-  const [value, setValue] = useState<TranscriptionConfig>(DEFAULT_TRANSCRIPTION);
-  const [baseline, setBaseline] = useState<TranscriptionConfig>(
-    DEFAULT_TRANSCRIPTION,
-  );
-  // 配置异步加载完成后回填(后端 snake_case → 本地 camelCase)
+  const [apiUrl, setApiUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [baseModel, setBaseModel] = useState("");
+
+  // 回填(api_url/model 来自配置;api_key 存数据库不回显)。
+  // 未配置过(空值)时回退到 MiMo 默认,与 base 一致避免一进页面就显示「未保存」。
   useEffect(() => {
-    if (!initial) return;
-    const loaded: TranscriptionConfig = {
-      providerId: initial.provider_id ?? "",
-      model: initial.model ?? "",
-    };
-    setValue(loaded);
-    setBaseline(loaded);
+    const url = initial?.api_url || DEFAULT_ASR_API_URL;
+    const m = initial?.model || DEFAULT_ASR_MODEL;
+    setApiUrl(url);
+    setModel(m);
+    setBaseUrl(url);
+    setBaseModel(m);
+    setApiKey("");
   }, [initial]);
-  const dirty = JSON.stringify(value) !== JSON.stringify(baseline);
-  // 仅支持语音识别(ASR)的厂商可选(目前仅小米 MiMo);新增 ASR 厂商后端放开即自动出现
-  const asrCodes = new Set(caps.filter((c) => c.asr).map((c) => c.code));
-  const asrProviders = providers.filter((p) => asrCodes.has(p.code));
-  const provider = providers.find((p) => p.id === value.providerId);
-  const models = providerModels(provider);
+
+  const dirty = apiUrl !== baseUrl || model !== baseModel || apiKey.trim() !== "";
 
   return (
     <SettingsCard
       title="语音转写"
-      description="选择支持语音识别的厂商与模型,采集完成后把视频音频转写为文案(目前仅小米 MiMo 支持 ASR)。"
+      description="直接配置语音识别(ASR)接口:API 地址、密钥与模型(采集完成后把视频音频转写为文案)。"
       dirty={dirty}
       onSave={() => {
         api
-          .setTranscriptionConfig(value.providerId, value.model)
+          .setTranscriptionConfig(apiUrl, model, apiKey)
           .then(() => {
-            setBaseline(value);
+            setBaseUrl(apiUrl);
+            setBaseModel(model);
+            setApiKey("");
             toast.success("语音转写配置已保存");
           })
           .catch((e) => toast.error(`保存失败: ${e}`));
       }}
     >
-      <ProviderModelPicker
-        providers={asrProviders}
-        providerId={value.providerId}
-        model={value.model}
-        onProviderChange={(id) => setValue({ providerId: id, model: "" })}
-        onModelChange={(m) => setValue({ ...value, model: m })}
-        models={models}
-      />
-    </SettingsCard>
-  );
-}
-
-// 厂商 + 模型 两级选择(从「模型厂商」读取)
-function ProviderModelPicker({
-  providers,
-  providerId,
-  model,
-  models,
-  onProviderChange,
-  onModelChange,
-}: {
-  providers: Provider[];
-  providerId: string;
-  model: string;
-  models: string[];
-  onProviderChange: (id: string) => void;
-  onModelChange: (model: string) => void;
-}) {
-  return (
-    <div className="grid gap-4 sm:grid-cols-2">
-      <div className="space-y-1.5">
-        <Label>厂商</Label>
-        <Select value={providerId} onValueChange={onProviderChange}>
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="选择厂商" />
-          </SelectTrigger>
-          <SelectContent>
-            {providers.length === 0 ? (
-              <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                请先在「模型厂商」添加厂商
-              </div>
-            ) : (
-              providers.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))
-            )}
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="space-y-1.5">
-        <Label>模型</Label>
-        <Select
-          value={model}
-          onValueChange={onModelChange}
-          disabled={!providerId}
-        >
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder={providerId ? "选择模型" : "请先选择厂商"} />
-          </SelectTrigger>
-          <SelectContent>
-            {models.length === 0 ? (
-              <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                该厂商暂无模型
-              </div>
-            ) : (
-              models.map((m) => (
-                <SelectItem key={m} value={m}>
-                  {m}
-                </SelectItem>
-              ))
-            )}
-          </SelectContent>
-        </Select>
-      </div>
-    </div>
-  );
-}
-
-function IntentSection({
-  providers,
-  prompts,
-  initial,
-}: {
-  providers: Provider[];
-  prompts: Prompt[];
-  initial?: {
-    provider_id: string;
-    model: string;
-    prompt_id: string;
-    batch_size: number;
-  };
-}) {
-  const [value, setValue] = useState<IntentConfig>(DEFAULT_INTENT);
-  const [baseline, setBaseline] = useState<IntentConfig>(DEFAULT_INTENT);
-  // 配置异步加载完成后回填(后端 snake_case → 本地 camelCase)
-  useEffect(() => {
-    if (!initial) return;
-    const loaded: IntentConfig = {
-      providerId: initial.provider_id ?? "",
-      model: initial.model ?? "",
-      promptId: initial.prompt_id ?? "",
-      batchSize: String(initial.batch_size ?? 10),
-    };
-    setValue(loaded);
-    setBaseline(loaded);
-  }, [initial]);
-  const dirty = JSON.stringify(value) !== JSON.stringify(baseline);
-  const provider = providers.find((p) => p.id === value.providerId);
-  const models = providerModels(provider);
-
-  return (
-    <SettingsCard
-      title="AI 意向分析"
-      description="选择厂商、模型与提示词,调用大模型分析用户意向。"
-      dirty={dirty}
-      onSave={() => {
-        api
-          .setIntentConfig(
-            value.providerId,
-            value.model,
-            value.promptId,
-            Number(value.batchSize) || 0,
-          )
-          .then(() => {
-            setBaseline(value);
-            toast.success("意向分析配置已保存");
-          })
-          .catch((e) => toast.error(`保存失败: ${e}`));
-      }}
-    >
-      <ProviderModelPicker
-        providers={providers}
-        providerId={value.providerId}
-        model={value.model}
-        models={models}
-        onProviderChange={(id) =>
-          setValue({ ...value, providerId: id, model: "" })
-        }
-        onModelChange={(m) => setValue({ ...value, model: m })}
-      />
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <div className="space-y-1.5">
-          <Label>提示词</Label>
-          <Select
-            value={value.promptId}
-            onValueChange={(v) => setValue({ ...value, promptId: v })}
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue placeholder="选择提示词" />
-            </SelectTrigger>
-            <SelectContent>
-              {prompts.length === 0 ? (
-                <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                  请先在「提示词」中添加
-                </div>
-              ) : (
-                prompts.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                  </SelectItem>
-                ))
-              )}
-            </SelectContent>
-          </Select>
+          <Label htmlFor="asr-url">API 地址</Label>
+          <Input
+            id="asr-url"
+            placeholder="https://api.xiaomimimo.com/v1"
+            value={apiUrl}
+            onChange={(e) => setApiUrl(e.target.value)}
+          />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="intent-batch">批处理大小</Label>
+          <Label htmlFor="asr-key">API Key</Label>
           <Input
-            id="intent-batch"
-            type="number"
-            min={1}
-            className="w-full"
-            value={value.batchSize}
-            onChange={(e) => setValue({ ...value, batchSize: e.target.value })}
+            id="asr-key"
+            type="password"
+            placeholder="留空则不修改已保存的密钥"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="asr-model">模型</Label>
+          <Input
+            id="asr-model"
+            placeholder="mimo-v2.5-asr"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
           />
         </div>
       </div>
@@ -1494,137 +1209,346 @@ function IntentSection({
   );
 }
 
-// 提示词搜索:匹配名称 / 编码 / 内容
-const promptFilterFn: FilterFn<Prompt> = (row, _columnId, value) =>
-  `${row.original.name} ${row.original.code} ${row.original.content}`
-    .toLowerCase()
-    .includes(String(value).toLowerCase());
+// 意向分析默认提示词模板(未配置过时自动填入,用户可微调后保存)
+const DEFAULT_INTENT_PROMPT =
+  "你是一名专业的用户购买意向分析助手。请根据用户在社交平台发布的评论内容,判断其购买/咨询意向的强弱等级。\n" +
+  "判定标准(必须从以下四个等级中选择其一):\n" +
+  "- 高:明确表达购买意愿,如主动询价、咨询购买/下单方式、索要链接或留下联系方式。\n" +
+  "- 中:对产品表现出明显兴趣,如询问功能、规格、效果、对比同类,但尚未明确表达购买。\n" +
+  "- 低:仅有泛泛互动或轻微关注,如随意点赞式评论、简单夸赞,无明显购买倾向。\n" +
+  "- 无:与购买无关的评论,如纯吐槽、调侃、广告引流、无意义灌水等。\n" +
+  "请结合评论语义客观判断,避免主观臆测,并为每条评论给出简要理由。";
 
-function PromptsSection({
-  prompts,
-  onCreate,
-  onEdit,
-  onDelete,
-  onReload,
+// 意向分析常用服务预设:点击快捷填入 API 地址 + 模型(仍可手改)
+const INTENT_PROVIDERS: { label: string; apiUrl: string; model: string }[] = [
+  { label: "智谱 GLM", apiUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4" },
+  { label: "DeepSeek", apiUrl: "https://api.deepseek.com", model: "deepseek-v4-flash" },
+  { label: "小米 MiMo", apiUrl: "https://api.xiaomimimo.com/v1", model: "MiMo-V2-Flash" },
+];
+
+function IntentSection({
+  initial,
 }: {
-  prompts: Prompt[];
-  onCreate: () => void;
-  onEdit: (prompt: Prompt) => void;
-  onDelete: (prompt: Prompt) => void;
-  onReload: () => void;
+  initial?: {
+    api_url: string;
+    model: string;
+    intent_prompt: string;
+    batch_size: number;
+  };
 }) {
-  const columns = useMemo<ColumnDef<Prompt>[]>(
-    () => [
-      {
-        accessorKey: "name",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} title="名称" />
-        ),
-        cell: ({ row }) => (
-          <span className="font-medium text-foreground">{row.original.name}</span>
-        ),
-      },
-      {
-        accessorKey: "code",
-        header: "编码",
-        enableSorting: false,
-        cell: ({ row }) => (
-          <span className="font-mono text-xs text-muted-foreground">
-            {row.original.code}
-          </span>
-        ),
-      },
-      {
-        id: "content",
-        header: "内容",
-        enableSorting: false,
-        cell: ({ row }) => (
-          <span
-            className="block max-w-[24rem] truncate text-muted-foreground"
-            title={row.original.content}
-          >
-            {row.original.content}
-          </span>
-        ),
-      },
-      {
-        id: "actions",
-        header: () => <div className="text-right">操作</div>,
-        enableSorting: false,
-        cell: ({ row }) => {
-          const p = row.original;
-          return (
-            <div className="flex justify-end">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="text-muted-foreground"
-                  >
-                    <MoreVertical />
-                    <span className="sr-only">操作</span>
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-32">
-                  <DropdownMenuItem onClick={() => onEdit(p)}>
-                    <SquarePen />
-                    编辑
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    className="text-destructive focus:text-destructive"
-                    onClick={() => onDelete(p)}
-                  >
-                    <Trash2 />
-                    删除
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          );
-        },
-      },
-    ],
-    [onEdit, onDelete],
-  );
+  const [apiUrl, setApiUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [batchSize, setBatchSize] = useState("10");
+  const [promptContent, setPromptContent] = useState("");
+  const [base, setBase] = useState({ apiUrl: "", model: "", batchSize: "10", prompt: "" });
+  // 提示词默认预览(渲染 Markdown),点「编辑」切到源码编辑
+  const [editingPrompt, setEditingPrompt] = useState(false);
+
+  useEffect(() => {
+    if (!initial) return;
+    const url = initial.api_url ?? "";
+    const m = initial.model ?? "";
+    const bs = String(initial.batch_size ?? 10);
+    const content = initial.intent_prompt ?? "";
+    setApiUrl(url);
+    setModel(m);
+    setBatchSize(bs);
+    setPromptContent(content || DEFAULT_INTENT_PROMPT);
+    setApiKey("");
+    setBase({ apiUrl: url, model: m, batchSize: bs, prompt: content });
+  }, [initial]);
+
+  const dirty =
+    apiUrl !== base.apiUrl ||
+    model !== base.model ||
+    batchSize !== base.batchSize ||
+    promptContent !== base.prompt ||
+    apiKey.trim() !== "";
+
+  async function handleSave() {
+    if (!promptContent.trim()) {
+      toast.error("请填写提示词");
+      return;
+    }
+    try {
+      await api.setIntentConfig(apiUrl, model, promptContent, Number(batchSize) || 0, apiKey);
+      setBase({ apiUrl, model, batchSize, prompt: promptContent });
+      setApiKey("");
+      toast.success("意向分析配置已保存");
+    } catch (e) {
+      toast.error(`保存失败: ${e}`);
+    }
+  }
+
+  const toggleCls = (on: boolean) =>
+    `rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+      on ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-accent"
+    }`;
 
   return (
-    <DataTable
-      columns={columns}
-      data={prompts}
-      itemLabel="个提示词"
-      globalFilterFn={promptFilterFn}
-      getRowId={(p) => p.id}
-      emptyState={
-        <div className="py-12 text-center">
-          <p className="text-sm font-medium text-foreground">暂无提示词</p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            点击右上角「新增」添加提示词模板
-          </p>
+    <SettingsCard
+      title="AI 意向分析"
+      description="大模型接口分析用户评论意向(高/中/低/无)。可点下方服务快捷填入接口地址与模型,再填 Key。"
+      dirty={dirty}
+      onSave={handleSave}
+    >
+      <div className="flex flex-wrap gap-2">
+        {INTENT_PROVIDERS.map((sp) => (
+          <button
+            key={sp.label}
+            type="button"
+            onClick={() => {
+              setApiUrl(sp.apiUrl);
+              setModel(sp.model);
+            }}
+            className={`rounded-md border px-3 py-1 text-xs font-medium transition-colors ${
+              apiUrl === sp.apiUrl
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-input text-muted-foreground hover:bg-accent"
+            }`}
+          >
+            {sp.label}
+          </button>
+        ))}
+      </div>
+      {/* API 地址 + API Key 一行 */}
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <Label htmlFor="intent-url">API 地址</Label>
+          <Input
+            id="intent-url"
+            placeholder="https://api.deepseek.com"
+            value={apiUrl}
+            onChange={(e) => setApiUrl(e.target.value)}
+          />
         </div>
-      }
-      renderToolbar={(table) => (
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="relative w-full sm:max-w-sm">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="搜索名称 / 编码 / 内容"
-              className="pl-9"
-              value={(table.getState().globalFilter as string) ?? ""}
-              onChange={(e) => table.setGlobalFilter(e.target.value)}
-            />
+        <div className="space-y-1.5">
+          <Label htmlFor="intent-key">API Key</Label>
+          <Input
+            id="intent-key"
+            type="password"
+            placeholder="留空则不修改已保存的密钥"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </div>
+      </div>
+      {/* 模型 + 批处理大小 一行 */}
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <Label htmlFor="intent-model">模型</Label>
+          <Input
+            id="intent-model"
+            placeholder="如 deepseek-v4-flash / glm-4"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="intent-batch">批处理大小</Label>
+          <Input
+            id="intent-batch"
+            type="number"
+            min={1}
+            value={batchSize}
+            onChange={(e) => setBatchSize(e.target.value)}
+          />
+        </div>
+      </div>
+      {/* 提示词:Markdown,默认预览,可切编辑 */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <Label htmlFor="intent-prompt">提示词(Markdown)</Label>
+          <div className="flex gap-1 rounded-md bg-muted/50 p-0.5">
+            <button
+              type="button"
+              className={toggleCls(!editingPrompt)}
+              onClick={() => setEditingPrompt(false)}
+            >
+              预览
+            </button>
+            <button
+              type="button"
+              className={toggleCls(editingPrompt)}
+              onClick={() => setEditingPrompt(true)}
+            >
+              编辑
+            </button>
           </div>
-          <div className="flex items-center gap-2">
-            <RefreshButton onClick={onReload} />
-            <Button onClick={onCreate}>
-              <Plus />
-              新增
-            </Button>
+        </div>
+        {editingPrompt ? (
+          <Textarea
+            id="intent-prompt"
+            placeholder="支持 Markdown。例如:请根据以下用户评论判断其购买意向(高/中/低/无),并给出理由。"
+            className="min-h-[40vh] max-h-[70vh] resize-y [field-sizing:content]"
+            value={promptContent}
+            onChange={(e) => setPromptContent(e.target.value)}
+          />
+        ) : (
+          <div className="min-h-[40vh] max-h-[70vh] overflow-auto rounded-md border border-input bg-muted/20 px-3 py-2 text-sm [&_h1]:mb-1 [&_h1]:mt-2 [&_h1]:text-base [&_h1]:font-bold [&_h2]:mb-1 [&_h2]:mt-2 [&_h2]:font-semibold [&_h3]:font-medium [&_p]:my-1 [&_ul]:my-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_strong]:font-semibold [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground">
+            {promptContent.trim() ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {promptContent}
+              </ReactMarkdown>
+            ) : (
+              <span className="text-muted-foreground">
+                提示词为空,点「编辑」添加。
+              </span>
+            )}
           </div>
+        )}
+      </div>
+    </SettingsCard>
+  );
+}
+
+// 角色模型:一个可选模型 = 厂商 + 模型名(value 用 "providerId::model" 编码,与对话页一致)。
+type RoleModelOption = { value: string; label: string };
+
+// 从厂商列表展开出可用模型(有 apiKey + models 行才算可用);编码同对话页 buildModelOptions。
+function buildRoleModelOptions(providers: Provider[]): RoleModelOption[] {
+  const out: RoleModelOption[] = [];
+  for (const p of providers) {
+    if (!p.apiKey.trim()) continue;
+    for (const line of p.models.split("\n")) {
+      const model = line.trim();
+      if (!model) continue;
+      out.push({ value: `${p.id}::${model}`, label: `${p.name} · ${model}` });
+    }
+  }
+  return out;
+}
+
+// 跟随会话模型(空值)在 Select 里用一个哨兵值表示(Select 不接受空串 value)
+const ROLE_MODEL_FOLLOW = "__follow__";
+
+// 单个角色的模型选择行:复用对话页同款 providerId::model 下拉,空=跟随会话模型。
+function RoleModelRow({
+  label,
+  hint,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  options: RoleModelOption[];
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label>{label}</Label>
+      <Select
+        value={value ? value : ROLE_MODEL_FOLLOW}
+        onValueChange={(v) => onChange(v === ROLE_MODEL_FOLLOW ? "" : v)}
+      >
+        <SelectTrigger className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={ROLE_MODEL_FOLLOW}>跟随会话模型(默认)</SelectItem>
+          {options.map((o) => (
+            <SelectItem key={o.value} value={o.value}>
+              {o.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <p className="text-xs text-muted-foreground">{hint}</p>
+    </div>
+  );
+}
+
+// 角色模型:让「杂活」走单独配置的便宜模型,主任务仍走会话绑定模型。
+// 仅在「选模型」这层加维度,不改对话 / 编程 Agent 的下游逻辑。
+function RoleModelSection({ providers }: { providers: Provider[] }) {
+  const options = useMemo(() => buildRoleModelOptions(providers), [providers]);
+  const [cfg, setCfg] = useState<RoleModelConfig>({
+    classifyModel: "",
+    summaryModel: "",
+    applyModel: "",
+  });
+  const [base, setBase] = useState<RoleModelConfig>({
+    classifyModel: "",
+    summaryModel: "",
+    applyModel: "",
+  });
+
+  useEffect(() => {
+    api
+      .getRoleModels()
+      .then((r) => {
+        setCfg(r);
+        setBase(r);
+      })
+      .catch(() => {});
+  }, []);
+
+  const dirty =
+    cfg.classifyModel !== base.classifyModel ||
+    cfg.summaryModel !== base.summaryModel ||
+    cfg.applyModel !== base.applyModel;
+
+  return (
+    <SettingsCard
+      title="角色模型"
+      description="为「杂活」单独指定便宜模型:意图分类、摘要/标题/记忆提取、套用改动。留空则跟随会话当前模型。主对话与编程主循环始终用会话模型,不受此处影响。"
+      dirty={dirty}
+      onSave={() => {
+        api
+          .setRoleModels(cfg)
+          .then(() => {
+            setBase(cfg);
+            toast.success("角色模型已保存");
+          })
+          .catch((e) => toast.error(`保存失败: ${e}`));
+      }}
+    >
+      {options.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          暂无可用模型,请先到「模型厂商」配置 API Key 与模型后再来选择。
+        </p>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-3">
+          <RoleModelRow
+            label="意图分类"
+            hint="判断首条消息是否编程任务(只回一个词),适合最便宜的小模型。"
+            options={options}
+            value={cfg.classifyModel}
+            onChange={(v) => setCfg((c) => ({ ...c, classifyModel: v }))}
+          />
+          <RoleModelRow
+            label="摘要 / 标题 / 记忆"
+            hint="长会话压缩、自动起标题、记忆提取等后台杂活。"
+            options={options}
+            value={cfg.summaryModel}
+            onChange={(v) => setCfg((c) => ({ ...c, summaryModel: v }))}
+          />
+          <RoleModelRow
+            label="套用改动"
+            hint="编程 Agent 应用改动场景(预留),暂可留空。"
+            options={options}
+            value={cfg.applyModel}
+            onChange={(v) => setCfg((c) => ({ ...c, applyModel: v }))}
+          />
         </div>
       )}
-    />
+    </SettingsCard>
+  );
+}
+
+// AI 记忆:跨会话长期记忆管理(全局开关 + 自动/手动条目的增删改查)。
+// 自动记忆由对话每轮提取后台落库;此处用于查看、手动补充与清理。
+function MemorySection() {
+  return (
+    <SettingsCard
+      title="AI 记忆"
+      description="让对话拥有跨会话的长期记忆:AI 会自动从聊天中提取关于你的稳定信息(身份、偏好、习惯等),在之后所有对话中参考。你也可以手动添加、编辑或删除。"
+    >
+      <ChatMemoryManager />
+    </SettingsCard>
   );
 }
 
@@ -1676,7 +1600,7 @@ function ProvidersSection({
         enableSorting: false,
         cell: ({ row }) => (
           <span
-            className="block max-w-[16rem] truncate font-mono text-xs text-muted-foreground"
+            className="block max-w-[24rem] truncate font-mono text-xs text-muted-foreground"
             title={row.original.apiUrl}
           >
             {row.original.apiUrl || "—"}
@@ -2010,114 +1934,6 @@ function ProviderFormSheet({
                   message="请至少填写一个可用模型"
                 />
               </div>
-            </div>
-          </div>
-          <SheetFooter className="flex-row justify-end gap-2 border-t">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
-              取消
-            </Button>
-            <Button type="submit">保存</Button>
-          </SheetFooter>
-        </form>
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-// 提示词 新增 / 编辑 抽屉
-function PromptFormSheet({
-  open,
-  initial,
-  onOpenChange,
-  onSubmit,
-}: {
-  open: boolean;
-  initial: Prompt | null;
-  onOpenChange: (open: boolean) => void;
-  onSubmit: (prompt: Prompt) => void;
-}) {
-  const isEdit = initial !== null;
-  const [code, setCode] = useState(initial?.code ?? generateCode("PRM"));
-  const [name, setName] = useState(initial?.name ?? "");
-  const [content, setContent] = useState(initial?.content ?? "");
-  const [submitted, setSubmitted] = useState(false);
-
-  function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    setSubmitted(true);
-    if (!name.trim() || !content.trim()) {
-      return;
-    }
-    onSubmit({
-      id: initial?.id ?? crypto.randomUUID(),
-      code,
-      name: name.trim(),
-      content: content.trim(),
-    });
-  }
-
-  // 用户改动过名称或内容(编码自动生成不计入)即视为已编辑,阻止误关
-  const isDirty =
-    name !== (initial?.name ?? "") || content !== (initial?.content ?? "");
-
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
-        blockClose={isDirty}
-      >
-        <SheetHeader className="border-b">
-          <SheetTitle>{isEdit ? "编辑提示词" : "新增提示词"}</SheetTitle>
-          <SheetDescription>提示词将作为大模型分析任务的指令。</SheetDescription>
-        </SheetHeader>
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <div className="flex-1 space-y-4 overflow-y-auto p-5">
-            <div className="space-y-1.5">
-              <Label htmlFor="prompt-name">
-                名称 <RequiredMark />
-              </Label>
-              <Input
-                id="prompt-name"
-                placeholder="如:意向分析 / 内容摘要"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                aria-invalid={submitted && !name.trim()}
-                autoFocus
-              />
-              <FieldError
-                show={submitted && !name.trim()}
-                message="名称不可为空"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="prompt-code">编码</Label>
-              <CodeField
-                id="prompt-code"
-                value={code}
-                onRegenerate={() => setCode(generateCode("PRM"))}
-              />
-              <p className="text-xs text-muted-foreground">系统自动生成,可刷新</p>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="prompt-content">
-                内容 <RequiredMark />
-              </Label>
-              <Textarea
-                id="prompt-content"
-                className="min-h-128"
-                placeholder="输入提示词内容,作为大模型分析任务的指令,例如:请根据以下用户评论判断其购买意向(高/中/低),并给出理由。"
-                value={content}
-                onChange={(e) => setContent(e.target.value)}
-                aria-invalid={submitted && !content.trim()}
-              />
-              <FieldError
-                show={submitted && !content.trim()}
-                message="内容不可为空"
-              />
             </div>
           </div>
           <SheetFooter className="flex-row justify-end gap-2 border-t">

@@ -4,10 +4,11 @@
 //! `data.items[]` 每项 `model_type=note` 含 `note_card`(笔记详情),抽取为统一 Content。
 //! `model_type=hot_query`(大家都在搜)等非笔记项跳过。
 //!
-//! 搜索接口的局限(联调须知):**只给**标题/封面/作者/互动数,**不含**正文、
-//! 视频无水印直链(video 类型也只有封面)、话题标签、视频时长。故 desc/video_url/
-//! topics/duration 均为空,需要时得另走笔记详情接口。互动数为字符串需转 i64,
-//! 发布时间是 `corner_tag_info` 里 `MM-DD`(当年)/`YYYY-MM-DD` 文本。
+//! 搜索接口的局限(联调须知):**只给**标题/封面/作者/互动数,**不含**正文、话题标签、视频时长,
+//! video 类型通常也只有封面。故 desc/topics/duration 均为空,需要时得另走笔记详情接口。
+//! 视频无水印直链按 `note_card.video.media.stream`(详情场景)解析(`parse_video_stream`),
+//! 搜索卡多半取不到则为空。互动数为字符串需转 i64,发布时间是 `corner_tag_info` 里
+//! `MM-DD`(当年)/`YYYY-MM-DD` 文本。
 
 use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
 use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
@@ -23,6 +24,8 @@ const SEARCH_PATH: &str = "/api/sns/web/v1/search/notes";
 const COMMENT_PATH: &str = "/api/sns/web/v2/comment/page";
 /// 作者主页用户信息接口 URL 特征(画像补采);真实路径需本机抓包核对。
 const PROFILE_PATH: &str = "/api/sns/web/v1/user/otherinfo";
+/// 笔记详情(feed)接口 URL 特征:详情卡才含 `video.media.stream`,供补取视频直链。
+const FEED_PATH: &str = "/api/sns/web/v1/feed";
 
 #[derive(Default)]
 pub struct XhsAdapter;
@@ -74,8 +77,9 @@ impl XhsAdapter {
             author: Self::parse_author(card.get("user")),
             stats: Self::parse_stats(card.get("interact_info")),
             published_at: Self::parse_published(card),
-            // 搜索接口不含视频直链 / 时长 / 话题
-            video_url: None,
+            // 视频无水印直链:note_card 带 video.media.stream(详情场景)时解析,供后续拉流转音频;
+            // 搜索卡通常只给封面、不含直链,此时为 None。时长/话题搜索接口同样缺失。
+            video_url: Self::parse_video_stream(card),
             cover_url,
             image_urls,
             duration: None,
@@ -157,6 +161,35 @@ impl XhsAdapter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 视频无水印直链:`note_card.video.media.stream` 下按编码优先级 h264→h265→av1 取首个可用流,
+    /// 每个流再多重兜底 `master_url`→`url`→`consumer.master_url`→`url_pre`。
+    /// 注意:搜索接口的 note_card 通常不含 `video.media`(只给封面),需走笔记详情才有直链;取不到返回 None。
+    fn parse_video_stream(card: &Value) -> Option<String> {
+        let stream = card.get("video")?.get("media")?.get("stream")?;
+        for codec in ["h264", "h265", "av1"] {
+            let Some(items) = stream.get(codec).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let url = item
+                    .get("master_url")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("url").and_then(Value::as_str))
+                    .or_else(|| {
+                        item.get("consumer")
+                            .and_then(|c| c.get("master_url"))
+                            .and_then(Value::as_str)
+                    })
+                    .or_else(|| item.get("url_pre").and_then(Value::as_str))
+                    .filter(|s| !s.is_empty());
+                if let Some(found) = url {
+                    return Some(found.to_string());
+                }
+            }
+        }
+        None
     }
 
     /// 发布时间:`corner_tag_info` 里 `type=publish_time` 的 text,
@@ -315,6 +348,57 @@ impl XhsAdapter {
         }
     }
 
+    /// 解析笔记详情(feed)接口响应为内容列表,主要拿视频无水印直链(`video.media.stream`)。
+    /// 详情响应 `/api/sns/web/v1/feed`:`data.items[]` 每项 `note_card` 是**完整**卡(含 video.media),
+    /// 比搜索卡多出视频流。只为补直链,取不到 stream 的项跳过。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut contents = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(FEED_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(items) = root
+                .get("data")
+                .and_then(|d| d.get("items"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for item in items {
+                let Some(content_id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let Some(card) = item.get("note_card") else {
+                    continue;
+                };
+                let Some(video_url) = Self::parse_video_stream(card) else {
+                    continue;
+                };
+                contents.push(Content {
+                    platform: PLATFORM_ID.to_string(),
+                    content_id: content_id.to_string(),
+                    kind: ContentKind::Video,
+                    video_url: Some(video_url),
+                    collected_at,
+                    ..Default::default()
+                });
+            }
+        }
+        FetchOutput {
+            contents,
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
+
     /// 解析一级评论接口响应为评论列表(contents 恒空)。
     fn parse_comments(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
@@ -425,15 +509,16 @@ impl PlatformAdapter for XhsAdapter {
     fn supports(&self, kind: &TaskKind) -> bool {
         matches!(
             kind,
-            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile
+            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile | TaskKind::ContentDetail
         )
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
-        // 按任务类型分流:评论任务解析一级评论,画像补采解析主页,其余按搜索笔记解析
+        // 按任务类型分流:评论解析一级评论,画像补采解析主页,详情补取解析视频直链,其余按搜索笔记解析
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::UserProfile => Self::parse_profile(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)

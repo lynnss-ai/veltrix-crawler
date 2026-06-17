@@ -31,6 +31,7 @@ import {
   type PlatformSeries,
 } from "@/lib/api";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { AnimatedNumber, useCountUp } from "@/components/animated-number";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import {
@@ -71,35 +72,6 @@ function toEndTs(d: Date): number {
 function fmtMd(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-// 用 Catmull-Rom 转三次贝塞尔生成平滑曲线路径(比折线更顺滑)。
-// yMin/yMax 为绘图区上下边界:控制点 y 夹在区间内,避免平滑曲线在 0 值点上下越界(冲出 x 轴)
-function smoothPath(
-  pts: [number, number][],
-  yMin: number,
-  yMax: number,
-): string {
-  if (pts.length === 0) return "";
-  if (pts.length < 3) {
-    return pts
-      .map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`)
-      .join(" ");
-  }
-  const clampY = (y: number) => Math.max(yMin, Math.min(yMax, y));
-  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1] ?? pts[i];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[i + 2] ?? p2;
-    const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
-    const cp1y = clampY(p1[1] + (p2[1] - p0[1]) / 6);
-    const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
-    const cp2y = clampY(p2[1] - (p3[1] - p1[1]) / 6);
-    d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
-  }
-  return d;
 }
 
 // 数据概览:累计计数(平台细分)+ 今日/任务概况 + 多平台趋势 + 意向/平台/素材占比 + 热门榜。
@@ -308,13 +280,13 @@ export function DashboardPage() {
                     <span className="flex w-16 justify-between">
                       <span className="text-muted-foreground">内容</span>
                       <span className="font-mono text-foreground">
-                        {(stat?.contents ?? 0).toLocaleString()}
+                        <AnimatedNumber value={stat?.contents ?? 0} />
                       </span>
                     </span>
                     <span className="flex w-16 justify-between">
                       <span className="text-muted-foreground">评论</span>
                       <span className="font-mono text-foreground">
-                        {(stat?.comments ?? 0).toLocaleString()}
+                        <AnimatedNumber value={stat?.comments ?? 0} />
                       </span>
                     </span>
                   </div>
@@ -323,12 +295,12 @@ export function DashboardPage() {
             </div>
           )}
         </div>
-        <div className="veltrix-card p-5">
+        <div className="veltrix-card flex flex-col p-5">
           <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
             <ListChecks className="size-4 text-muted-foreground" />
             任务状态
           </h3>
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid flex-1 grid-cols-4 grid-rows-1 gap-2">
             <StatusTile
               icon={Activity}
               label="进行中"
@@ -368,7 +340,7 @@ export function DashboardPage() {
       >
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-semibold text-foreground">
-            数据采集趋势 · 各平台按天(内容 + 评论)
+            数据采集趋势 · 各平台内容按天(平滑折线)
           </h2>
           <Popover>
             <PopoverTrigger asChild>
@@ -419,7 +391,7 @@ export function DashboardPage() {
         </div>
 
         {data && data.trendSeries.length > 0 && (
-          <div className="mb-3 flex flex-wrap gap-4 text-xs text-muted-foreground">
+          <div className="mb-3 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             {data.trendSeries.map((s, i) => (
               <span key={s.platform} className="inline-flex items-center gap-1.5">
                 <span
@@ -436,6 +408,7 @@ export function DashboardPage() {
           dates={data?.trendDates ?? []}
           series={data?.trendSeries ?? []}
           platformName={platformName}
+          metric="contents"
         />
       </div>
 
@@ -557,7 +530,7 @@ function OverviewCard({
           {label}
         </span>
         <span className="ml-auto font-mono text-2xl font-semibold text-foreground">
-          {total?.toLocaleString() ?? "—"}
+          <AnimatedNumber value={total} />
         </span>
       </div>
       <div className="mt-3 border-t pt-3 text-xs">
@@ -597,7 +570,7 @@ function KV({ label, value }: { label: string; value: number }) {
     <div className="flex items-center justify-between gap-2">
       <span className="truncate text-muted-foreground">{label}</span>
       <span className="shrink-0 font-mono font-medium text-foreground">
-        {value.toLocaleString()}
+        <AnimatedNumber value={value} />
       </span>
     </div>
   );
@@ -628,7 +601,7 @@ function TodayMetric({
       </div>
       <div className="min-w-0">
         <div className="font-mono text-xl font-semibold leading-none text-foreground">
-          {value?.toLocaleString() ?? "—"}
+          <AnimatedNumber value={value} />
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground">
           <span>{label}</span>
@@ -654,14 +627,14 @@ function StatusTile({
   bg: string;
 }) {
   return (
-    <div className="flex flex-col items-center gap-1.5 text-center">
+    <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
       <div
-        className={`flex size-11 items-center justify-center rounded-xl ${bg} ${color}`}
+        className={`flex size-14 items-center justify-center rounded-xl ${bg} ${color}`}
       >
-        <Icon className="size-6" />
+        <Icon className="size-7" />
       </div>
       <div className="font-mono text-xl font-semibold leading-none text-foreground">
-        {value?.toLocaleString() ?? "—"}
+        <AnimatedNumber value={value} />
       </div>
       <div className="text-[11px] text-muted-foreground">{label}</div>
     </div>
@@ -714,7 +687,7 @@ function DonutCard({
                   {d.label}
                 </span>
                 <span className="ml-auto shrink-0 font-mono text-foreground">
-                  {d.value.toLocaleString()}
+                  <AnimatedNumber value={d.value} />
                 </span>
                 <span className="w-9 shrink-0 text-right font-mono text-muted-foreground">
                   {pct}%
@@ -740,6 +713,7 @@ function DonutChart({
   size?: number;
 }) {
   const total = data.reduce((s, d) => s + d.value, 0);
+  const animatedTotal = useCountUp(total) ?? total;
   const r = size / 2 - 12;
   const c = 2 * Math.PI * r;
   let acc = 0;
@@ -774,6 +748,10 @@ function DonutChart({
                 strokeWidth={12}
                 strokeDasharray={`${(frac * c).toFixed(2)} ${c.toFixed(2)}`}
                 strokeDashoffset={(-acc * c).toFixed(2)}
+                style={{
+                  transition:
+                    "stroke-dasharray 0.6s ease-out, stroke-dashoffset 0.6s ease-out",
+                }}
               />
             );
             acc += frac;
@@ -789,7 +767,7 @@ function DonutChart({
         fontSize={22}
         fontWeight={600}
       >
-        {total.toLocaleString()}
+        {animatedTotal.toLocaleString()}
       </text>
       <text
         x={size / 2}
@@ -864,46 +842,88 @@ function AutoScrollList({
   );
 }
 
-// 多平台采集趋势折线图(纯 SVG):每平台一条平滑曲线,支持鼠标悬停查看当天各平台数值。
+// 多平台采集趋势(纯 SVG):以「内容」采集量为主的平滑折线 + 线下渐变面积,每平台一条品牌色曲线。
+// 评论量级与内容相差悬殊(常数十倍),不再叠进主图,改在悬停浮窗里看当天明细。
+// 平滑用控制点 y 钳在本段端点内的 Catmull-Rom:曲线必过数据点、孤立高点不过冲,不会鼓成误导性钟形。
 function MultiTrendChart({
   dates,
   series,
   platformName,
+  metric = "contents",
+  compact = false,
 }: {
   dates: string[];
   series: PlatformSeries[];
   platformName: (id: string) => string;
+  metric?: "contents" | "comments";
+  compact?: boolean;
 }) {
   const [hover, setHover] = useState<number | null>(null);
-  const hasData =
-    dates.length > 0 && series.some((s) => s.counts.some((c) => c > 0));
   // 区间完全没有日期才退回纯占位;有日期则照常画坐标轴,仅缺曲线
   if (dates.length === 0) {
     return <EmptyLine text="该区间暂无采集数据" className="h-52" />;
   }
 
+  // 主绘制字段:内容图(默认)或评论图(独立小图)。两图同款平滑折线,仅数据源 + 轴名不同
+  const valuesOf = (s: PlatformSeries) =>
+    metric === "comments" ? s.comments : s.contents;
+  const axisLabel = metric === "comments" ? "评论" : "内容";
+
   const W = 760;
-  const H = 240;
-  const padL = 32;
+  const H = compact ? 176 : 240;
+  const padL = 36;
   const padR = 16;
-  const padT = 16;
+  const padT = 26; // 顶部留白:给轴名腾位,与最高刻度数字拉开
   const padB = 28;
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
   const n = dates.length;
-  const maxV = Math.max(1, ...series.flatMap((s) => s.counts));
 
+  // 只画有数据的平台:全 0 平台会在底部叠成误导性的 0 基线。保留原始下标 si 用于配色,与图例一致
+  const active = series
+    .map((s, si) => ({ s, si }))
+    .filter(({ s }) => valuesOf(s).some((c) => c > 0));
+  const hasData = active.length > 0;
+
+  const maxV = Math.max(1, ...active.flatMap(({ s }) => valuesOf(s)));
   const px = (i: number) =>
     padL + (n === 1 ? innerW / 2 : (i * innerW) / (n - 1));
   const py = (v: number) => padT + innerH * (1 - v / maxV);
-  const linePath = (counts: number[]) =>
-    smoothPath(
-      counts.map((v, i) => [px(i), py(v)] as [number, number]),
-      padT,
-      padT + innerH,
-    );
 
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => Math.round(maxV * f));
+  // Catmull-Rom→三次贝塞尔,但把控制点 y 钳在本段两端点之间:平滑且不过冲、峰落在数据点上,
+  // 避免普通平滑把孤立高点鼓成偏移的钟形(评论那版钟形的根因)
+  const smooth = (pts: [number, number][]): string => {
+    if (pts.length === 0) return "";
+    if (pts.length === 1) {
+      return `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+    }
+    const clampSeg = (y: number, a: number, b: number) =>
+      Math.max(Math.min(a, b), Math.min(Math.max(a, b), y));
+    let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1] ?? pts[i];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[i + 2] ?? p2;
+      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+      const cp1y = clampSeg(p1[1] + (p2[1] - p0[1]) / 6, p1[1], p2[1]);
+      const cp2y = clampSeg(p2[1] - (p3[1] - p1[1]) / 6, p1[1], p2[1]);
+      d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+    }
+    return d;
+  };
+  const linePath = (counts: number[]) =>
+    smooth(counts.map((v, i) => [px(i), py(v)] as [number, number]));
+  // 面积:折线下沿沿底边闭合
+  const areaPath = (counts: number[]) => {
+    const yb = py(0).toFixed(1);
+    return `${linePath(counts)} L${px(n - 1).toFixed(1)},${yb} L${px(0).toFixed(1)},${yb} Z`;
+  };
+
+  const fractions = [0, 0.25, 0.5, 0.75, 1];
+  const ticks = fractions.map((f) => Math.round(maxV * f));
+  const tickY = (f: number) => padT + innerH * (1 - f);
   const step = Math.max(1, Math.ceil(n / 8));
 
   // 鼠标移动 → 命中最近日期下标(viewBox 与渲染宽度按比例换算)
@@ -924,8 +944,33 @@ function MultiTrendChart({
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
       >
-        {ticks.map((t, i) => {
-          const yy = py(t);
+        <defs>
+          {active.map(({ s, si }) => (
+            <linearGradient
+              key={`grad-${si}`}
+              id={`trend-grad-${metric}-${s.platform}`}
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="1"
+            >
+              <stop
+                offset="0%"
+                stopColor={platformColor(s.platform, si)}
+                stopOpacity={0.3}
+              />
+              <stop
+                offset="100%"
+                stopColor={platformColor(s.platform, si)}
+                stopOpacity={0}
+              />
+            </linearGradient>
+          ))}
+        </defs>
+
+        {/* 横向网格 + 内容刻度(单轴) */}
+        {fractions.map((f, i) => {
+          const yy = tickY(f);
           return (
             <g key={`g${i}`}>
               <line
@@ -934,20 +979,31 @@ function MultiTrendChart({
                 x2={W - padR}
                 y2={yy}
                 stroke="currentColor"
-                strokeOpacity={0.15}
+                strokeOpacity={0.12}
               />
               <text
                 x={padL - 6}
                 y={yy + 3}
                 textAnchor="end"
                 className="fill-muted-foreground"
-                fontSize={9}
+                fontSize={8}
               >
-                {t}
+                {ticks[i]}
               </text>
             </g>
           );
         })}
+
+        {/* 轴名:固定在顶部留白处,与最高刻度数字隔开 */}
+        <text
+          x={padL - 6}
+          y={10}
+          textAnchor="end"
+          className="fill-muted-foreground"
+          fontSize={8}
+        >
+          {axisLabel}
+        </text>
 
         {dates.map((d, i) =>
           i % step === 0 || i === n - 1 ? (
@@ -957,76 +1013,93 @@ function MultiTrendChart({
               y={H - 8}
               textAnchor="middle"
               className="fill-muted-foreground"
-              fontSize={9}
+              fontSize={8}
             >
               {d}
             </text>
           ) : null,
         )}
 
-        {series.map((s, si) => (
+        {/* 内容面积(渐变填充,科技感) */}
+        {active.map(({ s, si }) => (
           <path
-            key={s.platform}
-            d={linePath(s.counts)}
-            fill="none"
-            stroke={platformColor(s.platform, si)}
-            strokeWidth={1.5}
-            strokeLinejoin="round"
-            strokeLinecap="round"
+            key={`a${si}`}
+            d={areaPath(valuesOf(s))}
+            fill={`url(#trend-grad-${metric}-${s.platform})`}
+            stroke="none"
+            style={{ transition: "d 0.6s ease-out" }}
           />
         ))}
 
-        {/* 有坐标轴但区间内无任何采集数据时,中央叠加提示 */}
+        {/* 内容平滑折线(每平台品牌色) */}
+        {active.map(({ s, si }) => (
+          <path
+            key={`l${si}`}
+            d={linePath(valuesOf(s))}
+            fill="none"
+            stroke={platformColor(s.platform, si)}
+            strokeWidth={1}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            style={{ transition: "d 0.6s ease-out" }}
+          />
+        ))}
+
+        {/* 数据点标记(非零;悬停当天放大) */}
+        {active.map(({ s, si }) =>
+          valuesOf(s).map((v, i) =>
+            v > 0 ? (
+              <circle
+                key={`p${si}-${i}`}
+                cx={px(i)}
+                cy={py(v)}
+                r={hover === i ? 3.5 : 2}
+                fill={platformColor(s.platform, si)}
+                className="stroke-background"
+                strokeWidth={1.5}
+                style={{ transition: "r 0.15s" }}
+              />
+            ) : null,
+          ),
+        )}
+
         {!hasData && (
           <text
             x={W / 2}
             y={padT + innerH / 2}
             textAnchor="middle"
             className="fill-muted-foreground"
-            fontSize={9}
+            fontSize={8}
           >
             暂无采集数据
           </text>
         )}
 
-        {/* 悬停:竖线 + 各平台数据点高亮 */}
+        {/* 悬停竖线 */}
         {hover !== null && (
-          <>
-            <line
-              x1={px(hover)}
-              y1={padT}
-              x2={px(hover)}
-              y2={H - padB}
-              stroke="currentColor"
-              strokeOpacity={0.4}
-              strokeDasharray="3 3"
-            />
-            {series.map((s, si) => (
-              <circle
-                key={`h${si}`}
-                cx={px(hover)}
-                cy={py(s.counts[hover] ?? 0)}
-                r={2.5}
-                fill={platformColor(s.platform, si)}
-                stroke="white"
-                strokeWidth={1}
-              />
-            ))}
-          </>
+          <line
+            x1={px(hover)}
+            y1={padT}
+            x2={px(hover)}
+            y2={padT + innerH}
+            stroke="currentColor"
+            strokeOpacity={0.35}
+            strokeDasharray="3 3"
+          />
         )}
       </svg>
 
-      {/* 悬停浮窗:当天各平台数值 */}
-      {hover !== null && (
+      {/* 悬停浮窗:当天各平台内容 + 评论明细(评论虽不画线,数据仍可见) */}
+      {hover !== null && hasData && (
         <div
           className="pointer-events-none absolute top-1 z-10 w-max max-w-[260px] whitespace-nowrap rounded-md border bg-popover px-2.5 py-1.5 text-xs shadow-md"
           style={{
             left: `${(px(hover) / W) * 100}%`,
             // 靠左点左对齐、靠右点右对齐、中间居中,避免浮窗超出图表边缘被截断
             transform: `translateX(${
-              hover / Math.max(1, n - 1) < 0.18
+              px(hover) / W < 0.18
                 ? "0%"
-                : hover / Math.max(1, n - 1) > 0.82
+                : px(hover) / W > 0.82
                   ? "-100%"
                   : "-50%"
             })`,
@@ -1034,6 +1107,7 @@ function MultiTrendChart({
         >
           <div className="mb-1 font-medium text-foreground">{dates[hover]}</div>
           <div className="grid grid-cols-[1fr_auto_auto] items-center gap-x-4 gap-y-1">
+            {/* 「呈现所有」:浮窗列出全部平台当天数值(图只画有数据平台,浮窗补全 0 的) */}
             {series.map((s, si) => (
               <Fragment key={`t${si}`}>
                 <span className="flex items-center gap-1.5">

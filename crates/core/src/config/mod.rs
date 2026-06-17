@@ -445,30 +445,51 @@ impl Default for MediaConfig {
 /// 模型名 + 批大小;api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommentIntentConfig {
-    /// 模型厂商 id(providers.id 逻辑引用),空表示未配置。
+    /// API 地址(直接配置,空表示未配置)。
     #[serde(default)]
-    pub provider_id: String,
+    pub api_url: String,
     /// 所选模型(provider.models 之一)。
     #[serde(default)]
     pub model: String,
     /// 提示词 id(prompts.id 逻辑引用)。
     #[serde(default)]
-    pub prompt_id: String,
+    pub intent_prompt: String,
     /// 单批送入大模型的评论条数;<=0 时调用方回退默认值。
     #[serde(default)]
     pub batch_size: i32,
 }
 
-/// 语音转写配置(系统设置「语音转写」)。只存 providers 表 id 引用 + 模型名;
+/// 语音转写默认接入(MiMo ASR):开箱即用,用户仅需补 API Key。
+pub const DEFAULT_ASR_API_URL: &str = "https://api.xiaomimimo.com/v1";
+pub const DEFAULT_ASR_MODEL: &str = "mimo-v2.5-asr";
+
+fn default_asr_api_url() -> String {
+    DEFAULT_ASR_API_URL.to_string()
+}
+
+fn default_asr_model() -> String {
+    DEFAULT_ASR_MODEL.to_string()
+}
+
+/// 语音转写配置(系统设置「语音转写」)。api_url / model 默认 MiMo ASR(开箱即用);
 /// api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。目前仅支持 ASR 的厂商(小米 MiMo)。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
-    /// 模型厂商 id(providers.id 逻辑引用),空表示未配置。
-    #[serde(default)]
-    pub provider_id: String,
-    /// 所选 ASR 模型(provider.models 之一,如 mimo-v2.5-asr)。
-    #[serde(default)]
+    /// API 地址(默认 MiMo;旧配置存空时由 load_or_default 回退默认)。
+    #[serde(default = "default_asr_api_url")]
+    pub api_url: String,
+    /// 所选 ASR 模型(默认 mimo-v2.5-asr)。
+    #[serde(default = "default_asr_model")]
     pub model: String,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            api_url: default_asr_api_url(),
+            model: default_asr_model(),
+        }
+    }
 }
 
 /// 数据库配置。运行时二选一:连接串决定后端(SQLite / PostgreSQL)。
@@ -527,6 +548,13 @@ impl AppConfig {
         // 兼容旧配置文件:补全内置平台后续新增的关键字段(detail_url_template / 内置拦截特征)。
         // 「文件已存在则只读文件」会让老用户拿不到新增的内置配置(如评论采集所需),这里启动时补齐。
         cfg.merge_builtin_platform_defaults();
+        // 兼容旧配置:transcription 历史上常存成空字符串,启动时回退 MiMo 默认(开箱即用,仅 api_key 需用户补)
+        if cfg.transcription.api_url.trim().is_empty() {
+            cfg.transcription.api_url = default_asr_api_url();
+        }
+        if cfg.transcription.model.trim().is_empty() {
+            cfg.transcription.model = default_asr_model();
+        }
         Ok(cfg)
     }
 
@@ -624,6 +652,8 @@ impl AppConfig {
                     "/aweme/v1/web/search/item/",
                     // 一级评论接口;真实路径需本机抓包核对
                     "/aweme/v1/web/comment/list/",
+                    // 内容详情接口:补取/刷新视频直链用;真实路径需本机抓包核对
+                    "/aweme/v1/web/aweme/detail/",
                 ],
             ),
             (
@@ -637,6 +667,8 @@ impl AppConfig {
                     "/api/sns/web/v1/search/notes",
                     // 一级评论接口;真实路径需抓包核对
                     "/api/sns/web/v2/comment/page",
+                    // 笔记详情(feed)接口:详情卡含 video.media.stream,补取视频直链用;真实路径需抓包核对
+                    "/api/sns/web/v1/feed",
                 ],
             ),
             (

@@ -134,9 +134,10 @@ impl KuaishouAdapter {
     }
 
     /// 取视频无水印直链。快手 REST 响应里直链是 `photoUrls`(数组,每项 `{cdn,url}`),
-    /// 优先取首个可用 url;再兜底 H265 数组与历史的字符串字段(`photoUrl`/`photoH265Url`)。
+    /// 优先取首个可用 url;再兜底 H265 数组、历史字符串字段(`photoUrl`/`photoH265Url`)与
+    /// 老接口的 `mainMvUrls[].url`。任一命中即返回,供后续拉流转音频。
     fn first_video_url(photo: &Value) -> Option<String> {
-        for key in ["photoUrls", "photoH265Urls"] {
+        for key in ["photoUrls", "photoH265Urls", "mainMvUrls"] {
             if let Some(url) = photo
                 .get(key)
                 .and_then(Value::as_array)
@@ -358,6 +359,46 @@ impl KuaishouAdapter {
         }
     }
 
+    /// 解析内容详情(graphql `visionVideoDetail`)为单条内容,主要拿新鲜视频直链。
+    /// 详情响应 `data.visionVideoDetail.photo`(结构同搜索 feed 的 photo);取不到直链则跳过。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut contents = Vec::new();
+        for resp in &ctx.responses {
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(photo) = root
+                .get("data")
+                .and_then(|d| d.get("visionVideoDetail"))
+                .and_then(|v| v.get("photo"))
+            else {
+                continue;
+            };
+            let Some(content_id) =
+                Self::as_string_opt(photo.get("id").or_else(|| photo.get("photoId")))
+            else {
+                continue;
+            };
+            let Some(video_url) = Self::first_video_url(photo) else {
+                continue;
+            };
+            contents.push(Content {
+                platform: PLATFORM_ID.to_string(),
+                content_id,
+                kind: ContentKind::Video,
+                video_url: Some(video_url),
+                collected_at,
+                ..Default::default()
+            });
+        }
+        FetchOutput {
+            contents,
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
+
     /// 解析一级评论响应为评论列表(contents 恒空)。按响应体里的 visionCommentList 识别。
     fn parse_comments(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
@@ -404,7 +445,7 @@ impl PlatformAdapter for KuaishouAdapter {
     fn supports(&self, kind: &TaskKind) -> bool {
         matches!(
             kind,
-            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile
+            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile | TaskKind::ContentDetail
         )
     }
 
@@ -412,6 +453,7 @@ impl PlatformAdapter for KuaishouAdapter {
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::UserProfile => Self::parse_profile(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)

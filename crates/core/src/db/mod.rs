@@ -130,6 +130,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::customer::Entity, "customers").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
+    create_table(db, &schema, entity::app_secret::Entity, "app_secrets").await?;
     create_table(db, &schema, entity::task::Entity, "tasks").await?;
     create_table(db, &schema, entity::content::Entity, "contents").await?;
     create_table(db, &schema, entity::comment::Entity, "comments").await?;
@@ -151,6 +152,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     )
     .await?;
     create_table(db, &schema, entity::chat_message::Entity, "chat_messages").await?;
+    create_table(db, &schema, entity::chat_memory::Entity, "chat_memories").await?;
 
     // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
@@ -313,6 +315,55 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 兼容已建的 chat_conversations 表:补滚动摘要列(长会话压缩前情提要)+ 场景类型。
+    // summary 默认空串,summarized_upto_id 默认 0(尚未折叠任何消息);agent_type 默认 chat。
+    for (col, ddl) in [
+        ("summary", "ALTER TABLE chat_conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''"),
+        ("summarized_upto_id", "ALTER TABLE chat_conversations ADD COLUMN summarized_upto_id BIGINT NOT NULL DEFAULT 0"),
+        ("agent_type", "ALTER TABLE chat_conversations ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'chat'"),
+        ("archived", "ALTER TABLE chat_conversations ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"),
+        ("plan_todos", "ALTER TABLE chat_conversations ADD COLUMN plan_todos TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !column_exists(db, "chat_conversations", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER chat_conversations.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 chat_messages 表:补工具消息列(Agent 工具往返;均可空,旧行为纯文本)
+    for (col, ddl) in [
+        ("tool_calls", "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT"),
+        ("tool_call_id", "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT"),
+        ("tool_name", "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT"),
+    ] {
+        if !column_exists(db, "chat_messages", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER chat_messages.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
+    // 兼容已建的 authors 表:补黑名单开关列(旧行默认 0 = 未拉黑)
+    if !column_exists(db, "authors", "is_blacklisted").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE authors ADD COLUMN is_blacklisted BOOLEAN NOT NULL DEFAULT 0"
+                    .to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER authors.is_blacklisted 失败(忽略): {e}");
+        }
+    }
+
     // 二级索引:覆盖高频查询字段。CREATE INDEX IF NOT EXISTS 跨 SQLite/PG 通用,重启无副作用。
     for ddl in [
         "CREATE INDEX IF NOT EXISTS idx_accounts_platform_last_used ON accounts(platform, last_used_at)",
@@ -331,6 +382,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_authors_owner ON authors(owner)",
         "CREATE INDEX IF NOT EXISTS idx_authors_platform_uid ON authors(platform, uid)",
         "CREATE INDEX IF NOT EXISTS idx_authors_monitored ON authors(is_monitored)",
+        "CREATE INDEX IF NOT EXISTS idx_authors_blacklisted ON authors(is_blacklisted)",
         // 复合索引:全量库/评论库按 owner 过滤 + collected_at 倒序的列表与趋势查询,
         // 以及内容详情的作者维度聚合(owner+platform+author_uid)、意向客资筛选(intent_level)。
         // 大库(十万行级)下这些查询无索引会退化为全表扫描 + 文件排序。
@@ -342,6 +394,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_comments_intent ON comments(intent_level)",
         "CREATE INDEX IF NOT EXISTS idx_chat_conversations_owner ON chat_conversations(owner, updated_at)",
         "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_chat_memories_owner ON chat_memories(owner, updated_at)",
     ] {
         if let Err(e) = db
             .execute(Statement::from_string(backend, ddl.to_owned()))

@@ -1,8 +1,10 @@
 //! SeaORM 实体集合。新增表 = 加一个实体模块 + 在 `db::init_schema` 建表。
 
 pub mod account;
+pub mod app_secret;
 pub mod author;
 pub mod chat_conversation;
+pub mod chat_memory;
 pub mod chat_message;
 pub mod collect_log;
 pub mod comment;

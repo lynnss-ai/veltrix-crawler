@@ -135,6 +135,27 @@ export function AuthorLibraryPage() {
     }
   }
 
+  // 切换作者黑名单:加入后再次采集会排除其内容。行级 loading,成功后就地更新
+  async function toggleBlacklist(a: AuthorView, next: boolean) {
+    if (toggling.has(a.id)) return;
+    setToggling((prev) => new Set(prev).add(a.id));
+    try {
+      await api.setAuthorBlacklistedById(a.id, next);
+      setAuthors((prev) =>
+        prev.map((x) => (x.id === a.id ? { ...x, isBlacklisted: next } : x)),
+      );
+      toast.success(next ? "已加入黑名单 · 采集将排除其内容" : "已移出黑名单");
+    } catch (e) {
+      toast.error(`操作失败: ${e}`);
+    } finally {
+      setToggling((prev) => {
+        const nextSet = new Set(prev);
+        nextSet.delete(a.id);
+        return nextSet;
+      });
+    }
+  }
+
   // 画像补采:对当前筛选下「支持补采」的作者逐个打开主页拦截画像接口刷新档案。
   // 串行 + 逐个开窗,可能较慢——用当前筛选(平台 / 仅看监控 / 关键字)控制范围。
   async function enrichFiltered() {
@@ -273,6 +294,34 @@ export function AuthorLibraryPage() {
                 }
               >
                 {a.isMonitored ? "监控中" : "未监控"}
+              </span>
+            </span>
+          );
+        },
+      },
+      {
+        id: "blacklisted",
+        accessorKey: "isBlacklisted",
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} title="黑名单" />
+        ),
+        cell: ({ row }) => {
+          const a = row.original;
+          return (
+            <span className="flex items-center gap-2 text-xs">
+              <Switch
+                checked={a.isBlacklisted}
+                disabled={toggling.has(a.id)}
+                onCheckedChange={(v) => toggleBlacklist(a, v)}
+              />
+              <span
+                className={
+                  a.isBlacklisted
+                    ? "text-red-600 dark:text-red-400"
+                    : "text-muted-foreground"
+                }
+              >
+                {a.isBlacklisted ? "已拉黑" : "正常"}
               </span>
             </span>
           );

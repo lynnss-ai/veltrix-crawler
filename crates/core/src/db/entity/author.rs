@@ -33,6 +33,9 @@ pub struct Model {
     pub location: Option<String>,
     /// 是否被持续监控(作者级监控开关)
     pub is_monitored: bool,
+    /// 是否被拉黑(作者级黑名单开关):采集时命中该作者的内容会被排除、不抓
+    #[sea_orm(default_value = false)]
+    pub is_blacklisted: bool,
     /// 首次采集 / 最近采集时间(Unix 秒)
     pub first_collected_at: i64,
     pub last_collected_at: i64,

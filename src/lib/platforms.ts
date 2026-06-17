@@ -34,12 +34,12 @@ const SOLID_PALETTE: string[] = [
 // 抖音的红/青会与小红书红混淆,故用其最具辨识度的「黑」并随主题自适应,两个主题都清晰可读。
 // 其余未列平台仍按 id 哈希从 PALETTE 取色。
 const BRAND_TINT: Record<string, string> = {
-  xhs: "bg-[#FF2442]/10 text-[#FF2442]",
-  kuaishou: "bg-[#FF6A00]/10 text-[#FF6A00]",
+  xhs: "bg-[#FF2442]/10 text-[#E11D48] dark:bg-[#FF2442]/20 dark:text-[#FF7A90]",
+  kuaishou: "bg-[#FF6A00]/10 text-[#C2410C] dark:bg-[#FF6A00]/20 dark:text-[#FF9A4D]",
   douyin: "bg-foreground/10 text-foreground",
-  bilibili: "bg-[#FB7299]/10 text-[#FB7299]",
-  tiktok: "bg-[#25F4EE]/15 text-[#00A2B8] dark:text-[#25F4EE]",
-  youtube: "bg-[#FF0000]/10 text-[#E60000] dark:text-[#FF4444]",
+  bilibili: "bg-[#FB7299]/10 text-[#D6336C] dark:bg-[#FB7299]/20 dark:text-[#FB85A6]",
+  tiktok: "bg-[#25F4EE]/15 text-[#0E7490] dark:bg-[#25F4EE]/20 dark:text-[#34E8E0]",
+  youtube: "bg-[#FF0000]/10 text-[#DC2626] dark:bg-[#FF0000]/20 dark:text-[#FF5C5C]",
 };
 const BRAND_SOLID: Record<string, string> = {
   xhs: "bg-[#FF2442] text-white",
@@ -164,6 +164,21 @@ const PLATFORM_ORDER: string[] = [
   "bilibili", // B站
   "youtube", // YouTube
 ];
+
+/** 平台 id → 中文展示名(标准名)。平台管理里自定义改名以各页面内 platformName(读配置)为准;
+ *  此处用于对话资产文案等拿不到平台配置的场景。未知 id 原样返回。 */
+const PLATFORM_LABELS: Record<string, string> = {
+  douyin: "抖音",
+  xhs: "小红书",
+  kuaishou: "快手",
+  tiktok: "TikTok",
+  bilibili: "B站",
+  youtube: "YouTube",
+};
+
+export function platformLabel(id: string): string {
+  return PLATFORM_LABELS[id] ?? id;
+}
 
 /** 平台 id 的展示排序权重;未列入的平台返回末位权重,排到最后。 */
 export function platformOrder(id: string): number {

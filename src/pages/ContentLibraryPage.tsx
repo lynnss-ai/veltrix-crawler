@@ -1166,7 +1166,7 @@ function ContentCard({
           <LocalFirstImage
             localPath={c.coverPath}
             externalUrl={coverExternal}
-            className={`h-auto min-h-32 w-32 shrink-0 self-stretch rounded-md object-cover transition ${
+            className={`h-auto w-32 shrink-0 self-stretch rounded-md object-cover transition ${
               detailUrl ? "cursor-pointer hover:opacity-80" : ""
             }`}
             onClick={
@@ -1180,7 +1180,7 @@ function ContentCard({
           />
         </SimpleTooltip>
       ) : (
-        <div className="flex min-h-32 w-32 shrink-0 items-center justify-center self-stretch rounded-md bg-muted">
+        <div className="flex w-32 shrink-0 items-center justify-center self-stretch rounded-md bg-muted">
           <Icon className="size-6 text-muted-foreground" />
         </div>
       )}
@@ -1252,14 +1252,14 @@ function ContentCard({
           </span>
         </div>
 
-        {/* 标题:完整换行,点击打开应用内详情弹窗 */}
+        {/* 标题/文案:完整显示(自动换行、不截断),行高随内容自适应;点击打开详情弹窗 */}
         <SimpleTooltip content="查看详情">
-          <span
+          <p
             onClick={onOpenDetail}
-            className="w-fit cursor-pointer whitespace-normal break-words text-xs text-muted-foreground transition-colors hover:text-primary hover:underline"
+            className="w-full cursor-pointer whitespace-pre-wrap break-words text-xs leading-relaxed text-muted-foreground transition-colors hover:text-primary hover:underline"
           >
             {titleText}
-          </span>
+          </p>
         </SimpleTooltip>
 
         {/* 话题(紫标),包裹换行 */}

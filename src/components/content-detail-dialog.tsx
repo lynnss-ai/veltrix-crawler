@@ -397,21 +397,8 @@ export function ContentDetailDialog({
               视频=封面预览 + 本地音频播放 + 文案主体(视频详情以文案/音频为核心) */}
           <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto bg-muted/20 p-4">
             {content?.kind === "video" ? (
-              // 视频详情:不放封面,只保留音频播放 + 文案主体(看原视频走导航条「打开原文」)
+              // 视频详情:不放封面,文案主体在上、音频播放在下(看原视频走导航条「打开原文」)
               <div className="mx-auto flex h-full max-w-3xl flex-col gap-4">
-                {/* 本地音频:asset 协议播放转出的 mp3;旧数据未记录路径时给出指引 */}
-                {content.audioPath ? (
-                  <audio
-                    controls
-                    preload="metadata"
-                    src={convertFileSrc(content.audioPath)}
-                    className="w-full shrink-0"
-                  />
-                ) : content.audioExtracted ? (
-                  <div className="shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                    音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
-                  </div>
-                ) : null}
                 {/* 文案主体:视频详情的核心内容,占满剩余空间可滚动 */}
                 <div className="flex min-h-0 flex-1 flex-col rounded-lg border bg-card shadow-sm">
                   <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
@@ -446,6 +433,19 @@ export function ContentDetailDialog({
                     )}
                   </div>
                 </div>
+                {/* 本地音频:放在文案下方;asset 协议播放转出的 mp3,旧数据未记录路径时给出指引 */}
+                {content.audioPath ? (
+                  <audio
+                    controls
+                    preload="metadata"
+                    src={convertFileSrc(content.audioPath)}
+                    className="w-full shrink-0"
+                  />
+                ) : content.audioExtracted ? (
+                  <div className="shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                    音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
+                  </div>
+                ) : null}
               </div>
             ) : entries.length > 0 ? (
               // 瀑布流:按图片原始比例错落排列,break-inside-avoid 防跨列断裂

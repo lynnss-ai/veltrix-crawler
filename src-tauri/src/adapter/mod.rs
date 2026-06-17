@@ -86,3 +86,34 @@ impl AdapterRegistry {
         self.adapters.keys().cloned().collect()
     }
 }
+
+/// 从正文文本提取 #话题:遇 `#` 开始累积,遇下一个 `#` / 空白 / 结尾即截断成一个话题。
+/// 能正确拆分相邻无空格的「#话题a#话题b」(平台正文里话题常连写)。保序去重。
+/// 仅作平台结构化话题字段缺失时的兜底——正文中部的 `#` 可能误判,但话题惯例以 `#` 起、空格或连写分隔。
+pub(crate) fn extract_hashtags(text: &str) -> Vec<String> {
+    let mut topics: Vec<String> = Vec::new();
+    // buf=Some 表示正处于一个话题内(已遇到 #);None 表示在话题外的普通正文
+    let mut buf: Option<String> = None;
+    let flush = |buf: &mut Option<String>, out: &mut Vec<String>| {
+        if let Some(name) = buf.take() {
+            if !name.is_empty() {
+                let topic = format!("#{name}");
+                if !out.contains(&topic) {
+                    out.push(topic);
+                }
+            }
+        }
+    };
+    for ch in text.chars() {
+        if ch == '#' {
+            flush(&mut buf, &mut topics);
+            buf = Some(String::new());
+        } else if ch.is_whitespace() {
+            flush(&mut buf, &mut topics);
+        } else if let Some(name) = buf.as_mut() {
+            name.push(ch);
+        }
+    }
+    flush(&mut buf, &mut topics);
+    topics
+}

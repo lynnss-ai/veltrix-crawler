@@ -2,7 +2,7 @@
 // 筛选:左侧栏(行业 + 角标)+ 顶部(意向 / 平台 chip + 评论日期 + 关键字)。
 import { useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { Filter, Heart, MessageCircle, Search, X } from "lucide-react";
+import { Download, Filter, Heart, MessageCircle, Search, X } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
 
@@ -26,9 +26,17 @@ import {
   type IndustryView,
   type PlatformConfig,
 } from "@/lib/api";
-import { platformClass, platformChipClass } from "@/lib/platforms";
+import {
+  platformClass,
+  platformChipClass,
+  contentDetailUrl,
+  authorProfileUrl,
+} from "@/lib/platforms";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { EmptyState } from "@/components/EmptyState";
+import * as XLSX from "xlsx-js-style";
+import { save } from "@tauri-apps/plugin-dialog";
+import { recordDownload } from "@/lib/download-history";
 
 // 意向等级元数据(高=红、中=琥珀、低=灰、无=静默)
 type IntentLevel = "high" | "medium" | "low" | "none";
@@ -86,7 +94,7 @@ export function CommentLibraryPage() {
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [search, setSearch] = useState("");
   const [platformFilter, setPlatformFilter] = useState(""); // ""=全部
-  const [intentFilter, setIntentFilter] = useState("all");
+  const [intentFilter, setIntentFilter] = useState<string[]>([]);
   const [industryFilter, setIndustryFilter] = useState("__all");
   const [commentRange, setCommentRange] = useState<DateRange | undefined>();
   const [kindFilter, setKindFilter] = useState<string[]>([]); // []=全部形态
@@ -120,12 +128,10 @@ export function CommentLibraryPage() {
         return false;
       if (industryFilter !== "__all" && c.industry !== industryFilter)
         return false;
-      if (intentFilter !== "all") {
-        if (intentFilter === "unanalyzed") {
-          if (c.intentLevel != null) return false;
-        } else if (c.intentLevel !== intentFilter) {
-          return false;
-        }
+      if (intentFilter.length > 0) {
+        // 多选:评论意向键(未分析记 "unanalyzed")命中所选任一项才保留
+        const intentKey = c.intentLevel ?? "unanalyzed";
+        if (!intentFilter.includes(intentKey)) return false;
       }
       if (!inDateRange(c.createdAt, commentRange)) return false;
       if (search) {
@@ -147,11 +153,33 @@ export function CommentLibraryPage() {
     search,
   ]);
 
+  // 默认排序:创建时间(采集入库)降序为主;同一时间内按意向 高→中→低→无→未分析
+  const sorted = useMemo(() => {
+    const intentRank = (level: IntentLevel | null): number => {
+      switch (level) {
+        case "high":
+          return 5;
+        case "medium":
+          return 4;
+        case "low":
+          return 3;
+        case "none":
+          return 2;
+        default:
+          return 1; // 未分析(intentLevel 为 null)
+      }
+    };
+    return [...filtered].sort((a, b) => {
+      if (b.collectedAt !== a.collectedAt) return b.collectedAt - a.collectedAt;
+      return intentRank(b.intentLevel) - intentRank(a.intentLevel);
+    });
+  }, [filtered]);
+
   const hasFilter =
     platformFilter !== "" ||
     kindFilter.length > 0 ||
     industryFilter !== "__all" ||
-    intentFilter !== "all" ||
+    intentFilter.length > 0 ||
     commentRange?.from != null ||
     search !== "";
 
@@ -159,7 +187,7 @@ export function CommentLibraryPage() {
     setPlatformFilter("");
     setKindFilter([]);
     setIndustryFilter("__all");
-    setIntentFilter("all");
+    setIntentFilter([]);
     setCommentRange(undefined);
     setSearch("");
   };
@@ -304,21 +332,6 @@ export function CommentLibraryPage() {
         ),
       },
       {
-        id: "industry",
-        accessorKey: "industry",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} title="所属行业" />
-        ),
-        cell: ({ row }) =>
-          row.original.industry ? (
-            <span className="text-xs text-foreground">
-              {row.original.industry}
-            </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">—</span>
-          ),
-      },
-      {
         id: "intent",
         accessorFn: (c) => c.intentLevel ?? "unanalyzed",
         header: ({ column }) => (
@@ -381,11 +394,107 @@ export function CommentLibraryPage() {
           </span>
         ),
       },
+      {
+        id: "collectedAt",
+        accessorFn: (c) => c.collectedAt,
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} title="创建时间" />
+        ),
+        cell: ({ row }) => (
+          <span className="text-xs text-muted-foreground">
+            {formatTime(row.original.collectedAt)}
+          </span>
+        ),
+      },
     ],
     // platformName 依赖 platforms,平台加载后重建列以正确显示名称
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [platforms],
   );
+
+  // 导出当前筛选 + 排序后的评论为 Excel(.xlsx);路径经系统保存对话框选定
+  async function handleExport() {
+    if (sorted.length === 0) {
+      toast.error("当前没有可导出的评论");
+      return;
+    }
+    try {
+      const rows = sorted.map((c) => ({
+        平台: platformName(c.platform),
+        评论者: c.authorNickname,
+        作者主页:
+          authorProfileUrl(c.platform, c.authorUid, c.authorUniqueId) ?? "",
+        评论内容: c.text,
+        点赞数: c.likeCount ?? 0,
+        回复数: c.replyCount ?? 0,
+        意向: c.intentLevel ? INTENT_META[c.intentLevel].label : "未分析",
+        意向理由: c.intentReason ?? "",
+        采集关键词: c.keyword ?? "",
+        所属内容标题: c.contentTitle ?? "",
+        内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
+        评论时间: formatTime(c.createdAt),
+        创建时间: formatTime(c.collectedAt),
+      }));
+      const ws = XLSX.utils.json_to_sheet(rows);
+      // 表头样式:居中 + 靛蓝背景 + 加粗白字
+      const headerStyle = {
+        font: { bold: true, color: { rgb: "FFFFFF" } },
+        fill: { fgColor: { rgb: "4F46E5" } },
+        alignment: { horizontal: "center" as const, vertical: "center" as const },
+      };
+      if (ws["!ref"]) {
+        const range = XLSX.utils.decode_range(ws["!ref"]);
+        for (let col = range.s.c; col <= range.e.c; col++) {
+          const addr = XLSX.utils.encode_cell({ r: 0, c: col });
+          const cell = ws[addr];
+          if (cell) (cell as Record<string, unknown>).s = headerStyle;
+        }
+      }
+      // 列宽(字符数),与导出字段顺序对应
+      ws["!cols"] = [
+        { wch: 8 }, // 平台
+        { wch: 16 }, // 评论者
+        { wch: 42 }, // 作者主页
+        { wch: 50 }, // 评论内容
+        { wch: 8 }, // 点赞数
+        { wch: 8 }, // 回复数
+        { wch: 8 }, // 意向
+        { wch: 40 }, // 意向理由
+        { wch: 20 }, // 采集关键词
+        { wch: 34 }, // 所属内容标题
+        { wch: 46 }, // 内容链接
+        { wch: 20 }, // 评论时间
+        { wch: 20 }, // 创建时间
+      ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "评论");
+      const base64 = XLSX.write(wb, { type: "base64", bookType: "xlsx" });
+      const now = new Date();
+      const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+      // 当天导出流水号:每天从 001 起递增,导出成功才消耗(取消保存不计)
+      const SEQ_KEY = "veltrix.comment-export-seq";
+      let prevSeq: { date: string; seq: number } = { date: "", seq: 0 };
+      try {
+        const raw = localStorage.getItem(SEQ_KEY);
+        if (raw) prevSeq = JSON.parse(raw);
+      } catch {
+        // 本地记录损坏则从头计
+      }
+      const seq = prevSeq.date === ymd ? prevSeq.seq + 1 : 1;
+      const fileName = `意向评论-${ymd}-${String(seq).padStart(3, "0")}.xlsx`;
+      const path = await save({
+        defaultPath: fileName,
+        filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
+      });
+      if (!path) return; // 用户取消保存
+      await api.saveBinaryFile(path, base64);
+      recordDownload({ path, name: fileName, kind: "评论导出" });
+      localStorage.setItem(SEQ_KEY, JSON.stringify({ date: ymd, seq }));
+      toast.success(`已导出 ${rows.length} 条评论`);
+    } catch (e) {
+      toast.error(`导出失败:${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 gap-4">
@@ -437,6 +546,14 @@ export function CommentLibraryPage() {
               className="pl-9"
             />
           </div>
+          <Button
+            variant="outline"
+            className="cursor-pointer px-2 lg:px-3"
+            onClick={handleExport}
+          >
+            <Download className="size-4" />
+            导出 Excel
+          </Button>
           {hasFilter && (
             <Button
               variant="ghost"
@@ -474,9 +591,13 @@ export function CommentLibraryPage() {
             <FilterChip
               key={f.value}
               label={f.label}
-              active={intentFilter === f.value}
+              active={intentFilter.includes(f.value)}
               onClick={() =>
-                setIntentFilter((prev) => (prev === f.value ? "all" : f.value))
+                setIntentFilter((prev) =>
+                  prev.includes(f.value)
+                    ? prev.filter((v) => v !== f.value)
+                    : [...prev, f.value],
+                )
               }
             />
           ))}
@@ -484,7 +605,7 @@ export function CommentLibraryPage() {
 
         <DataTable
           columns={columns}
-          data={filtered}
+          data={sorted}
           itemLabel="评论"
           getRowId={(c) => c.id}
           defaultPageSize={50}

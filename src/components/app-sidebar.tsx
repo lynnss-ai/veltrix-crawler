@@ -1,5 +1,6 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useState } from "react";
 import {
+  Brain,
   CalendarClock,
   ChevronsUpDown,
   Clapperboard,
@@ -11,7 +12,6 @@ import {
   Image,
   Images,
   MessageSquare,
-  KeyRound,
   LayoutDashboard,
   LogOut,
   MoreHorizontal,
@@ -46,22 +46,29 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import { FieldError } from "@/components/FieldError";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
-import { useChat } from "@/components/chat-context";
+import { useChat } from "@/hooks/use-chat";
 import { api, type ConversationView } from "@/lib/api";
 
 // 两级导航:分组 + 带图标子页面。
@@ -78,8 +85,11 @@ export type PageKey =
   | "customers"
   | "users"
   | "system-config"
+  | "user-center"
   | "chat-sessions"
   | "chat-assistant"
+  | "chat-history"
+  | "memory-center"
   | "cowork-space"
   | "cowork-team";
 
@@ -127,7 +137,7 @@ const MENU_GROUPS: MenuGroup[] = [
     title: "系统管理",
     items: [
       { key: "users", label: "用户管理", icon: UserCog },
-      { key: "system-config", label: "系统配置", icon: Settings },
+      // 「系统配置」已从侧栏移除,统一从个人中心 → 系统设置进入(见用户下拉菜单)
     ],
   },
 ];
@@ -163,7 +173,12 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
   chat: [
     {
       title: "对话",
-      items: [{ key: "chat-sessions", label: "会话", icon: MessageSquare }],
+      // 会话列表在侧栏动态渲染(ChatConversationList);这里登记菜单项仅用于默认页与面包屑解析。
+      // 记忆中心为整页模块(记忆 / 知识库 / 知识图谱),从对话侧栏「记忆中心」入口进入。
+      items: [
+        { key: "chat-sessions", label: "会话", icon: MessageSquare },
+        { key: "memory-center", label: "记忆中心", icon: Brain },
+      ],
     },
   ],
   cowork: [
@@ -182,7 +197,17 @@ export function getWorkspaceDefaultPage(workspace: Workspace): PageKey {
   return WORKSPACE_MENUS[workspace][0].items[0].key;
 }
 
-// 根据页面 key 反查所属分组与页面名,用于顶栏面包屑(跨全部工作区)
+// 不在侧栏导航中、但可由个人中心等入口进入的页面,补面包屑(标题栏 H1 取 page)
+const OFF_NAV_PAGES: Partial<
+  Record<PageKey, { group: string; page: string }>
+> = {
+  "system-config": { group: "个人中心", page: "系统设置" },
+  "user-center": { group: "个人中心", page: "个人中心" },
+  "chat-history": { group: "对话", page: "对话记录" },
+};
+
+// 根据页面 key 反查所属分组与页面名,用于顶栏面包屑(跨全部工作区);
+// 侧栏菜单查不到再回退 OFF_NAV_PAGES(如系统设置)
 export function getPageBreadcrumb(key: PageKey): {
   group: string;
   page: string;
@@ -193,37 +218,17 @@ export function getPageBreadcrumb(key: PageKey): {
       if (item) return { group: group.title, page: item.label };
     }
   }
-  return { group: "", page: "" };
+  return OFF_NAV_PAGES[key] ?? { group: "", page: "" };
+}
+
+// 是否为脱离侧栏导航的页面(系统设置 / 个人中心):顶栏据此显示关闭按钮、关闭时返回来源页
+export function isOffNavPage(key: PageKey): boolean {
+  return key in OFF_NAV_PAGES;
 }
 
 // 把会话按最近更新时间分桶:今天 / 昨天 / 近 7 天 / 更早(后端已按 updatedAt 倒序,桶内保持有序)
-function groupConversationsByTime(
-  conversations: ConversationView[],
-): { label: string; items: ConversationView[] }[] {
-  const now = new Date();
-  const todayStart = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-  ).getTime() / 1000;
-  const yesterdayStart = todayStart - 86400;
-  const weekStart = todayStart - 6 * 86400;
-  const buckets: Record<string, ConversationView[]> = {
-    今天: [],
-    昨天: [],
-    "近 7 天": [],
-    更早: [],
-  };
-  for (const c of conversations) {
-    if (c.updatedAt >= todayStart) buckets["今天"].push(c);
-    else if (c.updatedAt >= yesterdayStart) buckets["昨天"].push(c);
-    else if (c.updatedAt >= weekStart) buckets["近 7 天"].push(c);
-    else buckets["更早"].push(c);
-  }
-  return ["今天", "昨天", "近 7 天", "更早"]
-    .map((label) => ({ label, items: buckets[label] }))
-    .filter((g) => g.items.length > 0);
-}
+// 「最近对话」侧栏展示上限:超出的与已归档会话都在「对话记录」页(查看更多)管理。
+const RECENT_LIMIT = 20;
 
 // 对话工作区侧栏:新对话按钮 + 历史会话(按时间分组,数据来自 ChatProvider)。
 // 点会话切到对话页并设为当前;每项可重命名/删除。
@@ -234,27 +239,65 @@ function ChatConversationList({
   active: PageKey;
   onChange: (key: PageKey) => void;
 }) {
-  const { conversations, activeId, setActiveId, reload } = useChat();
+  const { conversations, activeId, setActiveId, setPendingAgentType, reload } =
+    useChat();
   const onChat = active === "chat-sessions";
-  const groups = groupConversationsByTime(conversations);
+  // 最近对话:排除已归档,按更新倒序,只取最近 RECENT_LIMIT 条
+  const recent = conversations
+    .filter((c) => !c.archived)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, RECENT_LIMIT);
 
-  async function handleRename(c: ConversationView) {
-    const next = window.prompt("重命名会话", c.title);
-    if (next == null) return;
-    const title = next.trim();
-    if (!title || title === c.title) return;
+  // 重命名 / 删除会话:自定义弹框(替代原生 prompt 与无确认直删)
+  const [renameTarget, setRenameTarget] = useState<ConversationView | null>(
+    null,
+  );
+  const [renameValue, setRenameValue] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<ConversationView | null>(
+    null,
+  );
+
+  // 开新会话:设场景类型 + 清当前会话 + 切到对话页(首条消息时按场景建会话)
+  function startNew(agentType: string) {
+    setPendingAgentType(agentType);
+    setActiveId(null);
+    onChange("chat-sessions");
+  }
+
+  // 重命名:打开弹框,回填当前标题
+  function handleRename(c: ConversationView) {
+    setRenameValue(c.title);
+    setRenameTarget(c);
+  }
+
+  async function submitRename() {
+    if (!renameTarget) return;
+    const title = renameValue.trim();
+    if (!title || title === renameTarget.title) {
+      setRenameTarget(null);
+      return;
+    }
     try {
-      await api.renameConversation(c.id, title);
+      await api.renameConversation(renameTarget.id, title);
+      setRenameTarget(null);
       await reload();
     } catch (e) {
       toast.error(`重命名失败: ${e}`);
     }
   }
 
-  async function handleDelete(c: ConversationView) {
+  // 删除:打开二次确认弹框
+  function handleDelete(c: ConversationView) {
+    setDeleteTarget(c);
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
     try {
-      await api.deleteConversation(c.id);
-      if (activeId === c.id) setActiveId(null);
+      await api.deleteConversation(target.id);
+      if (activeId === target.id) setActiveId(null);
+      setDeleteTarget(null);
       await reload();
       toast.success("已删除会话");
     } catch (e) {
@@ -307,22 +350,34 @@ function ChatConversationList({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* 新对话:黑白低调菜单项(参考 Claude),悬停浅底,无彩色填充 */}
+      {/* 新对话 / 新编程会话:黑白低调菜单项(参考 Claude),悬停浅底,无彩色填充 */}
       <div className="p-2 pb-1">
+        {/* 新对话:统一入口;进入新会话后在窗口内选择智能体类型(对话 / 编程…),页面随之变形 */}
         <button
           type="button"
-          onClick={() => {
-            setActiveId(null);
-            onChange("chat-sessions");
-          }}
+          onClick={() => startNew("chat")}
           className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
         >
           <SquarePen className="size-4" />
           新对话
         </button>
+        {/* 记忆中心:整页模块(记忆 / 知识库 / 知识图谱),点击进入整页而非弹窗 */}
+        <button
+          type="button"
+          onClick={() => onChange("memory-center")}
+          className={cn(
+            "mt-0.5 flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm font-medium transition-colors",
+            active === "memory-center"
+              ? "bg-primary/10 text-primary shadow-[inset_2px_0_0_var(--primary)]"
+              : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+          )}
+        >
+          <Brain className="size-4" />
+          记忆中心
+        </button>
       </div>
 
-      {/* 历史对话:按时间分组,滚动区 */}
+      {/* 最近对话:仅最近 20 条(排除归档),更多 / 搜索 / 批量管理走「查看更多」对话记录页 */}
       <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto px-1 pb-2">
         {conversations.length === 0 ? (
           <div className="flex flex-col items-center gap-2 px-2 py-10 text-center text-muted-foreground">
@@ -333,18 +388,86 @@ function ChatConversationList({
             </span>
           </div>
         ) : (
-          groups.map((g) => (
-            <SidebarGroup key={g.label} className="px-1 py-1">
-              <SidebarGroupLabel className="px-2 text-[11px]">
-                {g.label}
+          <SidebarGroup className="px-1 py-1">
+            {/* 分组标题「最近对话」+ 右侧小入口「查看更多」(进入对话记录管理页) */}
+            <div className="flex items-center justify-between pr-1">
+              <SidebarGroupLabel className="text-[11px]">
+                最近对话
               </SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>{g.items.map(renderItem)}</SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
-          ))
+              <button
+                type="button"
+                onClick={() => onChange("chat-history")}
+                className="rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+              >
+                查看更多
+              </button>
+            </div>
+            <SidebarGroupContent>
+              {recent.length > 0 ? (
+                <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
+              ) : (
+                <div className="px-2 py-3 text-[11px] text-muted-foreground">
+                  最近对话已全部归档,点「查看更多」管理
+                </div>
+              )}
+            </SidebarGroupContent>
+          </SidebarGroup>
         )}
       </div>
+
+      {/* 重命名会话:自定义弹框(替代原生 prompt) */}
+      <Dialog
+        open={renameTarget !== null}
+        onOpenChange={(open) => !open && setRenameTarget(null)}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>重命名会话</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submitRename();
+              }
+            }}
+            placeholder="输入会话标题"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameTarget(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void submitRename()}>确定</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 删除会话:二次确认(与全局删除弹窗统一用 AlertDialog) */}
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除会话</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定删除「{deleteTarget?.title || "新对话"}」?此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => void confirmDelete()}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -366,7 +489,6 @@ export function AppSidebar({
   user,
   onLogout,
 }: AppSidebarProps) {
-  const [changePwdOpen, setChangePwdOpen] = useState(false);
   // 工作区切换标签的展示顺序(系统配置可调);按保存顺序排列,缺失项忽略
   const [wsOrder] = useWorkspaceOrder();
   const orderedWorkspaces = wsOrder
@@ -377,7 +499,8 @@ export function AppSidebar({
     // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
     // 这里按标题栏高度 --titlebar-h 下移并缩高,使其从标题栏下方开始
     <Sidebar
-      collapsible="icon"
+      // 对话 / 协作工作区:收起即完全隐藏(offcanvas);营销保持收成图标条(icon)
+      collapsible={workspace === "management" ? "icon" : "offcanvas"}
       className="top-(--titlebar-h)! h-[calc(100svh-var(--titlebar-h))]!"
     >
       <SidebarHeader>
@@ -546,10 +669,10 @@ export function AppSidebar({
                 <DropdownMenuSeparator className="my-1.5" />
                 <DropdownMenuItem
                   className="gap-2.5 py-2 cursor-pointer"
-                  onClick={() => setChangePwdOpen(true)}
+                  onClick={() => onChange("user-center")}
                 >
-                  <KeyRound />
-                  修改密码
+                  <UserRound />
+                  个人中心
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2.5 py-2 cursor-pointer"
@@ -572,140 +695,6 @@ export function AppSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
-
-      <ChangePasswordSheet
-        open={changePwdOpen}
-        onOpenChange={setChangePwdOpen}
-      />
     </Sidebar>
   );
 }
-
-// 修改密码弹窗。提交逻辑当前为前端占位,待后端 change_password 命令就绪后替换。
-function ChangePasswordSheet({
-  open,
-  onOpenChange,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const [oldPwd, setOldPwd] = useState("");
-  const [newPwd, setNewPwd] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [submitted, setSubmitted] = useState(false);
-  const [done, setDone] = useState(false);
-
-  // 每次打开重置表单状态(组件常驻不卸载,需手动清理)
-  useEffect(() => {
-    if (open) {
-      setOldPwd("");
-      setNewPwd("");
-      setConfirm("");
-      setSubmitted(false);
-      setDone(false);
-    }
-  }, [open]);
-
-  const mismatch = confirm.length > 0 && newPwd !== confirm;
-
-  function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    setSubmitted(true);
-    // 必填为空 / 两次不一致时改为字段下方提示,不再用顶部红框
-    if (!oldPwd || !newPwd || !confirm || newPwd !== confirm) {
-      return;
-    }
-    // TODO: invoke("change_password", { oldPwd, newPwd }),由后端校验旧密码并更新哈希
-    setDone(true);
-    setTimeout(() => onOpenChange(false), 900);
-  }
-
-  const dirty = Boolean(oldPwd || newPwd || confirm);
-
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-md"
-        blockClose={dirty && !done}
-      >
-        <SheetHeader className="border-b">
-          <SheetTitle>修改密码</SheetTitle>
-          <SheetDescription>修改成功后下次登录生效。</SheetDescription>
-        </SheetHeader>
-        {done ? (
-          <div className="flex-1 p-5">
-            <p className="text-sm text-emerald-600 dark:text-emerald-400">
-              密码修改成功(待接后端)
-            </p>
-          </div>
-        ) : (
-          <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-            <div className="flex-1 space-y-4 overflow-y-auto p-5">
-              <div className="space-y-1.5">
-                <Label htmlFor="old-pwd">
-                  当前密码 <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="old-pwd"
-                  type="password"
-                  value={oldPwd}
-                  onChange={(e) => setOldPwd(e.target.value)}
-                  aria-invalid={submitted && !oldPwd}
-                  autoFocus
-                />
-                <FieldError
-                  show={submitted && !oldPwd}
-                  message="当前密码不可为空"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="new-pwd">
-                  新密码 <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="new-pwd"
-                  type="password"
-                  value={newPwd}
-                  onChange={(e) => setNewPwd(e.target.value)}
-                  aria-invalid={submitted && !newPwd}
-                />
-                <FieldError
-                  show={submitted && !newPwd}
-                  message="新密码不可为空"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="confirm-pwd">
-                  确认新密码 <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="confirm-pwd"
-                  type="password"
-                  value={confirm}
-                  onChange={(e) => setConfirm(e.target.value)}
-                  aria-invalid={(submitted && !confirm) || mismatch}
-                />
-                <FieldError
-                  show={submitted && !confirm}
-                  message="请再次输入新密码"
-                />
-                <FieldError show={mismatch} message="两次输入的新密码不一致" />
-              </div>
-            </div>
-            <SheetFooter className="flex-row justify-end gap-2 border-t">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => onOpenChange(false)}
-              >
-                取消
-              </Button>
-              <Button type="submit">确认</Button>
-            </SheetFooter>
-          </form>
-        )}
-      </SheetContent>
-    </Sheet>
-  );
-}
-

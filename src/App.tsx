@@ -1,11 +1,15 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   AppSidebar,
   getPageBreadcrumb,
   getWorkspaceDefaultPage,
+  isOffNavPage,
   type PageKey,
   type Workspace,
 } from "@/components/app-sidebar";
+import { UserCenterPage } from "@/pages/UserCenterPage";
+import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
 import { type RemoteStatus } from "@/components/RemoteConnect";
 import { api, type UserView } from "@/lib/api";
 import { TitleBar } from "@/components/TitleBar";
@@ -20,8 +24,10 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
 import { CustomersPage } from "@/pages/CustomersPage";
 import { AuthorLibraryPage } from "@/pages/AuthorLibraryPage";
-import { ChatPage } from "@/pages/ChatPage";
+import { MemoryCenterPage } from "@/pages/MemoryCenterPage";
+import { ConversationsPage } from "@/pages/ConversationsPage";
 import { ChatProvider } from "@/components/chat-context";
+import { ConversationShell } from "@/components/conversation-shell";
 import { ContentLibraryPage } from "@/pages/ContentLibraryPage";
 import { CommentLibraryPage } from "@/pages/CommentLibraryPage";
 import { UsersPage } from "@/pages/UsersPage";
@@ -45,24 +51,54 @@ function loadStoredUser(): UserView | null {
   }
 }
 
-function renderPage(active: PageKey, currentUser: string): ReactNode {
+// 当前工作区 / 页面持久化键:刷新按钮是整页 reload,靠它在重载后停留原页而非回到数据概览
+const NAV_STORAGE_KEY = "veltrix.nav.page";
+
+function loadStoredNav(): { workspace: Workspace; active: PageKey } | null {
+  try {
+    const raw = sessionStorage.getItem(NAV_STORAGE_KEY);
+    return raw
+      ? (JSON.parse(raw) as { workspace: Workspace; active: PageKey })
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderPage(
+  active: PageKey,
+  loggedUser: UserView,
+  onProfileUpdated: (user: UserView) => void,
+  onNavigate: (key: PageKey) => void,
+): ReactNode {
   switch (active) {
     case "dashboard":
       return <DashboardPage />;
     case "collect-tasks":
       return <CollectPage />;
     case "accounts":
-      return <AccountsPage currentUser={currentUser} />;
+      return <AccountsPage currentUser={loggedUser.username} />;
     case "system-config":
       return <SettingsPage />;
+    case "user-center":
+      return (
+        <UserCenterPage
+          currentUser={loggedUser}
+          onProfileUpdated={onProfileUpdated}
+        />
+      );
     case "users":
       return <UsersPage />;
     case "industry":
       return <IndustryPage />;
     case "customers":
-      return <CustomersPage currentUser={currentUser} />;
+      return <CustomersPage currentUser={loggedUser.username} />;
     case "chat-sessions":
-      return <ChatPage />;
+      return <ConversationShell />;
+    case "chat-history":
+      return <ConversationsPage onNavigate={onNavigate} />;
+    case "memory-center":
+      return <MemoryCenterPage />;
     case "cowork-space":
       return (
         <PlaceholderPage
@@ -109,11 +145,25 @@ function renderPage(active: PageKey, currentUser: string): ReactNode {
 function App() {
   // 初始值从 localStorage 恢复:刷新页面不丢登录态
   const [loggedUser, setLoggedUser] = useState<UserView | null>(loadStoredUser);
-  const [workspace, setWorkspace] = useState<Workspace>("management");
-  const [active, setActive] = useState<PageKey>("dashboard");
+  // 初始工作区 / 页面从 sessionStorage 恢复:刷新后停留原页(无记录时回默认)
+  const storedNav = loadStoredNav();
+  const [workspace, setWorkspace] = useState<Workspace>(
+    storedNav?.workspace ?? "management",
+  );
+  const [active, setActive] = useState<PageKey>(storedNav?.active ?? "dashboard");
+  // 记住进入脱离侧栏页面(系统设置/个人中心)前的来源页,供关闭返回
+  const prevPageRef = useRef<PageKey>("dashboard");
   // 后端会话就绪标志:后端 set_current_user 完成后才允许各页面发 list 请求,
   // 否则服务端按 dataScope 过滤会因当前用户缺失而出错
   const [sessionReady, setSessionReady] = useState(false);
+
+  // 工作区 / 当前页持久化:刷新按钮走整页 window.location.reload(),靠这个在重载后恢复原页(而非回数据概览)
+  useEffect(() => {
+    sessionStorage.setItem(
+      NAV_STORAGE_KEY,
+      JSON.stringify({ workspace, active }),
+    );
+  }, [workspace, active]);
 
   // 登录 / 初始化成功:先同步后端当前用户,再持久化登录态。
   // remember=true 存 localStorage(关掉重开仍免登录);false 存 sessionStorage(仅本次会话,关闭后需重新登录)
@@ -131,6 +181,16 @@ function App() {
     setLoggedUser(user);
     setSessionReady(true);
   }
+  // 个人中心更新资料:同步内存登录态并刷新原本所在的持久化(username/dataScope 不变,无需重设后端会话)
+  function handleProfileUpdated(updated: UserView) {
+    setLoggedUser(updated);
+    const payload = JSON.stringify(updated);
+    if (localStorage.getItem(AUTH_STORAGE_KEY) !== null) {
+      localStorage.setItem(AUTH_STORAGE_KEY, payload);
+    } else if (sessionStorage.getItem(AUTH_STORAGE_KEY) !== null) {
+      sessionStorage.setItem(AUTH_STORAGE_KEY, payload);
+    }
+  }
   // 退出登录:清除后端会话与两处登录态
   function handleLogout() {
     // 后端清理失败不阻塞退出
@@ -146,6 +206,17 @@ function App() {
   function handleWorkspaceChange(next: Workspace) {
     setWorkspace(next);
     setActive(getWorkspaceDefaultPage(next));
+  }
+
+  // 进入「系统设置 / 个人中心」等脱离侧栏的页面前记住来源页,关闭时返回该页
+  function handleNavigate(next: PageKey) {
+    if (isOffNavPage(next) && !isOffNavPage(active)) {
+      prevPageRef.current = active;
+    }
+    setActive(next);
+  }
+  function closeOffNavPage() {
+    setActive(prevPageRef.current);
   }
   // 远程上报连接状态;后端 RemoteConfig 上报模块就绪前先占位为未连接
   const [remoteStatus] = useState<RemoteStatus>("disconnected");
@@ -285,7 +356,7 @@ function App() {
           workspace={workspace}
           onWorkspaceChange={handleWorkspaceChange}
           active={active}
-          onChange={setActive}
+          onChange={handleNavigate}
           user={loggedUser.username}
           onLogout={handleLogout}
         />
@@ -294,14 +365,29 @@ function App() {
           {/* 对话页整页即会话,不套标题与内边距外层;其余页保留标题 + 留白 */}
           {active === "chat-sessions" ? (
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-              {renderPage(active, loggedUser.username)}
+              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate)}
             </div>
           ) : (
             <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
               <div className="flex shrink-0 items-center justify-between gap-3">
-                <h1 className="text-xl font-semibold text-foreground">
-                  {breadcrumb.page}
-                </h1>
+                {/* 关闭入口统一放在标题左侧、标题前面(脱离侧栏的单页面:系统设置/个人中心/对话记录等) */}
+                <div className="flex min-w-0 items-center gap-2">
+                  {isOffNavPage(active) && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={closeOffNavPage}
+                      title="关闭"
+                      className="size-9 text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-6" />
+                      <span className="sr-only">关闭</span>
+                    </Button>
+                  )}
+                  <h1 className="truncate text-xl font-semibold text-foreground">
+                    {breadcrumb.page}
+                  </h1>
+                </div>
                 {active === "dashboard" && (
                   <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                     当前版本
@@ -311,7 +397,7 @@ function App() {
                   </span>
                 )}
               </div>
-              {renderPage(active, loggedUser.username)}
+              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate)}
             </div>
           )}
         </SidebarInset>

@@ -37,6 +37,8 @@ tokio = { version = "1", features = [
     "time",
     "fs",
     "net",
+    "process",
+    "io-util",
 ] }
 # HTTP 采集器;用 rustls 避免在 Windows 上引入 openssl 编译依赖
 reqwest = { version = "0.12", default-features = false, features = [

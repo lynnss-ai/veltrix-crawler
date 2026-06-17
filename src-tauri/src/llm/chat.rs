@@ -24,12 +24,22 @@ pub struct ChatRequest<'a> {
     pub retry_server_errors: bool,
 }
 
+/// 拼接 chat completions endpoint;api_url 已含该路径(用户填了完整 URL)时不重复拼。
+fn chat_endpoint(api_url: &str) -> String {
+    let trimmed = api_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
 /// 调用 `{api_url}/chat/completions`,返回 `choices[0].message.content`。
 pub async fn chat_completion(req: ChatRequest<'_>) -> Result<String> {
     if req.api_url.trim().is_empty() {
         return Err(CrawlerError::Config("厂商 api_url 为空".into()));
     }
-    let endpoint = format!("{}/chat/completions", req.api_url.trim_end_matches('/'));
+    let endpoint = chat_endpoint(req.api_url);
 
     let mut body = json!({ "model": req.model, "messages": req.messages });
     // extra_body 浅合并:把 temperature / asr_options 等并入顶层。
@@ -86,7 +96,7 @@ where
     if req.api_url.trim().is_empty() {
         return Err(CrawlerError::Config("厂商 api_url 为空".into()));
     }
-    let endpoint = format!("{}/chat/completions", req.api_url.trim_end_matches('/'));
+    let endpoint = chat_endpoint(req.api_url);
 
     let mut body = json!({ "model": req.model, "messages": req.messages, "stream": true });
     if let Some(extra) = req.extra_body {

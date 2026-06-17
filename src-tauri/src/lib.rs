@@ -1,6 +1,7 @@
 //! veltrix-crawler 后端入口。
 
 mod adapter;
+mod agent;
 mod cloud;
 mod commands;
 mod cookie;
@@ -93,10 +94,88 @@ fn show_main_from_tray(app: tauri::AppHandle) {
     }
 }
 
-// 托盘面板「退出」:真正退出进程
+// 托盘面板「退出」:真正退出进程。退出前停掉编程沙盒容器(释放资源,工作区文件保留)。
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let db = state.db.clone();
+        tauri::async_runtime::block_on(commands::coding::stop_sandbox_on_exit(&db));
+    }
     app.exit(0);
+}
+
+/// 弹系统保存对话框并把文本写到用户选定的文件(代码块下载等)。
+/// WebView2 不支持 `<a download>` 触发保存,改走原生对话框 + 写文件。
+/// 返回 Some(本地绝对路径)=已保存 / None=用户取消。(命令在工作线程运行,可安全用 blocking 对话框)
+#[tauri::command]
+fn save_text_dialog(
+    app: tauri::AppHandle,
+    content: String,
+    file_name: String,
+) -> std::result::Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(&file_name)
+        .blocking_save_file();
+    let Some(file_path) = chosen else {
+        return Ok(None); // 用户取消
+    };
+    // FilePath 在桌面保存场景为本地路径,Display 即路径字符串
+    let path = std::path::PathBuf::from(file_path.to_string());
+    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// 保存二进制文件(base64 解码后写盘):弹原生保存对话框,供导出 PDF 等渲染产物。
+/// 返回 Some(本地绝对路径)=已保存 / None=用户取消。
+#[tauri::command]
+fn save_binary_dialog(
+    app: tauri::AppHandle,
+    content_base64: String,
+    file_name: String,
+) -> std::result::Result<Option<String>, String> {
+    use base64::Engine;
+    use tauri_plugin_dialog::DialogExt;
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(&file_name)
+        .blocking_save_file();
+    let Some(file_path) = chosen else {
+        return Ok(None); // 用户取消
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_base64.as_bytes())
+        .map_err(|e| format!("内容解码失败: {e}"))?;
+    let path = std::path::PathBuf::from(file_path.to_string());
+    std::fs::write(&path, &bytes).map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// 文件是否仍存在于本地(下载历史标记「在 / 已丢失」用)。
+#[tauri::command]
+fn path_exists(path: String) -> bool {
+    std::path::Path::new(&path).is_file()
+}
+
+/// 在系统文件管理器中打开文件所在目录:文件还在则定位并选中它;文件已删则退而打开其父目录。
+#[tauri::command]
+fn reveal_path(app: tauri::AppHandle, path: String) -> std::result::Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = std::path::PathBuf::from(&path);
+    if p.is_file() {
+        app.opener()
+            .reveal_item_in_dir(&p)
+            .map_err(|e| format!("打开目录失败: {e}"))
+    } else if let Some(parent) = p.parent().filter(|d| d.exists()) {
+        app.opener()
+            .open_path(parent.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|e| format!("打开目录失败: {e}"))
+    } else {
+        Err("文件与所在目录均已不存在".into())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -153,6 +232,14 @@ pub fn run() {
                 let migrate_db = db.clone();
                 tauri::async_runtime::block_on(async {
                     commands::task::migrate_authors_from_contents(&migrate_db).await;
+                });
+            }
+
+            // 话题存量回填:历史内容 topics 为空但正文含 #话题 的,从正文补提取一次(幂等,不改正文)
+            {
+                let backfill_db = db.clone();
+                tauri::async_runtime::block_on(async {
+                    commands::task::backfill_empty_topics(&backfill_db).await;
                 });
             }
 
@@ -287,6 +374,15 @@ pub fn run() {
                 }
             });
 
+            // 编程沙盒:若设为 Docker 模式,启动时后台拉起共享容器(失败仅告警)
+            {
+                let sb_db = db.clone();
+                let sb_dir = config_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::coding::ensure_sandbox_on_start(&sb_db, &sb_dir).await;
+                });
+            }
+
             // 云端客户端:启动后自动检查是否已配对,若有 pc_token 直接拉起 WS
             let cloud = Arc::new(cloud::CloudClient::new(config_dir.clone()));
             let cloud_runner = cloud.clone();
@@ -320,6 +416,9 @@ pub fn run() {
                     commands::MAX_CONCURRENT_COLLECT,
                 )),
                 login_verdicts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                dev_server: Arc::new(std::sync::Mutex::new(
+                    commands::coding::DevServer::default(),
+                )),
             });
 
             // 任务调度器:每 30s 扫描 daily / watching 任务,到点自动启动采集
@@ -401,6 +500,12 @@ pub fn run() {
             // 托盘弹出面板
             show_main_from_tray,
             quit_app,
+            // 代码块下载 / 导出:保存对话框 + 写文件
+            save_text_dialog,
+            save_binary_dialog,
+            // 下载历史:查文件是否存在 + 打开所在目录
+            path_exists,
+            reveal_path,
             // 平台管理
             commands::get_app_config,
             commands::get_database_size,
@@ -412,8 +517,11 @@ pub fn run() {
             commands::set_storage_path,
             commands::set_intent_config,
             commands::set_transcription_config,
+            commands::get_role_models,
+            commands::set_role_models,
             commands::list_provider_capabilities,
             commands::save_text_file,
+            commands::save_binary_file,
             commands::clear_business_data,
             // 鉴权 / 初始化
             commands::admin::has_users,
@@ -427,6 +535,8 @@ pub fn run() {
             commands::admin::upsert_user,
             commands::admin::remove_user,
             commands::admin::reset_user_password,
+            commands::admin::change_password,
+            commands::admin::update_profile,
             // 系统配置:模型厂商 / 提示词
             commands::admin::list_providers,
             commands::admin::upsert_provider,
@@ -474,13 +584,14 @@ pub fn run() {
             commands::task::list_collect_logs,
             commands::task::list_task_runs,
             commands::task::list_run_logs,
-            commands::task::dashboard_overview,
+            commands::dashboard::dashboard_overview,
             commands::task::remove_content,
             commands::task::remove_contents,
             commands::task::get_content_detail,
             commands::task::set_author_monitored,
             commands::task::list_authors,
             commands::task::set_author_monitored_by_id,
+            commands::task::set_author_blacklisted_by_id,
             commands::enrich_authors,
             commands::retry_content_media,
             commands::compensate_task,
@@ -492,11 +603,44 @@ pub fn run() {
             commands::chat::list_conversations,
             commands::chat::create_conversation,
             commands::chat::rename_conversation,
+            commands::chat::archive_conversation,
+            commands::chat::update_conversation_model,
+            commands::chat::get_conversation_summary,
+            commands::chat::update_conversation_summary,
             commands::chat::delete_conversation,
             commands::chat::list_chat_messages,
             commands::chat::send_chat_message,
             commands::chat::send_chat_message_stream,
             commands::chat::transcribe_chat_audio,
+            commands::chat::build_content_attachments,
+            // AI 对话:长期记忆
+            commands::chat_memory::list_chat_memories,
+            commands::chat_memory::add_chat_memory,
+            commands::chat_memory::update_chat_memory,
+            commands::chat_memory::delete_chat_memory,
+            commands::chat_memory::clear_chat_memories,
+            commands::chat_memory::get_chat_memory_enabled,
+            commands::chat_memory::set_chat_memory_enabled,
+            // 编程 Agent
+            commands::coding::send_coding_message,
+            commands::coding::get_coding_workspace,
+            commands::coding::set_coding_workspace,
+            commands::coding::run_workspace_command,
+            commands::coding::checkpoint_rollback,
+            commands::coding::list_workspace_files,
+            commands::coding::read_workspace_file,
+            commands::coding::write_workspace_file,
+            commands::coding::classify_agent_type,
+            commands::coding::start_dev_server,
+            commands::coding::stop_dev_server,
+            commands::coding::get_dev_server_status,
+            commands::coding::get_sandbox_config,
+            commands::coding::set_sandbox_config,
+            commands::coding::sandbox_start,
+            commands::coding::sandbox_stop,
+            commands::coding::sandbox_recreate,
+            // 浏览器 Agent(RPA MVP)
+            commands::browser::send_browser_message,
             // 云端连接(配对 / WS / 远程指令)
             commands::cloud::cloud_get_config,
             commands::cloud::cloud_get_status,

@@ -14,6 +14,13 @@ pub struct Model {
     pub role: String,
     #[sea_orm(column_type = "Text")]
     pub content: String,
+    /// assistant 要求调用的工具(JSON 数组 [{id,name,arguments}]);纯文本回复为 None
+    #[sea_orm(column_type = "Text", nullable)]
+    pub tool_calls: Option<String>,
+    /// role=tool 时:对应的工具调用 id(关联上一条 assistant 的某次 tool_call)
+    pub tool_call_id: Option<String>,
+    /// role=tool 时:工具名(便于前端展示)
+    pub tool_name: Option<String>,
     pub created_at: i64,
 }
 

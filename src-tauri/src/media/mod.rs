@@ -53,6 +53,8 @@ const DIR_VIDEO: &str = "video";
 const DIR_IMAGE: &str = "image";
 /// 作者头像分组目录名。头像按作者去重存一份,不随内容/日期/形态分散。
 const DIR_AVATAR: &str = "avatar";
+/// 视频转出的音频单独分组目录:不与封面/视频同目录,便于检索与转写读取。
+const DIR_AUDIO: &str = "audio";
 /// 作者头像本地缓存有效期(秒):超过则删旧重下,保证头像不长期陈旧。7 天。
 const AVATAR_TTL_SECS: u64 = 7 * 24 * 3600;
 /// 文件名中需替换掉的非法字符(Windows 文件系统保留 + 路径分隔符)。
@@ -60,6 +62,10 @@ const ILLEGAL_FILENAME_CHARS: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>
 /// 文件名前缀最大字符数:content_id / uid 来自平台响应(外部输入),
 /// 过长会触发 Windows 260 字符路径上限导致整条素材写入失败。
 const MAX_FILENAME_PREFIX_CHARS: usize = 120;
+/// 视频拉流转音频的最大尝试次数:抖音等 CDN 偶发「收到请求不返响应直接断」,失败再原样重试。
+const MAX_EXTRACT_ATTEMPTS: usize = 2;
+/// 拉流转音频两次尝试之间的退避(毫秒),给 CDN 短暂喘息后重试。
+const EXTRACT_RETRY_DELAY_MS: u64 = 500;
 
 /// 解析媒体根目录:output_dir 为绝对路径时直接用,否则落到配置目录下。
 /// output_dir 为空回退 `{config_dir}/media`,非空相对路径则 `{config_dir}/{output_dir}`。
@@ -87,7 +93,20 @@ const REFERER_BY_CDN: &[(&str, &str)] = &[
     ("googlevideo.com", "https://www.youtube.com/"),
 ];
 
+/// 防盗链 Referer 按「内容所属平台」映射:抖音/快手/小红书等视频 CDN 缺 Referer 直接 403。
+/// 这些平台的视频 CDN 域名多变(douyinvod / kwaicdn / sns-video 等),按 CDN 子串匹配易漏,
+/// 而采集时 content.platform 是确定的——故优先按平台解析,比 REFERER_BY_CDN 更稳。
+const REFERER_BY_PLATFORM: &[(&str, &str)] = &[
+    ("douyin", "https://www.douyin.com/"),
+    ("kuaishou", "https://www.kuaishou.com/"),
+    ("xhs", "https://www.xiaohongshu.com/"),
+    ("bilibili", "https://www.bilibili.com/"),
+    ("tiktok", "https://www.tiktok.com/"),
+    ("youtube", "https://www.youtube.com/"),
+];
+
 /// 防盗链 CDN 同时校验 UA,配 Referer 一起带上浏览器 UA。
+/// 抖音 CDN 对「半成品 UA」会直接 close TCP 不返响应,故必须带完整 AppleWebKit...Safari 后缀。
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// 下载 URL 到本地文件。reqwest 拉取字节后整体写入;失败返回错误供调用方告警。
@@ -126,24 +145,68 @@ async fn is_file_fresh(path: &Path, ttl_secs: u64) -> bool {
     }
 }
 
-/// 用 ffmpeg 把视频转为音频:`-y -i <video> -vn <audio>`。
-/// ffmpeg_path 为空时用系统 PATH 的 `ffmpeg`。退出码非 0 视为失败。
-pub fn extract_audio(video: &Path, audio: &Path, ffmpeg_path: Option<&str>) -> Result<()> {
+/// 用 ffmpeg 直接从视频直链拉流转音频(不落地视频文件):
+/// `-y -reconnect... [-user_agent UA -headers "Referer/Origin"] -i <url> -vn [mp3优化参数] <audio>`。
+/// 防盗链 CDN 需带 Referer + 完整 UA(口径与 download_to_file 一致);HTTP 直链可被 ffmpeg 按 range
+/// 寻址,故不受 mp4 moov 在文件尾部影响。输出为 mp3 时按语音转写优化(单声道 22kHz 96k,体积减半、
+/// 转码更快,-threads 1 防并发互抢)。ffmpeg_path 为空用系统 PATH 的 `ffmpeg`,退出码非 0 视为失败。
+pub fn extract_audio_from_url(
+    url: &str,
+    audio: &Path,
+    ffmpeg_path: Option<&str>,
+    referer: Option<&str>,
+) -> Result<()> {
     let program = ffmpeg_path
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .unwrap_or("ffmpeg");
-    let status = std::process::Command::new(program)
-        .arg("-y") // 覆盖已存在的输出文件,避免转码卡在交互确认
-        .arg("-i")
-        .arg(video)
-        .arg("-vn") // 丢弃视频流,只保留音频
-        .arg(audio)
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
+    // CDN 偶发中途断流:让 ffmpeg 自行重连续传,避免一断就整条失败(须在 -i 之前作为输入选项)
+    cmd.args([
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "2",
+    ]);
+    // 防盗链直链:UA + Referer/Origin 必须作为「输入选项」放在 -i 之前
+    if let Some(ref_url) = referer {
+        let origin = ref_url.trim_end_matches('/'); // Origin 不带末尾斜杠
+        cmd.arg("-user_agent")
+            .arg(BROWSER_UA)
+            .arg("-headers")
+            .arg(format!("Referer: {ref_url}\r\nOrigin: {origin}\r\n"));
+    }
+    cmd.arg("-i").arg(url).arg("-vn"); // -vn 丢视频流,只保留音频
+    // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
+    let is_mp3 = audio
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("mp3"))
+        .unwrap_or(false);
+    if is_mp3 {
+        cmd.args([
+            "-acodec",
+            "libmp3lame",
+            "-ab",
+            "96k",
+            "-ar",
+            "22050",
+            "-ac",
+            "1",
+            "-threads",
+            "1",
+        ]);
+    }
+    cmd.arg(audio);
+    let status = cmd
         .status()
         .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
     if !status.success() {
         return Err(CrawlerError::Parse(format!(
-            "ffmpeg 转音频失败,退出码: {:?}",
+            "ffmpeg 拉流转音频失败,退出码: {:?}",
             status.code()
         )));
     }
@@ -189,7 +252,8 @@ fn sanitize_filename(raw: &str) -> String {
 }
 
 /// 处理单条内容的全部素材:封面、作者头像、图文图片、视频转音频。
-/// 目录结构 `{root}/{platform}/{今天 YYYY-MM-DD}/{视频|图文}/`,文件名以 content_id 为前缀。
+/// 目录结构 `{root}/{platform}/{今天 YYYY-MM-DD}/{video|image}/`(封面/图文图片),
+/// 视频转出的音频另存 `.../{今天}/audio/`,文件名以 content_id 为前缀。
 /// 副产品(封面/头像/图片)失败仅 `tracing::warn!`;主素材成败汇总进 `MediaOutcome` 返回供回写。
 pub async fn process_content(
     content: &Content,
@@ -204,7 +268,7 @@ pub async fn process_content(
     };
     // 用本机当天日期分目录,便于按天归档检索
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let dir = root.join(&content.platform).join(today).join(kind_dir);
+    let dir = root.join(&content.platform).join(&today).join(kind_dir);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(content_id = %content.content_id, "创建素材目录失败,跳过该条: {e}");
         return MediaOutcome {
@@ -278,12 +342,21 @@ pub async fn process_content(
     if content.kind == ContentKind::Video && ai_extract {
         match content.video_url.as_deref().filter(|s| !s.is_empty()) {
             Some(video_url) => {
-                let video = process_video(content, &dir, &prefix, video_url, media).await;
-                outcome.ok = video.downloaded;
-                outcome.audio_extracted = video.audio_extracted;
-                outcome.error = video.error;
-                outcome.audio_path = video.audio_path;
-                outcome.video_downloaded = Some(video.downloaded);
+                // 音频单独存到 audio 目录(与封面/视频分开),便于检索与转写读取
+                let audio_dir = root.join(&content.platform).join(&today).join(DIR_AUDIO);
+                if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+                    tracing::warn!(content_id = %content.content_id, "创建音频目录失败: {e}");
+                    outcome.ok = false;
+                    outcome.error = Some(format!("创建音频目录失败: {e}"));
+                    outcome.video_downloaded = Some(false);
+                } else {
+                    let video = process_video(content, &audio_dir, &prefix, video_url, media).await;
+                    outcome.ok = video.downloaded;
+                    outcome.audio_extracted = video.audio_extracted;
+                    outcome.error = video.error;
+                    outcome.audio_path = video.audio_path;
+                    outcome.video_downloaded = Some(video.downloaded);
+                }
             }
             None => {
                 // 视频内容却无直链:多为详情解析失败,标记失败(重试需重新采集刷新链接)
@@ -325,73 +398,80 @@ pub async fn process_content(
     outcome
 }
 
-/// 视频子流程:下载到 mp4 → ffmpeg 转音频 → 删除 mp4。
-/// 受 `enable_audio_extract` 控制:关闭时仅下载视频不转码、不删除,保证用户仍拿得到素材。
+/// 视频子流程:不落地视频,直接让 ffmpeg 从视频直链拉流转音频并保存到 audio 目录(只留音频)。
+/// ffmpeg 在阻塞线程池(spawn_blocking)执行,不占异步运行时工作线程。
 async fn process_video(
     content: &Content,
-    dir: &Path,
+    audio_dir: &Path,
     prefix: &str,
     video_url: &str,
     media: &MediaConfig,
 ) -> VideoOutcome {
-    let video_path = dir.join(format!("{prefix}.mp4"));
-    if let Err(e) = download_to_file(video_url, &video_path).await {
-        tracing::warn!(content_id = %content.content_id, "下载视频失败: {e}");
-        return VideoOutcome {
-            downloaded: false,
-            audio_extracted: None,
-            error: Some(format!("下载视频失败: {e}")),
-            audio_path: None,
-        };
-    }
-
-    // 走到这里意味着任务已开启 AI 文案提取,必转音频并删除原视频(只留音频)
     let audio_format = if media.audio_format.trim().is_empty() {
         "mp3"
     } else {
         media.audio_format.trim()
     };
-    let audio_path = dir.join(format!("{prefix}.{audio_format}"));
+    let audio_path = audio_dir.join(format!("{prefix}.{audio_format}"));
 
-    // ffmpeg 是同步阻塞调用,挪到阻塞线程池,避免占用异步运行时工作线程
-    let video_for_task = video_path.clone();
-    let audio_for_task = audio_path.clone();
-    let ffmpeg_path = media.ffmpeg_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        extract_audio(&video_for_task, &audio_for_task, ffmpeg_path.as_deref())
-    })
-    .await;
+    // 防盗链 Referer 优先按内容所属平台解析(视频 CDN 域名多变,按平台比按 CDN 子串更稳),
+    // 平台未命中再退回 CDN 子串匹配。referer 是 &'static str,可直接进 spawn_blocking 闭包。
+    let referer = REFERER_BY_PLATFORM
+        .iter()
+        .find(|(platform, _)| content.platform == *platform)
+        .map(|(_, r)| *r)
+        .or_else(|| {
+            REFERER_BY_CDN
+                .iter()
+                .find(|(cdn, _)| video_url.contains(cdn))
+                .map(|(_, r)| *r)
+        });
 
-    match result {
-        Ok(Ok(())) => {
-            // 转码成功才删原视频(用户决策:只留音频)
-            if let Err(e) = tokio::fs::remove_file(&video_path).await {
-                tracing::warn!(content_id = %content.content_id, "删除已转码视频失败: {e}");
+    // ffmpeg 同步阻塞,挪到阻塞线程池;直接从直链拉流转音频,不下载/不落地视频文件。
+    // 抖音等 CDN 偶发「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=MAX_EXTRACT_ATTEMPTS {
+        let url_for_task = video_url.to_string();
+        let audio_for_task = audio_path.clone();
+        let ffmpeg_for_task = media.ffmpeg_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            extract_audio_from_url(
+                &url_for_task,
+                &audio_for_task,
+                ffmpeg_for_task.as_deref(),
+                referer,
+            )
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                return VideoOutcome {
+                    downloaded: true,
+                    audio_extracted: Some(true),
+                    error: None,
+                    audio_path: Some(audio_path.to_string_lossy().into_owned()),
+                };
             }
-            VideoOutcome {
-                downloaded: true,
-                audio_extracted: Some(true),
-                error: None,
-                audio_path: Some(audio_path.to_string_lossy().into_owned()),
+            Ok(Err(e)) => {
+                tracing::warn!(content_id = %content.content_id, attempt, "视频拉流转音频失败: {e}");
+                last_error = Some(format!("音频提取失败: {e}"));
+            }
+            Err(e) => {
+                tracing::warn!(content_id = %content.content_id, attempt, "转码任务异常: {e}");
+                last_error = Some(format!("转码任务异常: {e}"));
             }
         }
-        Ok(Err(e)) => {
-            tracing::warn!(content_id = %content.content_id, "视频转音频失败,保留原视频: {e}");
-            VideoOutcome {
-                downloaded: true,
-                audio_extracted: Some(false),
-                error: Some(format!("音频提取失败: {e}")),
-                audio_path: None,
-            }
+
+        if attempt < MAX_EXTRACT_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(EXTRACT_RETRY_DELAY_MS)).await;
         }
-        Err(e) => {
-            tracing::warn!(content_id = %content.content_id, "转码任务异常: {e}");
-            VideoOutcome {
-                downloaded: true,
-                audio_extracted: Some(false),
-                error: Some(format!("转码任务异常: {e}")),
-                audio_path: None,
-            }
-        }
+    }
+
+    VideoOutcome {
+        downloaded: false,
+        audio_extracted: Some(false),
+        error: last_error,
+        audio_path: None,
     }
 }

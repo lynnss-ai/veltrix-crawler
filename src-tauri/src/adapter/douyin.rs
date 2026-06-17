@@ -7,7 +7,7 @@
 //! 解析全程用 `serde_json::Value` 按需取值(而非强类型反序列化),
 //! 任一字段缺失/改名只丢该字段,不会拖垮整条乃至整批解析。
 
-use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
+use crate::adapter::{extract_hashtags, FetchContext, FetchOutput, PlatformAdapter};
 use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -19,6 +19,8 @@ const PLATFORM_ID: &str = "douyin";
 const SEARCH_PATH: &str = "/aweme/v1/web/general/search/";
 /// 一级评论接口 URL 特征,与平台配置 intercept_patterns 对应。
 const COMMENT_PATH: &str = "/aweme/v1/web/comment/list/";
+/// 内容详情接口 URL 特征(补取/刷新视频直链用),与平台配置 intercept_patterns 对应。
+const DETAIL_PATH: &str = "/aweme/v1/web/aweme/detail/";
 
 #[derive(Default)]
 pub struct DouyinAdapter;
@@ -35,14 +37,7 @@ impl DouyinAdapter {
             return None;
         }
 
-        // 有非空 images 即图文,否则按视频
         let image_urls = Self::parse_image_urls(info.get("images"));
-        let kind = if image_urls.is_empty() {
-            ContentKind::Video
-        } else {
-            ContentKind::Image
-        };
-
         let video_url = info
             .get("video")
             .and_then(|v| v.get("play_addr"))
@@ -51,6 +46,21 @@ impl DouyinAdapter {
             .and_then(|l| l.first())
             .and_then(Value::as_str)
             .map(str::to_string);
+
+        // 归类:有图集即图文;有视频直链即视频;无直链但确有 video.play_addr 结构 = 视频被风控降级,
+        // 仍归 Video 以便走「视频缺直链 → 标记媒体失败可重试」(否则会变 Unknown 假成功、转写永久缺失且无重试标记);
+        // 完全无图、也无 video.play_addr 字段才按未知(避免图文 / 纯异常项被误判为视频去采音频)。
+        let has_video_field = info
+            .get("video")
+            .and_then(|v| v.get("play_addr"))
+            .is_some();
+        let kind = if !image_urls.is_empty() {
+            ContentKind::Image
+        } else if video_url.is_some() || has_video_field {
+            ContentKind::Video
+        } else {
+            ContentKind::Unknown
+        };
 
         // 封面:视频取 video.cover(退而求 origin_cover),图文用首图,保证两类内容都有封面可下
         let cover_url = if image_urls.is_empty() {
@@ -109,10 +119,11 @@ impl DouyinAdapter {
         })
     }
 
-    /// 话题标签:抖音把正文里的 #话题 结构化在 `text_extra[].hashtag_name`,
-    /// 比正则切 desc 更准(能拿到完整话题名、不误伤普通 # 文本)。统一加 # 前缀。
+    /// 话题标签:优先用抖音结构化字段 `text_extra[].hashtag_name`(最准:完整话题名、不误吞正文);
+    /// 该字段缺失时(部分内容平台不返回),兜底从正文 desc 提取 #话题——否则话题会整段黏在正文里不拆分。
     fn parse_topics(info: &Value) -> Vec<String> {
-        info.get("text_extra")
+        let structured: Vec<String> = info
+            .get("text_extra")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -121,6 +132,13 @@ impl DouyinAdapter {
                     .map(|name| format!("#{name}"))
                     .collect()
             })
+            .unwrap_or_default();
+        if !structured.is_empty() {
+            return structured;
+        }
+        info.get("desc")
+            .and_then(Value::as_str)
+            .map(extract_hashtags)
             .unwrap_or_default()
     }
 
@@ -324,6 +342,34 @@ impl DouyinAdapter {
             authors: Vec::new(),
         }
     }
+
+    /// 解析内容详情接口响应为单条内容(供「补取/刷新视频直链」)。详情接口
+    /// `/aweme/v1/web/aweme/detail/` 返回 `aweme_detail`(结构同搜索项的 aweme_info),
+    /// 复用 parse_aweme 提取,主要为拿到新鲜的 video.play_addr 直链。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut contents = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(DETAIL_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            // 详情接口把详情包在 aweme_detail;兼容个别变体的 aweme_info 顶层
+            let Some(info) = root.get("aweme_detail").or_else(|| root.get("aweme_info")) else {
+                continue;
+            };
+            if let Some(content) = Self::parse_aweme(info, collected_at) {
+                contents.push(content);
+            }
+        }
+        FetchOutput {
+            contents,
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -333,13 +379,17 @@ impl PlatformAdapter for DouyinAdapter {
     }
 
     fn supports(&self, kind: &TaskKind) -> bool {
-        matches!(kind, TaskKind::Search | TaskKind::Comments)
+        matches!(
+            kind,
+            TaskKind::Search | TaskKind::Comments | TaskKind::ContentDetail
+        )
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
-        // 按任务类型分流:评论任务解析一级评论,其余按搜索内容解析
+        // 按任务类型分流:评论任务解析一级评论,详情补取解析单条直链,其余按搜索内容解析
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)

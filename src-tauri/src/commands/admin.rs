@@ -302,6 +302,70 @@ pub async fn login(
     Ok(view)
 }
 
+/// 当前登录用户修改自己的密码:argon2 校验旧密码,通过后写入新密码哈希。
+#[tauri::command]
+pub async fn change_password(
+    state: State<'_, AppState>,
+    old_password: String,
+    new_password: String,
+) -> Result<()> {
+    let current = super::current_user(&state)
+        .ok_or_else(|| CrawlerError::Auth("未登录,无法修改密码".into()))?;
+    if new_password.chars().count() < 6 {
+        return Err(CrawlerError::Config("新密码至少 6 位".into()));
+    }
+    // 复用统一的 argon2 校验:旧密码错误会直接返回 Err
+    verify_user_password(&state.db, &current.name, &old_password).await?;
+    let model = user::Entity::find()
+        .filter(user::Column::Username.eq(current.name.as_str()))
+        .filter(user::Column::DeletedAt.eq(0))
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询用户失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Auth("用户不存在".into()))?;
+    let mut am = model.into_active_model();
+    am.password_hash = Set(hash_password(&new_password)?);
+    am.updated_at = Set(Utc::now().timestamp());
+    am.update(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("修改密码失败: {e}")))?;
+    Ok(())
+}
+
+/// 当前登录用户修改自己的资料(昵称/邮箱/头像/备注);用户名、数据范围、超管标识不可改。
+#[tauri::command]
+pub async fn update_profile(
+    state: State<'_, AppState>,
+    nickname: String,
+    email: String,
+    avatar: String,
+    remark: String,
+) -> Result<UserView> {
+    let current = super::current_user(&state)
+        .ok_or_else(|| CrawlerError::Auth("未登录,无法修改资料".into()))?;
+    let model = user::Entity::find()
+        .filter(user::Column::Username.eq(current.name.as_str()))
+        .filter(user::Column::DeletedAt.eq(0))
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询用户失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Auth("用户不存在".into()))?;
+    let mut am = model.into_active_model();
+    am.nickname = Set(nickname);
+    am.email = Set(email);
+    am.avatar = Set(avatar);
+    am.remark = Set(remark);
+    am.updated_at = Set(Utc::now().timestamp());
+    let updated = am
+        .update(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("修改资料失败: {e}")))?;
+    let mut view: UserView = updated.into();
+    view.is_super_admin =
+        earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
+    Ok(view)
+}
+
 // ===================== 模型厂商 =====================
 
 #[derive(Serialize, Deserialize)]
