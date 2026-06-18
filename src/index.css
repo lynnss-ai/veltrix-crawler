@@ -217,6 +217,8 @@ body {
   --chart-5: oklch(0.269 0 0);
   /* 全局圆角基准:所有 radius token 按比例派生自此值;0.375rem(6px)比默认 10px 更利落 */
   --radius: 0.375rem;
+  /* 自定义标题栏高度:定义在 :root 而非仅 App 容器,使 Portal 到 body 的抽屉/遮罩也能据此避开标题栏 */
+  --titlebar-h: 2.25rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);
