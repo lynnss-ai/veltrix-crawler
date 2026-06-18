@@ -350,6 +350,23 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 兼容已建的 chat_memories 表:补向量检索列(RAG)。embedding/embed_model 可空(未生成时为 NULL),
+    // pinned 默认 0;旧库走 ALTER,新库走 entity DDL。
+    for (col, ddl) in [
+        ("embedding", "ALTER TABLE chat_memories ADD COLUMN embedding TEXT"),
+        ("embed_model", "ALTER TABLE chat_memories ADD COLUMN embed_model TEXT"),
+        ("pinned", "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0"),
+    ] {
+        if !column_exists(db, "chat_memories", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER chat_memories.{col} 失败(忽略): {e}");
+            }
+        }
+    }
+
     // 兼容已建的 authors 表:补黑名单开关列(旧行默认 0 = 未拉黑)
     if !column_exists(db, "authors", "is_blacklisted").await {
         if let Err(e) = db

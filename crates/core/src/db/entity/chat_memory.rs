@@ -19,6 +19,13 @@ pub struct Model {
     pub source: String,
     /// 是否启用:关闭后不注入上下文,但保留可恢复
     pub enabled: bool,
+    /// 内容向量(JSON float 数组字符串);None=尚未生成。按当前问题语义检索 top-K 注入(RAG)用。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub embedding: Option<String>,
+    /// 生成该向量所用的 embedding 模型;换模型后据此判定旧向量失效、需重算。
+    pub embed_model: Option<String>,
+    /// 置顶:每轮对话恒注入,不参与相似度淘汰(给「称呼/职业」等永远要带的事实)。
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }

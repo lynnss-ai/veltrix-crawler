@@ -419,6 +419,11 @@ pub fn run() {
                 dev_server: Arc::new(std::sync::Mutex::new(
                     commands::coding::DevServer::default(),
                 )),
+                sandbox_ready: std::sync::Mutex::new(
+                    commands::coding::SandboxReady::default(),
+                ),
+                app_handle: app.handle().clone(),
+                agent_actions: Arc::new(webview::AgentActionChannel::new()),
             });
 
             // 任务调度器:每 30s 扫描 daily / watching 任务,到点自动启动采集
@@ -621,6 +626,9 @@ pub fn run() {
             commands::chat_memory::clear_chat_memories,
             commands::chat_memory::get_chat_memory_enabled,
             commands::chat_memory::set_chat_memory_enabled,
+            commands::chat_memory::set_chat_memory_pinned,
+            commands::chat_memory::get_embedding_config,
+            commands::chat_memory::set_embedding_config,
             // 编程 Agent
             commands::coding::send_coding_message,
             commands::coding::get_coding_workspace,
@@ -639,8 +647,10 @@ pub fn run() {
             commands::coding::sandbox_start,
             commands::coding::sandbox_stop,
             commands::coding::sandbox_recreate,
-            // 浏览器 Agent(RPA MVP)
+            // 浏览器 Agent(RPA:动作回读 + 应用内预览)
             commands::browser::send_browser_message,
+            commands::browser::browser_agent_result,
+            commands::browser::capture_agent_preview,
             // 云端连接(配对 / WS / 远程指令)
             commands::cloud::cloud_get_config,
             commands::cloud::cloud_get_status,

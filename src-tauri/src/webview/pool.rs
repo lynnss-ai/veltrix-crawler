@@ -94,15 +94,45 @@ fn time_labels(time_range: &str) -> Vec<String> {
     }
 }
 
+/// 排序/时间选项藏在「筛选」下拉浮层里、需先展开面板才能点到的平台,返回其「展开」按钮文案候选。
+/// 非空 ⟹ 该平台用「展开面板 + 文案点击」应用筛选(且不再拼 URL query 参数,避免同维度双重应用冲突);
+/// 选项在结果页直接可见的平台(快手等)返回空,跳过展开步骤。
+fn filter_panel_labels(platform_id: &str) -> Vec<String> {
+    match platform_id {
+        // 抖音排序依据/发布时间都收在右上角「筛选」浮层里,不展开则全 DOM 找不到文案点不到,需先点开
+        "douyin" => vec!["筛选".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// 展开筛选面板后等其渲染到位的停顿(毫秒)。
+const FILTER_PANEL_OPEN_MS: u64 = 900;
+
 /// 在结果页按任务排序/时间做 RPA 文案点击(综合/不限默认不点)。点击后留停顿等结果刷新。
-async fn apply_sort_time(window: &WebviewWindow, sort_mode: &str, time_range: &str) {
+/// 抖音等选项藏在「筛选」浮层里的平台,先展开面板再点;面板同时含排序与时间两段,展开一次即可。
+async fn apply_sort_time(
+    window: &WebviewWindow,
+    platform_id: &str,
+    sort_mode: &str,
+    time_range: &str,
+) {
     let sort_lbls = sort_labels(sort_mode);
+    let time_lbls = time_labels(time_range);
+    // 综合 + 不限即默认态,无需任何点击(也不必白白展开面板)
+    if sort_lbls.is_empty() && time_lbls.is_empty() {
+        return;
+    }
+    // 需展开的平台(抖音):先点「筛选」打开浮层并等渲染;浮层内同时含排序与时间两段,只需展开一次
+    let panel_lbls = filter_panel_labels(platform_id);
+    if !panel_lbls.is_empty() {
+        let _ = window.eval(&build_select_eval(&panel_lbls));
+        tokio::time::sleep(Duration::from_millis(FILTER_PANEL_OPEN_MS)).await;
+    }
     if !sort_lbls.is_empty() {
         let _ = window.eval(&build_select_eval(&sort_lbls));
         let _ = window.eval(&build_hud_log_eval("info", &format!("应用排序:{sort_mode}")));
         tokio::time::sleep(Duration::from_millis(1800)).await;
     }
-    let time_lbls = time_labels(time_range);
     if !time_lbls.is_empty() {
         let _ = window.eval(&build_select_eval(&time_lbls));
         let _ = window.eval(&build_hud_log_eval(
@@ -837,6 +867,7 @@ impl CollectBridge {
         } else {
             self.run_human_rpa(
                 &window,
+                &cfg.id,
                 &cfg.collect.rpa_steps,
                 req.keyword,
                 session_id,
@@ -1008,8 +1039,16 @@ impl CollectBridge {
                 cfg.id
             )));
         }
-        // 排序/时间映射成搜索 URL 参数(抖音 sort_type/publish_time),拼到搜索 URL 直接生效
-        let extra_query = build_search_query(&cfg.collect, sort_mode, time_range);
+        // 排序/时间应用策略二选一,避免同维度双重应用相互冲突:
+        // - 面板点击型平台(抖音):在结果页展开「筛选」浮层点选,不拼 URL 参数(实测 URL 的
+        //   sort_type/publish_time 初始导航不生效,改走面板点击,且文案点击对参数值变动免疫);
+        // - 其余平台(B站排序等):走 URL query 直接随搜索页加载生效。
+        let uses_filter_panel = !filter_panel_labels(&cfg.id).is_empty();
+        let extra_query = if uses_filter_panel {
+            String::new()
+        } else {
+            build_search_query(&cfg.collect, sort_mode, time_range)
+        };
         if !extra_query.is_empty() {
             let _ = window.eval(&build_hud_log_eval(
                 "info",
@@ -1038,15 +1077,18 @@ impl CollectBridge {
         }
 
         // URL query 未覆盖的排序/时间维度,回退到结果页文案点击(快手等无 URL 参数的平台靠这条生效;
-        // B站时间走绝对时间戳 URL 表达不了,也靠点击)。综合/不限默认不点;抖音 URL 已覆盖则跳过避免重复。
-        let sort_covered = !cfg.collect.sort_query_key.is_empty()
+        // B站时间走绝对时间戳 URL 表达不了,也靠点击)。综合/不限默认不点;URL 已覆盖的维度跳过点击避免重复。
+        // 面板点击型平台(抖音)上面已不拼 URL,故 uses_filter_panel 时两维都判未覆盖,全部交给 apply_sort_time。
+        let sort_covered = !uses_filter_panel
+            && !cfg.collect.sort_query_key.is_empty()
             && cfg
                 .collect
                 .sort_query_map
                 .get(sort_mode)
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-        let time_covered = !cfg.collect.time_query_key.is_empty()
+        let time_covered = !uses_filter_panel
+            && !cfg.collect.time_query_key.is_empty()
             && cfg
                 .collect
                 .time_query_map
@@ -1055,6 +1097,7 @@ impl CollectBridge {
                 .unwrap_or(false);
         apply_sort_time(
             window,
+            &cfg.id,
             if sort_covered { "" } else { sort_mode },
             if time_covered { "" } else { time_range },
         )
@@ -1351,6 +1394,7 @@ impl CollectBridge {
     async fn run_human_rpa(
         &self,
         window: &WebviewWindow,
+        platform_id: &str,
         steps: &[RpaStep],
         keyword: &str,
         session_id: u64,
@@ -1396,7 +1440,7 @@ impl CollectBridge {
         }
 
         // 结果页就绪后按任务排序/时间做 RPA 文案点击(综合/不限默认不点)
-        apply_sort_time(window, sort_mode, time_range).await;
+        apply_sort_time(window, platform_id, sort_mode, time_range).await;
 
         // 真实滚轮翻页:逐轮投递 WM_MOUSEWHEEL,拟人间隔,触发分页懒加载
         if let Some(rounds) = scroll_rounds {

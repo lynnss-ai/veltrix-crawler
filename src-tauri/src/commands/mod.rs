@@ -69,6 +69,12 @@ pub struct AppState {
     pub login_verdicts: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// 编程 Agent 的常驻开发服务器状态(预览-开发服务器模式)。
     pub dev_server: Arc<Mutex<coding::DevServer>>,
+    /// 沙盒容器「就绪结论」缓存:避免每个编程动作都重跑一串 docker 探测(慢且放大挂死面)。
+    pub sandbox_ready: Mutex<coding::SandboxReady>,
+    /// 应用句柄:供后台 / 非命令上下文(如 resolve_exec 回退本机时)向前端推送事件(弹窗等)。
+    pub app_handle: AppHandle,
+    /// 浏览器 Agent 动作回读通道:navigate/click/read 等动作经此按 req_id 等待页面回传结果。
+    pub agent_actions: Arc<crate::webview::AgentActionChannel>,
 }
 
 /// 全局同时进行的采集任务数上限(占用 WebView 窗口的阶段)。取 3:兼顾吞吐与资源占用,

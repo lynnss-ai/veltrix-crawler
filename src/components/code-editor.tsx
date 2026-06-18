@@ -148,6 +148,10 @@ export function CodeEditor({
         <CodeMirror
           value={draft}
           height="100%"
+          // @uiw/react-codemirror 会在 .cm-editor 外再包一层容器,height="100%" 只设到内层 .cm-editor;
+          // 外层容器默认 auto 高(随内容撑高)→ 长文件被父级 overflow-hidden 裁掉、无法滚动。
+          // h-full 让外层容器撑满有定高的父级,.cm-editor 的 100% 才有依据,.cm-scroller 方能正常滚动。
+          className="h-full"
           theme={isDark ? oneDark : "light"}
           extensions={[...langExt(path), fontTheme]}
           onChange={(v) => setDraft(v)}

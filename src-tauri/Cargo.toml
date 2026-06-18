@@ -88,6 +88,8 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     # 原生网络拦截:读 WebView2 响应内容流(IStream)需要 COM
     "Win32_System_Com",
+    # 应用内预览截图:CapturePreview 写入内存流需 CreateStreamOnHGlobal
+    "Win32_System_Com_StructuredStorage",
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"

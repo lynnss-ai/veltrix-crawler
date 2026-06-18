@@ -20,9 +20,9 @@ use tauri::State;
 use veltrix_core::db::entity::chat_memory as mem;
 use veltrix_core::error::{CrawlerError, Result};
 
-/// 注入上下文的记忆条数上限(取最近更新的若干条)。
-const MAX_MEMORIES_INJECT: u64 = 60;
-/// 注入上下文的记忆总字符数上限(避免撑爆上下文)。
+/// 每轮按语义相似度注入的记忆条数上限(置顶项额外恒注入,不占此额度)。
+const TOP_K_INJECT: usize = 12;
+/// 注入上下文的记忆总字符数上限(避免撑爆上下文,作最终兜底)。
 const MAX_MEMORY_INJECT_CHARS: usize = 4000;
 /// 每个用户记忆条数硬上限:达到后不再自动新增(用户可在设置页清理后继续)。
 const MEMORY_HARD_CAP: usize = 200;
@@ -30,6 +30,10 @@ const MEMORY_HARD_CAP: usize = 200;
 const MAX_MEMORY_ITEM_CHARS: usize = 500;
 /// 全局开关在 app_secrets 里的 key;值为 "0" 视为关闭,其余(含未设置)视为开启。
 const MEMORY_ENABLED_KEY: &str = "chat_memory_enabled";
+/// embedding(语义检索)配置在 app_secrets 的 key:base url / 模型 / 密钥三者齐全才启用检索。
+const EMBED_API_URL_KEY: &str = "embedding_api_url";
+const EMBED_MODEL_KEY: &str = "embedding_model";
+const EMBED_API_KEY_KEY: &str = "embedding_api_key";
 
 /// 自动记忆提取的系统指令:要求只输出 JSON 字符串数组。
 const EXTRACT_PROMPT: &str = "你是对话记忆提取器。请从下面这轮对话中,提取关于「用户」值得长期记住的稳定信息,用于未来所有对话的个性化。\n\
@@ -48,6 +52,8 @@ pub struct MemoryView {
     pub content: String,
     pub source: String,
     pub enabled: bool,
+    /// 置顶:恒注入,不参与相似度淘汰。
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -59,6 +65,7 @@ impl From<mem::Model> for MemoryView {
             content: m.content,
             source: m.source,
             enabled: m.enabled,
+            pinned: m.pinned,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -95,6 +102,7 @@ pub async fn add_chat_memory(state: State<'_, AppState>, content: String) -> Res
         content: Set(text),
         source: Set("manual".to_string()),
         enabled: Set(true),
+        pinned: Set(false),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -102,6 +110,8 @@ pub async fn add_chat_memory(state: State<'_, AppState>, content: String) -> Res
     .insert(&state.db)
     .await
     .map_err(|e| CrawlerError::Config(format!("保存记忆失败: {e}")))?;
+    // 异步补算向量,不阻塞返回(未配置 embedding 时静默跳过)
+    spawn_backfill(&state.db, vec![saved.id]);
     Ok(saved.into())
 }
 
@@ -122,10 +132,32 @@ pub async fn update_chat_memory(
     let mut am = row.into_active_model();
     am.content = Set(text);
     am.enabled = Set(enabled);
+    // 内容可能已改,旧向量失效:清空后异步重算
+    am.embedding = Set(None);
+    am.embed_model = Set(None);
     am.updated_at = Set(Utc::now().timestamp());
     am.update(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("更新记忆失败: {e}")))?;
+    spawn_backfill(&state.db, vec![id]);
+    Ok(())
+}
+
+/// 置顶 / 取消置顶一条记忆(归属校验)。置顶项每轮恒注入,不参与相似度淘汰。
+#[tauri::command]
+pub async fn set_chat_memory_pinned(
+    state: State<'_, AppState>,
+    id: i64,
+    pinned: bool,
+) -> Result<()> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let row = find_owned(&state.db, id, &me.name).await?;
+    let mut am = row.into_active_model();
+    am.pinned = Set(pinned);
+    am.updated_at = Set(Utc::now().timestamp());
+    am.update(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("更新置顶失败: {e}")))?;
     Ok(())
 }
 
@@ -166,28 +198,160 @@ pub async fn set_chat_memory_enabled(state: State<'_, AppState>, enabled: bool) 
     super::set_secret(&state.db, MEMORY_ENABLED_KEY, if enabled { "1" } else { "0" }).await
 }
 
+// ===================== 命令:embedding(语义检索)配置 =====================
+
+/// embedding 配置回填用视图;api_key 只回传「是否已配置」,不回明文。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingConfigView {
+    pub api_url: String,
+    pub model: String,
+    pub has_api_key: bool,
+}
+
+/// 读取 embedding 配置(供记忆中心回填)。
+#[tauri::command]
+pub async fn get_embedding_config(state: State<'_, AppState>) -> Result<EmbeddingConfigView> {
+    Ok(EmbeddingConfigView {
+        api_url: super::get_secret(&state.db, EMBED_API_URL_KEY).await,
+        model: super::get_secret(&state.db, EMBED_MODEL_KEY).await,
+        has_api_key: !super::get_secret(&state.db, EMBED_API_KEY_KEY)
+            .await
+            .trim()
+            .is_empty(),
+    })
+}
+
+/// 保存 embedding 配置;api_key 留空表示不修改已存密钥。配齐后即对历史记忆按需补算向量。
+#[tauri::command]
+pub async fn set_embedding_config(
+    state: State<'_, AppState>,
+    api_url: String,
+    model: String,
+    api_key: String,
+) -> Result<()> {
+    super::set_secret(&state.db, EMBED_API_URL_KEY, api_url.trim()).await?;
+    super::set_secret(&state.db, EMBED_MODEL_KEY, model.trim()).await?;
+    if !api_key.trim().is_empty() {
+        super::set_secret(&state.db, EMBED_API_KEY_KEY, api_key.trim()).await?;
+    }
+    Ok(())
+}
+
+/// 取 embedding 配置三元组;任一为空视为未配置(返回 None,调用方回退到非检索注入)。
+async fn embedding_config(db: &DatabaseConnection) -> Option<(String, String, String)> {
+    let api_url = super::get_secret(db, EMBED_API_URL_KEY).await;
+    let model = super::get_secret(db, EMBED_MODEL_KEY).await;
+    let api_key = super::get_secret(db, EMBED_API_KEY_KEY).await;
+    if api_url.trim().is_empty() || model.trim().is_empty() || api_key.trim().is_empty() {
+        return None;
+    }
+    Some((api_url, model, api_key))
+}
+
 // ===================== 辅助:注入与提取(供 chat 命令调用) =====================
 
-/// 取当前用户的启用记忆,拼成一条 system 消息(JSON)。无记忆 / 关闭时返回 None。
-pub async fn memory_system_message(db: &DatabaseConnection, owner: &str) -> Option<Value> {
+/// 取当前用户的启用记忆,**按当前问题语义检索 top-K** 拼成一条 system 消息(JSON)。
+/// 无记忆 / 关闭时返回 None。`query` 为本轮用户提问,用于语义匹配。
+///
+/// 检索策略:置顶记忆恒注入;其余按与 `query` 的余弦相似度取 top-K。
+/// 未配置 embedding / 查询为空 / 查询向量化失败时,回退到「最近更新优先」(旧行为,零破坏)。
+pub async fn memory_system_message(
+    db: &DatabaseConnection,
+    owner: &str,
+    query: &str,
+) -> Option<Value> {
     if !memory_enabled(db).await {
         return None;
     }
+    // 一次性载入该用户全部启用记忆(≤ MEMORY_HARD_CAP=200,内存暴力 cosine 足够快)
     let rows = mem::Entity::find()
         .filter(mem::Column::Owner.eq(owner))
         .filter(mem::Column::Enabled.eq(true))
         .order_by_desc(mem::Column::UpdatedAt)
-        .limit(MAX_MEMORIES_INJECT)
+        .limit(MEMORY_HARD_CAP as u64)
         .all(db)
         .await
         .ok()?;
     if rows.is_empty() {
         return None;
     }
-    // 按字符预算逐条拼接,超预算即停(优先最近更新的记忆)
+    let selected = select_memories(db, &rows, query).await;
+    build_memory_message(&selected)
+}
+
+/// 选出本轮要注入的记忆:置顶恒注入 + 其余按与 query 的语义相似度取 top-K。
+/// 缺向量的记忆触发后台补算;未配置 embedding / 查询空 / 向量化失败时回退最近更新优先。
+async fn select_memories<'a>(
+    db: &DatabaseConnection,
+    rows: &'a [mem::Model],
+    query: &str,
+) -> Vec<&'a mem::Model> {
+    let pinned: Vec<&mem::Model> = rows.iter().filter(|m| m.pinned).collect();
+    let rest: Vec<&mem::Model> = rows.iter().filter(|m| !m.pinned).collect();
+    let q = query.trim();
+
+    if let Some((api_url, model, api_key)) = embedding_config(db).await {
+        if !q.is_empty() {
+            if let Ok(mut qvecs) =
+                crate::llm::embedding::embed_texts(&api_url, &api_key, &model, &[q.to_string()])
+                    .await
+            {
+                if let Some(qvec) = qvecs.pop() {
+                    // 逐条算相似度;向量缺失或模型不匹配的记 -1(排末尾)并加入补算队列
+                    let mut scored: Vec<(f32, &mem::Model)> = Vec::with_capacity(rest.len());
+                    let mut missing: Vec<i64> = Vec::new();
+                    for m in &rest {
+                        let usable = m.embed_model.as_deref() == Some(model.as_str());
+                        match (usable, parse_embedding(m)) {
+                            (true, Some(v)) if v.len() == qvec.len() => {
+                                scored.push((crate::llm::embedding::cosine(&qvec, &v), m));
+                            }
+                            _ => {
+                                scored.push((-1.0, m));
+                                missing.push(m.id);
+                            }
+                        }
+                    }
+                    if !missing.is_empty() {
+                        spawn_backfill(db, missing);
+                    }
+                    scored.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut out = pinned;
+                    out.extend(scored.into_iter().take(TOP_K_INJECT).map(|(_, m)| m));
+                    return out;
+                }
+            }
+        }
+    }
+
+    // 回退:置顶 + 最近更新优先(rows 已按 UpdatedAt 倒序,rest 保持同序)
+    let mut out = pinned;
+    out.extend(rest.into_iter().take(TOP_K_INJECT));
+    out
+}
+
+/// 解析记忆里存的向量(JSON float 数组);为空 / 解析失败返回 None。
+fn parse_embedding(m: &mem::Model) -> Option<Vec<f32>> {
+    let raw = m.embedding.as_deref()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let arr: Vec<f32> = serde_json::from_str(raw).ok()?;
+    if arr.is_empty() {
+        None
+    } else {
+        Some(arr)
+    }
+}
+
+/// 把选中的记忆按字符预算拼成 system 消息(置顶在前,优先保留)。
+fn build_memory_message(selected: &[&mem::Model]) -> Option<Value> {
     let mut lines = String::new();
     let mut used = 0usize;
-    for r in &rows {
+    for r in selected {
         let line = r.content.trim();
         if line.is_empty() {
             continue;
@@ -204,9 +368,61 @@ pub async fn memory_system_message(db: &DatabaseConnection, owner: &str) -> Opti
         return None;
     }
     let content = format!(
-        "以下是关于当前用户的长期记忆(来自历史对话或用户手动设置)。请在回答时自然地结合这些信息,但不要主动复述或提及「记忆」本身,除非用户问起:\n{lines}"
+        "以下是与当前问题相关的用户长期记忆(来自历史对话或用户手动设置)。请在回答时自然地结合这些信息,但不要主动复述或提及「记忆」本身,除非用户问起:\n{lines}"
     );
     Some(json!({ "role": "system", "content": content }))
+}
+
+/// 把缺向量的记忆放到后台补算,不阻塞调用方;未配置 embedding 时静默跳过。
+fn spawn_backfill(db: &DatabaseConnection, ids: Vec<i64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let db = db.clone();
+    tauri::async_runtime::spawn(async move {
+        backfill_embeddings(&db, &ids).await;
+    });
+}
+
+/// 为指定记忆补算并写回向量(取当前内容重新 embedding)。任何失败仅告警,不影响主流程。
+async fn backfill_embeddings(db: &DatabaseConnection, ids: &[i64]) {
+    let Some((api_url, model, api_key)) = embedding_config(db).await else {
+        return;
+    };
+    let rows = match mem::Entity::find()
+        .filter(mem::Column::Id.is_in(ids.to_vec()))
+        .all(db)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("补算向量读取记忆失败: {e}");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let texts: Vec<String> = rows.iter().map(|m| m.content.clone()).collect();
+    let vecs = match crate::llm::embedding::embed_texts(&api_url, &api_key, &model, &texts).await {
+        Ok(v) if v.len() == rows.len() => v,
+        Ok(_) => {
+            tracing::warn!("补算向量数量不符,跳过");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("补算向量失败: {e}");
+            return;
+        }
+    };
+    for (m, v) in rows.into_iter().zip(vecs) {
+        let mut am = m.into_active_model();
+        am.embedding = Set(Some(serde_json::to_string(&v).unwrap_or_default()));
+        am.embed_model = Set(Some(model.clone()));
+        if let Err(e) = am.update(db).await {
+            tracing::warn!("写回向量失败: {e}");
+        }
+    }
 }
 
 /// 从本轮对话提取记忆并落库(去重)。失败仅告警,不影响主流程——本函数设计为在 spawn 中调用。
@@ -256,8 +472,7 @@ pub async fn extract_and_store_memories(
 
     // 去重:与已有记忆(规范化后精确匹配)及本批内部
     let mut seen: HashSet<String> = existing.iter().map(|m| normalize_key(&m.content)).collect();
-    let now = Utc::now().timestamp();
-    let mut to_insert: Vec<mem::ActiveModel> = Vec::new();
+    let mut contents: Vec<String> = Vec::new();
     for raw in extracted {
         let content: String = raw.trim().chars().take(MAX_MEMORY_ITEM_CHARS).collect();
         if content.is_empty() {
@@ -268,18 +483,45 @@ pub async fn extract_and_store_memories(
             continue;
         }
         seen.insert(key);
+        contents.push(content);
+    }
+    if contents.is_empty() {
+        return;
+    }
+
+    // 落库即生成向量(best-effort):配了 embedding 就内联存,未配 / 失败则留空,后续按需补算
+    let embeds: Option<(String, Vec<Vec<f32>>)> = match embedding_config(db).await {
+        Some((url, model, key)) => {
+            match crate::llm::embedding::embed_texts(&url, &key, &model, &contents).await {
+                Ok(v) if v.len() == contents.len() => Some((model, v)),
+                _ => None,
+            }
+        }
+        None => None,
+    };
+
+    let now = Utc::now().timestamp();
+    let mut to_insert: Vec<mem::ActiveModel> = Vec::with_capacity(contents.len());
+    for (i, content) in contents.into_iter().enumerate() {
+        let (embedding, embed_model) = match &embeds {
+            Some((model, vecs)) => (
+                Some(serde_json::to_string(&vecs[i]).unwrap_or_default()),
+                Some(model.clone()),
+            ),
+            None => (None, None),
+        };
         to_insert.push(mem::ActiveModel {
             owner: Set(owner.to_string()),
             content: Set(content),
             source: Set("auto".to_string()),
             enabled: Set(true),
+            pinned: Set(false),
+            embedding: Set(embedding),
+            embed_model: Set(embed_model),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         });
-    }
-    if to_insert.is_empty() {
-        return;
     }
     if let Err(e) = mem::Entity::insert_many(to_insert).exec(db).await {
         tracing::warn!("自动记忆落库失败: {e}");

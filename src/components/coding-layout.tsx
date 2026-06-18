@@ -2,10 +2,12 @@
 // 数据来自会话里的工具消息(assistant.toolCalls 与 role=tool 结果按 toolCallId 关联)。
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
   Box,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   Eye,
   FileCode,
   FolderOpen,
@@ -65,49 +67,6 @@ function parseToolCalls(json: string | null | undefined): ToolCallJson[] {
   }
 }
 
-// 工具调用的简要参数(单行展示)
-function briefArgs(name: string, args: Record<string, unknown>): string {
-  if (name === "read_file" || name === "write_file" || name === "list_dir") {
-    return String(args.path ?? "");
-  }
-  if (name === "run_command") {
-    return String(args.command ?? "");
-  }
-  return JSON.stringify(args);
-}
-
-// 渲染块:user 气泡 / 最终回答 / 中间「思考过程」步骤(assistant 工具调用 + tool 结果聚成一块,可折叠)
-type Block =
-  | { type: "user"; m: ChatMessageView }
-  | { type: "answer"; m: ChatMessageView }
-  | { type: "steps"; key: number; items: ChatMessageView[] };
-
-function buildBlocks(messages: ChatMessageView[]): Block[] {
-  const blocks: Block[] = [];
-  let steps: ChatMessageView[] = [];
-  const flush = () => {
-    if (steps.length) {
-      blocks.push({ type: "steps", key: steps[0].id, items: steps });
-      steps = [];
-    }
-  };
-  for (const m of messages) {
-    if (m.role === "user") {
-      flush();
-      blocks.push({ type: "user", m });
-    } else if (m.role === "assistant" && parseToolCalls(m.toolCalls).length === 0) {
-      // 无工具调用的 assistant = 最终回答
-      flush();
-      blocks.push({ type: "answer", m });
-    } else {
-      // assistant 的工具调用 / tool 结果 → 思考过程步骤
-      steps.push(m);
-    }
-  }
-  flush();
-  return blocks;
-}
-
 export function CodingLayout() {
   const {
     conversations,
@@ -153,19 +112,12 @@ export function CodingLayout() {
   const [fileRefresh, setFileRefresh] = useState(0);
   // 预览刷新信号:文件保存后 +1,通知 PreviewServer 重新加载 iframe(实时反映编译结果)
   const [previewReload, setPreviewReload] = useState(0);
+  // 自动预览信号:每次 act 模式生成结束 +1,通知 PreviewServer「自动编译并打开预览」(未跑则启动,已跑则重载)
+  const [previewAutoStart, setPreviewAutoStart] = useState(0);
   // 用户在终端直接执行的命令(与 Agent 跑过的命令合并展示)
   const [userRuns, setUserRuns] = useState<{ command: string; output: string }[]>([]);
   const [termInput, setTermInput] = useState("");
   const [running, setRunning] = useState(false);
-  // 已展开的「思考过程」步骤块(按块首条消息 id);默认折叠
-  const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
-  const toggleSteps = (key: number) =>
-    setExpandedSteps((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
   const [sandboxOpen, setSandboxOpen] = useState(false);
   // 沙盒可用性(用于头部「未隔离」提示);null=未知
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
@@ -222,7 +174,6 @@ export function CodingLayout() {
     setUserRuns([]);
     setInput("");
     setSteps([]);
-    setExpandedSteps(new Set<number>());
     setTermInput("");
     setSelectedFile(null);
   }, [activeId]);
@@ -245,6 +196,31 @@ export function CodingLayout() {
     listen<{ conversationId: string; label: string }>("agent-step", (e) => {
       if (sendingConvRef.current !== e.payload.conversationId) return;
       setSteps((prev) => [...prev, e.payload.label]);
+    }).then(
+      (fn) => {
+        if (disposed) fn();
+        else dispose = fn;
+      },
+      () => {},
+    );
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, []);
+
+  // 监听「Docker 沙盒不可用,已回退本机执行」事件 → 弹窗提示(后端在重新探测且回退时推送)。
+  // 用固定 toast id:即便短时多次回退也只刷新同一条提示,不堆叠刷屏。
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    listen<{ reason: string }>("coding-sandbox-fallback", (e) => {
+      setDockerOk(false);
+      toast.warning("Docker 沙盒不可用,已回退本机执行(未隔离)", {
+        id: "coding-sandbox-fallback",
+        description: e.payload.reason,
+        duration: 8000,
+      });
     }).then(
       (fn) => {
         if (disposed) fn();
@@ -320,8 +296,6 @@ export function CodingLayout() {
     }
     return list;
   }, [messages]);
-  // 消息分块:user / 最终回答 / 思考过程步骤(用于可折叠展示)
-  const blocks = useMemo(() => buildBlocks(messages), [messages]);
   // 终端显示 = Agent 跑过的命令 + 用户直接敲的命令
   const combinedTerminal = [...terminal, ...userRuns];
 
@@ -427,6 +401,11 @@ export function CodingLayout() {
       const fresh = await api.listChatMessages(convId);
       setMessages(fresh);
       await reload();
+      // 生成完成:act 模式自动切到预览并触发自动编译/重载(plan 模式只产方案、不写代码,跳过)
+      if (sendMode === "act") {
+        setWorkTab("preview");
+        setPreviewAutoStart((k) => k + 1);
+      }
     } catch (e) {
       toast.error(`执行失败: ${e}`);
       setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
@@ -504,46 +483,6 @@ export function CodingLayout() {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      {/* 头:标题 + 工作区路径 */}
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-2">
-        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-          <FileCode className="size-4 text-primary" />
-          {active?.title || "新编程会话"}
-        </div>
-        <div className="flex min-w-0 items-center gap-2">
-          <div className="flex min-w-0 items-center gap-1.5 truncate text-xs text-muted-foreground">
-            <FolderOpen className="size-3.5 shrink-0" />
-            <span className="truncate" title={workspace}>
-              {workspace || "工作区加载中…"}
-            </span>
-          </div>
-          {dockerOk === false && (
-            <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
-              未隔离·本机
-            </span>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 shrink-0 gap-1 text-xs"
-            disabled={!activeId}
-            title="回退到本轮发送前(丢弃本轮文件改动)"
-            onClick={handleRollback}
-          >
-            <Undo2 className="size-3.5" />
-            回退
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 shrink-0 gap-1 text-xs"
-            onClick={() => setSandboxOpen(true)}
-          >
-            <Box className="size-3.5" />
-            沙盒
-          </Button>
-        </div>
-      </div>
       <SandboxDialog open={sandboxOpen} onOpenChange={setSandboxOpen} />
 
       {/* 双栏(中间分割条可拖动调整宽度) */}
@@ -615,18 +554,7 @@ export function CodingLayout() {
                 />
               )
             ) : (
-              blocks.map((b) =>
-                b.type === "steps" ? (
-                  <StepsBlock
-                    key={b.key}
-                    items={b.items}
-                    expanded={expandedSteps.has(b.key)}
-                    onToggle={() => toggleSteps(b.key)}
-                  />
-                ) : (
-                  <CodingMessage key={b.m.id} message={b.m} />
-                ),
-              )
+              messages.map((m) => <CodingMessage key={m.id} message={m} />)
             )}
             {/* 进行中:实时思考过程(逐步累计,可滚动) */}
             {sending && (
@@ -736,6 +664,46 @@ export function CodingLayout() {
               <SquareTerminal className="size-3.5" />
               终端{terminal.length > 0 ? ` (${terminal.length})` : ""}
             </WorkTab>
+            <div className="ml-auto flex items-center gap-1">
+              {dockerOk === false && (
+                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+                  未隔离·本机
+                </span>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 gap-1 text-xs"
+                disabled={!activeId}
+                title="回退到本轮发送前(丢弃本轮文件改动)"
+                onClick={handleRollback}
+              >
+                <Undo2 className="size-3.5" />
+                回退
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 gap-1 text-xs"
+                onClick={() => setSandboxOpen(true)}
+              >
+                <Box className="size-3.5" />
+                沙盒
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 gap-1 text-xs"
+                disabled={!workspace}
+                title="在系统文件管理器中打开工作区目录"
+                onClick={() =>
+                  void openPath(workspace).catch((e) => toast.error(`打开目录失败: ${e}`))
+                }
+              >
+                <FolderOpen className="size-3.5" />
+                打开目录
+              </Button>
+            </div>
           </div>
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {workTab === "files" ? (
@@ -791,7 +759,7 @@ export function CodingLayout() {
                 )}
               </div>
             ) : workTab === "preview" ? (
-              <PreviewServer reloadSignal={previewReload} />
+              <PreviewServer reloadSignal={previewReload} autoStart={previewAutoStart} />
             ) : (
               <div className="flex min-h-0 flex-1 flex-col">
                 <div className="veltrix-thin-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
@@ -872,11 +840,20 @@ function WorkTab({
 // 预览统一走「预览服务」:在沙盒内常驻起一个服务进程并经 <名>.localhost:<port> 给出访问地址。
 // 不再区分静态 / 开发服务器——前端项目用 `npm run dev`,单个 HTML / 纯静态目录用内置静态服务器,
 // 二者都得到一个真实访问地址(单 HTML 不再用本地 file 协议直开)。轮询状态,检测到端口后 iframe 接入。
-function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
+function PreviewServer({
+  reloadSignal,
+  autoStart,
+}: {
+  reloadSignal?: number;
+  autoStart?: number;
+}) {
   const { activeId } = useChat();
-  // 默认前端项目(Vite)预览;容器内服务须绑 0.0.0.0(--host),宿主已发布同号端口,经 localhost:<port> 访问。
+  // 默认前端项目(Vite)预览;容器内服务须绑 0.0.0.0(--host),宿主已发布端口,经 localhost:<port> 访问。
   // 加 CHOKIDAR_USEPOLLING:Docker(尤其 Win/WSL2)bind mount 的文件变更事件常不传播,开轮询让 Vite 感知保存并热更新。
-  const DEV_CMD = "CHOKIDAR_USEPOLLING=true npm run dev -- --host";
+  // --port + --strictPort:命令里的端口号会被后端按会话改写为「自定义且未被占用」的端口(本机模式查占用、
+  // 多程序不撞 5173),strictPort 保证撞端口时直接报错可见,而非静默爬升到未知端口。实际端口见下方状态行。
+  const DEV_CMD =
+    "CHOKIDAR_USEPOLLING=true npm run dev -- --host --port 5173 --strictPort";
   const [command, setCommand] = useState(DEV_CMD);
   const [status, setStatus] = useState<DevServerStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -907,6 +884,14 @@ function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
     if (reloadSignal) setIframeKey((k) => k + 1);
   }, [reloadSignal]);
 
+  // 生成完成信号(autoStart 自增)→ 自动编译并打开预览(由 startSilently 据后端真实状态决定起 / 重载)。
+  // 仅以 autoStart 自增为触发沿,故意不纳入其它依赖避免重复触发。
+  useEffect(() => {
+    if (!autoStart) return;
+    void startSilently();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart]);
+
   // dev server 是全局单实例;仅当其归属当前会话时才认它,否则切到别的会话不串台(防显示他会话内容)
   const belongsToThis =
     !status?.conversationId || status.conversationId === activeId;
@@ -916,6 +901,8 @@ function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
   // (返回 "Blocked request"),而 <slug>.localhost 并无反代按子域路由,纯属多余,故统一用 localhost。
   const host = "localhost";
   const src = port ? `http://${host}:${port}/?_=${iframeKey}` : "";
+  // 在外部浏览器打开用干净地址(不带 iframe 缓存破坏参数)
+  const externalUrl = port ? `http://${host}:${port}/` : "";
 
   async function start() {
     setBusy(true);
@@ -938,25 +925,29 @@ function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
       setBusy(false);
     }
   }
+  // 自动启动(静默):用于「生成完成自动预览」。先查后端真实状态——已在跑就只重载,
+  // 避免切 tab 重挂载时把正在跑的 dev server 重启(闪烁);未跑才启动。
+  // 工作区可能尚无可预览内容(纯方案 / 空目录),失败不弹错(区别于手动「启动」按钮),避免每轮无谓打扰。
+  async function startSilently() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const s = await api.getDevServerStatus();
+      const alreadyRunning =
+        s.running && (!s.conversationId || s.conversationId === activeId);
+      if (!alreadyRunning) {
+        await api.startDevServer(activeId ?? "", command);
+      }
+      setIframeKey((k) => k + 1);
+    } catch {
+      // 无可预览内容时静默忽略
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* 预设:一键填入前端项目(Vite)启动命令 */}
-      <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1 text-[11px]">
-        <span className="text-muted-foreground">预设</span>
-        <button
-          type="button"
-          onClick={() => setCommand(DEV_CMD)}
-          className={cn(
-            "rounded px-2 py-0.5 transition-colors",
-            command === DEV_CMD
-              ? "bg-primary/10 font-medium text-primary"
-              : "text-muted-foreground hover:bg-accent/50",
-          )}
-        >
-          前端项目(Vite)
-        </button>
-      </div>
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
         <input
           value={command}
@@ -997,6 +988,19 @@ function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
           onClick={() => setIframeKey((k) => k + 1)}
         >
           <RotateCw className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="size-7 shrink-0"
+          disabled={!externalUrl}
+          title={externalUrl ? `在外部浏览器打开 ${host}:${port}` : "服务运行后可在外部浏览器打开"}
+          onClick={() =>
+            void openUrl(externalUrl).catch((e) => toast.error(`打开浏览器失败: ${e}`))
+          }
+        >
+          <ExternalLink className="size-3.5" />
         </Button>
         <Button
           type="button"
@@ -1046,82 +1050,6 @@ function PreviewServer({ reloadSignal }: { reloadSignal?: number }) {
   );
 }
 
-// 思考过程步骤块(可折叠):折叠时显示「思考过程 · N 步(工具名)」,展开显示每步的
-// 推理文字 / 工具调用(名+参数)/ 工具结果(可滚动)。
-function StepsBlock({
-  items,
-  expanded,
-  onToggle,
-}: {
-  items: ChatMessageView[];
-  expanded: boolean;
-  onToggle: () => void;
-}) {
-  const calls = items.flatMap((m) =>
-    m.role === "assistant" ? parseToolCalls(m.toolCalls) : [],
-  );
-  const names = Array.from(new Set(calls.map((c) => c.name)));
-
-  return (
-    <div className="overflow-hidden rounded-md border bg-muted/20">
-      <button
-        type="button"
-        onClick={onToggle}
-        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/40"
-      >
-        {expanded ? (
-          <ChevronDown className="size-3.5 shrink-0" />
-        ) : (
-          <ChevronRight className="size-3.5 shrink-0" />
-        )}
-        <Wrench className="size-3.5 shrink-0 text-primary" />
-        <span className="font-medium text-foreground">思考过程</span>
-        <span className="shrink-0">· {calls.length} 步</span>
-        {names.length > 0 && (
-          <span className="truncate">({names.join(", ")})</span>
-        )}
-      </button>
-      {expanded && (
-        <div className="space-y-2 border-t px-2.5 py-2">
-          {items.map((m) =>
-            m.role === "assistant" ? (
-              <div key={m.id} className="space-y-1">
-                {m.content.trim() && (
-                  <p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">
-                    {m.content}
-                  </p>
-                )}
-                {parseToolCalls(m.toolCalls).map((c) => (
-                  <div key={c.id} className="flex items-center gap-1.5 text-xs">
-                    <Wrench className="size-3 shrink-0 text-primary" />
-                    <span className="font-medium text-foreground">{c.name}</span>
-                    <span
-                      className="truncate text-muted-foreground"
-                      title={briefArgs(c.name, c.arguments ?? {})}
-                    >
-                      {briefArgs(c.name, c.arguments ?? {})}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div key={m.id} className="text-xs">
-                <div className="mb-0.5 flex items-center gap-1 text-muted-foreground">
-                  <span className="text-emerald-500">↳</span>
-                  <span className="font-medium">{m.toolName || "tool"}</span>
-                </div>
-                <pre className="veltrix-thin-scrollbar max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-background/60 p-1.5 font-mono text-[11px] text-muted-foreground">
-                  {m.content}
-                </pre>
-              </div>
-            ),
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // 编程沙盒设置:本机 / Docker(每会话共享容器内独立目录);镜像/容器名 + 启停 + 状态。
 function SandboxDialog({
   open,
@@ -1157,6 +1085,14 @@ function SandboxDialog({
       setBusy(false);
     }
   }
+  // 去掉显式「保存」按钮:镜像 / 容器名改动在失焦及启动 / 重建前自动持久化,确保编辑即时生效。
+  async function persistConfig() {
+    try {
+      await api.setSandboxConfig(image, container);
+    } catch (e) {
+      toast.error(`保存沙盒配置失败: ${e}`);
+    }
+  }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
@@ -1175,11 +1111,21 @@ function SandboxDialog({
           <div className="grid gap-2 sm:grid-cols-2">
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">基础镜像</span>
-              <Input value={image} onChange={(e) => setImage(e.target.value)} placeholder="node:20-bookworm" />
+              <Input
+                value={image}
+                onChange={(e) => setImage(e.target.value)}
+                onBlur={() => void persistConfig()}
+                placeholder="node:20-bookworm"
+              />
             </label>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">容器名</span>
-              <Input value={container} onChange={(e) => setContainer(e.target.value)} placeholder="veltrix-sandbox" />
+              <Input
+                value={container}
+                onChange={(e) => setContainer(e.target.value)}
+                onBlur={() => void persistConfig()}
+                placeholder="veltrix-sandbox"
+              />
             </label>
           </div>
           <div className="rounded-md border bg-muted/20 px-2.5 py-2 text-xs text-muted-foreground">
@@ -1206,6 +1152,8 @@ function SandboxDialog({
                       await api.sandboxStop();
                       toast.success("已停止沙盒容器");
                     } else {
+                      // 启动前先落盘当前镜像 / 容器名,确保用的是最新编辑值(后端按已保存配置拉容器)
+                      await persistConfig();
                       toast.success(await api.sandboxStart());
                     }
                     await refresh();
@@ -1235,6 +1183,8 @@ function SandboxDialog({
               onClick={() =>
                 void withBusy(async () => {
                   try {
+                    // 重建前先落盘当前镜像 / 容器名,确保按最新编辑值重建
+                    await persistConfig();
                     toast.success(await api.sandboxRecreate());
                     await refresh();
                   } catch (e) {
@@ -1258,30 +1208,61 @@ function SandboxDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
-          <Button
-            disabled={busy}
-            onClick={() =>
-              void withBusy(async () => {
-                try {
-                  await api.setSandboxConfig(image, container);
-                  toast.success("沙盒配置已保存");
-                  await refresh();
-                } catch (e) {
-                  toast.error(`保存失败: ${e}`);
-                }
-              })
-            }
-          >
-            {busy && <Loader2 className="size-4 animate-spin" />}
-            保存
-          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-// 单条消息渲染:user 气泡 / assistant 最终回答(无工具调用)
+// 写代码类工具:对话中以折叠块呈现实际代码 / diff;其余工具调用一律隐藏。
+const CODE_TOOLS = ["write_file", "replace_in_file"] as const;
+
+// 编码折叠块:Agent 写文件 / 改文件时把代码或 diff 折叠展示(默认收起,点标题展开)。
+function CollapsibleCode({
+  label,
+  path,
+  code,
+}: {
+  label: string;
+  path: string;
+  code: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const lineCount = code ? code.split("\n").length : 0;
+  return (
+    <div className="overflow-hidden rounded-md border bg-card">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-accent/40"
+      >
+        {open ? (
+          <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <FileCode className="size-3.5 shrink-0 text-primary" />
+        <span className="shrink-0 font-medium text-foreground">{label}</span>
+        <span className="truncate text-muted-foreground" title={path}>
+          {path}
+        </span>
+        <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+          {lineCount} 行
+        </span>
+      </button>
+      {open && (
+        <pre className="veltrix-thin-scrollbar max-h-80 overflow-auto whitespace-pre-wrap break-words border-t bg-background/60 p-2 font-mono text-[11px] leading-5 text-muted-foreground">
+          {code}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+// 单条消息渲染:
+// - user → 右侧气泡
+// - assistant → 思考过程 / 最终回答文字全量呈现(Markdown)+ 编码类工具折叠块;其余工具调用隐藏
+// - tool(工具结果)→ 对话中不呈现(run_command 的输出仍在「终端」tab)
 function CodingMessage({ message: m }: { message: ChatMessageView }) {
   if (m.role === "user") {
     return (
@@ -1292,36 +1273,35 @@ function CodingMessage({ message: m }: { message: ChatMessageView }) {
       </div>
     );
   }
-  if (m.role === "tool") {
-    return (
-      <div className="flex items-center gap-1.5 pl-1 text-[11px] text-muted-foreground">
-        <span className="text-emerald-500">↳</span>
-        <span className="font-medium">{m.toolName || "tool"}</span>
-        <span className="opacity-70">结果 · {m.content.length} 字</span>
-      </div>
-    );
-  }
-  // assistant
-  const calls = parseToolCalls(m.toolCalls);
+  if (m.role !== "assistant") return null;
+
+  const hasText = m.content.trim().length > 0;
+  // 仅保留写代码类工具(write_file / replace_in_file)折叠展示;读取 / 列目录 / 跑命令 / 搜索 / 计划等隐藏
+  const codeCalls = parseToolCalls(m.toolCalls).filter((c) =>
+    (CODE_TOOLS as readonly string[]).includes(c.name),
+  );
+  // 既无文字又无编码 → 纯工具调用步骤,整条隐藏
+  if (!hasText && codeCalls.length === 0) return null;
   return (
     <div className="space-y-1.5">
-      {m.content.trim() && (
+      {hasText && (
         <div className="text-sm text-foreground">
           <MarkdownMessage content={m.content} />
         </div>
       )}
-      {calls.map((c) => (
-        <div
-          key={c.id}
-          className="flex items-center gap-1.5 rounded-md border bg-card px-2.5 py-1.5 text-xs"
-        >
-          <Wrench className="size-3.5 shrink-0 text-primary" />
-          <span className="font-medium text-foreground">{c.name}</span>
-          <span className="truncate text-muted-foreground" title={briefArgs(c.name, c.arguments ?? {})}>
-            {briefArgs(c.name, c.arguments ?? {})}
-          </span>
-        </div>
-      ))}
+      {codeCalls.map((c) => {
+        const isWrite = c.name === "write_file";
+        const args = c.arguments ?? {};
+        const code = String((isWrite ? args.content : args.diff) ?? "");
+        return (
+          <CollapsibleCode
+            key={c.id}
+            label={isWrite ? "写入文件" : "修改文件"}
+            path={String(args.path ?? "")}
+            code={code}
+          />
+        );
+      })}
     </div>
   );
 }

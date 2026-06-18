@@ -387,9 +387,9 @@ pub async fn send_chat_message(
         .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
     history.reverse();
     let mut arr: Vec<Value> = Vec::with_capacity(history.len() + 2);
-    // 跨会话长期记忆:作为 system 消息注入到最前面(开关关闭 / 无记忆时为 None)
+    // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
     if let Some(sys) =
-        crate::commands::chat_memory::memory_system_message(&state.db, &me.name).await
+        crate::commands::chat_memory::memory_system_message(&state.db, &me.name, &text).await
     {
         arr.push(sys);
     }
@@ -576,9 +576,9 @@ pub async fn send_chat_message_stream(
     // 当前 user 消息:无附件用纯文本;有附件用多模态 content 数组
     let current_content = build_user_content(&text, &attachments);
     let mut arr: Vec<Value> = Vec::with_capacity(prior.len() + 3);
-    // 跨会话长期记忆:作为 system 消息注入到最前面(开关关闭 / 无记忆时为 None)
+    // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
     if let Some(sys) =
-        crate::commands::chat_memory::memory_system_message(&state.db, &me.name).await
+        crate::commands::chat_memory::memory_system_message(&state.db, &me.name, &text).await
     {
         arr.push(sys);
     }

@@ -37,9 +37,34 @@ const SANDBOX_IMAGE_KEY: &str = "coding_sandbox_image";
 const SANDBOX_CONTAINER_KEY: &str = "coding_sandbox_container";
 const DEFAULT_SANDBOX_IMAGE: &str = "node:20-bookworm";
 const DEFAULT_SANDBOX_CONTAINER: &str = "veltrix-sandbox";
-/// 沙盒发布到宿主的常用 dev 端口:容器内服务绑 0.0.0.0 后,宿主经 127.0.0.1:<port> 即可预览。
-/// `create_container` 据此发布端口;`get_dev_server_status` 据此主动探测端口(日志解析失败时兜底)。
-const DEV_PREVIEW_PORTS: [u16; 5] = [5173, 5174, 4173, 3000, 8080];
+/// Docker 沙盒发布到宿主的预览端口集:容器内服务绑 0.0.0.0 后,宿主经 127.0.0.1:<port> 即可预览。
+/// `create_container` 据此发布端口;Docker 模式下 `pick_preview_port` 按会话从中取一个(每个程序相对固定)。
+const DOCKER_PUBLISH_PORTS: [u16; 5] = [5173, 5174, 4173, 3000, 8080];
+/// 本机执行模式的预览端口扫描区间 `[HOST_PORT_BASE, HOST_PORT_BASE + HOST_PORT_SPAN)`:
+/// 每个会话按 id 派生一个区间内的起点端口(自定义、相对固定),被占用则在区间内顺延找空闲端口。
+/// Docker 不可用回退本机时,多个程序 / 残留进程都挤同一端口,固定 5173 会撞车——故按会话分配并查占用。
+const HOST_PORT_BASE: u16 = 5173;
+const HOST_PORT_SPAN: u16 = 16;
+/// docker 探测类命令(inspect/version/start/stop/exec 探测)超时:Docker Desktop 守护进程卡顿 / 重启时,
+/// `docker` CLI 会无限挂死,拖垮整个编程流程——一律加超时,超时即当作不可用,稳妥回退本机执行。
+const DOCKER_PROBE_TIMEOUT_SECS: u64 = 12;
+/// `docker run`(可能含首次拉镜像)超时:给足,避免大镜像拉取被误判失败。
+const DOCKER_RUN_TIMEOUT_SECS: u64 = 600;
+/// 沙盒就绪结论缓存有效期:此窗口内不再重跑 docker 探测,直接复用上次结论(连接稳定 + 提速)。
+const SANDBOX_VERIFY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 沙盒「就绪结论」缓存:避免每个编程动作都重跑一串 docker 探测(每次 4 个进程 spawn,慢且放大挂死面)。
+/// 同容器/镜像在 TTL 内复用结论;配置变更 / 手动启停时失效重验。
+#[derive(Default)]
+pub struct SandboxReady {
+    /// 上次验证时刻;None = 从未验证 / 已失效。
+    verified_at: Option<std::time::Instant>,
+    /// 上次结论:true = Docker 沙盒可用;false = 已回退本机执行。
+    docker_ok: bool,
+    /// 验证时的容器名 / 镜像(与当前配置不一致则缓存失效)。
+    container: String,
+    image: String,
+}
 
 /// 工作区根目录(自定义优先,否则默认数据目录下 coding-workspaces)。
 fn workspace_base(state: &AppState, custom: &str) -> PathBuf {
@@ -106,22 +131,75 @@ async fn resolve_exec(state: &AppState, conv_id: &str) -> Result<(PathBuf, codin
     tokio::fs::create_dir_all(&ws)
         .await
         .map_err(|e| CrawlerError::Config(format!("创建工作区失败: {e}")))?;
-    // 默认就用 Docker 沙盒;Docker 不可用 / 创建失败时自动回退本机执行(见下 ensure_container 的 Err 分支)。
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
-    match ensure_container(&base, &image, &container).await {
-        Ok(()) => Ok((
-            ws,
-            coding::ExecConfig::Docker {
-                container,
-                workdir: format!("/workspace/{}", safe_id(conv_id)),
-            },
-        )),
-        Err(e) => {
-            tracing::warn!("Docker 沙盒不可用,回退本机执行: {e}");
-            Ok((ws, coding::ExecConfig::Host))
-        }
+    let workdir = format!("/workspace/{}", safe_id(conv_id));
+
+    // 就绪缓存命中(同容器 / 镜像、TTL 内):直接复用上次结论,免去每个动作 4 连击 docker(慢且放大挂死面)
+    if let Some(docker_ok) = sandbox_cached(state, &container, &image) {
+        return Ok((ws, exec_for(docker_ok, container, workdir)));
     }
+
+    // 默认就用 Docker 沙盒;不可用 / 创建失败 / docker 探测超时 → 自动回退本机执行
+    let docker_ok = match ensure_container(&base, &image, &container).await {
+        Ok(()) => true,
+        Err(e) => {
+            // 仅在「重新探测」(缓存未命中)时走到这里,故 30s 内最多推一次,不会刷屏。
+            // 同步推前端弹窗:让用户明确知道命令已退回本机(未隔离),而不是只埋在日志里。
+            let reason = e.to_string();
+            tracing::warn!("Docker 沙盒不可用,回退本机执行: {reason}");
+            let _ = state
+                .app_handle
+                .emit("coding-sandbox-fallback", json!({ "reason": reason }));
+            false
+        }
+    };
+    sandbox_cache_store(state, &container, &image, docker_ok);
+    Ok((ws, exec_for(docker_ok, container, workdir)))
+}
+
+/// 据就绪结论构造 ExecConfig。
+fn exec_for(docker_ok: bool, container: String, workdir: String) -> coding::ExecConfig {
+    if docker_ok {
+        coding::ExecConfig::Docker { container, workdir }
+    } else {
+        coding::ExecConfig::Host
+    }
+}
+
+/// 读就绪缓存:命中(同容器 / 镜像 + 未过期)返回 Some(docker_ok),否则 None(需重验)。
+fn sandbox_cached(state: &AppState, container: &str, image: &str) -> Option<bool> {
+    let g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = g
+        .verified_at
+        .map(|t| t.elapsed() < SANDBOX_VERIFY_TTL)
+        .unwrap_or(false);
+    if fresh && g.container == container && g.image == image {
+        Some(g.docker_ok)
+    } else {
+        None
+    }
+}
+
+/// 写就绪缓存。
+fn sandbox_cache_store(state: &AppState, container: &str, image: &str, docker_ok: bool) {
+    let mut g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+    g.verified_at = Some(std::time::Instant::now());
+    g.docker_ok = docker_ok;
+    g.container = container.to_string();
+    g.image = image.to_string();
+}
+
+/// 失效就绪缓存(配置变更 / 手动启停后强制下次重验)。
+fn sandbox_cache_invalidate(state: &AppState) {
+    let mut g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+    g.verified_at = None;
+}
+
+/// 缓存里当前是否判定为 Docker 模式(供 dev server 清残留时判断要不要进容器操作)。
+fn sandbox_uses_docker(state: &AppState) -> bool {
+    let g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+    g.verified_at.is_some() && g.docker_ok
 }
 
 /// 用户在终端直接执行一条命令(在该会话的工作区 / 沙盒内;超时);返回 exit/stdout/stderr 文本。
@@ -249,9 +327,25 @@ pub async fn write_workspace_file(
     Ok(())
 }
 
-/// 跑一条 docker 子命令。
+/// 跑一条 docker 子命令(探测类默认超时;超时即当 io 错误,调用方据此回退,绝不无限挂死)。
 async fn docker(args: &[&str]) -> std::io::Result<std::process::Output> {
-    tokio::process::Command::new("docker").args(args).output().await
+    docker_timeout(args, DOCKER_PROBE_TIMEOUT_SECS).await
+}
+
+/// 跑 docker 子命令并加超时;超时映射为 `TimedOut` io 错误。
+async fn docker_timeout(args: &[&str], secs: u64) -> std::io::Result<std::process::Output> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(secs),
+        tokio::process::Command::new("docker").args(args).output(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("docker {} 超时(>{secs}s)", args.first().copied().unwrap_or("")),
+        )),
+    }
 }
 
 /// 确保共享沙盒容器存在并运行,且把工作区根目录正确挂到 /workspace。
@@ -263,12 +357,14 @@ async fn ensure_container(base: &Path, image: &str, container: &str) -> Result<(
         .map(|o| o.status.success())
         .unwrap_or(false);
     if exists {
-        if container_has_workspace_mount(container).await {
+        // 必须同时满足:挂了 /workspace(宿主文件容器可见)+ 发布了预览端口(宿主连得上 dev/静态服务器)。
+        // 旧容器缺任一都删掉重建——否则要么看不到文件、要么预览「localhost 拒绝连接」。
+        if container_has_workspace_mount(container).await && container_publishes_ports(container).await
+        {
             let _ = docker(&["start", container]).await;
             return Ok(());
         }
-        // 旧容器没挂载工作区 → 删掉重建(否则宿主文件在容器里看不到)
-        tracing::warn!("沙盒容器缺少 /workspace 挂载,删除并重建");
+        tracing::warn!("沙盒容器缺少 /workspace 挂载或未发布预览端口,删除并重建");
         let _ = docker(&["rm", "-f", container]).await;
     }
     create_container(base, image, container).await
@@ -290,6 +386,18 @@ async fn container_has_workspace_mount(container: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// 容器是否发布了预览端口(以 DOCKER_PUBLISH_PORTS 第一个 5173 为探针)。
+/// 旧容器没发布端口时,服务在容器内跑得起来、宿主却连不上(localhost 拒绝连接),需重建。
+async fn container_publishes_ports(container: &str) -> bool {
+    let probe = format!("{}/tcp", DOCKER_PUBLISH_PORTS[0]);
+    docker(&["inspect", "-f", "{{json .HostConfig.PortBindings}}", container])
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&probe))
+        .unwrap_or(false)
+}
+
 /// 创建共享沙盒容器:`--mount`(避开 Windows 盘符冒号与 -v 分隔冲突)挂载工作区根目录 →
 /// /workspace,常驻 sleep infinity,并发布常用 dev 端口。端口被占用导致失败时回退不发布端口。
 async fn create_container(base: &Path, image: &str, container: &str) -> Result<()> {
@@ -299,8 +407,8 @@ async fn create_container(base: &Path, image: &str, container: &str) -> Result<(
 
     let mut args: Vec<&str> =
         vec!["run", "-d", "--name", container, "--mount", bind.as_str(), "-w", "/workspace"];
-    // 发布常用 dev 端口(与 DEV_PREVIEW_PORTS 探测集一致);publish 须比 args 活得久。
-    let publish: Vec<String> = DEV_PREVIEW_PORTS.iter().map(|p| format!("{p}:{p}")).collect();
+    // 发布常用 dev 端口(与 DOCKER_PUBLISH_PORTS 探测集一致);publish 须比 args 活得久。
+    let publish: Vec<String> = DOCKER_PUBLISH_PORTS.iter().map(|p| format!("{p}:{p}")).collect();
     for p in &publish {
         args.push("-p");
         args.push(p.as_str());
@@ -308,7 +416,7 @@ async fn create_container(base: &Path, image: &str, container: &str) -> Result<(
     args.push(image);
     args.push("sleep");
     args.push("infinity");
-    let out = docker(&args)
+    let out = docker_timeout(&args, DOCKER_RUN_TIMEOUT_SECS)
         .await
         .map_err(|e| CrawlerError::Config(format!("docker run 失败(Docker 是否已安装并运行?): {e}")))?;
     if out.status.success() {
@@ -316,10 +424,13 @@ async fn create_container(base: &Path, image: &str, container: &str) -> Result<(
     }
     // 回退:清掉残留同名容器,不发布端口重建(命令执行仍可用,仅 dev 预览不可达)
     let _ = docker(&["rm", "-f", container]).await;
-    let out2 = docker(&[
-        "run", "-d", "--name", container, "--mount", bind.as_str(), "-w", "/workspace", image,
-        "sleep", "infinity",
-    ])
+    let out2 = docker_timeout(
+        &[
+            "run", "-d", "--name", container, "--mount", bind.as_str(), "-w", "/workspace", image,
+            "sleep", "infinity",
+        ],
+        DOCKER_RUN_TIMEOUT_SECS,
+    )
     .await
     .map_err(|e| CrawlerError::Config(format!("docker run 失败: {e}")))?;
     if out2.status.success() {
@@ -341,6 +452,7 @@ pub async fn sandbox_recreate(state: State<'_, AppState>) -> Result<String> {
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let _ = docker(&["rm", "-f", &container]).await;
     create_container(&base, &image, &container).await?;
+    sandbox_cache_invalidate(&state); // 容器已重建,下次动作重验
     Ok(format!("沙盒容器 {container} 已重建并正确挂载工作区"))
 }
 
@@ -387,6 +499,7 @@ pub async fn set_sandbox_config(
         if c.is_empty() { DEFAULT_SANDBOX_CONTAINER } else { c },
     )
     .await?;
+    sandbox_cache_invalidate(&state); // 容器名 / 镜像变了,旧就绪结论作废
     Ok(())
 }
 
@@ -397,6 +510,7 @@ pub async fn sandbox_start(state: State<'_, AppState>) -> Result<String> {
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     ensure_container(&base, &image, &container).await?;
+    sandbox_cache_invalidate(&state); // 手动拉起后重验,确保结论与实际一致
     Ok(format!("沙盒容器 {container} 已就绪(镜像 {image})"))
 }
 
@@ -405,6 +519,7 @@ pub async fn sandbox_start(state: State<'_, AppState>) -> Result<String> {
 pub async fn sandbox_stop(state: State<'_, AppState>) -> Result<()> {
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let _ = docker(&["stop", "-t", "2", &container]).await;
+    sandbox_cache_invalidate(&state); // 容器已停,下次动作重验(会重新 start)
     Ok(())
 }
 
@@ -440,7 +555,10 @@ const DEV_LOG_CAP: usize = 300;
 #[derive(Default)]
 pub struct DevServer {
     child: Option<tokio::process::Child>,
+    /// 实际探测到的监听端口(日志解析 / TCP 探测得出);未知为 None。
     port: Option<u16>,
+    /// 后端为本会话选定并注入命令的预览端口:供 `probe_dev_port` 精确探测该端口(免去全区间扫描)。
+    intended_port: Option<u16>,
     command: String,
     running: bool,
     logs: Vec<String>,
@@ -535,6 +653,8 @@ where
 }
 
 /// 停止当前 dev server(杀进程 + 复位状态)。同步操作,不跨 await 持锁。
+/// 注意:Docker 模式下这只杀宿主侧 `docker exec` 客户端,容器内的 vite/node **不一定**跟着死
+/// (non-TTY exec 的既有行为)。容器内残留由 `cleanup_container_dev` 显式清理,二者配合才彻底。
 fn stop_dev_inner(dev: &Arc<Mutex<DevServer>>) {
     let mut g = dev.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = g.child.take() {
@@ -542,7 +662,98 @@ fn stop_dev_inner(dev: &Arc<Mutex<DevServer>>) {
     }
     g.running = false;
     g.port = None;
+    g.intended_port = None;
     g.conversation_id.clear();
+}
+
+/// 清掉沙盒容器内残留的 dev server 进程(node/vite)。
+/// 共享容器内只跑单实例预览,孤儿进程会占住端口导致下次 vite 端口爬升(爬出已发布范围 → 预览白屏)。
+/// 直接按进程名 pkill;procps 缺失时此步无效,靠 dev 命令的 `--strictPort` 兜底(冲突即报错,不再静默爬升)。
+async fn cleanup_container_dev(container: &str) {
+    let _ = docker_timeout(
+        &[
+            "exec",
+            container,
+            "sh",
+            "-lc",
+            "pkill -9 -f node 2>/dev/null; pkill -9 -f vite 2>/dev/null; true",
+        ],
+        DOCKER_PROBE_TIMEOUT_SECS,
+    )
+    .await;
+}
+
+/// 内置静态预览服务器模板(node 内联脚本):无 package.json 的纯静态目录(单个 HTML 等)直接托管。
+/// `__PORT__` 占位由 `static_server_js` 注入后端选定端口;绑 0.0.0.0 后宿主经 localhost:<port> 访问,
+/// 带常见 MIME + 目录穿越防护,并打印 localhost:<port> 供端口探测。
+/// 全程只用双引号、不含单引号,故可安全嵌入 `node -e '...'`(外层单引号包裹)。
+const STATIC_SERVER_JS_TEMPLATE: &str = r#"const http=require("http"),fs=require("fs"),path=require("path");const root=process.cwd(),port=__PORT__;const M={".html":"text/html; charset=utf-8",".htm":"text/html; charset=utf-8",".css":"text/css",".js":"text/javascript",".mjs":"text/javascript",".json":"application/json",".svg":"image/svg+xml",".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".gif":"image/gif",".webp":"image/webp",".ico":"image/x-icon",".woff":"font/woff",".woff2":"font/woff2",".ttf":"font/ttf",".txt":"text/plain; charset=utf-8",".map":"application/json"};http.createServer(function(req,res){var u=decodeURIComponent(req.url.split("?")[0]);var f=path.join(root,u);if(path.resolve(f).indexOf(path.resolve(root))!==0){res.statusCode=403;res.end("403");return;}try{if(fs.statSync(f).isDirectory())f=path.join(f,"index.html");}catch(e){}fs.readFile(f,function(e,d){if(e){res.statusCode=404;res.setHeader("Content-Type","text/plain; charset=utf-8");res.end("404 Not Found");return;}res.setHeader("Content-Type",M[path.extname(f).toLowerCase()]||"application/octet-stream");res.end(d);});}).listen(port,"0.0.0.0",function(){console.log("Static preview on http://localhost:"+port+"/");});"#;
+
+/// 把静态服务器模板里的 `__PORT__` 替换为实际端口,生成可嵌入 `node -e '...'` 的脚本。
+fn static_server_js(port: u16) -> String {
+    STATIC_SERVER_JS_TEMPLATE.replace("__PORT__", &port.to_string())
+}
+
+/// 会话 id → 预览端口区间内的稳定偏移(FNV-1a 哈希取模):让每个程序有「自己的」相对固定端口,
+/// 便于记忆 / 书签;同一会话每次预览倾向同一端口(占用时再顺延)。
+fn conv_port_offset(conversation_id: &str) -> u16 {
+    let mut hash: u32 = 2166136261; // FNV-1a 偏移基准
+    for byte in conversation_id.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    (hash % HOST_PORT_SPAN as u32) as u16
+}
+
+/// 宿主某端口当前是否空闲:能成功 bind 127.0.0.1:port 即空闲(随即释放,仅做占用探测)。
+fn host_port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// 为某会话挑选预览端口(满足「每个程序自定义端口 + 检查占用」):
+/// - 按会话 id 在区间内派生一个起点(每个程序相对固定的「自己的」端口);
+/// - **本机模式**:从起点环形扫描区间,返回第一个未被占用的端口——多个程序 / 残留进程不再挤同一端口;
+///   全被占用才回退派生端口(交给 `--strictPort` 给出明确报错,而非静默爬升到未知端口)。
+/// - **Docker 模式**:宿主端口被 docker-proxy 占着、宿主侧占用探测无意义,直接从已发布端口集按会话取一个
+///   (容器内单实例 + 启动前清残留 + `--strictPort` 已足够避免容器内端口冲突)。
+fn pick_preview_port(conversation_id: &str, exec: &coding::ExecConfig) -> u16 {
+    let offset = conv_port_offset(conversation_id);
+    if let coding::ExecConfig::Docker { .. } = exec {
+        let idx = (offset as usize) % DOCKER_PUBLISH_PORTS.len();
+        return DOCKER_PUBLISH_PORTS[idx];
+    }
+    for i in 0..HOST_PORT_SPAN {
+        let port = HOST_PORT_BASE + (offset + i) % HOST_PORT_SPAN;
+        if host_port_free(port) {
+            return port;
+        }
+    }
+    HOST_PORT_BASE + offset % HOST_PORT_SPAN
+}
+
+/// 把命令里的预览端口统一改写为后端选定端口:替换 `--port <n>` / `--port=<n>` 的端口号(无则原样返回)。
+/// 前端默认 dev 命令固定带 `--port`,故替换即可生效;静态服务器另由 `static_server_js` 直接注入端口,不走此函数。
+fn apply_preview_port(command: &str, port: u16) -> String {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token == "--port" && i + 1 < tokens.len() {
+            out.push("--port".to_string());
+            out.push(port.to_string());
+            i += 2;
+            continue;
+        }
+        if token.starts_with("--port=") {
+            out.push(format!("--port={port}"));
+            i += 1;
+            continue;
+        }
+        out.push(token.to_string());
+        i += 1;
+    }
+    out.join(" ")
 }
 
 /// 启动 / 重启开发服务器:在编程工作区内跑给定命令(如 `npm run dev`),常驻。
@@ -552,16 +763,70 @@ pub async fn start_dev_server(
     conversation_id: String,
     command: String,
 ) -> Result<()> {
-    let cmd = command.trim().to_string();
+    let mut cmd = command.trim().to_string();
     if cmd.is_empty() {
         return Err(CrawlerError::Config("命令为空".into()));
     }
     // 在该会话的工作区 / 沙盒内常驻运行(docker 模式经 docker exec)。dev server 需绑 0.0.0.0,
-    // 容器已发布常用端口,故可经 <名>.localhost:<port> 预览。
+    // 容器已发布常用端口,故可经 localhost:<port> 预览。
     let (ws, exec) = resolve_exec(&state, &conversation_id).await?;
+
+    // 为本会话挑选预览端口(每个程序自定义端口 + 本机模式检查占用,避免多程序 / 残留进程撞 5173)。
+    let port = pick_preview_port(&conversation_id, &exec);
+
+    // npm/yarn/vite 这类命令依赖 package.json。探测工作区(与实际启动相同的 exec 环境,docker/本机都准):
+    // 有 package.json → 按原命令;有文件但无 package.json(纯静态,如单个 HTML)→ 自动改用内置静态服务器
+    // (无需 package.json);空目录 → 直接报错,而不是让 npm 吐一长串 ENOENT。
+    let mut is_static = false;
+    let needs_pkg = cmd.contains("npm") || cmd.contains("yarn") || cmd.contains("vite");
+    if needs_pkg {
+        let kind = tokio::time::timeout(
+            std::time::Duration::from_secs(DOCKER_PROBE_TIMEOUT_SECS),
+            coding::build_exec_command(
+                &exec,
+                &ws,
+                "if [ -f package.json ]; then echo PKG; elif [ -n \"$(ls -A 2>/dev/null)\" ]; then echo STATIC; else echo EMPTY; fi",
+            )
+            .output(),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+        match kind.as_str() {
+            // 真 npm 项目,或探测失败(保持原命令,失败也会给出原生错误)
+            "PKG" | "" => {}
+            "EMPTY" => {
+                return Err(CrawlerError::Config(
+                    "预览启动失败:该会话工作区是空的,没有可预览的内容。\
+                     先让编程 Agent 生成文件——前端项目用 `npm create vite`、纯静态写个 index.html——再点预览。\
+                     (若确信已生成却看不到,多半是旧沙盒容器挂载错位:去「设置 → 重建容器」后重试。)"
+                        .into(),
+                ));
+            }
+            // STATIC:有文件但无 package.json → 纯静态目录,内置 node 静态服务器托管(单个 HTML 也能预览)
+            _ => {
+                is_static = true;
+                cmd = format!("node -e '{}'", static_server_js(port));
+            }
+        }
+    }
+
+    // 非静态命令(npm/vite 等):把命令里的 `--port` 改写为后端选定端口;静态服务器已注入端口,跳过。
+    if !is_static {
+        cmd = apply_preview_port(&cmd, port);
+    }
 
     // 先停掉已有的(避免端口冲突 / 进程泄漏)
     stop_dev_inner(&state.dev_server);
+    // Docker 模式:显式清掉容器内可能残留的上一个 dev server——孤儿进程占住端口会逼 vite 端口爬升,
+    // 配合前端 `--strictPort` 固定端口,杜绝爬出已发布范围导致预览白屏。
+    if let coding::ExecConfig::Docker { container, .. } = &exec {
+        cleanup_container_dev(container).await;
+        // 给内核一点时间释放端口,随后固定端口启动才不会撞上刚杀掉的进程
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
 
     let mut launcher = coding::build_exec_command(&exec, &ws, &cmd);
     launcher
@@ -580,6 +845,7 @@ pub async fn start_dev_server(
         generation = g.generation;
         g.child = Some(child);
         g.port = None;
+        g.intended_port = Some(port); // 记后端选定端口,供 probe_dev_port 精确探测
         g.command = cmd;
         g.running = true;
         g.logs.clear();
@@ -598,14 +864,28 @@ pub async fn start_dev_server(
 #[tauri::command]
 pub async fn stop_dev_server(state: State<'_, AppState>) -> Result<()> {
     stop_dev_inner(&state.dev_server);
+    // Docker 模式:连容器内残留一并清掉(host 模式不进容器,避免无谓的 docker exec 调用)
+    if sandbox_uses_docker(&state) {
+        let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
+        cleanup_container_dev(&container).await;
+    }
     Ok(())
 }
 
-/// 主动探测已发布端口:返回第一个能建立 TCP 连接的端口(按 Vite 优先序)。
+/// 主动探测监听端口:返回第一个能建立 TCP 连接的端口。
 /// 兜底用——docker exec 非 TTY 流里 Vite 的就绪 banner 常被缓冲 / 着色吞掉,日志解析不到端口,
 /// 但服务确在 0.0.0.0:<port> 监听,直接连宿主回环即可定位,避免预览永远卡在「正在探测端口」。
-async fn probe_dev_port() -> Option<u16> {
-    for p in DEV_PREVIEW_PORTS {
+/// 已知后端选定端口(intended)时只精确探测它;未知则回退扫描两类常用端口。
+async fn probe_dev_port(intended: Option<u16>) -> Option<u16> {
+    let candidates: Vec<u16> = match intended {
+        Some(p) => vec![p],
+        None => DOCKER_PUBLISH_PORTS
+            .iter()
+            .copied()
+            .chain(HOST_PORT_BASE..HOST_PORT_BASE + HOST_PORT_SPAN)
+            .collect(),
+    };
+    for p in candidates {
         let connected = tokio::time::timeout(
             std::time::Duration::from_millis(250),
             tokio::net::TcpStream::connect(("127.0.0.1", p)),
@@ -625,13 +905,20 @@ async fn probe_dev_port() -> Option<u16> {
 #[tauri::command]
 pub async fn get_dev_server_status(state: State<'_, AppState>) -> Result<DevServerStatus> {
     // 先取快照即释放锁(std Mutex 绝不跨 await 持有)
-    let (running, port, command, logs, conversation_id) = {
+    let (running, port, intended, command, logs, conversation_id) = {
         let g = state.dev_server.lock().unwrap_or_else(|e| e.into_inner());
-        (g.running, g.port, g.command.clone(), g.logs.clone(), g.conversation_id.clone())
+        (
+            g.running,
+            g.port,
+            g.intended_port,
+            g.command.clone(),
+            g.logs.clone(),
+            g.conversation_id.clone(),
+        )
     };
     // 日志没解析到端口(docker exec 非 TTY 常吞 banner)→ 主动探测兜底,并回填(仅当仍是同一运行实例)
     if running && port.is_none() {
-        if let Some(p) = probe_dev_port().await {
+        if let Some(p) = probe_dev_port(intended).await {
             let mut g = state.dev_server.lock().unwrap_or_else(|e| e.into_inner());
             if g.running && g.port.is_none() {
                 g.port = Some(p);

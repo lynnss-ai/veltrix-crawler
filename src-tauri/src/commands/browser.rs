@@ -1,10 +1,11 @@
 //! 浏览器 Agent 命令:send_browser_message(ReAct 循环 + 工具往返落库 + 进度事件)。
 //!
 //! 骨架照搬 `commands::coding::send_coding_message`:逐步落库 chat_messages、emit `agent-step`、
-//! MAX_ITERS 防失控。区别在于工具集来自 `agent::browser`(navigate/click/type),系统提示词为
-//! 浏览器 Agent 版,且用独立平台名 "agent" 的 per-window 隔离窗口(不绑采集登录态)。
+//! MAX_ITERS 防失控。区别在于工具集来自 `agent::browser`(navigate/click/type/read_page/wait_for),
+//! 系统提示词为浏览器 Agent 版,且用独立平台名 "agent" 的 per-window 隔离窗口(不绑采集登录态)。
 //!
-//! MVP 范围(严格):只「发出动作」不回读结果,故无 auto-fix 续修(命令无成败可判);
+//! 动作回读:工具经 `AgentActionChannel` 按 req_id 等待页面回传结果(`browser_agent_result` 命令),
+//! 故动作有真实成败 / 页面信息;`capture_agent_preview` 截取窗口画面供前端右栏实时预览。
 //! 复用 coding 的消息行 ↔ ChatMsg 转换 / 标题截断 / 滚动摘要,避免重复实现。
 
 use crate::agent::browser;
@@ -89,9 +90,14 @@ pub async fn send_browser_message(
     .await
     .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
 
-    // 工具注册表:用 conversation_id 作为 per-window 隔离 key(独立 "agent" 窗口,不绑采集登录态)
-    let registry =
-        browser::build_registry(app.clone(), state.webviews.clone(), conversation_id.clone());
+    // 工具注册表:用 conversation_id 作为 per-window 隔离 key(独立 "agent" 窗口,不绑采集登录态)。
+    // 传入动作回读通道,使 navigate/click/read 等动作能按 req_id 等待页面回传结果。
+    let registry = browser::build_registry(
+        app.clone(),
+        state.webviews.clone(),
+        state.agent_actions.clone(),
+        conversation_id.clone(),
+    );
     let tool_defs = registry.defs();
 
     // live 原文窗口 + 滚动摘要(与 coding / chat 一致):id 大于已折叠边界的为原文,更早的靠摘要承载
@@ -228,6 +234,46 @@ pub async fn send_browser_message(
     spawn_browser_summary_maintenance(&state.db, &conversation_id, provider_ref);
 
     Ok(final_msg.into())
+}
+
+/// 页面注入脚本经此回传一次浏览器 Agent 动作结果(navigate/click/read 等的回读)。
+/// 与注入脚本里的 `browser_agent_result` 调用对应:按 req_id 把结果投递给等待中的动作。
+/// data 为页面回读的任意 JSON(url/title/元素清单等);缺省为空对象。
+#[tauri::command]
+pub fn browser_agent_result(
+    state: State<'_, AppState>,
+    req_id: u64,
+    ok: bool,
+    data: Option<serde_json::Value>,
+) -> Result<()> {
+    state.agent_actions.complete(
+        req_id,
+        crate::webview::AgentActionOutcome {
+            ok,
+            data: data.unwrap_or(serde_json::Value::Null),
+        },
+    );
+    Ok(())
+}
+
+/// 截取某浏览器 Agent 会话窗口的当前画面,返回 PNG 的 data URL(供右栏预览 <img> 直接用)。
+/// 窗口尚未创建(还没 navigate)或平台不支持截图时返回 None,前端显示占位。
+#[tauri::command]
+pub async fn capture_agent_preview(
+    app: AppHandle,
+    conversation_id: String,
+) -> Result<Option<String>> {
+    use base64::Engine;
+    use tauri::Manager;
+    let label = crate::webview::pool::window_label("agent", &conversation_id);
+    let Some(window) = app.get_webview_window(&label) else {
+        return Ok(None);
+    };
+    let Some(png) = crate::webview::screenshot::capture_png(&window).await else {
+        return Ok(None);
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Ok(Some(format!("data:image/png;base64,{b64}")))
 }
 
 /// 把浏览器会话的滚动摘要维护放到后台 spawn 执行,避免阻塞回复返回。

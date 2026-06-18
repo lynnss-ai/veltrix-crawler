@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod chat;
+pub mod embedding;
 pub mod http;
 pub mod intent;
 pub mod provider;

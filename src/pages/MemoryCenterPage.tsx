@@ -8,14 +8,21 @@ import {
   Loader2,
   MessageSquare,
   Network,
+  Pin,
   Plus,
   Search,
+  Sparkles,
   SquarePen,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { api, type ChatMemoryView, type ConversationView } from "@/lib/api";
+import {
+  api,
+  type ChatMemoryView,
+  type ConversationView,
+  type EmbeddingConfigView,
+} from "@/lib/api";
 import { useChat } from "@/hooks/use-chat";
 import { EmptyState } from "@/components/EmptyState";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
@@ -127,6 +134,10 @@ function MemorySection() {
 type SourceFilter = "all" | "auto" | "manual";
 type StatusFilter = "all" | "enabled" | "disabled";
 
+// 语义检索默认厂商:Qwen text-embedding-v4(OpenAI 兼容 /embeddings,中文效果好)
+const EMBED_DEFAULT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const EMBED_DEFAULT_MODEL = "text-embedding-v4";
+
 // 顶部数字条单元:大数字 + 小标签
 function MetricPill({ label, value }: { label: string; value: number }) {
   return (
@@ -158,6 +169,13 @@ function GlobalMemorySection() {
   const [confirm, setConfirm] = useState<
     null | { title: string; desc: string; run: () => void | Promise<void> }
   >(null);
+  // 语义检索(embedding)配置
+  const [embedCfg, setEmbedCfg] = useState<EmbeddingConfigView | null>(null);
+  const [embedOpen, setEmbedOpen] = useState(false);
+  const [embedUrl, setEmbedUrl] = useState(EMBED_DEFAULT_URL);
+  const [embedModel, setEmbedModel] = useState(EMBED_DEFAULT_MODEL);
+  const [embedKey, setEmbedKey] = useState("");
+  const [savingEmbed, setSavingEmbed] = useState(false);
 
   function reload() {
     setLoading(true);
@@ -170,8 +188,60 @@ function GlobalMemorySection() {
 
   useEffect(() => {
     api.getChatMemoryEnabled().then(setEnabled).catch(() => {});
+    api
+      .getEmbeddingConfig()
+      .then((cfg) => {
+        setEmbedCfg(cfg);
+        if (cfg.apiUrl) setEmbedUrl(cfg.apiUrl);
+        if (cfg.model) setEmbedModel(cfg.model);
+      })
+      .catch(() => {});
     reload();
   }, []);
+
+  // 语义检索是否已就绪:三要素齐全(apiKey 已存或本次填了)
+  const embedReady = !!embedCfg?.hasApiKey;
+
+  async function saveEmbed() {
+    const url = embedUrl.trim();
+    const model = embedModel.trim();
+    if (!url || !model) {
+      toast.error("请填写 Base URL 与模型名");
+      return;
+    }
+    if (!embedCfg?.hasApiKey && !embedKey.trim()) {
+      toast.error("请填写 API Key");
+      return;
+    }
+    setSavingEmbed(true);
+    try {
+      await api.setEmbeddingConfig(url, model, embedKey.trim());
+      setEmbedKey("");
+      const cfg = await api.getEmbeddingConfig();
+      setEmbedCfg(cfg);
+      setEmbedOpen(false);
+      toast.success("已保存,新对话将按语义检索注入记忆");
+    } catch (e) {
+      toast.error(`保存失败: ${e}`);
+    } finally {
+      setSavingEmbed(false);
+    }
+  }
+
+  async function togglePin(m: ChatMemoryView) {
+    const next = !m.pinned;
+    setMemories((prev) =>
+      prev.map((x) => (x.id === m.id ? { ...x, pinned: next } : x)),
+    );
+    try {
+      await api.setChatMemoryPinned(m.id, next);
+    } catch (e) {
+      setMemories((prev) =>
+        prev.map((x) => (x.id === m.id ? { ...x, pinned: m.pinned } : x)),
+      );
+      toast.error(`置顶失败: ${e}`);
+    }
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -329,11 +399,68 @@ function GlobalMemorySection() {
         <MetricPill label="启用" value={stats.enabledCount} />
         <MetricPill label="自动" value={stats.autoCount} />
         <MetricPill label="手动" value={stats.manualCount} />
-        <div className="ml-auto flex items-center gap-2 rounded-lg border bg-card px-3 py-2">
+        <Button
+          variant={embedOpen ? "secondary" : "outline"}
+          className="ml-auto"
+          onClick={() => setEmbedOpen((v) => !v)}
+        >
+          <Sparkles className="size-4" />
+          语义检索
+          <span
+            className={cn(
+              "ml-1 size-1.5 rounded-full",
+              embedReady ? "bg-emerald-500" : "bg-muted-foreground/40",
+            )}
+          />
+        </Button>
+        <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2">
           <span className="text-xs text-muted-foreground">对话记忆</span>
           <Switch checked={enabled} onCheckedChange={toggleEnabled} />
         </div>
       </div>
+
+      {/* 语义检索配置(点「语义检索」展开):配齐后记忆按当前问题相关度注入,而非一股脑全塞 */}
+      {embedOpen && (
+        <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+          <p className="text-xs text-muted-foreground">
+            配置 embedding 厂商后,每轮对话只注入与当前问题最相关的记忆(RAG)。推荐 Qwen
+            text-embedding-v4(OpenAI 兼容)。未配置时回退为「最近更新优先」。
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Input
+              value={embedUrl}
+              onChange={(e) => setEmbedUrl(e.target.value)}
+              placeholder="Base URL"
+              className="min-w-[260px] flex-1"
+            />
+            <Input
+              value={embedModel}
+              onChange={(e) => setEmbedModel(e.target.value)}
+              placeholder="模型名,如 text-embedding-v4"
+              className="min-w-[180px] flex-1"
+            />
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Input
+              type="password"
+              value={embedKey}
+              onChange={(e) => setEmbedKey(e.target.value)}
+              placeholder={
+                embedCfg?.hasApiKey ? "API Key(已配置,留空不改)" : "API Key"
+              }
+              className="min-w-[260px] flex-1"
+            />
+            <Button
+              className="shrink-0"
+              onClick={() => void saveEmbed()}
+              disabled={savingEmbed}
+            >
+              {savingEmbed ? <Loader2 className="size-4 animate-spin" /> : null}
+              保存
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* 工具栏:搜索 + 筛选 + 添加 */}
       <div className="flex flex-wrap items-center gap-2">
@@ -563,6 +690,12 @@ function GlobalMemorySection() {
                       {m.content}
                     </p>
                     <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                      {m.pinned && (
+                        <>
+                          <span className="font-medium text-primary">置顶</span>
+                          <span>·</span>
+                        </>
+                      )}
                       <span>{m.source === "auto" ? "自动" : "手动"}</span>
                       <span>·</span>
                       <span>
@@ -573,30 +706,50 @@ function GlobalMemorySection() {
                 )}
               </div>
               {editingId !== m.id && (
-                <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                  <SimpleTooltip content="编辑">
+                <div className="flex shrink-0 items-center gap-0.5">
+                  {/* 置顶按钮:已置顶恒显示(主色),未置顶悬停显示 */}
+                  <SimpleTooltip
+                    content={m.pinned ? "已置顶 · 点击取消" : "置顶(每轮恒注入)"}
+                  >
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="size-7"
-                      onClick={() => {
-                        setEditingId(m.id);
-                        setEditDraft(m.content);
-                      }}
+                      className={cn(
+                        "size-7 transition-opacity",
+                        m.pinned
+                          ? "text-primary opacity-100"
+                          : "opacity-0 group-hover:opacity-100",
+                      )}
+                      onClick={() => void togglePin(m)}
                     >
-                      <SquarePen className="size-3.5" />
+                      <Pin className={cn("size-3.5", m.pinned && "fill-current")} />
                     </Button>
                   </SimpleTooltip>
-                  <SimpleTooltip content="删除">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="size-7 text-destructive hover:text-destructive"
-                      onClick={() => void removeItem(m.id)}
-                    >
-                      <Trash2 className="size-3.5" />
-                    </Button>
-                  </SimpleTooltip>
+                  <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                    <SimpleTooltip content="编辑">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7"
+                        onClick={() => {
+                          setEditingId(m.id);
+                          setEditDraft(m.content);
+                        }}
+                      >
+                        <SquarePen className="size-3.5" />
+                      </Button>
+                    </SimpleTooltip>
+                    <SimpleTooltip content="删除">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 text-destructive hover:text-destructive"
+                        onClick={() => void removeItem(m.id)}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </SimpleTooltip>
+                  </div>
                 </div>
               )}
             </div>
