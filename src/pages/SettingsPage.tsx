@@ -4,16 +4,16 @@ import {
   useRef,
   useState,
   type FormEvent,
-  type ReactNode,
 } from "react";
-import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
-import { AudioLines, Bot, Brain, Check, ExternalLink, Eye, EyeOff, FolderOpen, GripVertical, Layers, Loader2, MoreVertical, NotebookPen, SquarePen, Plus, Search, Settings2, Smartphone, Sparkles, Trash2, TriangleAlert, Unplug, X } from "lucide-react";
+import { SECTION_GROUPS, CLEAR_CONFIRM_TEXT, formatBytes } from "./settings-meta";
+import type { SectionKey, Provider } from "./settings-meta";
+import { SettingsCard, Row } from "./settings-shared";
+import { ProvidersSection, ProviderFormSheet } from "./settings-providers";
+import { Check, ExternalLink, FolderOpen, GripVertical, Loader2, TriangleAlert, Unplug, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
-import { RefreshButton } from "@/components/RefreshButton";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
-import { FieldError } from "@/components/FieldError";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -25,13 +25,9 @@ import {
   type RoleModelConfig,
 } from "@/lib/api";
 import { ChatMemoryManager } from "@/components/chat-memory-manager";
-import { DataTable } from "@/components/DataTable";
-import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
-import { StatusBadge } from "@/components/StatusBadge";
 import { ErrorBanner } from "@/components/ErrorBanner";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -39,7 +35,6 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -53,21 +48,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -80,62 +60,6 @@ import {
 
 // 配置项当前为前端占位,待后端 set_config / clear_data 等命令就绪后接入。
 
-const SECTION_GROUPS = [
-  {
-    title: "基础设置",
-    items: [
-      { key: "general", label: "常规", icon: Settings2 },
-      { key: "remote-control", label: "远程控制", icon: Smartphone },
-      { key: "obsidian", label: "Obsidian", icon: NotebookPen },
-    ],
-  },
-  {
-    title: "AI 配置",
-    items: [
-      { key: "providers", label: "模型厂商", icon: Bot },
-      { key: "role-models", label: "角色模型", icon: Layers },
-      { key: "transcription", label: "语音转写", icon: AudioLines },
-      { key: "intent", label: "意向分析", icon: Sparkles },
-      { key: "memory", label: "AI 记忆", icon: Brain },
-    ],
-  },
-] as const;
-type SectionKey = (typeof SECTION_GROUPS)[number]["items"][number]["key"];
-
-
-interface Provider {
-  id: string;
-  code: string;
-  name: string;
-  apiUrl: string;
-  apiKey: string;
-  models: string; // 每行一个模型
-}
-
-// 模型厂商预设(code/name/apiUrl/asr)由后端 list_provider_capabilities 提供(单一真相源):
-// 新增厂商下拉、不可重复添加、语音转写按 ASR 过滤都据此,前端不再硬编码厂商清单。
-type ProviderPreset = {
-  code: string;
-  name: string;
-  apiUrl: string;
-  asr: boolean;
-};
-
-// 清空数据需输入的确认词
-const CLEAR_CONFIRM_TEXT = "清空数据";
-
-// 字节数格式化为可读大小
-function formatBytes(bytes: number): string {
-  if (bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let i = 0;
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024;
-    i += 1;
-  }
-  return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
 
 export function SettingsPage() {
   const [active, setActive] = useState<SectionKey>("general");
@@ -452,40 +376,6 @@ export function SettingsPage() {
 }
 
 // 通用配置卡片:标题 + 内容 + (可选)保存按钮,保存后短暂提示
-function SettingsCard({
-  title,
-  description,
-  children,
-  onSave,
-  dirty,
-}: {
-  title: string;
-  description?: string;
-  children: ReactNode;
-  onSave?: () => void;
-  dirty?: boolean;
-}) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        {description && <CardDescription>{description}</CardDescription>}
-        {onSave && (
-          <CardAction className="self-center">
-            <Button disabled={!dirty} onClick={onSave}>
-              保存
-            </Button>
-          </CardAction>
-        )}
-      </CardHeader>
-      <CardContent className="space-y-4">{children}</CardContent>
-    </Card>
-  );
-}
-
-// 工作区顺序编辑:拖动调整侧栏顶部工作区切换标签的排列。
-// 用指针事件(pointer events)+ pointer capture 实现,不依赖 HTML5 drag API
-// (WebView2 里原生 DnD 不可靠);拖动期间用本地副本即时重排,松手才持久化一次。
 function WorkspaceOrderEditor() {
   const [order, setOrder] = useWorkspaceOrder();
   // 拖动期间的本地工作副本;非拖动态与 order 同步
@@ -578,20 +468,6 @@ function WorkspaceOrderEditor() {
 }
 
 // 必填字段标记
-function RequiredMark() {
-  return <span className="ml-0.5 text-destructive">*</span>;
-}
-
-function Row({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="flex gap-3 text-sm">
-      <dt className="w-28 shrink-0 text-muted-foreground">{label}</dt>
-      <dd className="min-w-0 flex-1 text-foreground">{children}</dd>
-    </div>
-  );
-}
-
-// 远程控制配置:云端中转服务地址 + 登录态 + 实时连接状态。
 // 管理员级配置:URL 通常在部署时一次性配好;手机端配对在侧栏「远程控制」弹窗发起
 function RemoteControlSection() {
   const [cfg, setCfg] = useState<CloudConfigView | null>(null);
@@ -1553,401 +1429,3 @@ function MemorySection() {
 }
 
 // 模型厂商搜索:匹配名称 / API URL
-const providerFilterFn: FilterFn<Provider> = (row, _columnId, value) =>
-  `${row.original.name} ${row.original.apiUrl}`
-    .toLowerCase()
-    .includes(String(value).toLowerCase());
-
-function ProvidersSection({
-  providers,
-  presetCount,
-  onCreate,
-  onEdit,
-  onDelete,
-  onReload,
-}: {
-  providers: Provider[];
-  presetCount: number;
-  onCreate: () => void;
-  onEdit: (provider: Provider) => void;
-  onDelete: (provider: Provider) => void;
-  onReload: () => void;
-}) {
-  const columns = useMemo<ColumnDef<Provider>[]>(
-    () => [
-      {
-        accessorKey: "name",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} title="名称" />
-        ),
-        cell: ({ row }) => (
-          <span className="font-medium text-foreground">{row.original.name}</span>
-        ),
-      },
-      {
-        accessorKey: "code",
-        header: "编码",
-        enableSorting: false,
-        cell: ({ row }) => (
-          <span className="font-mono text-xs text-muted-foreground">
-            {row.original.code}
-          </span>
-        ),
-      },
-      {
-        accessorKey: "apiUrl",
-        header: "API URL",
-        enableSorting: false,
-        cell: ({ row }) => (
-          <span
-            className="block max-w-[24rem] truncate font-mono text-xs text-muted-foreground"
-            title={row.original.apiUrl}
-          >
-            {row.original.apiUrl || "—"}
-          </span>
-        ),
-      },
-      {
-        id: "models",
-        header: "模型",
-        enableSorting: false,
-        cell: ({ row }) => {
-          const models = row.original.models
-            .split("\n")
-            .map((m) => m.trim())
-            .filter(Boolean);
-          return models.length === 0 ? (
-            <span className="text-muted-foreground">—</span>
-          ) : (
-            <div className="flex flex-wrap gap-1">
-              {models.map((m) => (
-                <Badge key={m} variant="secondary" className="font-normal">
-                  {m}
-                </Badge>
-              ))}
-            </div>
-          );
-        },
-      },
-      {
-        id: "apiKey",
-        header: "密钥",
-        enableSorting: false,
-        cell: ({ row }) =>
-          row.original.apiKey ? (
-            <StatusBadge tone="success">已配置</StatusBadge>
-          ) : (
-            <StatusBadge tone="neutral">未配置</StatusBadge>
-          ),
-      },
-      {
-        id: "actions",
-        header: () => <div className="text-right">操作</div>,
-        enableSorting: false,
-        cell: ({ row }) => {
-          const p = row.original;
-          return (
-            <div className="flex justify-end">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="text-muted-foreground"
-                  >
-                    <MoreVertical />
-                    <span className="sr-only">操作</span>
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-32">
-                  <DropdownMenuItem onClick={() => onEdit(p)}>
-                    <SquarePen />
-                    编辑
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    className="text-destructive focus:text-destructive"
-                    onClick={() => onDelete(p)}
-                  >
-                    <Trash2 />
-                    删除
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          );
-        },
-      },
-    ],
-    [onEdit, onDelete],
-  );
-
-  return (
-    <DataTable
-      columns={columns}
-      data={providers}
-      itemLabel="个配置"
-      globalFilterFn={providerFilterFn}
-      getRowId={(p) => p.id}
-      emptyState={
-        <div className="py-12 text-center">
-          <p className="text-sm font-medium text-foreground">暂无模型厂商</p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            点击右上角「新增」添加厂商接口
-          </p>
-        </div>
-      }
-      renderToolbar={(table) => (
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="relative w-full sm:max-w-sm">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="搜索名称 / API URL"
-              className="pl-9"
-              value={(table.getState().globalFilter as string) ?? ""}
-              onChange={(e) => table.setGlobalFilter(e.target.value)}
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <RefreshButton onClick={onReload} />
-            <SimpleTooltip
-              content={
-                presetCount > 0 && providers.length >= presetCount
-                  ? "已添加全部支持的厂商"
-                  : "新增厂商"
-              }
-            >
-              <span>
-                <Button
-                  onClick={onCreate}
-                  disabled={presetCount > 0 && providers.length >= presetCount}
-                >
-                  <Plus />
-                  新增
-                </Button>
-              </span>
-            </SimpleTooltip>
-          </div>
-        </div>
-      )}
-    />
-  );
-}
-
-// 厂商 新增 / 编辑 抽屉
-function ProviderFormSheet({
-  open,
-  initial,
-  providers,
-  presets,
-  onOpenChange,
-  onSubmit,
-}: {
-  open: boolean;
-  initial: Provider | null;
-  providers: Provider[];
-  presets: ProviderPreset[];
-  onOpenChange: (open: boolean) => void;
-  onSubmit: (provider: Provider) => void;
-}) {
-  const isEdit = initial !== null;
-  // 新增时厂商只能从「未添加的预设」里选,保证不可重复添加
-  const usedCodes = new Set(providers.map((p) => p.code));
-  const availablePresets = presets.filter((p) => !usedCodes.has(p.code));
-  const [code, setCode] = useState(initial?.code ?? "");
-  const [name, setName] = useState(initial?.name ?? "");
-  const [apiUrl, setApiUrl] = useState(initial?.apiUrl ?? "");
-  const [apiKey, setApiKey] = useState(initial?.apiKey ?? "");
-  const [models, setModels] = useState(initial?.models ?? "");
-  const [showKey, setShowKey] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
-
-  function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    setSubmitted(true);
-    // 必填项为空时改为字段下方提示,不再用顶部红框
-    if (!code || !name.trim() || !apiUrl.trim() || !apiKey.trim() || !models.trim()) {
-      return;
-    }
-    onSubmit({
-      id: initial?.id ?? crypto.randomUUID(),
-      code,
-      name: name.trim(),
-      apiUrl: apiUrl.trim(),
-      apiKey: apiKey.trim(),
-      models: models.trim(),
-    });
-  }
-
-  // 用户改动过任一字段(编码自动生成不计入)即视为已编辑,阻止误关
-  const isDirty =
-    name !== (initial?.name ?? "") ||
-    apiUrl !== (initial?.apiUrl ?? "") ||
-    apiKey !== (initial?.apiKey ?? "") ||
-    models !== (initial?.models ?? "");
-
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        className="flex w-full flex-col gap-0 p-0 sm:max-w-[600px]"
-        blockClose={isDirty}
-      >
-        <SheetHeader className="border-b">
-          <SheetTitle>{isEdit ? "编辑厂商" : "新增厂商"}</SheetTitle>
-          <SheetDescription>
-            配置大模型厂商的接口与可用模型,供语音转写、意向分析引用。
-          </SheetDescription>
-        </SheetHeader>
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <div className="flex-1 space-y-6 overflow-y-auto p-5">
-            <div className="space-y-3">
-              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                基本信息
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="provider-name">
-                  厂商 <RequiredMark />
-                </Label>
-                {isEdit ? (
-                  // 编辑态厂商不可改(换厂商等于换一家,应删除后重建)
-                  <Input id="provider-name" value={name} disabled />
-                ) : (
-                  <Select
-                    value={code}
-                    onValueChange={(v) => {
-                      const preset = presets.find((p) => p.code === v);
-                      if (preset) {
-                        setCode(preset.code);
-                        setName(preset.name);
-                        setApiUrl(preset.apiUrl);
-                      }
-                    }}
-                  >
-                    <SelectTrigger
-                      id="provider-name"
-                      aria-invalid={submitted && !code}
-                    >
-                      <SelectValue placeholder="选择厂商" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availablePresets.length === 0 ? (
-                        <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                          已添加全部支持的厂商
-                        </div>
-                      ) : (
-                        availablePresets.map((p) => (
-                          <SelectItem key={p.code} value={p.code}>
-                            {p.name}
-                          </SelectItem>
-                        ))
-                      )}
-                    </SelectContent>
-                  </Select>
-                )}
-                <FieldError show={submitted && !code} message="请选择厂商" />
-                <p className="text-xs text-muted-foreground">
-                  仅支持 DeepSeek / 千问 Qwen / 小米 MiMo / 智谱 GLM /
-                  MiniMax,且每家只能添加一次
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                接口配置
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="provider-url">
-                  API URL <RequiredMark />
-                </Label>
-                <Input
-                  id="provider-url"
-                  placeholder="https://api.openai.com/v1"
-                  value={apiUrl}
-                  onChange={(e) => setApiUrl(e.target.value)}
-                  aria-invalid={submitted && !apiUrl.trim()}
-                  disabled={isEdit}
-                />
-                <FieldError
-                  show={submitted && !apiUrl.trim()}
-                  message="API URL 不可为空"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="provider-key">
-                  API Key <RequiredMark />
-                </Label>
-                <div className="relative">
-                  <Input
-                    id="provider-key"
-                    type={showKey ? "text" : "password"}
-                    className="pr-10"
-                    placeholder="sk-..."
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    aria-invalid={submitted && !apiKey.trim()}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowKey((s) => !s)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
-                    title={showKey ? "隐藏" : "显示"}
-                  >
-                    {showKey ? (
-                      <EyeOff className="size-4" />
-                    ) : (
-                      <Eye className="size-4" />
-                    )}
-                    <span className="sr-only">
-                      {showKey ? "隐藏" : "显示"}密钥
-                    </span>
-                  </button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  仅本地保存;含密码建议改用环境变量
-                </p>
-                <FieldError
-                  show={submitted && !apiKey.trim()}
-                  message="API Key 不可为空"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                可用模型 <RequiredMark />
-              </div>
-              <div className="space-y-1.5">
-                <Textarea
-                  id="provider-models"
-                  className="min-h-68"
-                  placeholder={"每行一个模型,例如:\ngpt-4o\ngpt-4o-mini"}
-                  value={models}
-                  onChange={(e) => setModels(e.target.value)}
-                  aria-invalid={submitted && !models.trim()}
-                />
-                <p className="text-xs text-muted-foreground">
-                  每行一个模型,供语音转写 / 意向分析选择
-                </p>
-                <FieldError
-                  show={submitted && !models.trim()}
-                  message="请至少填写一个可用模型"
-                />
-              </div>
-            </div>
-          </div>
-          <SheetFooter className="flex-row justify-end gap-2 border-t">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
-              取消
-            </Button>
-            <Button type="submit">保存</Button>
-          </SheetFooter>
-        </form>
-      </SheetContent>
-    </Sheet>
-  );
-}
