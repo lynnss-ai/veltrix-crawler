@@ -38,7 +38,7 @@ pub async fn embed_texts(
         return Ok(Vec::new());
     }
     let endpoint = embeddings_endpoint(api_url);
-    let client = http::build_client(http::CHAT_TIMEOUT_SECS)?;
+    let client = http::shared_client(http::CHAT_TIMEOUT_SECS)?;
     let mut out: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
     for chunk in inputs.chunks(MAX_BATCH) {
         let body = json!({ "model": model, "input": chunk });

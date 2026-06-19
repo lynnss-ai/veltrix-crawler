@@ -1,15 +1,17 @@
 //! 编程 Agent 命令:send_coding_message(ReAct 循环 + 工具往返落库 + 进度事件)、工作区读写。
 //!
-//! 复用 `llm::agent`(LlmProvider + ToolRegistry)与 `agent::coding`(工具集 + 提示词)。
+//! 复用 `agent::core::llm`(LlmProvider + ToolRegistry)与 `agent::coding::tools`(工具集 + 提示词)。
 //! 工具与 run_command 限定在「编程工作区」目录内(沙箱)。
 
-use crate::agent::coding;
-use crate::commands::chat::MessageView;
-use crate::commands::conversation_summary as conv_summary;
-use crate::commands::{current_user, AppState};
-use crate::llm::agent::{
-    provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef, ToolCall,
+use crate::agent::coding::tools as coding;
+use crate::agent::core::shared::{
+    row_to_chat_msg, tool_calls_to_json, truncate_title, MessageView, MAX_ITERS,
 };
+use crate::agent::core::summary as conv_summary;
+use crate::agent::core::{
+    provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef,
+};
+use crate::commands::{current_user, AppState};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
@@ -26,8 +28,10 @@ use veltrix_core::db::entity::{
 };
 use veltrix_core::error::{CrawlerError, Result};
 
-/// ReAct 最大步数(防失控循环)。浏览器 Agent 命令复用,统一一处定义。
-pub(crate) const MAX_ITERS: usize = 25;
+/// 自主续航(Act 模式)总步数硬上限:远大于 MAX_ITERS 让长任务一气呵成,但仍有界防失控。
+const MAX_AUTO_ITERS: usize = 50;
+/// 自主续航中「模型过早收尾但计划仍有未完成项」时,自动注入续写提示推进的最大次数(防空转)。
+const MAX_CONTINUES: usize = 4;
 /// run_command 失败后,模型若想直接收尾,自动注入引导逼它修复重试的最大次数(防卡死)。
 const AUTO_FIX_MAX: usize = 2;
 /// 工作区根目录在 app_secrets 的 key;空 = 默认 `<app_data>/coding-workspaces`(每会话一个子目录)。
@@ -95,7 +99,7 @@ fn conv_workspace(base: &Path, conv_id: &str) -> PathBuf {
 
 /// 读 secret,空则取默认(已 trim)。
 async fn secret_or(db: &sea_orm::DatabaseConnection, key: &str, default: &str) -> String {
-    let v = super::get_secret(db, key).await;
+    let v = crate::commands::get_secret(db, key).await;
     if v.trim().is_empty() {
         default.to_string()
     } else {
@@ -109,7 +113,7 @@ pub async fn get_coding_workspace(
     state: State<'_, AppState>,
     conversation_id: Option<String>,
 ) -> Result<String> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let p = match conversation_id {
         Some(id) if !id.trim().is_empty() => conv_workspace(&base, &id),
         _ => base,
@@ -120,13 +124,13 @@ pub async fn get_coding_workspace(
 /// 设置工作区根目录(空串=恢复默认)。
 #[tauri::command]
 pub async fn set_coding_workspace(state: State<'_, AppState>, path: String) -> Result<()> {
-    super::set_secret(&state.db, CODING_WORKSPACE_KEY, path.trim()).await
+    crate::commands::set_secret(&state.db, CODING_WORKSPACE_KEY, path.trim()).await
 }
 
 /// 解析某会话的执行环境:返回(宿主工作区目录, ExecConfig)。
 /// docker 模式确保共享容器就绪(容器内 /workspace/<会话id>);容器不可用则回退本机执行(同一目录,只是不隔离)。
 async fn resolve_exec(state: &AppState, conv_id: &str) -> Result<(PathBuf, coding::ExecConfig)> {
-    let base = workspace_base(state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let ws = conv_workspace(&base, conv_id);
     tokio::fs::create_dir_all(&ws)
         .await
@@ -237,6 +241,67 @@ pub async fn checkpoint_rollback(
     Ok("已回退到本轮发送前的文件状态(历史记录保留)".to_string())
 }
 
+/// 一个回退版本(git 检查点):commit 短哈希 + 提交时间(unix 秒)+ 该轮任务标签。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointView {
+    pub hash: String,
+    pub time: i64,
+    pub message: String,
+}
+
+/// 列出某会话工作区的回退版本(git 检查点历史,新→旧;上限 50)。无 git / 无提交则返回空。
+#[tauri::command]
+pub async fn list_coding_checkpoints(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<CheckpointView>> {
+    let (ws, exec) = resolve_exec(&state, &conversation_id).await?;
+    // 用 0x1f(单元分隔符)分隔字段,避免提交信息里的空格 / 制表符干扰解析
+    let out = coding::run_command_in(&ws, "git log -n 50 --pretty=format:%h%x1f%ct%x1f%s", &exec)
+        .await;
+    if out.is_error {
+        return Ok(Vec::new()); // 无 git / 无提交:无版本可列
+    }
+    let mut list = Vec::new();
+    for line in out.content.lines() {
+        let mut parts = line.splitn(3, '\u{1f}');
+        let (Some(hash), Some(time), Some(message)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        list.push(CheckpointView {
+            hash: hash.trim().to_string(),
+            time: time.trim().parse().unwrap_or(0),
+            message: message.to_string(),
+        });
+    }
+    Ok(list)
+}
+
+/// 回退到指定检查点:git reset --hard <hash> + 清理未跟踪文件。hash 必须是十六进制(防 shell 注入)。
+#[tauri::command]
+pub async fn rollback_to_checkpoint(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    hash: String,
+) -> Result<String> {
+    let h = hash.trim();
+    if h.is_empty() || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CrawlerError::Config("无效的版本标识".into()));
+    }
+    let (ws, exec) = resolve_exec(&state, &conversation_id).await?;
+    let reset = coding::run_command_in(&ws, &format!("git reset --hard {h}"), &exec).await;
+    if reset.is_error {
+        return Err(CrawlerError::Config(format!(
+            "回退失败(版本不存在 / 环境无 git): {}",
+            reset.content.chars().take(200).collect::<String>()
+        )));
+    }
+    let _ = coding::run_command_in(&ws, "git clean -fd", &exec).await;
+    Ok("已回退到所选版本(文件已恢复,对话历史保留)".to_string())
+}
+
 /// 文件面板:列出工作区真实文件的上限 / 跳过目录 / 单文件预览字节上限。
 const WS_LIST_MAX_FILES: usize = 2000;
 const WS_SKIP_DIRS: &[&str] =
@@ -250,7 +315,7 @@ pub async fn list_workspace_files(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<String>> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let mut files: Vec<String> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.clone()];
@@ -288,7 +353,7 @@ pub async fn read_workspace_file(
     conversation_id: String,
     path: String,
 ) -> Result<String> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     let bytes = tokio::fs::read(&full)
@@ -315,7 +380,7 @@ pub async fn write_workspace_file(
     path: String,
     content: String,
 ) -> Result<()> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     if let Some(parent) = full.parent() {
@@ -447,7 +512,7 @@ async fn create_container(base: &Path, image: &str, container: &str) -> Result<(
 /// 强制重建沙盒容器(删旧 + 用正确挂载新建)。用于旧容器挂载错误 / 想换镜像时一键修复。
 #[tauri::command]
 pub async fn sandbox_recreate(state: State<'_, AppState>) -> Result<String> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let _ = docker(&["rm", "-f", &container]).await;
@@ -482,6 +547,54 @@ pub async fn get_sandbox_config(state: State<'_, AppState>) -> Result<SandboxCon
     Ok(SandboxConfigView { image, container, docker_available, container_running })
 }
 
+/// 沙盒容器资源占用视图(`docker stats` 解析)。容器未运行 / docker 不可用时 running=false、其余空。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxStatsView {
+    pub running: bool,
+    /// CPU 占用,如 "12.34%"。
+    pub cpu_perc: String,
+    /// 内存使用,如 "120MiB / 7.5GiB"。
+    pub mem_usage: String,
+    /// 内存占用百分比,如 "1.56%"。
+    pub mem_perc: String,
+}
+
+/// 读取沙盒容器的实时资源占用(`docker stats --no-stream`,单次采样)。
+/// 容器内经 docker exec 跑的 dev server 等进程计入同一 cgroup,故能反映预览/命令的真实占用。
+#[tauri::command]
+pub async fn get_sandbox_stats(state: State<'_, AppState>) -> Result<SandboxStatsView> {
+    let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
+    let line = docker(&[
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.CPUPerc}};{{.MemUsage}};{{.MemPerc}}",
+        &container,
+    ])
+    .await
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+    if line.is_empty() {
+        return Ok(SandboxStatsView {
+            running: false,
+            cpu_perc: String::new(),
+            mem_usage: String::new(),
+            mem_perc: String::new(),
+        });
+    }
+    let parts: Vec<&str> = line.split(';').collect();
+    let pick = |i: usize| parts.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+    Ok(SandboxStatsView {
+        running: true,
+        cpu_perc: pick(0),
+        mem_usage: pick(1),
+        mem_perc: pick(2),
+    })
+}
+
 /// 写入沙盒配置(image / container 空则用默认)。
 #[tauri::command]
 pub async fn set_sandbox_config(
@@ -490,10 +603,10 @@ pub async fn set_sandbox_config(
     container: String,
 ) -> Result<()> {
     let img = image.trim();
-    super::set_secret(&state.db, SANDBOX_IMAGE_KEY, if img.is_empty() { DEFAULT_SANDBOX_IMAGE } else { img })
+    crate::commands::set_secret(&state.db, SANDBOX_IMAGE_KEY, if img.is_empty() { DEFAULT_SANDBOX_IMAGE } else { img })
         .await?;
     let c = container.trim();
-    super::set_secret(
+    crate::commands::set_secret(
         &state.db,
         SANDBOX_CONTAINER_KEY,
         if c.is_empty() { DEFAULT_SANDBOX_CONTAINER } else { c },
@@ -506,7 +619,7 @@ pub async fn set_sandbox_config(
 /// 手动拉起沙盒容器(按需 pull 镜像)。返回状态文本。
 #[tauri::command]
 pub async fn sandbox_start(state: State<'_, AppState>) -> Result<String> {
-    let base = workspace_base(&state, &super::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     ensure_container(&base, &image, &container).await?;
@@ -526,7 +639,7 @@ pub async fn sandbox_stop(state: State<'_, AppState>) -> Result<()> {
 /// 启动时:后台拉起沙盒容器(供 lib.rs setup 调用;Docker 不可用则忽略,运行时自动回退本机)。
 pub async fn ensure_sandbox_on_start(db: &sea_orm::DatabaseConnection, config_dir: &Path) {
     let base = {
-        let c = super::get_secret(db, CODING_WORKSPACE_KEY).await;
+        let c = crate::commands::get_secret(db, CODING_WORKSPACE_KEY).await;
         if c.trim().is_empty() {
             config_dir.join("coding-workspaces")
         } else {
@@ -943,6 +1056,16 @@ fn classify_by_keywords(text: &str) -> &'static str {
     if RPA_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "rpa";
     }
+    // 电脑操作(桌面级:截图 / 鼠标键盘 / 窗口 / 进程 / 启动程序),优先于 coding——
+    // 避免"打开 / 运行 / 文件"这类词被 coding 信号吃掉。
+    const COMPUTER_SIGNALS: &[&str] = &[
+        "截图", "截屏", "屏幕", "桌面", "鼠标", "键盘", "剪贴板", "打开程序", "启动程序",
+        "打开软件", "打开应用", "切换窗口", "关闭窗口", "任务管理器", "结束进程", "杀进程",
+        "电脑操作", "操作电脑", "控制电脑", "识别屏幕", "看屏幕",
+    ];
+    if COMPUTER_SIGNALS.iter().any(|k| lower.contains(k)) {
+        return "computer";
+    }
     if lower.contains("```") {
         return "coding";
     }
@@ -1101,8 +1224,8 @@ pub async fn send_coding_message(
 
     // 准备本会话工作区 + 执行环境(host 或 Docker 沙盒)+ 工具注册表
     let (workspace, exec) = resolve_exec(&state, &conversation_id).await?;
-    // 本轮开始前打检查点(git commit),Agent 改崩可经 checkpoint_rollback 回到发送前
-    coding::checkpoint(&workspace, &exec).await;
+    // 本轮开始前打检查点(git commit,带本轮提问作标签),供版本回退识别快照对应哪次任务
+    coding::checkpoint(&workspace, &exec, &text).await;
     let registry = coding::build_registry(workspace, exec, agent_mode);
     let tool_defs = registry.defs();
 
@@ -1161,11 +1284,29 @@ pub async fn send_coding_message(
         );
     };
 
+    // 自主续航:Act 模式默认开启——内层步数跑满或模型「过早收尾但计划仍有未完成项」时自动续写,
+    // 直到模型调 finish / 计划全完 / 触发预算 / 被手动停。Plan 模式只出方案,不续航。
+    let autonomous = matches!(agent_mode, coding::AgentMode::Act);
+    let max_iters = if autonomous { MAX_AUTO_ITERS } else { MAX_ITERS };
+    // 进入前清除可能残留的取消标志,避免误停本次
+    let _ = take_agent_cancel(&state, &conversation_id);
+    // 计划进度:初始化为会话已存 todos,update_plan 时同步;用于「是否还有未完成项」判定续航
+    let mut latest_todos: Value =
+        serde_json::from_str(&conversation.plan_todos).unwrap_or(Value::Null);
+
     // ReAct 循环。auto_fix:run_command 失败后模型若想直接收尾,自动注入引导再修(有配额防卡死)
     let mut final_text = String::new();
     let mut auto_fix_used = 0usize;
+    let mut continue_used = 0usize;
     let mut last_run_failed = false;
-    for iter in 0..MAX_ITERS {
+    let mut goal_done = false;
+    let mut finish_summary: Option<String> = None;
+    for iter in 0..max_iters {
+        // 手动停:命中即优雅收尾(下一步检查点生效)
+        if autonomous && take_agent_cancel(&state, &conversation_id) {
+            final_text = "(已手动停止自主续航。可继续追问以推进。)".to_string();
+            break;
+        }
         emit(format!("思考中…(第 {} 步)", iter + 1));
         let resp = llm
             .chat(LlmRequest {
@@ -1191,6 +1332,23 @@ pub async fn send_coding_message(
                     });
                 }
                 messages.push(ChatMsg::User(coding::auto_fix_prompt(auto_fix_used)));
+                continue;
+            }
+            // 自主续航:模型过早收尾但计划仍有未完成项 → 注入续写提示推进(限次数防空转)
+            if autonomous
+                && !goal_done
+                && has_unfinished_todos(&latest_todos)
+                && continue_used < MAX_CONTINUES
+            {
+                continue_used += 1;
+                emit(format!("自主推进下一步…(第 {continue_used} 次)"));
+                if resp.content.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
+                    messages.push(ChatMsg::Assistant {
+                        text: resp.content.clone(),
+                        tool_calls: vec![],
+                    });
+                }
+                messages.push(ChatMsg::User(coding::auto_continue_prompt()));
                 continue;
             }
             final_text = resp.content.unwrap_or_default();
@@ -1229,6 +1387,7 @@ pub async fn send_coding_message(
             // 拦截 update_plan:把模型给的完整 todo 清单落库到会话(工具层不碰 DB,持久化在此保持分层)
             if call.name == "update_plan" && !result.is_error {
                 if let Some(todos) = call.arguments.get("todos") {
+                    latest_todos = todos.clone(); // 同步本地进度,供续航判定
                     let _ = conv::Entity::update_many()
                         .col_expr(
                             conv::Column::PlanTodos,
@@ -1238,6 +1397,15 @@ pub async fn send_coding_message(
                         .exec(&state.db)
                         .await;
                 }
+            }
+            // 拦截 finish:模型显式声明整个任务完成 → 结束自主续航
+            if call.name == "finish" && !result.is_error {
+                goal_done = true;
+                finish_summary = call
+                    .arguments
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             msg::ActiveModel {
                 conversation_id: Set(conversation_id.clone()),
@@ -1258,9 +1426,22 @@ pub async fn send_coding_message(
         }
         last_run_failed = run_failed;
 
+        // 模型声明完成 → 收尾(用 finish 的 summary,否则给个默认收尾语)
+        if goal_done {
+            final_text = finish_summary
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "任务已完成。".to_string());
+            break;
+        }
+
         // 达上限:强制收尾
-        if iter == MAX_ITERS - 1 {
-            final_text = format!("(已达最大步数 {MAX_ITERS},已停止。可继续追问以推进。)");
+        if iter == max_iters - 1 {
+            final_text = if autonomous {
+                format!("(已达自主续航上限 {max_iters} 步,先停下。可继续追问以推进。)")
+            } else {
+                format!("(已达最大步数 {max_iters},已停止。可继续追问以推进。)")
+            };
         }
     }
 
@@ -1290,6 +1471,34 @@ pub async fn send_coding_message(
     spawn_coding_summary_maintenance(&state.db, &conversation_id, provider_ref);
 
     Ok(final_msg.into())
+}
+
+/// 取出并消费某会话的「请求停止」标志:存在则移除并返回 true(供自主续航循环每步检查点调用)。
+fn take_agent_cancel(state: &AppState, conversation_id: &str) -> bool {
+    let mut set = state.agent_cancel.lock().unwrap_or_else(|e| e.into_inner());
+    set.remove(conversation_id)
+}
+
+/// 计划里是否还有未完成项(自主续航判定用;无计划 / 解析失败视为「无未完成」,不强制续写)。
+fn has_unfinished_todos(todos: &Value) -> bool {
+    todos
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .any(|t| !t.get("done").and_then(Value::as_bool).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+/// 请求停止某会话正在自主续航的编程 Agent;循环在下一步检查点优雅收尾(不强杀,保证落库一致)。
+#[tauri::command]
+pub fn stop_coding_agent(state: State<'_, AppState>, conversation_id: String) -> Result<()> {
+    let mut set = state
+        .agent_cancel
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    set.insert(conversation_id);
+    Ok(())
 }
 
 /// 把编程会话的滚动摘要维护放到后台 spawn 执行,避免阻塞回复返回。
@@ -1323,69 +1532,4 @@ fn spawn_coding_summary_maintenance(
     });
 }
 
-/// DB 消息行 → 统一 ChatMsg;无法识别的角色跳过。
-pub(crate) fn row_to_chat_msg(m: &msg::Model) -> Option<ChatMsg> {
-    match m.role.as_str() {
-        "user" => Some(ChatMsg::User(m.content.clone())),
-        "assistant" => {
-            let tool_calls = m
-                .tool_calls
-                .as_deref()
-                .map(parse_tool_calls)
-                .unwrap_or_default();
-            let text = if m.content.is_empty() {
-                None
-            } else {
-                Some(m.content.clone())
-            };
-            Some(ChatMsg::Assistant { text, tool_calls })
-        }
-        "tool" => Some(ChatMsg::Tool {
-            tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
-            content: m.content.clone(),
-        }),
-        _ => None,
-    }
-}
-
-/// 解析 DB 里存的 tool_calls JSON([{id,name,arguments}])为 Vec<ToolCall>。
-pub(crate) fn parse_tool_calls(json_str: &str) -> Vec<ToolCall> {
-    serde_json::from_str::<Value>(json_str)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|tc| {
-                    Some(ToolCall {
-                        id: tc.get("id")?.as_str()?.to_string(),
-                        name: tc.get("name")?.as_str()?.to_string(),
-                        arguments: tc.get("arguments").cloned().unwrap_or(Value::Null),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Vec<ToolCall> → 落库用 JSON 字符串。
-pub(crate) fn tool_calls_to_json(calls: &[ToolCall]) -> String {
-    let arr: Vec<Value> = calls
-        .iter()
-        .map(|tc| json!({ "id": tc.id, "name": tc.name, "arguments": tc.arguments }))
-        .collect();
-    Value::Array(arr).to_string()
-}
-
-/// 用首条用户消息生成标题:取前 24 个字符,去换行。
-pub(crate) fn truncate_title(text: &str) -> String {
-    let one_line = text.replace(['\n', '\r'], " ");
-    let trimmed = one_line.trim();
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= 24 {
-        trimmed.to_string()
-    } else {
-        let mut s: String = chars[..24].iter().collect();
-        s.push('…');
-        s
-    }
-}
+// 消息行 ↔ ChatMsg 转换、tool_calls 序列化、标题截断已上移到 `crate::agent::core::shared`(三智能体共用)。

@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, DevServerStatus, SandboxConfigView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -152,12 +152,41 @@ export const api = {
   // mode:plan(只调研出方案)/ act(亲自动手执行),缺省 act
   sendCodingMessage: (conversationId: string, content: string, mode?: string) =>
     invoke<ChatMessageView>("send_coding_message", { conversationId, content, mode }),
-  // 浏览器 / RPA Agent:驱动 navigate/click/type/read_page/wait_for 的 ReAct 循环(动作可回读结果)
+  // 编程 Agent:请求停止该会话正在自主续航的循环(下一步检查点优雅收尾)
+  stopCodingAgent: (conversationId: string) =>
+    invoke<void>("stop_coding_agent", { conversationId }),
+  // 浏览器 / RPA Agent:驱动 navigate/click/type/read_page/wait_for/get_network 的 ReAct 循环(动作可回读结果)
   sendBrowserMessage: (conversationId: string, content: string) =>
     invoke<ChatMessageView>("send_browser_message", { conversationId, content }),
-  // 截取该会话浏览器 Agent 窗口当前画面(PNG data URL);窗口未开 / 平台不支持返回 null
-  captureAgentPreview: (conversationId: string) =>
-    invoke<string | null>("capture_agent_preview", { conversationId }),
+  // 电脑操作 Agent:聚合桌面/文件/进程/OCR/UIA/HTTP/终端工具的 ReAct 循环
+  sendComputerMessage: (conversationId: string, content: string) =>
+    invoke<ChatMessageView>("send_computer_message", { conversationId, content }),
+  // 截当前桌面屏幕,返回 PNG 的 data URL(电脑操作 Agent 右栏预览用);target 空=主屏
+  captureDesktopScreenshot: (target?: string) =>
+    invoke<string>("capture_desktop_screenshot", { target: target ?? null }),
+  // 按右栏 DOM 区域(逻辑坐标,相对主窗口客户区)定位内嵌 Agent webview;未创建则静默忽略
+  setAgentWebviewBounds: (
+    conversationId: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ) =>
+    invoke<void>("set_agent_webview_bounds", { conversationId, x, y, width, height }),
+  // 显示某会话的内嵌 Agent webview(进入/返回 RPA 页时)
+  showAgentWebview: (conversationId: string) =>
+    invoke<void>("show_agent_webview", { conversationId }),
+  // 隐藏某会话的内嵌 Agent webview(切会话/弹模态时)
+  hideAgentWebview: (conversationId: string) =>
+    invoke<void>("hide_agent_webview", { conversationId }),
+  // 隐藏全部内嵌 Agent webview(离开 RPA 工作区时,防原生层盖住其它页面)
+  hideAllAgentWebviews: () => invoke<void>("hide_all_agent_webviews"),
+  // 读取该会话拦截到的接口响应(实时增量另走 agent-network 事件);可选 url 子串过滤
+  getAgentNetwork: (conversationId: string, urlContains?: string) =>
+    invoke<NetworkEntryView[]>("get_agent_network", {
+      conversationId,
+      urlContains: urlContains ?? null,
+    }),
   // 工作区路径:传 conversationId 返回该会话目录,否则返回根目录
   getCodingWorkspace: (conversationId?: string) =>
     invoke<string>("get_coding_workspace", {
@@ -177,6 +206,11 @@ export const api = {
   // 回退:丢弃本轮 Agent 的文件改动,回到最近检查点(发送前状态)
   checkpointRollback: (conversationId: string) =>
     invoke<string>("checkpoint_rollback", { conversationId }),
+  // 版本回退:列出工作区检查点历史 / 回退到指定版本(git reset)
+  listCodingCheckpoints: (conversationId: string) =>
+    invoke<CheckpointView[]>("list_coding_checkpoints", { conversationId }),
+  rollbackToCheckpoint: (conversationId: string, hash: string) =>
+    invoke<string>("rollback_to_checkpoint", { conversationId, hash }),
   // 文件面板:列出工作区真实文件树 / 读取某文件内容
   listWorkspaceFiles: (conversationId: string) =>
     invoke<string[]>("list_workspace_files", { conversationId }),
@@ -186,6 +220,8 @@ export const api = {
     invoke<void>("write_workspace_file", { conversationId, path, content }),
   // 编程沙盒(host / docker)配置与生命周期
   getSandboxConfig: () => invoke<SandboxConfigView>("get_sandbox_config"),
+  // 沙盒容器实时资源占用(docker stats 单次采样)
+  getSandboxStats: () => invoke<SandboxStatsView>("get_sandbox_stats"),
   setSandboxConfig: (image: string, container: string) =>
     invoke<void>("set_sandbox_config", { image, container }),
   sandboxStart: () => invoke<string>("sandbox_start"),

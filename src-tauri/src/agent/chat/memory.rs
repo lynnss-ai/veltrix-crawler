@@ -195,7 +195,7 @@ pub async fn get_chat_memory_enabled(state: State<'_, AppState>) -> Result<bool>
 /// 设置全局记忆开关:关闭后既不注入也不自动提取。
 #[tauri::command]
 pub async fn set_chat_memory_enabled(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    super::set_secret(&state.db, MEMORY_ENABLED_KEY, if enabled { "1" } else { "0" }).await
+    crate::commands::set_secret(&state.db, MEMORY_ENABLED_KEY, if enabled { "1" } else { "0" }).await
 }
 
 // ===================== 命令:embedding(语义检索)配置 =====================
@@ -213,9 +213,9 @@ pub struct EmbeddingConfigView {
 #[tauri::command]
 pub async fn get_embedding_config(state: State<'_, AppState>) -> Result<EmbeddingConfigView> {
     Ok(EmbeddingConfigView {
-        api_url: super::get_secret(&state.db, EMBED_API_URL_KEY).await,
-        model: super::get_secret(&state.db, EMBED_MODEL_KEY).await,
-        has_api_key: !super::get_secret(&state.db, EMBED_API_KEY_KEY)
+        api_url: crate::commands::get_secret(&state.db, EMBED_API_URL_KEY).await,
+        model: crate::commands::get_secret(&state.db, EMBED_MODEL_KEY).await,
+        has_api_key: !crate::commands::get_secret(&state.db, EMBED_API_KEY_KEY)
             .await
             .trim()
             .is_empty(),
@@ -230,19 +230,19 @@ pub async fn set_embedding_config(
     model: String,
     api_key: String,
 ) -> Result<()> {
-    super::set_secret(&state.db, EMBED_API_URL_KEY, api_url.trim()).await?;
-    super::set_secret(&state.db, EMBED_MODEL_KEY, model.trim()).await?;
+    crate::commands::set_secret(&state.db, EMBED_API_URL_KEY, api_url.trim()).await?;
+    crate::commands::set_secret(&state.db, EMBED_MODEL_KEY, model.trim()).await?;
     if !api_key.trim().is_empty() {
-        super::set_secret(&state.db, EMBED_API_KEY_KEY, api_key.trim()).await?;
+        crate::commands::set_secret(&state.db, EMBED_API_KEY_KEY, api_key.trim()).await?;
     }
     Ok(())
 }
 
 /// 取 embedding 配置三元组;任一为空视为未配置(返回 None,调用方回退到非检索注入)。
 async fn embedding_config(db: &DatabaseConnection) -> Option<(String, String, String)> {
-    let api_url = super::get_secret(db, EMBED_API_URL_KEY).await;
-    let model = super::get_secret(db, EMBED_MODEL_KEY).await;
-    let api_key = super::get_secret(db, EMBED_API_KEY_KEY).await;
+    let api_url = crate::commands::get_secret(db, EMBED_API_URL_KEY).await;
+    let model = crate::commands::get_secret(db, EMBED_MODEL_KEY).await;
+    let api_key = crate::commands::get_secret(db, EMBED_API_KEY_KEY).await;
     if api_url.trim().is_empty() || model.trim().is_empty() || api_key.trim().is_empty() {
         return None;
     }
@@ -290,6 +290,14 @@ async fn select_memories<'a>(
     let pinned: Vec<&mem::Model> = rows.iter().filter(|m| m.pinned).collect();
     let rest: Vec<&mem::Model> = rows.iter().filter(|m| !m.pinned).collect();
     let q = query.trim();
+
+    // 非置顶记忆本就 ≤ 注入额度:全部注入即可,排序无意义 → 跳过 embedding 网络往返(降每条消息延迟)。
+    // 与下方回退分支结果一致(rest 全取),只是省掉了对 embedding 接口的调用。
+    if rest.len() <= TOP_K_INJECT {
+        let mut out = pinned;
+        out.extend(rest);
+        return out;
+    }
 
     if let Some((api_url, model, api_key)) = embedding_config(db).await {
         if !q.is_empty() {
@@ -545,7 +553,7 @@ async fn find_owned(db: &DatabaseConnection, id: i64, owner: &str) -> Result<mem
 
 /// 全局记忆开关:仅显式存 "0" 视为关闭,其余(含未设置)默认开启。
 async fn memory_enabled(db: &DatabaseConnection) -> bool {
-    super::get_secret(db, MEMORY_ENABLED_KEY).await != "0"
+    crate::commands::get_secret(db, MEMORY_ENABLED_KEY).await != "0"
 }
 
 /// 记忆去重用的规范化 key:裁剪 + 小写 + 折叠空白。

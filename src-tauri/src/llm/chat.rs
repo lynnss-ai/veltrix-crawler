@@ -55,7 +55,7 @@ pub async fn chat_completion(req: ChatRequest<'_>) -> Result<String> {
         }
     }
 
-    let client = http::build_client(req.timeout_secs)?;
+    let client = http::shared_client(req.timeout_secs)?;
     let resp = http::send_with_retry(
         || client.post(&endpoint).bearer_auth(req.api_key).json(&body),
         "大模型 chat",
@@ -110,7 +110,7 @@ where
         }
     }
 
-    let client = http::build_client(req.timeout_secs)?;
+    let client = http::shared_client(req.timeout_secs)?;
     let resp = client
         .post(&endpoint)
         .bearer_auth(req.api_key)

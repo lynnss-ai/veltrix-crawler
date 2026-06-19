@@ -1282,14 +1282,15 @@ function IntentSection({
 // 角色模型:一个可选模型 = 厂商 + 模型名(value 用 "providerId::model" 编码,与对话页一致)。
 type RoleModelOption = { value: string; label: string };
 
-// 从厂商列表展开出可用模型(有 apiKey + models 行才算可用);编码同对话页 buildModelOptions。
+// 从厂商列表展开出可用模型(有 apiKey + 具备「对话」能力的模型才算可用);编码同对话页 buildModelOptions。
+// 角色模型(分类/摘要/套用)都是文本任务,按「对话」能力过滤。
 function buildRoleModelOptions(providers: Provider[]): RoleModelOption[] {
   const out: RoleModelOption[] = [];
   for (const p of providers) {
     if (!p.apiKey.trim()) continue;
-    for (const line of p.models.split("\n")) {
-      const model = line.trim();
-      if (!model) continue;
+    for (const spec of p.models) {
+      const model = spec.name.trim();
+      if (!model || !spec.capabilities.includes("text")) continue;
       out.push({ value: `${p.id}::${model}`, label: `${p.name} · ${model}` });
     }
   }

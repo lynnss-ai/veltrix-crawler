@@ -21,6 +21,10 @@ pub struct Model {
     pub tool_call_id: Option<String>,
     /// role=tool 时:工具名(便于前端展示)
     pub tool_name: Option<String>,
+    /// user 消息携带的附件元数据(JSON 数组 `[{name,mime,path}]`;图片 path 为本地绝对路径)。
+    /// 仅图片落盘并带 path,供历史渲染与多轮多模态重建;非图片附件 path 为空,仅作文件名展示。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub attachments: Option<String>,
     pub created_at: i64,
 }
 

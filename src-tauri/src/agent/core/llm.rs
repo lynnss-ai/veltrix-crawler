@@ -4,14 +4,14 @@
 //! 屏蔽各厂商 function-calling / 消息 / 流式差异;换模型只改 `ProviderRef`。
 //! 现状:OpenAI 兼容(DeepSeek/Qwen/MiMo/GLM/MiniMax)已实现;Anthropic 原生先占位。
 //! 不影响现有 `llm::chat`(意向 / 标题 / 摘要 / 记忆提取仍走旧函数)。
-#![allow(dead_code)] // 地基先落,编程 Agent 落地后即被使用
+#![allow(dead_code)] // Anthropic 原生实现等为占位,暂未全部启用
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use veltrix_core::error::{CrawlerError, Result};
 
-use super::http;
+use crate::llm::http;
 
 /// 厂商协议类型:决定请求 / 响应 / 工具 / 流式的具体格式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,11 +55,17 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// 统一消息(含工具往返)。多模态(图片)后续在 User 上扩展。
+/// 统一消息(含工具往返 + 多模态视觉)。
 #[derive(Clone, Debug)]
 pub enum ChatMsg {
     System(String),
     User(String),
+    /// 带图片的用户消息(多模态):`text` 为正文,`images` 为图片 data URL(`data:image/png;base64,...`)。
+    /// 让走统一链路的 Agent 把截屏 / 图片喂给视觉模型(需模型具备 vision 能力)。
+    UserWithImages {
+        text: String,
+        images: Vec<String>,
+    },
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
@@ -344,6 +350,17 @@ fn msg_to_openai(m: &ChatMsg) -> Value {
     match m {
         ChatMsg::System(s) => json!({ "role": "system", "content": s }),
         ChatMsg::User(s) => json!({ "role": "user", "content": s }),
+        // 多模态:正文 + 各图片拼成 OpenAI content 数组(text part + image_url part)
+        ChatMsg::UserWithImages { text, images } => {
+            let mut parts: Vec<Value> = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            for url in images {
+                parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+            }
+            json!({ "role": "user", "content": parts })
+        }
         ChatMsg::Assistant { text, tool_calls } => {
             let mut v = json!({ "role": "assistant", "content": text });
             if !tool_calls.is_empty() {
@@ -502,6 +519,10 @@ impl ToolRegistry {
     }
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);
+    }
+    /// 合并另一个注册表的全部工具:组装「全能 Agent」时把多个独立工具模块聚合成一个注册表。
+    pub fn merge(&mut self, other: ToolRegistry) {
+        self.tools.extend(other.tools);
     }
     /// 所有工具定义(发给 LLM)。
     pub fn defs(&self) -> Vec<ToolDef> {

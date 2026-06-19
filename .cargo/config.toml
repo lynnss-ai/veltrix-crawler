@@ -1,0 +1,5 @@
+# Windows 下用工具链自带的 rust-lld 替代默认 MSVC link.exe。
+# 链接是 dev 增量重建的大头,rust-lld 通常比 link.exe 快数倍,能显著缩短「改后端 → 重启」的等待。
+# rust-lld.exe 随 rustup 工具链分发,rustc 会自动从 sysroot 解析,无需额外安装或改 PATH。
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

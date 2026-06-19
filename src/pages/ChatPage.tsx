@@ -34,7 +34,7 @@ import {
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import html2canvas from "html2canvas-pro";
 import { jsPDF } from "jspdf";
 import { toast } from "sonner";
@@ -44,6 +44,7 @@ import {
   type ChatAttachment,
   type ChatMessageView,
   type ContentView,
+  type MessageAttachment,
   type ProviderDto,
 } from "@/lib/api";
 import {
@@ -98,6 +99,24 @@ interface ModelOption {
   providerName: string;
   model: string;
   value: string;
+}
+
+// 记住用户上次选用的模型(value=providerId::model),作为下次新会话的默认。
+// 桌面端 UI 偏好,与登录态一致存 localStorage;localStorage 不可用时静默回退。
+const LAST_MODEL_KEY = "veltrix:chat:last-model";
+function readLastModel(): string {
+  try {
+    return localStorage.getItem(LAST_MODEL_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+function rememberLastModel(value: string) {
+  try {
+    localStorage.setItem(LAST_MODEL_KEY, value);
+  } catch {
+    // 隐私模式等 localStorage 不可用时跳过,不影响模型选择本身
+  }
 }
 
 // 附件限制:最多 12 个,单个 ≤ 10MB
@@ -171,14 +190,15 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-// 从厂商列表展开出可用模型(有 apiKey + models 行才算可用)
+// 从厂商列表展开出可用模型(有 apiKey + 具备「对话」能力的模型才算可用)
 function buildModelOptions(providers: ProviderDto[]): ModelOption[] {
   const opts: ModelOption[] = [];
   for (const p of providers) {
     if (!p.apiKey.trim()) continue;
-    for (const line of p.models.split("\n")) {
-      const model = line.trim();
-      if (!model) continue;
+    for (const spec of p.models) {
+      const model = spec.name.trim();
+      // 对话场景只列能「对话」的模型
+      if (!model || !spec.capabilities.includes("text")) continue;
       opts.push({
         providerId: p.id,
         providerName: p.name,
@@ -355,6 +375,10 @@ export function ChatPage() {
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // 历史消息里点开的图片(全屏预览);null=未预览。与输入区附件灯箱(previewIndex)相互独立
+  const [historyImagePreview, setHistoryImagePreview] = useState<string | null>(
+    null,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [sending, setSending] = useState(false);
   // 意图判断(新会话首条消息分类)进行中:此阶段较慢且会发 LLM 请求,需挡住连点造成的重复发送
@@ -440,9 +464,12 @@ export function ChatPage() {
     };
   }, []);
 
-  // providers 加载后默认选中首个可用模型
+  // providers 加载后初始化默认模型:优先上次记住的(仍有效),否则回退首个可用
   useEffect(() => {
-    if (models.length > 0 && !pickedModel) setPickedModel(models[0].value);
+    if (models.length === 0 || pickedModel) return;
+    const remembered = readLastModel();
+    const valid = remembered && models.some((m) => m.value === remembered);
+    setPickedModel(valid ? remembered : models[0].value);
   }, [models, pickedModel]);
 
   // 切换会话时加载消息
@@ -532,6 +559,8 @@ export function ChatPage() {
   // - 已有会话且已产生消息 → 开一个新会话(不改当前会话绑定),避免同会话混用模型
   // - 已有会话但空(无消息)→ 直接回写后端绑定模型
   async function handleModelChange(value: string) {
+    // 记住本次选择,作为下次新会话的默认(占位的失效模型不记)
+    if (models.some((m) => m.value === value)) rememberLastModel(value);
     if (!active) {
       setPickedModel(value);
       return;
@@ -727,16 +756,17 @@ export function ChatPage() {
       return false;
     }
     setSending(true);
-    // 乐观追加用户消息(正文 + 附件名提示,与后端落库口径一致)
-    const optimisticContent =
-      atts.length > 0
-        ? [text, ...atts.map((a) => `[附件: ${a.name}]`)].filter(Boolean).join("\n")
-        : text;
+    // 乐观追加用户消息:正文 + 附件(图片带内联 base64 即时预览,落库后由后端 path 接管)
     const optimistic: ChatMessageView = {
       id: Date.now(),
       conversationId: activeId ?? "",
       role: "user",
-      content: optimisticContent,
+      content: text,
+      attachments: atts.map((a) => ({
+        name: a.name,
+        mime: a.mime,
+        data: a.data,
+      })),
       createdAt: Math.floor(Date.now() / 1000),
     };
     // 发送即视为回到底部,确保新消息与回复滚动可见
@@ -797,7 +827,7 @@ export function ChatPage() {
         } finally {
           setClassifying(false);
         }
-        if (type === "coding" || type === "rpa") {
+        if (type === "coding" || type === "rpa" || type === "computer") {
           const id = crypto.randomUUID();
           try {
             await api.createConversation(id, opt.providerId, opt.model, type);
@@ -806,7 +836,7 @@ export function ChatPage() {
             return;
           }
           setInput("");
-          // 交接:建好对应会话后切布局,首条消息由 CodingLayout / RpaLayout 自动发送
+          // 交接:建好对应会话后切布局,首条消息由 CodingLayout / RpaLayout / ComputerLayout 自动发送
           setPendingFirstMessage(text);
           setPendingAgentType(type);
           setActiveId(id);
@@ -1227,6 +1257,7 @@ export function ChatPage() {
                   onCopy={copyToClipboard}
                   onRegenerate={regenerate}
                   onToggleFeedback={toggleFeedback}
+                  onPreviewImage={setHistoryImagePreview}
                 />
               ))}
               {/* 流式生成中:无头像,Markdown 实时渲染;首 token 前显示三点跳动 loading 动画 */}
@@ -1550,6 +1581,28 @@ export function ChatPage() {
           </div>
         )}
 
+        {/* 历史消息图片全屏预览:点消息里的缩略图打开;点背景关闭 */}
+        {historyImagePreview && (
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-10"
+            onClick={() => setHistoryImagePreview(null)}
+          >
+            <button
+              type="button"
+              className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white transition-colors hover:bg-white/20"
+              onClick={() => setHistoryImagePreview(null)}
+            >
+              <X className="size-5" />
+            </button>
+            <img
+              src={historyImagePreview}
+              alt="预览"
+              className="max-h-full max-w-full object-contain"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        )}
+
         {/* 重命名会话:自定义弹框(替代原生 prompt) */}
         <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
           <DialogContent className="sm:max-w-sm">
@@ -1666,28 +1719,74 @@ function IconBtn({
 
 // 单条消息:用户右侧气泡(纯文本),助手左侧全宽(Markdown);各带时间 + 操作栏。
 // memo + 稳定回调:流式时已完成消息不重渲染(性能)。
+// 历史附件取显示 src:有本地 path 走 asset 协议;否则用乐观消息的内联 base64;都没有返回空。
+function messageAttachmentSrc(a: MessageAttachment): string {
+  if (a.path) return convertFileSrc(a.path);
+  if (a.data) return `data:${a.mime};base64,${a.data}`;
+  return "";
+}
+
 const MessageBubble = memo(function MessageBubble({
   message,
   feedback,
   onCopy,
   onRegenerate,
   onToggleFeedback,
+  onPreviewImage,
 }: {
   message: ChatMessageView;
   feedback?: "like" | "dislike";
   onCopy: (text: string, okMsg?: string) => void;
   onRegenerate: (content: string) => void;
   onToggleFeedback: (id: number, v: "like" | "dislike") => void;
+  onPreviewImage: (src: string) => void;
 }) {
   const isUser = message.role === "user";
   const time = fmtMsgTime(message.createdAt);
 
   if (isUser) {
+    const atts = message.attachments ?? [];
+    const images = atts.filter((a) => a.mime.startsWith("image/"));
+    const files = atts.filter((a) => !a.mime.startsWith("image/"));
     return (
       <div className="group flex flex-col items-end gap-1">
-        <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3.5 py-2 text-sm leading-relaxed text-foreground">
-          {message.content}
-        </div>
+        {/* 图片附件:右对齐缩略图,点击全屏预览 */}
+        {images.length > 0 && (
+          <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+            {images.map((a, i) => {
+              const src = messageAttachmentSrc(a);
+              return (
+                <img
+                  key={i}
+                  src={src}
+                  alt={a.name}
+                  className="size-24 cursor-zoom-in rounded-lg border border-border/60 object-cover"
+                  onClick={() => src && onPreviewImage(src)}
+                />
+              );
+            })}
+          </div>
+        )}
+        {/* 非图片附件:文件名 chip */}
+        {files.length > 0 && (
+          <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+            {files.map((a, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs text-foreground"
+              >
+                <FileText className="size-4 shrink-0 text-muted-foreground" />
+                <span className="max-w-[160px] truncate">{a.name}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* 正文气泡:纯图片消息(空正文)不渲染空气泡 */}
+        {message.content && (
+          <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3.5 py-2 text-sm leading-relaxed text-foreground">
+            {message.content}
+          </div>
+        )}
         {/* 时间 + 操作图标:都默认隐藏,悬浮在消息上才显示 */}
         <div className="flex items-center gap-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
           <span className="mr-0.5 text-[11px]">{time}</span>

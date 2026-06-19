@@ -99,7 +99,7 @@ fn show_main_from_tray(app: tauri::AppHandle) {
 fn quit_app(app: tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         let db = state.db.clone();
-        tauri::async_runtime::block_on(commands::coding::stop_sandbox_on_exit(&db));
+        tauri::async_runtime::block_on(agent::coding::commands::stop_sandbox_on_exit(&db));
     }
     app.exit(0);
 }
@@ -379,7 +379,7 @@ pub fn run() {
                 let sb_db = db.clone();
                 let sb_dir = config_dir.clone();
                 tauri::async_runtime::spawn(async move {
-                    commands::coding::ensure_sandbox_on_start(&sb_db, &sb_dir).await;
+                    agent::coding::commands::ensure_sandbox_on_start(&sb_db, &sb_dir).await;
                 });
             }
 
@@ -417,13 +417,13 @@ pub fn run() {
                 )),
                 login_verdicts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 dev_server: Arc::new(std::sync::Mutex::new(
-                    commands::coding::DevServer::default(),
+                    agent::coding::commands::DevServer::default(),
                 )),
                 sandbox_ready: std::sync::Mutex::new(
-                    commands::coding::SandboxReady::default(),
+                    agent::coding::commands::SandboxReady::default(),
                 ),
                 app_handle: app.handle().clone(),
-                agent_actions: Arc::new(webview::AgentActionChannel::new()),
+                agent_cancel: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             });
 
             // 任务调度器:每 30s 扫描 daily / watching 任务,到点自动启动采集
@@ -605,52 +605,65 @@ pub fn run() {
             commands::get_obsidian_vault,
             commands::sync_contents_to_obsidian,
             // AI 对话
-            commands::chat::list_conversations,
-            commands::chat::create_conversation,
-            commands::chat::rename_conversation,
-            commands::chat::archive_conversation,
-            commands::chat::update_conversation_model,
-            commands::chat::get_conversation_summary,
-            commands::chat::update_conversation_summary,
-            commands::chat::delete_conversation,
-            commands::chat::list_chat_messages,
-            commands::chat::send_chat_message,
-            commands::chat::send_chat_message_stream,
-            commands::chat::transcribe_chat_audio,
-            commands::chat::build_content_attachments,
+            agent::chat::commands::list_conversations,
+            agent::chat::commands::create_conversation,
+            agent::chat::commands::rename_conversation,
+            agent::chat::commands::archive_conversation,
+            agent::chat::commands::update_conversation_model,
+            agent::chat::commands::get_conversation_summary,
+            agent::chat::commands::update_conversation_summary,
+            agent::chat::commands::delete_conversation,
+            agent::chat::commands::list_chat_messages,
+            agent::chat::commands::send_chat_message,
+            agent::chat::commands::send_chat_message_stream,
+            agent::chat::commands::transcribe_chat_audio,
+            agent::chat::commands::build_content_attachments,
             // AI 对话:长期记忆
-            commands::chat_memory::list_chat_memories,
-            commands::chat_memory::add_chat_memory,
-            commands::chat_memory::update_chat_memory,
-            commands::chat_memory::delete_chat_memory,
-            commands::chat_memory::clear_chat_memories,
-            commands::chat_memory::get_chat_memory_enabled,
-            commands::chat_memory::set_chat_memory_enabled,
-            commands::chat_memory::set_chat_memory_pinned,
-            commands::chat_memory::get_embedding_config,
-            commands::chat_memory::set_embedding_config,
+            agent::chat::memory::list_chat_memories,
+            agent::chat::memory::add_chat_memory,
+            agent::chat::memory::update_chat_memory,
+            agent::chat::memory::delete_chat_memory,
+            agent::chat::memory::clear_chat_memories,
+            agent::chat::memory::get_chat_memory_enabled,
+            agent::chat::memory::set_chat_memory_enabled,
+            agent::chat::memory::set_chat_memory_pinned,
+            agent::chat::memory::get_embedding_config,
+            agent::chat::memory::set_embedding_config,
             // 编程 Agent
-            commands::coding::send_coding_message,
-            commands::coding::get_coding_workspace,
-            commands::coding::set_coding_workspace,
-            commands::coding::run_workspace_command,
-            commands::coding::checkpoint_rollback,
-            commands::coding::list_workspace_files,
-            commands::coding::read_workspace_file,
-            commands::coding::write_workspace_file,
-            commands::coding::classify_agent_type,
-            commands::coding::start_dev_server,
-            commands::coding::stop_dev_server,
-            commands::coding::get_dev_server_status,
-            commands::coding::get_sandbox_config,
-            commands::coding::set_sandbox_config,
-            commands::coding::sandbox_start,
-            commands::coding::sandbox_stop,
-            commands::coding::sandbox_recreate,
-            // 浏览器 Agent(RPA:动作回读 + 应用内预览)
-            commands::browser::send_browser_message,
-            commands::browser::browser_agent_result,
-            commands::browser::capture_agent_preview,
+            agent::coding::commands::send_coding_message,
+            agent::coding::commands::stop_coding_agent,
+            agent::coding::commands::get_coding_workspace,
+            agent::coding::commands::set_coding_workspace,
+            agent::coding::commands::run_workspace_command,
+            agent::coding::commands::checkpoint_rollback,
+            agent::coding::commands::list_coding_checkpoints,
+            agent::coding::commands::rollback_to_checkpoint,
+            agent::coding::commands::list_workspace_files,
+            agent::coding::commands::read_workspace_file,
+            agent::coding::commands::write_workspace_file,
+            agent::coding::commands::classify_agent_type,
+            agent::coding::commands::start_dev_server,
+            agent::coding::commands::stop_dev_server,
+            agent::coding::commands::get_dev_server_status,
+            agent::coding::commands::get_sandbox_config,
+            agent::coding::commands::get_sandbox_stats,
+            agent::coding::commands::set_sandbox_config,
+            agent::coding::commands::sandbox_start,
+            agent::coding::commands::sandbox_stop,
+            agent::coding::commands::sandbox_recreate,
+            // 浏览器 Agent(RPA:内嵌右栏真实 webview + 回读 + 接口拦截)
+            agent::rpa::commands::send_browser_message,
+            agent::rpa::commands::set_agent_webview_bounds,
+            agent::rpa::commands::show_agent_webview,
+            agent::rpa::commands::hide_agent_webview,
+            agent::rpa::commands::hide_all_agent_webviews,
+            agent::rpa::commands::get_agent_network,
+            // 「电脑操作」工具基础设施(桌面 GUI + 跨平台终端;独立模块,列出供前端 / 编排挑选)
+            agent::list_agent_tools,
+            // 电脑操作 Agent:聚合全部工具的 ReAct 智能体
+            agent::computer::commands::send_computer_message,
+            // 拍照回传:截桌面屏幕 → base64 data URL(前端预览 / 将来喂视觉模型)
+            agent::capture_desktop_screenshot,
             // 云端连接(配对 / WS / 远程指令)
             commands::cloud::cloud_get_config,
             commands::cloud::cloud_get_status,

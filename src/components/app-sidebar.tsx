@@ -2,6 +2,8 @@ import { useState } from "react";
 import {
   Brain,
   CalendarClock,
+  ChevronDown,
+  ChevronRight,
   ChevronsUpDown,
   Clapperboard,
   Contact,
@@ -14,7 +16,7 @@ import {
   MessageSquare,
   LayoutDashboard,
   LogOut,
-  MoreHorizontal,
+  MoreVertical,
   Radar,
   Rocket,
   Settings,
@@ -256,6 +258,8 @@ function ChatConversationList({
   const [deleteTarget, setDeleteTarget] = useState<ConversationView | null>(
     null,
   );
+  // 「最近对话」分组折叠态(默认展开)
+  const [recentCollapsed, setRecentCollapsed] = useState(false);
 
   // 开新会话:设场景类型 + 清当前会话 + 切到对话页(首条消息时按场景建会话)
   function startNew(agentType: string) {
@@ -318,7 +322,6 @@ function ChatConversationList({
           }}
           className="pr-7 data-active:bg-primary/10 data-active:font-medium data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:[&_svg]:text-primary"
         >
-          <MessageSquare />
           <span className="truncate">{c.title}</span>
         </SidebarMenuButton>
         <DropdownMenu>
@@ -327,7 +330,7 @@ function ChatConversationList({
               type="button"
               className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover/conv:opacity-100 data-[state=open]:opacity-100"
             >
-              <MoreHorizontal className="size-4" />
+              <MoreVertical className="size-4" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -388,29 +391,50 @@ function ChatConversationList({
             </span>
           </div>
         ) : (
-          <SidebarGroup className="px-1 py-1">
-            {/* 分组标题「最近对话」+ 右侧小入口「查看更多」(进入对话记录管理页) */}
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="text-[11px]">
-                最近对话
-              </SidebarGroupLabel>
+          <SidebarGroup className="group/recent px-1 py-1">
+            {/* 分组标题「最近对话」可点击折叠;紧跟其后的「查看更多 / 折叠箭头」默认隐藏,悬浮分组才显示 */}
+            <div className="flex items-center gap-1 pr-1">
               <button
                 type="button"
-                onClick={() => onChange("chat-history")}
-                className="rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+                onClick={() => setRecentCollapsed((v) => !v)}
+                className="rounded px-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
               >
-                查看更多
+                最近对话
               </button>
+              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/recent:opacity-100">
+                <button
+                  type="button"
+                  onClick={() => onChange("chat-history")}
+                  className="flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+                >
+                  查看更多
+                  <ChevronRight className="size-3" />
+                </button>
+                <button
+                  type="button"
+                  aria-label={recentCollapsed ? "展开最近对话" : "折叠最近对话"}
+                  onClick={() => setRecentCollapsed((v) => !v)}
+                  className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+                >
+                  {recentCollapsed ? (
+                    <ChevronRight className="size-3" />
+                  ) : (
+                    <ChevronDown className="size-3" />
+                  )}
+                </button>
+              </div>
             </div>
-            <SidebarGroupContent>
-              {recent.length > 0 ? (
-                <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
-              ) : (
-                <div className="px-2 py-3 text-[11px] text-muted-foreground">
-                  最近对话已全部归档,点「查看更多」管理
-                </div>
-              )}
-            </SidebarGroupContent>
+            {!recentCollapsed && (
+              <SidebarGroupContent>
+                {recent.length > 0 ? (
+                  <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
+                ) : (
+                  <div className="px-2 py-3 text-[11px] text-muted-foreground">
+                    最近对话已全部归档,点「查看更多」管理
+                  </div>
+                )}
+              </SidebarGroupContent>
+            )}
           </SidebarGroup>
         )}
       </div>

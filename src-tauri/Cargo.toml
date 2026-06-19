@@ -20,7 +20,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # 抽出的不依赖 Tauri 的共享后端库(配置 / 错误 / 数据库 / HTTP API)
 veltrix-core = { path = "../crates/core" }
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
+# unstable:启用多 webview(Window::add_child),用于把 RPA 浏览器 Agent 的真实 webview 内嵌到主窗口右栏。
+# 注意:开启后 Tauri 内部对所有 WebviewWindow 改用「窗口+子 webview」实现,需回归验证采集窗口。
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png", "unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # 自动更新:启动/手动检查 GitHub Releases 的 latest.json,验签后下载安装
@@ -79,6 +81,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # 语音转写:把本地音频读出后 base64 内联进 MiMo input_audio 请求体
 base64 = "0.22"
 
+# 桌面操作 Agent 工具(electron 之外的「电脑操作」基础设施),三平台通用:
+# enigo  — 跨平台鼠标 / 键盘合成(Win SendInput、mac CGEvent、Linux x11rb)
+# xcap   — 跨平台截屏 / 列窗口(返回 image::RgbaImage)
+# arboard— 跨平台系统剪贴板读写
+# image  — 保存截图 PNG(版本与 xcap / arboard 内部对齐,避免重复编译)
+enigo = "0.6"
+xcap = { version = "0.9", features = ["image"] }
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# 效率工具(跨平台纯 Rust):文件系统遍历(walkdir)+ 系统 / 进程信息(sysinfo)
+walkdir = "2"
+sysinfo = "0.39"
+
 # Windows 真实滚轮:WebView2 窗口化宿主没有 SendMouseInput(那是合成宿主才有),
 # 改用 PostMessage WM_MOUSEWHEEL 给渲染子窗口投递真实滚轮消息触发懒加载;
 # 后台并发窗口也能滚、不劫持物理鼠标。版本与 Tauri 内部 windows crate 对齐(0.61)。
@@ -90,6 +106,13 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     # 应用内预览截图:CapturePreview 写入内存流需 CreateStreamOnHGlobal
     "Win32_System_Com_StructuredStorage",
+    # 屏幕 OCR(agent/ocr):WinRT Windows.Media.Ocr 链路
+    "Foundation",          # IAsyncOperation.get() 同步等待
+    "Media_Ocr",           # OcrEngine / OcrResult
+    "Graphics_Imaging",    # SoftwareBitmap / BitmapDecoder
+    "Storage_Streams",     # InMemoryRandomAccessStream / DataWriter
+    # UI 控件读取(agent/uia):UI Automation 客户端 COM 接口
+    "Win32_UI_Accessibility",
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"

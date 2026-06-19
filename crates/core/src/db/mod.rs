@@ -339,6 +339,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("tool_calls", "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT"),
         ("tool_call_id", "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT"),
         ("tool_name", "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT"),
+        ("attachments", "ALTER TABLE chat_messages ADD COLUMN attachments TEXT"),
     ] {
         if !column_exists(db, "chat_messages", col).await {
             if let Err(e) = db

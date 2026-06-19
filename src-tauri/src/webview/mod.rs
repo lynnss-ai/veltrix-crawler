@@ -19,6 +19,7 @@
 pub mod native_intercept;
 pub mod pool;
 pub mod screenshot;
+pub mod script_eval;
 
 use veltrix_core::config::RpaStep;
 use veltrix_core::error::{CrawlerError, Result};
@@ -153,61 +154,8 @@ impl RpaChannel {
     }
 }
 
-/// 浏览器 Agent 一次「动作 + 回读」的结果,由页面脚本经 `browser_agent_result` 回传。
-/// 与 RPA 的 [`RpaOutcome`] 区别:动作粒度更细(单次 navigate/click/read),`data` 携带
-/// 回读的页面信息(url / title / 命中元素 / 可见交互元素清单等任意 JSON),供 Agent 据此决策。
-#[derive(Debug, Clone)]
-pub struct AgentActionOutcome {
-    /// 动作是否成功(命中元素 / 读到页面)。
-    pub ok: bool,
-    /// 回读数据(JSON):navigate 给 url/title,read_page 给元素清单与正文摘要等。
-    pub data: serde_json::Value,
-}
-
-/// 浏览器 Agent 动作回读通道:每次动作分配 req_id,以 oneshot 等待页面经
-/// `browser_agent_result` 回传结果(把 fire-and-forget 升级为请求-响应)。
-///
-/// 与持续推送的 [`InterceptChannel`] 不同、和一次性的 [`RpaChannel`] 同构:一次动作只回一次。
-/// 接收端超时被 drop 后,迟到的 `complete` 安全忽略;req_id 区分并发会话的多个动作。
-#[derive(Default)]
-pub struct AgentActionChannel {
-    seq: AtomicU64,
-    /// req_id -> 结果发送端。
-    pending: Mutex<HashMap<u64, oneshot::Sender<AgentActionOutcome>>>,
-}
-
-impl AgentActionChannel {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 开启一次动作,返回 req_id 与结果接收端。
-    pub fn open_action(&self) -> Result<(u64, oneshot::Receiver<AgentActionOutcome>)> {
-        let req_id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|_| CrawlerError::Sign("Agent 动作通道锁异常".into()))?
-            .insert(req_id, tx);
-        Ok((req_id, rx))
-    }
-
-    /// 页面回传一次动作结果。req_id 未登记或已完成(超时)则忽略。
-    pub fn complete(&self, req_id: u64, outcome: AgentActionOutcome) {
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(tx) = pending.remove(&req_id) {
-                let _ = tx.send(outcome);
-            }
-        }
-    }
-
-    /// 放弃一次动作(等待方超时后调用),避免发送端条目永久残留。
-    pub fn cancel(&self, req_id: u64) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&req_id);
-        }
-    }
-}
+// 注:浏览器 Agent 早期的「动作 + 回读」请求-响应通道(AgentActionChannel / AgentActionOutcome)
+// 已废弃——回读改走 WebView2 ExecuteScript(见 webview::script_eval),不再依赖页面 invoke 回传。
 
 /// 采集中断控制:HUD「结束」按钮经 `stop_collect` 命令登记 session_id,
 /// 采集循环每轮检查到即**优雅停止**(保留已采内容、作为正常完成),而非报错中断。
@@ -702,29 +650,20 @@ pub fn build_select_eval(labels: &[String]) -> String {
     TEMPLATE.replace("__LABELS__", &labels_json)
 }
 
-// ===================== 浏览器 Agent 动作脚本(请求-响应:动作 + 回读 DOM) =====================
+// ===================== 浏览器 Agent 动作脚本(同步 IIFE 返回对象,供 ExecuteScript 回读) =====================
 //
-// 为何与采集的 build_*_eval 分开:浏览器 Agent 用独立 "agent" 窗口、不绑登录态/不注入采集 HUD。
-// 这些脚本不再是 fire-and-forget:动作做完后**同步**读回结果(命中与否 / url / title / 元素清单),
-// 再经 `browser_agent_result` invoke 回传 Rust(由 AgentActionChannel 按 req_id 配对等待),
-// 把「只发出、看不到结果」升级为「发出 + 确认 + 读页面」,Agent 据此决策。
+// 为何与采集的 build_*_eval 分开:浏览器 Agent 用内嵌主窗口的 "agent" 子 webview、不绑登录态/不注入采集 HUD。
+// 回读机制:这些脚本是**同步 IIFE 返回一个对象**,由 Rust 侧 `script_eval::eval_json`(WebView2
+// ExecuteScript)把返回对象序列化成 JSON 取回——**不走页面 invoke**,故任意域名都能回读
+// (原 invoke 回传受 capabilities 远程白名单限制,在非白名单域调不通)。
 //
-// 关键时序:click/type 在派发事件后**立即**(同一同步轮)调用回传,早于点击引发的异步导航
-// 拆毁当前脚本上下文,故回传不会丢;navigate 会拆上下文,改由 Rust 先 assign 再隔一段 eval probe 回读。
-
-/// 注入脚本里回传浏览器 Agent 动作结果的命令名;与 Rust 端 `#[tauri::command] browser_agent_result` 对应。
-pub const AGENT_RESULT_COMMAND: &str = "browser_agent_result";
+// 关键约束:ExecuteScript **不 await Promise**,故脚本必须同步返回。
+// - click/type 在派发事件后**同一同步轮**返回结果,早于点击引发的异步导航拆毁上下文,故结果不丢;
+// - navigate 用 assign 拆上下文,回读交给随后单独 eval 的 probe;
+// - 「等元素出现」改由 Rust 多次调用 `build_agent_exists_eval` 轮询(替代页面内 setTimeout 轮询)。
 
 /// read_page 默认回读的可见交互元素上限(防止超大页面塞爆上下文)。
 pub const AGENT_READ_ELEMENT_CAP: usize = 40;
-
-/// 生成回传样板:定义 `send(ok, data)` 把结果 invoke 给 `browser_agent_result`。各脚本嵌入复用。
-fn agent_send_snippet(req_id: u64) -> String {
-    format!(
-        "var __rid={req_id};function send(ok,data){{try{{window.__TAURI_INTERNALS__.invoke('{cmd}',{{reqId:__rid,ok:ok,data:data||{{}}}});}}catch(e){{}}}}",
-        cmd = AGENT_RESULT_COMMAND,
-    )
-}
 
 /// 构造「导航到指定 URL」脚本(fire-and-forget:assign 会拆毁上下文,回读交给随后的 probe)。
 /// url 只接受 http/https,由 Rust 侧先校验。
@@ -735,25 +674,21 @@ pub fn build_navigate_eval(url: &str) -> String {
     format!("(function () {{ window.location.assign({url_lit}); }})();")
 }
 
-/// 构造「探测当前页面」脚本:读回 url / title / readyState 并回传。
+/// 构造「探测当前页面」脚本:返回 {url,title,readyState}。
 /// 用于 navigate 之后(等导航 settle 后单独 eval 一次拿到落地页信息)。
-pub fn build_agent_probe_eval(req_id: u64) -> String {
-    format!(
-        "(function(){{{send}try{{send(true,{{url:location.href,title:document.title,readyState:document.readyState}});}}catch(e){{send(false,{{error:String(e)}});}}}})();",
-        send = agent_send_snippet(req_id),
-    )
+pub fn build_agent_probe_eval() -> String {
+    "(function(){try{return {url:location.href,title:document.title,readyState:document.readyState};}catch(e){return {error:String(e)};}})();".to_string()
 }
 
-/// 构造「按 CSS 选择器点击元素」脚本:命中即派发鼠标事件并**同步**回传 {matched,tag,text};
-/// 未命中回传 {matched:false}。同步回传早于点击引发的异步导航,故结果不会因跳转丢失。
-pub fn build_agent_click_eval(req_id: u64, selector: &str) -> String {
+/// 构造「按 CSS 选择器点击元素」脚本:命中即派发鼠标事件并**同步**返回 {matched,tag,text};
+/// 未命中返回 {matched:false}。同步返回早于点击引发的异步导航,故结果不会因跳转丢失。
+pub fn build_agent_click_eval(selector: &str) -> String {
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     const TEMPLATE: &str = r#"(function () {
-  __SEND__
   var SEL = __SEL__;
   var el = null;
-  try { el = document.querySelector(SEL); } catch (e) { return send(false, { error: '非法选择器: ' + String(e) }); }
-  if (!el) return send(false, { matched: false });
+  try { el = document.querySelector(SEL); } catch (e) { return { error: '非法选择器: ' + String(e) }; }
+  if (!el) return { matched: false };
   try {
     el.scrollIntoView({ block: 'center' });
     var r = el.getBoundingClientRect();
@@ -761,26 +696,23 @@ pub fn build_agent_click_eval(req_id: u64, selector: &str) -> String {
     el.dispatchEvent(new MouseEvent('mousedown', o));
     el.dispatchEvent(new MouseEvent('mouseup', o));
     el.dispatchEvent(new MouseEvent('click', o));
-    send(true, { matched: true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60) });
-  } catch (e) { send(false, { error: String(e) }); }
+    return { matched: true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60) };
+  } catch (e) { return { error: String(e) }; }
 })();"#;
-    TEMPLATE
-        .replace("__SEND__", &agent_send_snippet(req_id))
-        .replace("__SEL__", &sel_json)
+    TEMPLATE.replace("__SEL__", &sel_json)
 }
 
 /// 构造「向输入框写入文本」脚本:命中 input/textarea/contenteditable,聚焦整体赋值并派发
-/// input/change(触发框架受控更新),同步回传 {matched,tag};未命中回传 {matched:false}。
-pub fn build_agent_type_eval(req_id: u64, selector: &str, text: &str) -> String {
+/// input/change(触发框架受控更新),返回 {matched,tag};未命中返回 {matched:false}。
+pub fn build_agent_type_eval(selector: &str, text: &str) -> String {
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     const TEMPLATE: &str = r#"(function () {
-  __SEND__
   var SEL = __SEL__;
   var TEXT = __TEXT__;
   var el = null;
-  try { el = document.querySelector(SEL); } catch (e) { return send(false, { error: '非法选择器: ' + String(e) }); }
-  if (!el) return send(false, { matched: false });
+  try { el = document.querySelector(SEL); } catch (e) { return { error: '非法选择器: ' + String(e) }; }
+  if (!el) return { matched: false };
   try {
     el.focus();
     if (el.isContentEditable) { el.textContent = TEXT; }
@@ -791,47 +723,35 @@ pub fn build_agent_type_eval(req_id: u64, selector: &str, text: &str) -> String 
     }
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
-    send(true, { matched: true, tag: el.tagName });
-  } catch (e) { send(false, { error: String(e) }); }
+    return { matched: true, tag: el.tagName };
+  } catch (e) { return { error: String(e) }; }
 })();"#;
     TEMPLATE
-        .replace("__SEND__", &agent_send_snippet(req_id))
         .replace("__SEL__", &sel_json)
         .replace("__TEXT__", &text_json)
 }
 
-/// 构造「轮询等待元素出现」脚本:命中或超时(timeout_ms)后回传 {matched,visible,timeout}。
-/// Rust 侧等待该动作的超时须大于 timeout_ms。
-pub fn build_agent_wait_eval(req_id: u64, selector: &str, timeout_ms: u64) -> String {
+/// 构造「单次检查元素是否存在」脚本:返回 {matched,visible,text}。
+/// 「等元素出现」由 Rust 侧按间隔多次调用本脚本轮询实现(ExecuteScript 不 await Promise,
+/// 故不在页面内 setTimeout 轮询)。
+pub fn build_agent_exists_eval(selector: &str) -> String {
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     const TEMPLATE: &str = r#"(function () {
-  __SEND__
   var SEL = __SEL__;
-  var TO = __TO__;
-  var start = Date.now();
-  (function poll() {
-    var el = null;
-    try { el = document.querySelector(SEL); } catch (e) { return send(false, { error: '非法选择器: ' + String(e) }); }
-    if (el) {
-      var r = el.getBoundingClientRect();
-      return send(true, { matched: true, visible: (r.width > 0 && r.height > 0), text: (el.textContent || '').trim().slice(0, 60) });
-    }
-    if (Date.now() - start > TO) return send(false, { matched: false, timeout: true });
-    setTimeout(poll, 250);
-  })();
+  var el = null;
+  try { el = document.querySelector(SEL); } catch (e) { return { error: '非法选择器: ' + String(e) }; }
+  if (!el) return { matched: false };
+  var r = el.getBoundingClientRect();
+  return { matched: true, visible: (r.width > 0 && r.height > 0), text: (el.textContent || '').trim().slice(0, 60) };
 })();"#;
-    TEMPLATE
-        .replace("__SEND__", &agent_send_snippet(req_id))
-        .replace("__SEL__", &sel_json)
-        .replace("__TO__", &timeout_ms.to_string())
+    TEMPLATE.replace("__SEL__", &sel_json)
 }
 
-/// 构造「读取页面」脚本:回传 url / title / readyState、可见交互元素清单(给每个元素打上
+/// 构造「读取页面」脚本:返回 url / title / readyState、可见交互元素清单(给每个元素打上
 /// `data-veltrix-id` 并以 `[data-veltrix-id="N"]` 作为可靠选择器,供后续 click/type 精确命中)、
 /// 以及正文摘要(截断)。`cap` 限制元素数量。这是 Agent「看清页面再动手」的核心工具。
-pub fn build_agent_read_eval(req_id: u64, cap: usize) -> String {
+pub fn build_agent_read_eval(cap: usize) -> String {
     const TEMPLATE: &str = r#"(function () {
-  __SEND__
   var CAP = __CAP__;
   try {
     function vis(el) {
@@ -851,12 +771,10 @@ pub fn build_agent_read_eval(req_id: u64, cap: usize) -> String {
       items.push({ id: vid, tag: tag, type: (el.getAttribute('type') || ''), text: label, selector: '[data-veltrix-id="' + vid + '"]' });
     }
     var bodyText = (document.body ? (document.body.innerText || '') : '').replace(/\s+/g, ' ').trim().slice(0, 1500);
-    send(true, { url: location.href, title: document.title, readyState: document.readyState, elements: items, text: bodyText });
-  } catch (e) { send(false, { error: String(e) }); }
+    return { url: location.href, title: document.title, readyState: document.readyState, elements: items, text: bodyText };
+  } catch (e) { return { error: String(e) }; }
 })();"#;
-    TEMPLATE
-        .replace("__SEND__", &agent_send_snippet(req_id))
-        .replace("__CAP__", &cap.to_string())
+    TEMPLATE.replace("__CAP__", &cap.to_string())
 }
 
 /// 注入脚本里回传 RPA 执行结果的命令名;与 Rust 端 `#[tauri::command] rpa_done` 对应。

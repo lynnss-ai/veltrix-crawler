@@ -1,3 +1,8 @@
 [workspace]
 members = ["src-tauri", "crates/core", "crates/server"]
 resolver = "2"
+
+# dev 只保留行号级调试信息:panic/backtrace 仍带文件:行号,去掉变量级符号以加速 codegen 与链接。
+# workspace 下 [profile] 仅在根生效,故放这里统一作用于桌面端/server/core。
+[profile.dev]
+debug = "line-tables-only"
