@@ -7,24 +7,21 @@
 
 use crate::agent::computer::tools as computer;
 use crate::agent::core::shared::{
-    row_to_chat_msg, tool_calls_to_json, truncate_title, MessageView, MAX_ITERS,
+    begin_agent_turn, finalize_conversation_meta, insert_assistant_tool_calls,
+    insert_final_assistant, insert_tool_result, live_windowed_messages, load_agent_guidelines,
+    MessageView, MAX_ITERS,
 };
 use crate::agent::core::summary as conv_summary;
 use crate::agent::core::{
     provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef,
 };
 use crate::commands::{current_user, AppState};
-use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set,
-};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
-use veltrix_core::db::entity::{
-    chat_conversation as conv, chat_message as msg, provider as provider_entity,
-};
 use veltrix_core::error::{CrawlerError, Result};
+
+/// 危险操作等待用户确认的超时(秒):超时按「拒绝」处理,避免 ReAct 永久挂起。
+const CONFIRM_TIMEOUT_SECS: u64 = 180;
 
 /// 发送一条用户消息,驱动电脑操作 Agent 的 ReAct 循环;逐步落库 + 推 `agent-step` 进度,
 /// 返回最终 assistant 消息(前端在 resolve 后重载消息以渲染完整工具往返)。
@@ -40,74 +37,28 @@ pub async fn send_computer_message(
     if text.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
     }
-
-    let conversation = conv::Entity::find_by_id(conversation_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
-    if conversation.owner != me.name {
-        return Err(CrawlerError::Config("无权操作该会话".into()));
-    }
-    let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
-    if provider.api_key.trim().is_empty() {
-        return Err(CrawlerError::Config(
-            "该模型厂商未配置 API Key,请到系统配置补全".into(),
-        ));
-    }
-
-    // 是否首轮(决定是否用首句起标题)
-    let had_messages = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
-    let now = Utc::now().timestamp();
-    msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("user".to_string()),
-        content: Set(text.clone()),
-        created_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
+    // 前奏(归属 / api_key 校验 + 首轮判定 + 落库 user 消息)统一走 core::shared
+    let (conversation, provider, had_messages) =
+        begin_agent_turn(&state.db, &me.name, &conversation_id, &text).await?;
 
     // 聚合全部电脑操作工具(desktop/fs/system/ocr/uia/net/shell + capture_screen)
     let registry = computer::build_registry(app.clone());
     let tool_defs = registry.defs();
+    // 危险操作确认通道(命中危险工具时暂停等前端回执)
+    let confirm_channel = state.agent_confirm.clone();
 
-    // live 原文窗口 + 滚动摘要(与 coding/rpa 一致)
-    let mut rows = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .filter(msg::Column::Id.gt(conversation.summarized_upto_id))
-        .order_by_desc(msg::Column::Id)
-        .limit(conv_summary::LIVE_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
-    rows.reverse();
-    // 窗口须从第一条 user 开始,否则可能以 tool / assistant(tool_calls)开头致 OpenAI 报 400
-    let windowed: &[msg::Model] = match rows.iter().position(|m| m.role == "user") {
-        Some(start) => &rows[start..],
-        None => &[],
-    };
-
+    // 系统提示词 + 滚动摘要 + live 原文窗口(窗口构建统一走 core::shared)
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(computer::SYSTEM_PROMPT.to_string())];
+    // 用户可编辑的附加规范(<config_dir>/agent-guidelines/computer.md):有则注入
+    if let Some(g) = load_agent_guidelines(&state.config_dir, "computer").await {
+        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+    }
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
             messages.push(ChatMsg::System(summary_text.to_string()));
         }
     }
-    messages.extend(windowed.iter().filter_map(row_to_chat_msg));
+    messages.extend(live_windowed_messages(&state.db, &conversation).await?);
 
     let provider_ref = ProviderRef {
         kind: ProviderKind::from_code(&provider.code),
@@ -116,7 +67,11 @@ pub async fn send_computer_message(
         model: conversation.model.clone(),
     };
     let llm = provider_for(provider_ref.kind);
-    let options = LlmOptions::default();
+    // 低温:电脑操作 Agent 要的是精准、确定的工具调用,而非发散
+    let options = LlmOptions {
+        temperature: Some(0.2),
+        ..LlmOptions::default()
+    };
 
     let emit = |label: String| {
         let _ = app.emit(
@@ -127,6 +82,8 @@ pub async fn send_computer_message(
 
     // ReAct 循环
     let mut final_text = String::new();
+    // 模型「无工具调用、直接收尾」那步的思考过程(达上限收尾路径无对应推理,保持 None)
+    let mut final_reasoning: Option<String> = None;
     for iter in 0..MAX_ITERS {
         emit(format!("思考中…(第 {} 步)", iter + 1));
         let resp = llm
@@ -140,38 +97,62 @@ pub async fn send_computer_message(
 
         // 无工具调用 → 模型收尾
         if resp.tool_calls.is_empty() {
+            final_reasoning = resp.reasoning.clone();
             final_text = resp.content.unwrap_or_default();
             break;
         }
 
-        // 落库 assistant(带 tool_calls)
-        let assistant_text = resp.content.clone().unwrap_or_default();
-        let tc_json = tool_calls_to_json(&resp.tool_calls);
-        msg::ActiveModel {
-            conversation_id: Set(conversation_id.clone()),
-            role: Set("assistant".to_string()),
-            content: Set(assistant_text.clone()),
-            tool_calls: Set(Some(tc_json)),
-            created_at: Set(Utc::now().timestamp()),
-            ..Default::default()
-        }
-        .insert(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+        // 落库 assistant(带 tool_calls)+ 推入内存上下文
+        insert_assistant_tool_calls(&state.db, &conversation_id, &resp).await?;
         messages.push(ChatMsg::Assistant {
             text: resp.content.clone(),
             tool_calls: resp.tool_calls.clone(),
         });
 
-        // 逐个执行工具。capture_screen 截图作 UserWithImages 回灌视觉模型;危险工具先 emit 提示。
+        // 逐个执行工具。capture_screen 截图作 UserWithImages 回灌视觉模型;危险工具先暂停等用户确认。
         let mut pending_images: Vec<String> = Vec::new();
         for call in &resp.tool_calls {
-            if computer::is_dangerous(&call.name) {
-                emit(format!("⚠ 危险操作 {}", call.name));
+            // 危险工具:暂停,emit agent-confirm 让前端弹确认框,等回执;拒绝 / 超时则不执行,
+            // 把「已拒绝」作为工具结果回灌模型,让它改用更安全的方式而非中断整个循环。
+            let result = if computer::is_dangerous(&call.name) {
+                emit(format!("⚠ 危险操作 {},待确认", call.name));
+                let (confirm_id, rx) = confirm_channel.open();
+                let _ = app.emit(
+                    "agent-confirm",
+                    json!({
+                        "conversationId": &conversation_id,
+                        "confirmId": confirm_id,
+                        "tool": &call.name,
+                        "args": &call.arguments,
+                    }),
+                );
+                let approved = match tokio::time::timeout(
+                    std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
+                    rx,
+                )
+                .await
+                {
+                    Ok(Ok(v)) => v,
+                    // 超时或发送端被 drop:按拒绝处理,并清理通道条目
+                    _ => {
+                        confirm_channel.cancel(confirm_id);
+                        false
+                    }
+                };
+                if approved {
+                    emit(format!("🔧 {}", call.name));
+                    registry.run(&call.name, call.arguments.clone()).await
+                } else {
+                    emit(format!("✗ 已拒绝 {}", call.name));
+                    crate::agent::core::ToolResult::err(format!(
+                        "用户拒绝执行危险操作「{}」。请勿重试该操作,改用更安全的方式,或先向用户说明原因再继续。",
+                        call.name
+                    ))
+                }
             } else {
                 emit(format!("🔧 {}", call.name));
-            }
-            let result = registry.run(&call.name, call.arguments.clone()).await;
+                registry.run(&call.name, call.arguments.clone()).await
+            };
             let flag = if result.is_error { "✗" } else { "✓" };
             emit(format!("{flag} {}", call.name));
 
@@ -182,18 +163,7 @@ pub async fn send_computer_message(
             } else {
                 result.content.clone()
             };
-            msg::ActiveModel {
-                conversation_id: Set(conversation_id.clone()),
-                role: Set("tool".to_string()),
-                content: Set(tool_text.clone()),
-                tool_call_id: Set(Some(call.id.clone())),
-                tool_name: Set(Some(call.name.clone())),
-                created_at: Set(Utc::now().timestamp()),
-                ..Default::default()
-            }
-            .insert(&state.db)
-            .await
-            .map_err(|e| CrawlerError::Config(format!("保存工具结果失败: {e}")))?;
+            insert_tool_result(&state.db, &conversation_id, call, &tool_text).await?;
             messages.push(ChatMsg::Tool {
                 tool_call_id: call.id.clone(),
                 content: tool_text,
@@ -216,25 +186,24 @@ pub async fn send_computer_message(
     }
 
     // 落库最终 assistant 消息
-    let final_msg = msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("assistant".to_string()),
-        content: Set(final_text),
-        created_at: Set(Utc::now().timestamp()),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+    let final_msg =
+        insert_final_assistant(&state.db, &conversation_id, final_text, final_reasoning).await?;
     emit("完成".to_string());
 
-    // 更新会话时间;首轮用用户首句起标题
-    let mut am = conversation.into_active_model();
-    am.updated_at = Set(Utc::now().timestamp());
-    if !had_messages {
-        am.title = Set(truncate_title(&text));
-    }
-    let _ = am.update(&state.db).await;
+    // 更新会话时间;首轮用用户首句起标题(统一走 core::shared)
+    finalize_conversation_meta(&state.db, conversation, had_messages, &text).await;
 
     Ok(MessageView::from(final_msg))
+}
+
+/// 前端对危险操作确认框的回执:approved=true 放行执行,false 拒绝。
+/// 由 `send_computer_message` 的 ReAct 循环等待端接收;未登记 / 已超时的 confirm_id 安全忽略。
+#[tauri::command]
+pub async fn resolve_agent_confirm(
+    state: State<'_, AppState>,
+    confirm_id: u64,
+    approved: bool,
+) -> Result<()> {
+    state.agent_confirm.complete(confirm_id, approved);
+    Ok(())
 }

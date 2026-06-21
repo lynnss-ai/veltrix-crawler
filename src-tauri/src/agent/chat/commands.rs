@@ -574,19 +574,23 @@ pub async fn send_chat_message_stream(
             timeout_secs: crate::llm::http::CHAT_TIMEOUT_SECS,
             retry_server_errors: false,
         },
-        move |delta| {
+        move |kind, delta| {
+            // kind 区分正文(content)与思考过程(reasoning),前端分别渲染
             let _ = app_emit.emit(
                 "chat-stream",
-                json!({ "conversationId": cid_emit, "delta": delta }),
+                json!({ "conversationId": cid_emit, "kind": kind, "delta": delta }),
             );
         },
     )
     .await?;
+    let reply_text = reply.content;
+    let reply_reasoning = reply.reasoning;
 
     let assistant = msg::ActiveModel {
         conversation_id: Set(conversation_id.clone()),
         role: Set("assistant".to_string()),
-        content: Set(reply.clone()),
+        content: Set(reply_text.clone()),
+        reasoning: Set(reply_reasoning),
         created_at: Set(Utc::now().timestamp()),
         ..Default::default()
     }
@@ -598,7 +602,7 @@ pub async fn send_chat_message_stream(
     let fallback_ref = session_provider_ref(&provider, &conversation.model);
 
     // 自动记忆提取:从本轮对话抽取值得长期记住的事实,异步落库,不阻塞回复返回
-    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply);
+    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply_text);
 
     // 滚动摘要维护:live 过长时把较旧消息折叠进会话摘要,异步进行,不阻塞回复返回
     spawn_summary_maintenance(&state.db, &conversation_id, fallback_ref.clone());
@@ -616,7 +620,7 @@ pub async fn send_chat_message_stream(
                 &title_ref.api_key,
                 &title_ref.model,
                 &text,
-                &reply,
+                &reply_text,
             )
             .await
             .unwrap_or_else(|| truncate_title(&text)),
@@ -630,6 +634,53 @@ pub async fn send_chat_message_stream(
     let _ = am.update(&state.db).await;
 
     Ok(assistant.into())
+}
+
+/// 把录制好的视频以附件方式作为一条 user 消息加入对话(引用本地路径,不重新上传 base64)。
+/// 录屏停止后前端按当前会话调用;返回新消息视图供前端追加渲染(内联播放器)。
+#[tauri::command]
+pub async fn attach_recording_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    path: String,
+) -> Result<MessageView> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(CrawlerError::Config("录制文件路径为空".into()));
+    }
+    let conversation = conv::Entity::find_by_id(conversation_id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
+    if conversation.owner != me.name {
+        return Err(CrawlerError::Config("无权操作该会话".into()));
+    }
+    let name = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "recording.mp4".to_string());
+    // 附件 JSON 与 persist_attachments 同口径:[{name,mime,path}](path 为本地绝对路径,走 asset 协议播放)
+    let attachments_json =
+        json!([{ "name": name, "mime": "video/mp4", "path": trimmed }]).to_string();
+    let now = Utc::now().timestamp();
+    let saved = msg::ActiveModel {
+        conversation_id: Set(conversation_id.clone()),
+        role: Set("user".to_string()),
+        content: Set(String::new()),
+        attachments: Set(Some(attachments_json)),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&state.db)
+    .await
+    .map_err(|e| CrawlerError::Config(format!("保存录制消息失败: {e}")))?;
+    // 抬升会话 updated_at,让其在侧栏置顶
+    let mut am = conversation.into_active_model();
+    am.updated_at = Set(now);
+    let _ = am.update(&state.db).await;
+    Ok(saved.into())
 }
 
 /// 把本轮对话的记忆提取放到后台 spawn 执行,避免阻塞回复返回。

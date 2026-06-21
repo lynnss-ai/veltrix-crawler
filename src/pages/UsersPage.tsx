@@ -42,6 +42,7 @@ import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
 import { RefreshButton } from "@/components/RefreshButton";
 import { Button } from "@/components/ui/button";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -457,33 +458,36 @@ function ResetPasswordSheet({
                 onChange={(e) => setPassword(e.target.value)}
                 aria-invalid={tooShort}
               />
-              <button
-                type="button"
-                onClick={() => setShow((s) => !s)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
-                title={show ? "隐藏" : "显示"}
-              >
-                {show ? (
-                  <EyeOff className="size-4" />
-                ) : (
-                  <Eye className="size-4" />
-                )}
-              </button>
+              <SimpleTooltip content={show ? "隐藏" : "显示"}>
+                <button
+                  type="button"
+                  onClick={() => setShow((s) => !s)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
+                  aria-label={show ? "隐藏密码" : "显示密码"}
+                >
+                  {show ? (
+                    <EyeOff className="size-4" />
+                  ) : (
+                    <Eye className="size-4" />
+                  )}
+                </button>
+              </SimpleTooltip>
             </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              className="shrink-0"
-              title="重新生成"
-              onClick={() => {
-                setPassword(generatePassword());
-                setShow(true);
-              }}
-            >
-              <RefreshCw />
-              <span className="sr-only">重新生成</span>
-            </Button>
+            <SimpleTooltip content="重新生成">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="shrink-0"
+                aria-label="重新生成"
+                onClick={() => {
+                  setPassword(generatePassword());
+                  setShow(true);
+                }}
+              >
+                <RefreshCw />
+              </Button>
+            </SimpleTooltip>
           </div>
           <FieldError
             show={tooShort}
@@ -728,36 +732,36 @@ function UserForm({
                       onChange={(e) => setPassword(e.target.value)}
                       aria-invalid={submitted && !password}
                     />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword((s) => !s)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
-                      title={showPassword ? "隐藏" : "显示"}
-                    >
-                      {showPassword ? (
-                        <EyeOff className="size-4" />
-                      ) : (
-                        <Eye className="size-4" />
-                      )}
-                      <span className="sr-only">
-                        {showPassword ? "隐藏密码" : "显示密码"}
-                      </span>
-                    </button>
+                    <SimpleTooltip content={showPassword ? "隐藏" : "显示"}>
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((s) => !s)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
+                        aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                      >
+                        {showPassword ? (
+                          <EyeOff className="size-4" />
+                        ) : (
+                          <Eye className="size-4" />
+                        )}
+                      </button>
+                    </SimpleTooltip>
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className="shrink-0"
-                    title="重新生成"
-                    onClick={() => {
-                      setPassword(generatePassword());
-                      setShowPassword(true);
-                    }}
-                  >
-                    <RefreshCw />
-                    <span className="sr-only">重新生成</span>
-                  </Button>
+                  <SimpleTooltip content="重新生成">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="shrink-0"
+                      aria-label="重新生成"
+                      onClick={() => {
+                        setPassword(generatePassword());
+                        setShowPassword(true);
+                      }}
+                    >
+                      <RefreshCw />
+                    </Button>
+                  </SimpleTooltip>
                 </div>
                 <p className="text-xs text-muted-foreground">
                   系统随机生成(大小写字母 + 数字),可查看 / 刷新 / 手动修改

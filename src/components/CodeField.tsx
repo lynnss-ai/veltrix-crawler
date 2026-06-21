@@ -3,6 +3,7 @@ import { Check, Copy, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 
 // 编码字符集(去掉易混淆的 0/O/1/I/L)与长度
 const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -43,28 +44,30 @@ export function CodeField({
   return (
     <div className="flex items-center gap-2">
       <Input id={id} value={value} readOnly className="font-mono" />
-      <Button
-        type="button"
-        variant="outline"
-        size="icon"
-        className="shrink-0"
-        title="重新生成"
-        onClick={onRegenerate}
-      >
-        <RefreshCw />
-        <span className="sr-only">重新生成</span>
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="icon"
-        className="shrink-0"
-        title={copied ? "已复制" : "复制"}
-        onClick={handleCopy}
-      >
-        {copied ? <Check /> : <Copy />}
-        <span className="sr-only">复制</span>
-      </Button>
+      <SimpleTooltip content="重新生成">
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="shrink-0"
+          aria-label="重新生成"
+          onClick={onRegenerate}
+        >
+          <RefreshCw />
+        </Button>
+      </SimpleTooltip>
+      <SimpleTooltip content={copied ? "已复制" : "复制"}>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="shrink-0"
+          aria-label="复制"
+          onClick={handleCopy}
+        >
+          {copied ? <Check /> : <Copy />}
+        </Button>
+      </SimpleTooltip>
     </div>
   );
 }

@@ -14,7 +14,6 @@ import { FieldError } from "@/components/FieldError";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -69,7 +68,7 @@ export function ProvidersSection({
         enableSorting: false,
         cell: ({ row }) => (
           <span
-            className="block max-w-[24rem] truncate font-mono text-xs text-muted-foreground"
+            className="block max-w-[16rem] truncate font-mono text-xs text-muted-foreground"
             title={row.original.apiUrl}
           >
             {row.original.apiUrl || "—"}
@@ -85,26 +84,36 @@ export function ProvidersSection({
           return models.length === 0 ? (
             <span className="text-muted-foreground">—</span>
           ) : (
-            <div className="flex flex-wrap gap-1.5">
+            // 每个模型独占一行(名称 + 能力图标),行间虚线分割
+            <div className="flex min-w-[20rem] flex-col divide-y divide-dashed divide-border">
               {models.map((m) => (
-                <Badge
+                <div
                   key={m.name}
-                  variant="secondary"
-                  className="gap-1.5 font-normal"
+                  className="flex items-center gap-2 py-1.5 first:pt-0 last:pb-0"
                 >
-                  {m.name}
+                  {/* 名称固定宽度,保证各行能力图标纵向对齐;超长截断,完整名见 title */}
+                  <span
+                    className="w-[12rem] shrink-0 truncate font-medium text-foreground"
+                    title={m.name}
+                  >
+                    {m.name}
+                  </span>
                   {m.capabilities.length > 0 && (
-                    <span className="flex items-center gap-0.5 text-muted-foreground">
+                    // 能力用文字标识药丸,过多时自动换行包裹
+                    <span className="flex flex-wrap items-center gap-1">
                       {MODEL_CAPABILITIES.filter((c) =>
                         m.capabilities.includes(c.code),
                       ).map((c) => (
-                        <SimpleTooltip key={c.code} content={c.label}>
-                          <c.icon className="size-3" />
-                        </SimpleTooltip>
+                        <span
+                          key={c.code}
+                          className="rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground"
+                        >
+                          {c.label}
+                        </span>
                       ))}
                     </span>
                   )}
-                </Badge>
+                </div>
               ))}
             </div>
           );

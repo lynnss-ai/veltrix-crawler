@@ -340,6 +340,7 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("tool_call_id", "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT"),
         ("tool_name", "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT"),
         ("attachments", "ALTER TABLE chat_messages ADD COLUMN attachments TEXT"),
+        ("reasoning", "ALTER TABLE chat_messages ADD COLUMN reasoning TEXT"),
     ] {
         if !column_exists(db, "chat_messages", col).await {
             if let Err(e) = db
@@ -357,6 +358,12 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("embedding", "ALTER TABLE chat_memories ADD COLUMN embedding TEXT"),
         ("embed_model", "ALTER TABLE chat_memories ADD COLUMN embed_model TEXT"),
         ("pinned", "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0"),
+        // 记忆模块深化:分类 + 重要度/置信度打分 + 命中计数/时间衰减(检索排序与淘汰用)
+        ("mem_type", "ALTER TABLE chat_memories ADD COLUMN mem_type TEXT NOT NULL DEFAULT 'other'"),
+        ("importance", "ALTER TABLE chat_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3"),
+        ("confidence", "ALTER TABLE chat_memories ADD COLUMN confidence INTEGER NOT NULL DEFAULT 3"),
+        ("hit_count", "ALTER TABLE chat_memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0"),
+        ("last_hit_at", "ALTER TABLE chat_memories ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !column_exists(db, "chat_memories", col).await {
             if let Err(e) = db

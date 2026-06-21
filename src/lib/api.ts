@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -25,6 +25,11 @@ export const api = {
     invoke<void>("set_database_config", { url, maxConnections }),
   setStoragePath: (path: string) =>
     invoke<void>("set_storage_path", { path }),
+  // 智能体可编辑附加规范(kind: coding/computer/rpa);下一轮对话注入生效,无需重启
+  getAgentGuidelines: (kind: string) =>
+    invoke<string>("get_agent_guidelines", { kind }),
+  setAgentGuidelines: (kind: string, text: string) =>
+    invoke<void>("set_agent_guidelines", { kind, text }),
   // 保存语音转写配置(系统设置「语音转写」)
   setTranscriptionConfig: (apiUrl: string, model: string, apiKey: string) =>
     invoke<void>("set_transcription_config", { apiUrl, model, apiKey }),
@@ -161,9 +166,23 @@ export const api = {
   // 电脑操作 Agent:聚合桌面/文件/进程/OCR/UIA/HTTP/终端工具的 ReAct 循环
   sendComputerMessage: (conversationId: string, content: string) =>
     invoke<ChatMessageView>("send_computer_message", { conversationId, content }),
+  // 危险操作确认回执:approved=true 放行后端执行,false 拒绝(后端把「已拒绝」回灌模型)
+  resolveAgentConfirm: (confirmId: number, approved: boolean) =>
+    invoke<void>("resolve_agent_confirm", { confirmId, approved }),
   // 截当前桌面屏幕,返回 PNG 的 data URL(电脑操作 Agent 右栏预览用);target 空=主屏
   captureDesktopScreenshot: (target?: string) =>
     invoke<string>("capture_desktop_screenshot", { target: target ?? null }),
+  // 屏幕录制:打开悬浮条(不录制)/ 取消 / 开始(最小化主窗口 + ffmpeg 录全屏)/ 停止 / 查状态
+  openRecordingOverlay: () => invoke<void>("open_recording_overlay"),
+  cancelRecordingOverlay: () => invoke<void>("cancel_recording_overlay"),
+  // 仅录视频(不录音频)
+  startScreenRecording: () =>
+    invoke<RecordingStatus>("start_screen_recording"),
+  stopScreenRecording: () => invoke<RecordingStatus>("stop_screen_recording"),
+  getRecordingStatus: () => invoke<RecordingStatus>("get_recording_status"),
+  // 录屏停止后:把视频以附件方式加入指定对话(引用本地路径),返回新消息
+  attachRecordingMessage: (conversationId: string, path: string) =>
+    invoke<ChatMessageView>("attach_recording_message", { conversationId, path }),
   // 按右栏 DOM 区域(逻辑坐标,相对主窗口客户区)定位内嵌 Agent webview;未创建则静默忽略
   setAgentWebviewBounds: (
     conversationId: string,
@@ -206,9 +225,11 @@ export const api = {
   // 回退:丢弃本轮 Agent 的文件改动,回到最近检查点(发送前状态)
   checkpointRollback: (conversationId: string) =>
     invoke<string>("checkpoint_rollback", { conversationId }),
-  // 版本回退:列出工作区检查点历史 / 回退到指定版本(git reset)
+  // 版本管理:列出检查点历史 / 取某版本改动详情 / 回退到指定版本(git reset)
   listCodingCheckpoints: (conversationId: string) =>
     invoke<CheckpointView[]>("list_coding_checkpoints", { conversationId }),
+  getCheckpointDiff: (conversationId: string, hash: string) =>
+    invoke<CheckpointDiffView>("get_checkpoint_diff", { conversationId, hash }),
   rollbackToCheckpoint: (conversationId: string, hash: string) =>
     invoke<string>("rollback_to_checkpoint", { conversationId, hash }),
   // 文件面板:列出工作区真实文件树 / 读取某文件内容
@@ -257,10 +278,26 @@ export const api = {
 
   // AI 对话:长期记忆(跨会话,设置页「AI 记忆」管理)
   listChatMemories: () => invoke<ChatMemoryView[]>("list_chat_memories"),
-  addChatMemory: (content: string) =>
-    invoke<ChatMemoryView>("add_chat_memory", { content }),
-  updateChatMemory: (id: number, content: string, enabled: boolean) =>
-    invoke<void>("update_chat_memory", { id, content, enabled }),
+  addChatMemory: (content: string, memType?: string, importance?: number) =>
+    invoke<ChatMemoryView>("add_chat_memory", {
+      content,
+      memType: memType ?? null,
+      importance: importance ?? null,
+    }),
+  updateChatMemory: (
+    id: number,
+    content: string,
+    enabled: boolean,
+    memType?: string,
+    importance?: number,
+  ) =>
+    invoke<void>("update_chat_memory", {
+      id,
+      content,
+      enabled,
+      memType: memType ?? null,
+      importance: importance ?? null,
+    }),
   deleteChatMemory: (id: number) =>
     invoke<void>("delete_chat_memory", { id }),
   clearChatMemories: () => invoke<void>("clear_chat_memories"),

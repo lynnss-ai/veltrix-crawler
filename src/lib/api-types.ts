@@ -176,6 +176,8 @@ export interface ChatMessageView {
   toolName?: string | null;
   // user 消息附件(图片 + 文件);无附件为空数组 / 缺省
   attachments?: MessageAttachment[];
+  // assistant 思考过程(模型推理内容);仅推理型模型非空,前端折叠展示
+  reasoning?: string | null;
   createdAt: number;
 }
 
@@ -202,6 +204,20 @@ export interface CheckpointView {
   message: string; // 该轮任务标签
 }
 
+// 编程 Agent:某版本里单个文件的改动
+export interface CheckpointFileDiff {
+  status: "added" | "modified" | "deleted" | "renamed" | string;
+  path: string;
+  additions: number;
+  deletions: number;
+  diff: string; // 该文件的 unified diff 正文
+}
+
+// 编程 Agent:某版本(检查点)的完整改动详情
+export interface CheckpointDiffView {
+  files: CheckpointFileDiff[];
+}
+
 // 编程 Agent:沙盒配置(默认 Docker;Docker 不可用时命令自动回退本机执行)
 export interface SandboxConfigView {
   image: string;
@@ -218,6 +234,15 @@ export interface SandboxStatsView {
   memPerc: string; // 如 "1.56%"
 }
 
+// 记忆分类:身份 / 偏好 / 项目 / 人际 / 习惯 / 其它(与后端 MEM_TYPES 对应)
+export type MemoryType =
+  | "identity"
+  | "preference"
+  | "project"
+  | "relationship"
+  | "habit"
+  | "other";
+
 // AI 对话:长期记忆(跨会话,按用户归属)
 export interface ChatMemoryView {
   id: number;
@@ -226,6 +251,14 @@ export interface ChatMemoryView {
   enabled: boolean;
   /** 置顶:每轮恒注入,不参与相似度淘汰 */
   pinned: boolean;
+  /** 分类 */
+  memType: MemoryType;
+  /** 重要度 1-5 */
+  importance: number;
+  /** 置信度 1-5 */
+  confidence: number;
+  /** 命中次数(被注入的累计次数) */
+  hitCount: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -685,4 +718,14 @@ export interface CloudPairView {
   qr_payload: string;
   expires_in: number;
   base_url: string;
+}
+
+// 屏幕录制状态(对应后端 RecordingStatus)
+export interface RecordingStatus {
+  // 是否正在录制
+  recording: boolean;
+  // 开始时间(Unix 秒);未录制为 null
+  startedAt: number | null;
+  // 输出 MP4 路径;未录制为 null
+  outputPath: string | null;
 }

@@ -19,6 +19,18 @@ const MAX_RETRIES: u32 = 3;
 /// 指数退避基数(毫秒)。
 const RETRY_BASE_MS: u64 = 800;
 
+/// 幂等拼接厂商 endpoint:base 已以 suffix 结尾则原样返回,否则去尾斜杠后追加。
+/// suffix 以 / 开头(如 `/chat/completions`、`/embeddings`)。统一「填 base 或填完整 URL 都对」的逻辑,
+/// 供 chat / embedding / agent core 共用,避免三处各写一份拼接规则后分叉。
+pub fn join_endpoint(base: &str, suffix: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with(suffix) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{suffix}")
+    }
+}
+
 /// 构造带连接/总超时的 reqwest client。
 pub fn build_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
     reqwest::Client::builder()

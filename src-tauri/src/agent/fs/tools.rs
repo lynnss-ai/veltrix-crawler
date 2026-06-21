@@ -419,6 +419,10 @@ impl Tool for CopyFileTool {
         let src = src.trim().to_string();
         let dest = dest.trim().to_string();
         let joined = tokio::task::spawn_blocking(move || {
+            // dest 会被覆盖写入,过护栏(与 write/move/delete 一致;src 仅读不设限)
+            if let Some(reason) = protected_path_reason(&dest) {
+                return Err(format!("拒绝复制:{reason}"));
+            }
             if !Path::new(&src).is_file() {
                 return Err(format!("源不是文件或不存在: {src}"));
             }
@@ -511,6 +515,10 @@ impl Tool for MakeDirTool {
             return ToolResult::err("path 不能为空");
         }
         let joined = tokio::task::spawn_blocking(move || {
+            // 在系统关键目录下建目录同样有害,过护栏
+            if let Some(reason) = protected_path_reason(&path) {
+                return Err(format!("拒绝创建:{reason}"));
+            }
             std::fs::create_dir_all(&path).map_err(|e| format!("创建目录失败: {e}"))?;
             Ok::<String, String>(format!("已创建目录 {path}"))
         })

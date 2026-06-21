@@ -26,12 +26,7 @@ pub struct ChatRequest<'a> {
 
 /// 拼接 chat completions endpoint;api_url 已含该路径(用户填了完整 URL)时不重复拼。
 fn chat_endpoint(api_url: &str) -> String {
-    let trimmed = api_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
-    }
+    http::join_endpoint(api_url, "/chat/completions")
 }
 
 /// 调用 `{api_url}/chat/completions`,返回 `choices[0].message.content`。
@@ -83,13 +78,20 @@ pub async fn chat_completion(req: ChatRequest<'_>) -> Result<String> {
     }
 }
 
-/// 流式 chat:请求体带 `stream:true`,按 SSE 逐块解析 `choices[0].delta.content`,
-/// 每拿到一段增量就调 `on_delta`(供命令层 emit 给前端实现打字机效果),返回拼接后的完整文本。
+/// 流式 chat 的完整产出:正文 + 思考过程(推理型模型才有 reasoning)。
+pub struct StreamOutcome {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+/// 流式 chat:请求体带 `stream:true`,按 SSE 逐块解析 `choices[0].delta`,正文走 content、
+/// 思考过程走 reasoning_content/reasoning。每拿到一段增量就调 `on_delta(kind, piece)`
+///(kind ∈ {"content","reasoning"},供命令层按类型 emit 给前端),返回拼接后的正文与完整思考过程。
 ///
 /// 不走 send_with_retry:流式响应需按字节流读取且重试语义复杂,这里单次请求即可。
-pub async fn chat_completion_stream<F>(req: ChatRequest<'_>, mut on_delta: F) -> Result<String>
+pub async fn chat_completion_stream<F>(req: ChatRequest<'_>, mut on_delta: F) -> Result<StreamOutcome>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, &str),
 {
     use futures_util::StreamExt;
 
@@ -131,6 +133,7 @@ where
 
     let mut stream = resp.bytes_stream();
     let mut full = String::new();
+    let mut reasoning = String::new();
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| CrawlerError::Config(format!("读取流失败: {e}")))?;
@@ -147,26 +150,44 @@ where
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(delta) = v
+                let delta = v
                     .get("choices")
                     .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.get("delta"));
+                let Some(delta) = delta else { continue };
+                if let Some(piece) = delta.get("content").and_then(Value::as_str) {
+                    if !piece.is_empty() {
+                        full.push_str(piece);
+                        on_delta("content", piece);
+                    }
+                }
+                // 思考过程增量:字段不一,优先 reasoning_content,回退 reasoning
+                if let Some(piece) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
                     .and_then(Value::as_str)
                 {
-                    if !delta.is_empty() {
-                        full.push_str(delta);
-                        on_delta(delta);
+                    if !piece.is_empty() {
+                        reasoning.push_str(piece);
+                        on_delta("reasoning", piece);
                     }
                 }
             }
         }
     }
 
+    // 仅有思考过程而无正文也算异常(正常收尾必有正文);两者皆空才报错
     if full.is_empty() {
         return Err(CrawlerError::Config(
             "大模型未返回内容(可能被风控拦截或配额不足)".into(),
         ));
     }
-    Ok(full)
+    Ok(StreamOutcome {
+        content: full,
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+    })
 }

@@ -70,6 +70,11 @@ pub struct AppState {
     pub app_handle: AppHandle,
     /// 自主续航编程 Agent 的「请求停止」会话集合(stop_coding_agent 写入,续航循环每步消费)。
     pub agent_cancel: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Agent 危险操作「暂停 — 等用户确认」通道(ReAct 循环命中危险工具时等待,前端
+    /// `resolve_agent_confirm` 回执)。
+    pub agent_confirm: Arc<crate::agent::core::shared::AgentConfirmChannel>,
+    /// 电脑操作 Agent 的屏幕录制状态(同一时刻仅一个录制会话)。
+    pub recording: crate::agent::computer::recorder::RecordingState,
 }
 
 /// 全局同时进行的采集任务数上限(占用 WebView 窗口的阶段)。取 3:兼顾吞吐与资源占用,
@@ -214,6 +219,42 @@ pub fn set_storage_path(state: State<'_, AppState>, path: String) -> Result<()> 
     let mut cfg = lock_config(&state)?;
     cfg.media.output_dir = path;
     cfg.save(&state.config_dir)
+}
+
+/// 读取某 agent(coding/computer/rpa)的用户自定义附加规范文本(无则空串)。供设置页回填。
+#[tauri::command]
+pub async fn get_agent_guidelines(state: State<'_, AppState>, kind: String) -> Result<String> {
+    use crate::agent::core::shared::{is_valid_guidelines_kind, load_agent_guidelines};
+    if !is_valid_guidelines_kind(&kind) {
+        return Err(CrawlerError::Config("无效的 agent 类型".into()));
+    }
+    Ok(load_agent_guidelines(&state.config_dir, &kind)
+        .await
+        .unwrap_or_default())
+}
+
+/// 保存某 agent 的用户自定义附加规范(写入 <config_dir>/agent-guidelines/<kind>.md;空串=清空)。
+/// 下一轮该 agent 对话即注入生效,无需重启。
+#[tauri::command]
+pub async fn set_agent_guidelines(
+    state: State<'_, AppState>,
+    kind: String,
+    text: String,
+) -> Result<()> {
+    use crate::agent::core::shared::{agent_guidelines_path, is_valid_guidelines_kind};
+    if !is_valid_guidelines_kind(&kind) {
+        return Err(CrawlerError::Config("无效的 agent 类型".into()));
+    }
+    let path = agent_guidelines_path(&state.config_dir, &kind);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("创建规范目录失败: {e}")))?;
+    }
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("保存规范失败: {e}")))?;
+    Ok(())
 }
 
 /// 保存评论意向分析配置(系统设置「意向分析」)。只存对 providers/prompts 的 id 引用 +

@@ -9,6 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronDown,
@@ -17,14 +18,20 @@ import {
   Loader2,
   Network,
   Pencil,
+  Plus,
   Send,
   Trash2,
+  Video,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { api, type ChatMessageView, type NetworkEntryView } from "@/lib/api";
 import { useChat } from "@/hooks/use-chat";
+import { useAgentStepListener } from "@/hooks/use-agent-step-listener";
+import { useScreenRecording } from "@/hooks/use-screen-recording";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
+import { ReasoningBlock } from "@/components/ReasoningBlock";
+import { RecordingChip } from "@/components/RecordingChip";
 import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -79,6 +86,9 @@ function briefArgs(name: string, args: Record<string, unknown>): string {
   return JSON.stringify(args);
 }
 
+// 消息列表初始只渲染最近 N 条(长 ReAct 对话切换时避免一次性解析全部),可「加载更早」
+const MSG_PAGE_SIZE = 30;
+
 export function RpaLayout() {
   const {
     conversations,
@@ -92,8 +102,12 @@ export function RpaLayout() {
   const active = conversations.find((c) => c.id === activeId) ?? null;
   const pendingRef = useRef(pendingFirstMessage);
   pendingRef.current = pendingFirstMessage;
+  // 抑制「本次发送自建的新会话」触发加载 effect:setActiveId 会让加载与发送抢跑致首条消息重复/闪烁
+  const skipLoadRef = useRef<string | null>(null);
 
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
+  // 当前会话只渲染最近 visibleCount 条;切会话重置,「加载更早」时增加
+  const [visibleCount, setVisibleCount] = useState(MSG_PAGE_SIZE);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [steps, setSteps] = useState<string[]>([]);
@@ -101,6 +115,10 @@ export function RpaLayout() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // 屏幕录制:加号点击打开悬浮控制条;停止后视频先「挂起」到输入区,发送时才一并加入对话
+  const [pendingRecording, setPendingRecording] = useState<string | null>(null);
+  const { openOverlay: openScreenRecording } =
+    useScreenRecording(handleRecordingSaved);
   // 浏览器(RPA)智能体走 ReAct + function calling,只列具备「工具调用」能力的模型。
   const models = useMemo(() => {
     const opts: { providerId: string; model: string }[] = [];
@@ -120,11 +138,17 @@ export function RpaLayout() {
 
   // 切会话加载消息(交接时跳过,交给发送流程)
   useEffect(() => {
+    setVisibleCount(MSG_PAGE_SIZE); // 切会话回到「只渲染最近 N 条」
     if (!activeId) {
       setMessages([]);
       return;
     }
     if (pendingRef.current) return;
+    // 本次发送刚自建的会话:消息由发送流程维护,跳过这次加载
+    if (skipLoadRef.current === activeId) {
+      skipLoadRef.current = null;
+      return;
+    }
     api
       .listChatMessages(activeId)
       .then(setMessages)
@@ -141,33 +165,63 @@ export function RpaLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingFirstMessage, activeId]);
 
-  // Agent 进度事件(仅当前发送会话)
-  useEffect(() => {
-    let dispose: (() => void) | undefined;
-    let disposed = false;
-    listen<{ conversationId: string; label: string }>("agent-step", (e) => {
-      if (sendingConvRef.current !== e.payload.conversationId) return;
-      setSteps((prev) => [...prev, e.payload.label]);
-    }).then(
-      (fn) => {
-        if (disposed) fn();
-        else dispose = fn;
-      },
-      () => {},
-    );
-    return () => {
-      disposed = true;
-      dispose?.();
-    };
-  }, []);
+  // Agent 进度事件(仅当前发送会话):统一走 useAgentStepListener
+  useAgentStepListener(sendingConvRef, setSteps);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, steps, sending]);
 
+  // 录屏停止后:把视频「挂起」到输入区(待发送),由用户决定何时连同指令一并加入对话
+  function handleRecordingSaved(path: string) {
+    setPendingRecording(path);
+    toast.success("屏幕录制已就绪,将随下条消息一并加入对话");
+  }
+
+  // 仅发送待发送的录屏(输入框无文字时):落库视频消息,不触发 Agent 回合
+  async function sendRecordingOnly() {
+    const recording = pendingRecording;
+    if (!recording) return;
+    try {
+      let convId = activeId;
+      if (!convId) {
+        if (models.length === 0) {
+          toast.error("尚无可用模型:请先配置模型或开始一个对话,再录屏");
+          return;
+        }
+        const conv = await api.createConversation(
+          crypto.randomUUID(),
+          models[0].providerId,
+          models[0].model,
+          "rpa",
+        );
+        convId = conv.id;
+        skipLoadRef.current = conv.id;
+        setActiveId(conv.id);
+      }
+      const msg = await api.attachRecordingMessage(convId, recording);
+      setMessages((prev) => [...prev, msg]);
+      setPendingRecording(null);
+      await reload();
+    } catch (e) {
+      toast.error(`添加录屏到对话失败: ${e}`);
+    }
+  }
+
+  // 发送:有文字走 Agent 回合(回合内会先落库待发送录屏);仅录屏无文字则只落库视频
+  function handleSend() {
+    const text = input.trim();
+    if (text) {
+      void doSend(text);
+    } else if (pendingRecording) {
+      void sendRecordingOnly();
+    }
+  }
+
   async function doSend(text: string) {
     if (dispatchingRef.current || !text || sending) return;
+    const recording = pendingRecording; // 本次随消息一并发送的待发送录屏(若有)
     if (!activeId && models.length === 0) {
       toast.error("尚无可用模型:浏览器 Agent 需具备「工具调用」能力的模型,请到系统配置 → 模型厂商勾选");
       return;
@@ -195,7 +249,13 @@ export function RpaLayout() {
           "rpa",
         );
         convId = conv.id;
+        skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的本会话加载,防首条消息重复
         setActiveId(conv.id);
+      }
+      // 待发送录屏:先落库为一条视频消息(排在本轮指令之前),清除挂起态
+      if (recording) {
+        await api.attachRecordingMessage(convId, recording);
+        setPendingRecording(null);
       }
       sendingConvRef.current = convId;
       await api.sendBrowserMessage(convId, text);
@@ -350,7 +410,26 @@ export function RpaLayout() {
               description="描述要在浏览器里做的操作(导航 / 点击 / 输入 / 看接口)。我会在右侧内嵌浏览器中亲自操作,并实时回读页面与接口数据。"
             />
           ) : (
-            messages.map((m) => <RpaMessage key={m.id} message={m} />)
+            <>
+              {messages.length > visibleCount && (
+                <div className="flex justify-center">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs text-muted-foreground"
+                    onClick={() => setVisibleCount((c) => c + MSG_PAGE_SIZE)}
+                  >
+                    加载更早的消息({messages.length - visibleCount})
+                  </Button>
+                </div>
+              )}
+              {(messages.length > visibleCount
+                ? messages.slice(messages.length - visibleCount)
+                : messages
+              ).map((m) => (
+                <RpaMessage key={m.id} message={m} />
+              ))}
+            </>
           )}
           {sending && (
             <div className="space-y-1">
@@ -370,29 +449,53 @@ export function RpaLayout() {
 
         {/* 输入 */}
         <div className="shrink-0 px-4 pb-3">
-          <div className="flex items-end gap-2 rounded-2xl border bg-card p-2 shadow-lg">
+          <div className="flex flex-col gap-1 rounded-2xl border bg-card p-2 shadow-lg">
+            {pendingRecording && (
+              <RecordingChip onRemove={() => setPendingRecording(null)} />
+            )}
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  if (!sending) void doSend(input.trim());
+                  if (!sending) handleSend();
                 }
               }}
               placeholder="描述浏览器操作,Enter 发送 / Shift+Enter 换行"
               className="veltrix-thin-scrollbar max-h-52 min-h-10 w-full resize-none border-0 bg-transparent px-2 py-2 text-[15px] leading-6 shadow-none focus-visible:ring-0 dark:bg-transparent"
               rows={1}
             />
-            <Button
-              type="button"
-              size="icon"
-              className="size-9 shrink-0 cursor-pointer rounded-xl"
-              disabled={sending || !input.trim()}
-              onClick={() => void doSend(input.trim())}
-            >
-              {sending ? <Loader2 className="animate-spin" /> : <Send />}
-            </Button>
+            {/* 第二行:左侧加号(更多功能,含录屏)/ 右侧发送 */}
+            <div className="flex items-center justify-between gap-2">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 shrink-0 cursor-pointer rounded-xl"
+                  >
+                    <Plus />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" side="top">
+                  <DropdownMenuItem onClick={() => void openScreenRecording()}>
+                    <Video className="size-4" />
+                    屏幕录制
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Button
+                type="button"
+                size="icon"
+                className="size-9 shrink-0 cursor-pointer rounded-xl"
+                disabled={sending || (!input.trim() && !pendingRecording)}
+                onClick={() => handleSend()}
+              >
+                {sending ? <Loader2 className="animate-spin" /> : <Send />}
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -628,11 +731,26 @@ function NetworkPanel({ activeId }: { activeId: string | null }) {
 // 单条消息:user 气泡 / assistant 文本+工具调用 / tool 结果行
 function RpaMessage({ message: m }: { message: ChatMessageView }) {
   if (m.role === "user") {
+    // 视频附件(如屏幕录制):内联播放器;有正文才渲染气泡
+    const videos = (m.attachments ?? []).filter((a) =>
+      a.mime.startsWith("video/"),
+    );
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3 py-2 text-sm text-foreground">
-          {m.content}
-        </div>
+      <div className="flex flex-col items-end gap-1.5">
+        {videos.map((a, i) => (
+          <video
+            key={i}
+            src={a.path ? convertFileSrc(a.path) : ""}
+            controls
+            preload="metadata"
+            className="max-h-72 w-full max-w-md rounded-lg border border-border/60 bg-black"
+          />
+        ))}
+        {m.content.trim() && (
+          <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3 py-2 text-sm text-foreground">
+            {m.content}
+          </div>
+        )}
       </div>
     );
   }
@@ -653,6 +771,7 @@ function RpaMessage({ message: m }: { message: ChatMessageView }) {
   const calls = parseToolCalls(m.toolCalls);
   return (
     <div className="space-y-1.5">
+      {m.reasoning?.trim() && <ReasoningBlock reasoning={m.reasoning} />}
       {m.content.trim() && <MarkdownMessage content={m.content} />}
       {calls.map((c) => (
         <div

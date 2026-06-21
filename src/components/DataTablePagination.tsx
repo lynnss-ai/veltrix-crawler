@@ -1,23 +1,8 @@
 import { type Table } from "@tanstack/react-table";
-import {
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Pagination, DEFAULT_PAGE_SIZE_OPTIONS } from "@/components/Pagination";
 
-// 表格分页栏(参考 shadcn dashboard-01):已选计数 + 每页行数 + 页码 + 首/上/下/末页。
-const DEFAULT_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
-
+// 表格分页栏:把 @tanstack/react-table 的分页状态适配为通用 Pagination 的受控属性,
+// 渲染交给 Pagination,避免与非表格列表的分页样式各写一套。
 interface DataTablePaginationProps<TData> {
   table: Table<TData>;
   pageSizeOptions?: number[];
@@ -30,85 +15,17 @@ export function DataTablePagination<TData>({
   itemLabel = "行",
 }: DataTablePaginationProps<TData>) {
   const { pageIndex, pageSize } = table.getState().pagination;
-  const pageCount = Math.max(1, table.getPageCount());
-  const totalCount = table.getFilteredRowModel().rows.length;
 
   return (
-    <div className="flex w-full items-center justify-between gap-4">
-      <span className="hidden flex-1 text-sm text-muted-foreground sm:inline">
-        共 {totalCount} {itemLabel}
-      </span>
-      <div className="flex items-center gap-4 sm:gap-6 lg:gap-8">
-        <div className="flex items-center gap-2">
-          <Label htmlFor="rows-per-page" className="text-sm font-medium">
-            每页行数
-          </Label>
-          <Select
-            value={String(pageSize)}
-            onValueChange={(v) => table.setPageSize(Number(v))}
-          >
-            {/* data-pagination:让页面级 FORM_CONTROL_SIZING 的 :not 排除它,保持紧凑 h-7 与翻页图标等高 */}
-            <SelectTrigger
-              size="sm"
-              id="rows-per-page"
-              data-pagination="true"
-              className="h-7 w-20"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent side="top">
-              {pageSizeOptions.map((size) => (
-                <SelectItem key={size} value={String(size)}>
-                  {size}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex h-7 w-fit items-center justify-center text-sm font-medium">
-          第 {pageIndex + 1} / {pageCount} 页
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="icon-sm"
-            className="hidden lg:flex"
-            onClick={() => table.setPageIndex(0)}
-            disabled={!table.getCanPreviousPage()}
-          >
-            <ChevronsLeft />
-            <span className="sr-only">首页</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="icon-sm"
-            onClick={() => table.previousPage()}
-            disabled={!table.getCanPreviousPage()}
-          >
-            <ChevronLeft />
-            <span className="sr-only">上一页</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="icon-sm"
-            onClick={() => table.nextPage()}
-            disabled={!table.getCanNextPage()}
-          >
-            <ChevronRight />
-            <span className="sr-only">下一页</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="icon-sm"
-            className="hidden lg:flex"
-            onClick={() => table.setPageIndex(pageCount - 1)}
-            disabled={!table.getCanNextPage()}
-          >
-            <ChevronsRight />
-            <span className="sr-only">末页</span>
-          </Button>
-        </div>
-      </div>
-    </div>
+    <Pagination
+      pageIndex={pageIndex}
+      pageCount={table.getPageCount()}
+      onPageChange={(i) => table.setPageIndex(i)}
+      totalCount={table.getFilteredRowModel().rows.length}
+      itemLabel={itemLabel}
+      pageSize={pageSize}
+      pageSizeOptions={pageSizeOptions}
+      onPageSizeChange={(size) => table.setPageSize(size)}
+    />
   );
 }

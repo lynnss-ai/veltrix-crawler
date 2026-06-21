@@ -239,34 +239,41 @@ pub enum RpaStep {
 /// 打开真实页面用 DevTools 校准后修正;校准前可能 `waitFor` 超时。未列平台返回空 = 走旧逻辑。
 fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
     match platform_id {
-        // 小红书:首页搜索框逐字输入 → 回车 → 等结果列表 → 分段滚动翻页
-        "xhs" => vec![
-            RpaStep::WaitFor {
-                selector: "#search-input".into(),
-                timeout_ms: 10_000,
-            },
-            RpaStep::Click {
-                selector: "#search-input".into(),
-            },
-            RpaStep::Type {
-                selector: "#search-input".into(),
-                text: "{keyword}".into(),
-            },
-            RpaStep::Pause {
-                min_ms: 400,
-                max_ms: 900,
-            },
-            RpaStep::PressEnter {
-                selector: "#search-input".into(),
-            },
-            RpaStep::WaitFor {
-                // 搜索结果页特有的频道栏(全部/图文/视频/用户),首页没有,可靠判断「已进入结果页」
-                selector: "#channel-container".into(),
-                timeout_ms: 12_000,
-            },
-            // 作为最大滚动轮数上限;实际滚到底(内容不再增长)自动停
-            RpaStep::Scroll { segments: 40 },
-        ],
+        // 小红书:信息流搜索框逐字输入 → 点搜索图标提交 → 等结果频道栏 → 分段滚动翻页。
+        // 改版后搜索框是 textarea(name=aiSearchTextarea,容器 #search-input-in-feeds,旁有「问点点」AI 入口);
+        // textarea 回车不一定提交,故改为点搜索图标(.submit-button)。选择器用逗号候选,兼容新旧结构。
+        "xhs" => {
+            let box_sel = "textarea[name='aiSearchTextarea'], #search-input-in-feeds textarea, .search-input textarea, #search-input, input#search-input";
+            let submit_sel = "#search-input-in-feeds .submit-button-wrapper, .search-input .submit-button-wrapper, .submit-button-wrapper, .submit-button";
+            vec![
+                RpaStep::WaitFor {
+                    selector: box_sel.into(),
+                    timeout_ms: 10_000,
+                },
+                RpaStep::Click {
+                    selector: box_sel.into(),
+                },
+                RpaStep::Type {
+                    selector: box_sel.into(),
+                    text: "{keyword}".into(),
+                },
+                RpaStep::Pause {
+                    min_ms: 400,
+                    max_ms: 900,
+                },
+                // 点搜索图标提交(textarea 回车不一定触发搜索)
+                RpaStep::Click {
+                    selector: submit_sel.into(),
+                },
+                RpaStep::WaitFor {
+                    // 搜索结果页特有的频道栏(全部/图文/视频/用户),首页没有,可靠判断「已进入结果页」
+                    selector: "#channel-container".into(),
+                    timeout_ms: 12_000,
+                },
+                // 作为最大滚动轮数上限;实际滚到底(内容不再增长)自动停
+                RpaStep::Scroll { segments: 40 },
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -632,6 +639,9 @@ impl AppConfig {
             if p.collect.next_page_texts.is_empty() {
                 p.collect.next_page_texts = bp.collect.next_page_texts.clone();
             }
+            // rpa_steps 由我们随平台改版维护、无用户编辑入口:始终用最新内置值刷新(而非仅补空),
+            // 确保选择器更新(如小红书改版搜索框/筛选)对老配置也即时生效,无需删档重建。
+            p.collect.rpa_steps = bp.collect.rpa_steps.clone();
         }
     }
 

@@ -14,12 +14,7 @@ const MAX_BATCH: usize = 10;
 
 /// 拼接 embeddings endpoint;api_url 已含该路径(用户填了完整 URL)时不重复拼。
 fn embeddings_endpoint(api_url: &str) -> String {
-    let trimmed = api_url.trim_end_matches('/');
-    if trimmed.ends_with("/embeddings") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/embeddings")
-    }
+    http::join_endpoint(api_url, "/embeddings")
 }
 
 /// 把若干文本转成向量,顺序与输入一致。空输入返回空;任一批失败则整体返回 Err(调用方据此回退)。

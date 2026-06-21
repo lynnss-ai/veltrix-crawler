@@ -33,12 +33,20 @@ import { TaskFormSheet } from "./TaskFormSheet";
 // ---- 数据模型(沿用后端 TaskView,本地 alias 为 TaskItem 方便引用) ----
 
 function CountdownCell({ t }: { t: TaskItem }) {
+  const inProgress = isInProgress(t);
+  const next = nextRunTs(t);
+  // 仅「显示倒计时」的状态才需要每秒重渲染;运行中 / 已停止 / 待首次 / 无下次 都是静态的,不开 interval(省掉无谓的每秒重渲染)
+  const showCountdown =
+    !inProgress &&
+    !(t.trigger === "watching" && t.status === "cancelled") &&
+    next != null;
   // 仅用于驱动每秒重渲染,值本身不消费
   const [, setTick] = useState(0);
   useEffect(() => {
+    if (!showCountdown) return;
     const id = setInterval(() => setTick((x) => x + 1), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [showCountdown]);
 
   const plan =
     t.trigger === "daily" ? (
@@ -51,7 +59,7 @@ function CountdownCell({ t }: { t: TaskItem }) {
       </>
     );
 
-  if (isInProgress(t)) {
+  if (inProgress) {
     return (
       <span className="text-xs text-muted-foreground">
         {plan}
@@ -69,7 +77,6 @@ function CountdownCell({ t }: { t: TaskItem }) {
       </span>
     );
   }
-  const next = nextRunTs(t);
   if (next == null) {
     return (
       <span className="text-xs text-muted-foreground">

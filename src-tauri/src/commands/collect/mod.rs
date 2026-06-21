@@ -438,9 +438,12 @@ async fn run_task_body(ctx: RunTaskCtx) {
 
         // 该任务已采内容快照(content_id 集合):智能停止据此「只数新增」(重复不占目标配额),
         // 素材下载也据此跳过已成功下载的旧内容。运行开始时取一次,运行中新增的不进此集合。
-        let existing_ids = load_existing_content_ids(&db, &task_id).await;
-        // 黑名单作者 uid(owner+platform):采集时排除其内容——增量(legacy 滚动)与兜底两路都过滤
-        let blacklisted_uids = load_blacklisted_author_uids(&db, &owner, &cfg.id).await;
+        // 黑名单作者 uid(owner+platform):采集时排除其内容——增量(legacy 滚动)与兜底两路都过滤。
+        // 两个初始加载相互独立,并发执行省一次 DB 往返。
+        let (existing_ids, blacklisted_uids) = tokio::join!(
+            load_existing_content_ids(&db, &task_id),
+            load_blacklisted_author_uids(&db, &owner, &cfg.id),
+        );
         if !blacklisted_uids.is_empty() {
             emit_collect_log(
                 &app,
@@ -888,11 +891,14 @@ async fn run_task_body(ctx: RunTaskCtx) {
                         .map(|(cid, _, _, _)| format!("{task_id}-{}-{}", cfg.id, cid))
                         .collect();
                     if !ids.is_empty() {
-                        let _ = content_entity::Entity::update_many()
+                        if let Err(e) = content_entity::Entity::update_many()
                             .col_expr(content_entity::Column::CommentCollected, Expr::value(true))
                             .filter(content_entity::Column::Id.is_in(ids))
                             .exec(&db)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!("标记 comment_collected 失败(可能导致下次重复采集评论): {e}");
+                        }
                     }
                 }
             }
@@ -939,12 +945,15 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 use sea_orm::sea_query::Expr;
                 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
                 use veltrix_core::db::entity::content as content_entity;
-                let _ = content_entity::Entity::update_many()
+                if let Err(e) = content_entity::Entity::update_many()
                     .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
                     .filter(content_entity::Column::TaskId.eq(&task_id))
                     .filter(content_entity::Column::CommentCollected.eq(true))
                     .exec(&db)
-                    .await;
+                    .await
+                {
+                    tracing::warn!("标记 intent_analyzed 失败: {e}");
+                }
             }
         }
 
@@ -1872,12 +1881,15 @@ pub async fn compensate_task(
         if intent_ready {
             write_task_analyzing(&app, &db, &id).await;
             analyze_comments_intent(&app, &db, &id, &intent_cfg).await;
-            let _ = content_entity::Entity::update_many()
+            if let Err(e) = content_entity::Entity::update_many()
                 .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
                 .filter(content_entity::Column::TaskId.eq(&id))
                 .filter(content_entity::Column::CommentCollected.eq(true))
                 .exec(&db)
-                .await;
+                .await
+            {
+                tracing::warn!("补偿:标记 intent_analyzed 失败: {e}");
+            }
         }
 
         // 素材下载 + 转写补做(仅 ai_extract;filter_pending_media 排除已成功的)
@@ -1943,6 +1955,8 @@ pub async fn check_ffmpeg(state: State<'_, AppState>) -> Result<FfmpegStatus> {
     })
     .await
     .map_err(|e| CrawlerError::Config(format!("ffmpeg 探测任务失败: {e}")))?;
+    // 顺带刷新录屏的 ffmpeg 可用性标记:用户手动检测后即时生效,免重启
+    state.recording.set_ffmpeg_available(version.is_some());
     Ok(FfmpegStatus {
         available: version.is_some(),
         version,

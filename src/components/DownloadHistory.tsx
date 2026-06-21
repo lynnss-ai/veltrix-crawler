@@ -17,6 +17,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 
 function fmtTime(ms: number): string {
   const d = new Date(ms);
@@ -106,41 +107,48 @@ export function DownloadHistory() {
                   key={r.id}
                   className="group flex items-center gap-1.5 px-2 py-1.5 hover:bg-accent/60"
                 >
-                  <button
-                    type="button"
-                    onClick={() => reveal(r)}
-                    title={r.path}
-                    className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
-                  >
-                    <span className="flex w-full items-center gap-1.5">
-                      <span className="truncate text-xs font-medium">
-                        {r.name}
+                  <SimpleTooltip content={r.path}>
+                    <button
+                      type="button"
+                      onClick={() => reveal(r)}
+                      className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
+                    >
+                      <span className="flex w-full items-center gap-1.5">
+                        <span className="truncate text-xs font-medium">
+                          {r.name}
+                        </span>
+                        <ExistBadge state={ok} />
                       </span>
-                      <ExistBadge state={ok} />
-                    </span>
-                    <span className="truncate text-[11px] text-muted-foreground">
-                      {r.kind} · {fmtTime(r.savedAt)}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => reveal(r)}
-                    title={ok === false ? "文件已不在,打开所在目录" : "打开所在目录"}
-                    className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                      <span className="truncate text-[11px] text-muted-foreground">
+                        {r.kind} · {fmtTime(r.savedAt)}
+                      </span>
+                    </button>
+                  </SimpleTooltip>
+                  <SimpleTooltip
+                    content={ok === false ? "文件已不在,打开所在目录" : "打开所在目录"}
                   >
-                    <FolderOpen className="size-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      removeDownloadRecord(r.id);
-                      setRecords(getDownloadHistory());
-                    }}
-                    title="移除该记录"
-                    className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:bg-accent hover:text-foreground"
-                  >
-                    <X className="size-3.5" />
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => reveal(r)}
+                      aria-label="打开所在目录"
+                      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    >
+                      <FolderOpen className="size-3.5" />
+                    </button>
+                  </SimpleTooltip>
+                  <SimpleTooltip content="移除该记录">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        removeDownloadRecord(r.id);
+                        setRecords(getDownloadHistory());
+                      }}
+                      aria-label="移除该记录"
+                      className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:bg-accent hover:text-foreground"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </SimpleTooltip>
                 </li>
               );
             })}

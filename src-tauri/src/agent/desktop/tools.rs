@@ -672,8 +672,10 @@ impl Tool for OpenPathTool {
         }
         let joined = tokio::task::spawn_blocking(move || {
             let result = if cfg!(windows) {
-                // start 是 cmd 内建命令;空 "" 占位窗口标题,避免带空格路径被当标题
-                std::process::Command::new("cmd").args(["/C", "start", "", &target]).spawn()
+                // 直接 spawn explorer.exe(target 作单个 argv,不经 cmd):避免 `cmd /C start`
+                // 让 cmd 重新解析 & | > ^ 等元字符导致命令注入(BatBadBut / CVE-2024-24576 类)。
+                // explorer 不是 shell,对文件/文件夹/URL 都按关联程序打开。
+                std::process::Command::new("explorer.exe").arg(&target).spawn()
             } else if cfg!(target_os = "macos") {
                 std::process::Command::new("open").arg(&target).spawn()
             } else {

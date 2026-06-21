@@ -631,20 +631,27 @@ pub fn build_select_eval(labels: &[String]) -> String {
   if (!LABELS.length) return;
   var nodes = document.querySelectorAll('button,a,span,div,li,[role="tab"],[role="button"]');
   for (var i = 0; i < nodes.length; i++) {
-    var t = (nodes[i].textContent || '').trim();
-    for (var j = 0; j < LABELS.length; j++) {
-      if (t === LABELS[j]) {
-        try {
-          nodes[i].scrollIntoView({ block: 'center' });
-          var r = nodes[i].getBoundingClientRect();
-          var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-          nodes[i].dispatchEvent(new MouseEvent('mousedown', o));
-          nodes[i].dispatchEvent(new MouseEvent('mouseup', o));
-          nodes[i].dispatchEvent(new MouseEvent('click', o));
-        } catch (e) {}
-        return;
-      }
-    }
+    var el = nodes[i];
+    var t = (el.textContent || '').trim();
+    var hit = false;
+    for (var j = 0; j < LABELS.length; j++) { if (t === LABELS[j]) { hit = true; break; } }
+    if (!hit) continue;
+    // 跳过 aria-hidden 的装饰/诱饵层(小红书在每个筛选项上叠了不可见同名代理 data-hp-*,点它无效)及零尺寸元素
+    if (el.closest && el.closest('[aria-hidden="true"]')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    try {
+      el.scrollIntoView({ block: 'center' });
+      var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+      // 先派发 hover/move:抖音/小红书「筛选」等下拉靠 hover(React/Vue 的 mouseenter←mouseover)展开,只点不 hover 展不开
+      try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
+      el.dispatchEvent(new MouseEvent('mouseover', o));
+      el.dispatchEvent(new MouseEvent('mousemove', o));
+      el.dispatchEvent(new MouseEvent('mousedown', o));
+      el.dispatchEvent(new MouseEvent('mouseup', o));
+      el.dispatchEvent(new MouseEvent('click', o));
+    } catch (e) {}
+    return;
   }
 })();"#;
     TEMPLATE.replace("__LABELS__", &labels_json)

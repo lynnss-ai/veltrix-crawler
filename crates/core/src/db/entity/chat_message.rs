@@ -25,6 +25,10 @@ pub struct Model {
     /// 仅图片落盘并带 path,供历史渲染与多轮多模态重建;非图片附件 path 为空,仅作文件名展示。
     #[sea_orm(column_type = "Text", nullable)]
     pub attachments: Option<String>,
+    /// assistant 的思考过程(模型推理内容:Claude thinking 块 / DeepSeek reasoning_content)。
+    /// 仅推理型模型非空;供前端「思考过程」折叠块展示,历史里也能看到完整推理。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reasoning: Option<String>,
     pub created_at: i64,
 }
 

@@ -103,7 +103,6 @@ function CodeBlock({
           <button
             type="button"
             onClick={copy}
-            title="复制代码"
             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
@@ -112,7 +111,6 @@ function CodeBlock({
           <button
             type="button"
             onClick={() => void download()}
-            title="下载代码"
             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Download className="size-3" />
@@ -249,7 +247,6 @@ function MermaidBlock({ code, plain }: { code: string; plain?: boolean }) {
           <button
             type="button"
             onClick={copy}
-            title="复制源码"
             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
@@ -258,7 +255,6 @@ function MermaidBlock({ code, plain }: { code: string; plain?: boolean }) {
           <button
             type="button"
             onClick={() => void download()}
-            title="下载源码"
             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Download className="size-3" />

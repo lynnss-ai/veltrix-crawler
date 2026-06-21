@@ -38,12 +38,16 @@ import {
   api,
   type ChatMessageView,
   type CheckpointView,
+  type CheckpointDiffView,
+  type CheckpointFileDiff,
   type DevServerStatus,
   type SandboxConfigView,
   type SandboxStatsView,
 } from "@/lib/api";
 import { useChat } from "@/hooks/use-chat";
+import { useAgentStepListener } from "@/hooks/use-agent-step-listener";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
+import { ReasoningBlock } from "@/components/ReasoningBlock";
 import { CodeEditor } from "@/components/code-editor";
 import { EmptyState } from "@/components/EmptyState";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
@@ -89,6 +93,8 @@ import { cn } from "@/lib/utils";
 // 左栏占比低于此值(百分比)视为「过窄」,联动自动收起侧边菜单给左栏腾空间。
 // 用占比而非像素:不受窗口 / 侧栏宽度影响,拖到足够窄一定会触发(分割条拖动下限为 28%)
 const LEFT_NARROW_PCT = 38;
+// 消息列表初始只渲染最近 N 条(长 ReAct 对话切换时避免一次性解析全部),可「加载更早」
+const MSG_PAGE_SIZE = 30;
 
 interface ToolCallJson {
   id: string;
@@ -122,11 +128,15 @@ export function CodingLayout() {
   // 当前是否有待交接的首条消息(读最新值,避免把它加进 load 副作用的依赖里导致重复加载)
   const pendingRef = useRef(pendingFirstMessage);
   pendingRef.current = pendingFirstMessage;
+  // 抑制「本次发送自建的新会话」触发加载 effect:setActiveId 会让加载与发送抢跑致首条消息重复/闪烁
+  const skipLoadRef = useRef<string | null>(null);
   // 供异步发送闭包读「当前激活会话」:切走后不把结果刷回错误会话,也用于过滤 agent-step
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
 
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
+  // 当前会话只渲染最近 visibleCount 条;切会话重置,「加载更早」时增加
+  const [visibleCount, setVisibleCount] = useState(MSG_PAGE_SIZE);
   const [input, setInput] = useState("");
   // 按会话维度的运行态:某会话在后台跑时,开/切到别的会话互不影响(后端本就并发执行)
   const [runningIds, setRunningIds] = useState<Set<string>>(() => new Set());
@@ -136,10 +146,16 @@ export function CodingLayout() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
-  // 版本回退:检查点列表(下拉打开时拉取)+ 待确认回退的目标版本
+  // 版本管理:检查点列表(下拉打开时拉取)+ 待确认回退的目标版本
   const [checkpoints, setCheckpoints] = useState<CheckpointView[]>([]);
   const [rollbackTarget, setRollbackTarget] = useState<CheckpointView | null>(
     null,
+  );
+  // 版本管理下拉:受控开合 + 当前展开查看改动的版本 hash + 各版本改动详情缓存(按 hash)
+  const [versionMenuOpen, setVersionMenuOpen] = useState(false);
+  const [expandedHash, setExpandedHash] = useState<string | null>(null);
+  const [diffCache, setDiffCache] = useState<Record<string, CheckpointDiffView>>(
+    {},
   );
   // 标记/清除某会话的运行态(增删 Set 元素,触发按会话渲染)。名取 ConvRunning 避开终端的 setRunning
   function setConvRunning(id: string, on: boolean) {
@@ -231,6 +247,11 @@ export function CodingLayout() {
       return;
     }
     if (pendingRef.current) return;
+    // 本次发送刚自建的会话:消息由发送流程维护,跳过这次加载
+    if (skipLoadRef.current === activeId) {
+      skipLoadRef.current = null;
+      return;
+    }
     api
       .listChatMessages(activeId)
       .then(setMessages)
@@ -245,6 +266,7 @@ export function CodingLayout() {
     setSteps([]);
     setTermInput("");
     setSelectedFile(null);
+    setVisibleCount(MSG_PAGE_SIZE); // 切会话回到「只渲染最近 N 条」
   }, [activeId]);
 
   // 交接的首条消息:建好 coding 会话后自动发送一次
@@ -258,26 +280,9 @@ export function CodingLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingFirstMessage, activeId]);
 
-  // 监听 Agent 进度事件(逐步标签),仅取当前发送会话
-  useEffect(() => {
-    let dispose: (() => void) | undefined;
-    let disposed = false;
-    listen<{ conversationId: string; label: string }>("agent-step", (e) => {
-      // 只显示「当前正在查看的会话」的步骤;其他会话在后台跑、步骤不抢占视图
-      if (activeIdRef.current !== e.payload.conversationId) return;
-      setSteps((prev) => [...prev, e.payload.label]);
-    }).then(
-      (fn) => {
-        if (disposed) fn();
-        else dispose = fn;
-      },
-      () => {},
-    );
-    return () => {
-      disposed = true;
-      dispose?.();
-    };
-  }, []);
+  // 监听 Agent 进度事件(逐步标签):只显示「当前正在查看的会话」的步骤,
+  // 其他会话在后台跑、步骤不抢占视图。统一走 useAgentStepListener。
+  useAgentStepListener(activeIdRef, setSteps);
 
   // 监听「Docker 沙盒不可用,已回退本机执行」事件 → 弹窗提示(后端在重新探测且回退时推送)。
   // 用固定 toast id:即便短时多次回退也只刷新同一条提示,不堆叠刷屏。
@@ -464,6 +469,7 @@ export function CodingLayout() {
           "coding",
         );
         convId = conv.id;
+        skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的本会话加载,防首条消息重复
         setActiveId(conv.id);
       }
       setConvRunning(convId, true); // 标记该会话运行中(按会话维度,不锁其他会话)
@@ -565,13 +571,28 @@ export function CodingLayout() {
     );
   }
 
-  // 版本回退:打开下拉时拉取检查点列表;选中某版本 → 二次确认 → reset 到该提交
+  // 版本管理:打开下拉时拉取检查点列表;展开某版本看其改动详情;选中某版本 → 二次确认 → reset 到该提交
   async function loadCheckpoints() {
     if (!activeId) return;
     try {
       setCheckpoints(await api.listCodingCheckpoints(activeId));
     } catch (e) {
       toast.error(`读取版本失败: ${e}`);
+    }
+  }
+  // 展开/收起某版本:展开时懒加载该版本改动详情(已缓存则直接用)
+  async function toggleVersion(hash: string) {
+    if (expandedHash === hash) {
+      setExpandedHash(null);
+      return;
+    }
+    setExpandedHash(hash);
+    if (!activeId || diffCache[hash]) return;
+    try {
+      const detail = await api.getCheckpointDiff(activeId, hash);
+      setDiffCache((prev) => ({ ...prev, [hash]: detail }));
+    } catch (e) {
+      toast.error(`读取版本改动失败: ${e}`);
     }
   }
   async function doRollback() {
@@ -780,7 +801,26 @@ export function CodingLayout() {
                 />
               )
             ) : (
-              messages.map((m) => <CodingMessage key={m.id} message={m} />)
+              <>
+                {messages.length > visibleCount && (
+                  <div className="flex justify-center">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs text-muted-foreground"
+                      onClick={() => setVisibleCount((c) => c + MSG_PAGE_SIZE)}
+                    >
+                      加载更早的消息({messages.length - visibleCount})
+                    </Button>
+                  </div>
+                )}
+                {(messages.length > visibleCount
+                  ? messages.slice(messages.length - visibleCount)
+                  : messages
+                ).map((m) => (
+                  <CodingMessage key={m.id} message={m} />
+                ))}
+              </>
             )}
             {/* 进行中:实时思考过程(逐步累计,可滚动)——仅当前查看的会话 */}
             {activeSending && (
@@ -959,10 +999,15 @@ export function CodingLayout() {
                     启动
                   </Button>
                 ))}
-              {/* 回退:点开列出版本历史(每轮任务前的快照),选一个 → 二次确认 → reset */}
+              {/* 版本管理:点开列出版本历史(每轮任务前的快照),展开看该版本改动详情,选一个 → 二次确认 → reset */}
               <DropdownMenu
+                open={versionMenuOpen}
                 onOpenChange={(open) => {
-                  if (open) void loadCheckpoints();
+                  setVersionMenuOpen(open);
+                  if (open) {
+                    setExpandedHash(null);
+                    void loadCheckpoints();
+                  }
                 }}
               >
                 <DropdownMenuTrigger asChild>
@@ -973,32 +1018,77 @@ export function CodingLayout() {
                     disabled={!activeId}
                   >
                     <History className="size-3.5" />
-                    回退
+                    版本管理
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent
                   align="end"
-                  className="max-h-80 w-72 overflow-y-auto"
+                  className="max-h-[70vh] w-[34rem] overflow-y-auto p-0"
                 >
                   {checkpoints.length === 0 ? (
-                    <div className="px-2 py-3 text-center text-xs text-muted-foreground">
-                      暂无可回退的版本
+                    <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+                      暂无版本(发送任务后会自动建立检查点)
                     </div>
                   ) : (
-                    checkpoints.map((c) => (
-                      <DropdownMenuItem
-                        key={c.hash}
-                        onClick={() => setRollbackTarget(c)}
-                        className="flex-col items-start gap-0.5"
-                      >
-                        <span className="line-clamp-1 w-full text-xs">
-                          {c.message}
-                        </span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {new Date(c.time * 1000).toLocaleString()}
-                        </span>
-                      </DropdownMenuItem>
-                    ))
+                    checkpoints.map((c) => {
+                      const expanded = expandedHash === c.hash;
+                      const detail = diffCache[c.hash];
+                      return (
+                        <div key={c.hash} className="border-b last:border-b-0">
+                          {/* 版本行:点击展开/收起其改动详情 */}
+                          <button
+                            type="button"
+                            onClick={() => void toggleVersion(c.hash)}
+                            className="flex w-full items-start gap-2 px-3 py-2 text-left transition-colors hover:bg-accent"
+                          >
+                            <ChevronRight
+                              className={cn(
+                                "mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-transform",
+                                expanded && "rotate-90",
+                              )}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="line-clamp-1 text-xs">{c.message}</div>
+                              <div className="text-[10px] text-muted-foreground">
+                                {new Date(c.time * 1000).toLocaleString()}
+                              </div>
+                            </div>
+                          </button>
+                          {expanded && (
+                            <div className="px-3 pb-2.5">
+                              {!detail ? (
+                                <div className="py-2 text-center text-xs text-muted-foreground">
+                                  <Loader2 className="mr-1 inline size-3 animate-spin" />
+                                  加载改动…
+                                </div>
+                              ) : detail.files.length === 0 ? (
+                                <div className="py-2 text-xs text-muted-foreground">
+                                  该版本无文件改动
+                                </div>
+                              ) : (
+                                <div className="space-y-1.5">
+                                  {detail.files.map((f) => (
+                                    <CheckpointFileItem key={f.path} file={f} />
+                                  ))}
+                                </div>
+                              )}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="mt-2 h-7 w-full gap-1 text-xs text-amber-600 hover:text-amber-600 dark:text-amber-500 dark:hover:text-amber-500"
+                                onClick={() => {
+                                  setVersionMenuOpen(false);
+                                  setRollbackTarget(c);
+                                }}
+                              >
+                                <History className="size-3.5" />
+                                回退到此版本
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
                   )}
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1987,6 +2077,75 @@ function CollapsibleCode({
   );
 }
 
+// 版本管理:单个文件的改动条目——状态徽标 + 路径 + 增删行数 + 可展开的完整 diff(按行着色)
+const FILE_STATUS_META: Record<string, { label: string; cls: string }> = {
+  added: { label: "新增", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" },
+  modified: { label: "修改", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
+  deleted: { label: "删除", cls: "bg-red-500/15 text-red-600 dark:text-red-400" },
+  renamed: { label: "重命名", cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400" },
+};
+
+function CheckpointFileItem({ file }: { file: CheckpointFileDiff }) {
+  const [open, setOpen] = useState(false);
+  const meta = FILE_STATUS_META[file.status] ?? {
+    label: file.status,
+    cls: "bg-muted text-muted-foreground",
+  };
+  return (
+    <div className="overflow-hidden rounded border bg-muted/20">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] transition-colors hover:bg-accent"
+      >
+        <span className={cn("shrink-0 rounded px-1 py-0.5 text-[10px] font-medium", meta.cls)}>
+          {meta.label}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono">{file.path}</span>
+        {file.additions > 0 && (
+          <span className="shrink-0 text-emerald-600 dark:text-emerald-400">
+            +{file.additions}
+          </span>
+        )}
+        {file.deletions > 0 && (
+          <span className="shrink-0 text-red-600 dark:text-red-400">
+            -{file.deletions}
+          </span>
+        )}
+        {file.diff && (
+          <ChevronRight
+            className={cn(
+              "size-3 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90",
+            )}
+          />
+        )}
+      </button>
+      {open && file.diff && (
+        <pre className="veltrix-thin-scrollbar max-h-72 overflow-auto border-t bg-background/40 px-2 py-1 font-mono text-[10px] leading-relaxed">
+          {file.diff.split("\n").map((line, i) => (
+            <div
+              key={i}
+              className={cn(
+                "whitespace-pre",
+                line.startsWith("@@")
+                  ? "text-sky-600 dark:text-sky-400"
+                  : line.startsWith("+")
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : line.startsWith("-")
+                      ? "text-red-600 dark:text-red-400"
+                      : "text-muted-foreground",
+              )}
+            >
+              {line || " "}
+            </div>
+          ))}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 // 单条消息渲染:
 // - user → 右侧气泡
 // - assistant → 思考过程 / 最终回答文字全量呈现(Markdown)+ 编码类工具折叠块;其余工具调用隐藏
@@ -2004,14 +2163,16 @@ function CodingMessage({ message: m }: { message: ChatMessageView }) {
   if (m.role !== "assistant") return null;
 
   const hasText = m.content.trim().length > 0;
+  const hasReasoning = !!m.reasoning?.trim();
   // 仅保留写代码类工具(write_file / replace_in_file)折叠展示;读取 / 列目录 / 跑命令 / 搜索 / 计划等隐藏
   const codeCalls = parseToolCalls(m.toolCalls).filter((c) =>
     (CODE_TOOLS as readonly string[]).includes(c.name),
   );
-  // 既无文字又无编码 → 纯工具调用步骤,整条隐藏
-  if (!hasText && codeCalls.length === 0) return null;
+  // 既无文字、无编码、也无思考过程 → 纯工具调用步骤,整条隐藏
+  if (!hasText && codeCalls.length === 0 && !hasReasoning) return null;
   return (
     <div className="space-y-1.5">
+      {hasReasoning && <ReasoningBlock reasoning={m.reasoning ?? ""} />}
       {hasText && (
         <div className="text-sm text-foreground">
           <MarkdownMessage content={m.content} />

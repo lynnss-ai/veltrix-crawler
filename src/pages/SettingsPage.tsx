@@ -24,7 +24,6 @@ import {
   type CloudConnectionState,
   type RoleModelConfig,
 } from "@/lib/api";
-import { ChatMemoryManager } from "@/components/chat-memory-manager";
 import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { ErrorBanner } from "@/components/ErrorBanner";
@@ -229,7 +228,6 @@ export function SettingsPage() {
             {active === "intent" && (
               <IntentSection initial={cfg?.intent} />
             )}
-            {active === "memory" && <MemorySection />}
             {active === "obsidian" && <ObsidianSection />}
           </div>
         )}
@@ -1412,19 +1410,6 @@ function RoleModelSection({ providers }: { providers: Provider[] }) {
           />
         </div>
       )}
-    </SettingsCard>
-  );
-}
-
-// AI 记忆:跨会话长期记忆管理(全局开关 + 自动/手动条目的增删改查)。
-// 自动记忆由对话每轮提取后台落库;此处用于查看、手动补充与清理。
-function MemorySection() {
-  return (
-    <SettingsCard
-      title="AI 记忆"
-      description="让对话拥有跨会话的长期记忆:AI 会自动从聊天中提取关于你的稳定信息(身份、偏好、习惯等),在之后所有对话中参考。你也可以手动添加、编辑或删除。"
-    >
-      <ChatMemoryManager />
     </SettingsCard>
   );
 }

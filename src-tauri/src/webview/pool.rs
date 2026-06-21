@@ -106,14 +106,15 @@ fn time_labels(time_range: &str) -> Vec<String> {
 /// 选项在结果页直接可见的平台(快手等)返回空,跳过展开步骤。
 fn filter_panel_labels(platform_id: &str) -> Vec<String> {
     match platform_id {
-        // 抖音排序依据/发布时间都收在右上角「筛选」浮层里,不展开则全 DOM 找不到文案点不到,需先点开
-        "douyin" => vec!["筛选".into()],
+        // 抖音 / 小红书:排序依据(综合/最新/最多点赞…)、发布时间等都收在「筛选」浮层里,
+        // 不展开则全 DOM 找不到文案、点不到,需先点「筛选」展开。小红书改版后也走此浮层。
+        "douyin" | "xhs" => vec!["筛选".into()],
         _ => Vec::new(),
     }
 }
 
-/// 展开筛选面板后等其渲染到位的停顿(毫秒)。
-const FILTER_PANEL_OPEN_MS: u64 = 900;
+/// 展开筛选面板后等其渲染到位的停顿(毫秒)。hover 触发的 React 下拉是异步重渲染,留足时间。
+const FILTER_PANEL_OPEN_MS: u64 = 1300;
 
 /// 在结果页按任务排序/时间做 RPA 文案点击(综合/不限默认不点)。点击后留停顿等结果刷新。
 /// 抖音等选项藏在「筛选」浮层里的平台,先展开面板再点;面板同时含排序与时间两段,展开一次即可。
@@ -555,7 +556,8 @@ impl WebviewPool {
                 return Ok(());
             }
             for attempt in 0..5 {
-                match std::fs::remove_dir_all(&dir) {
+                // 递归删目录是阻塞 IO,用 tokio::fs(内部 spawn_blocking)避免阻塞 tokio 工作线程
+                match tokio::fs::remove_dir_all(&dir).await {
                     Ok(()) => return Ok(()),
                     Err(_) if attempt < 4 => {
                         tokio::time::sleep(Duration::from_millis(300)).await;

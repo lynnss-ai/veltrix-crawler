@@ -3,4 +3,5 @@
 //! 横向能力来自各独立模块(仍可被别处复用),本模块只负责"装到一起"并驱动 ReAct。
 
 pub mod commands;
+pub mod recorder;
 pub mod tools;

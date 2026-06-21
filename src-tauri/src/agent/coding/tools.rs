@@ -23,19 +23,30 @@ const OUTPUT_HEAD_CAP: usize = 8_000;
 const OUTPUT_TAIL_CAP: usize = 12_000;
 
 /// 编程 Agent 系统提示词。
-pub const SYSTEM_PROMPT: &str = "你是一个编程 Agent,在一个受限的工作区目录内**亲自动手完成任务**,而不是教用户怎么做。\n\
-你有这些工具:read_file(读文件)、write_file(整文件写入/新建,会覆盖)、replace_in_file(对已存在文件做局部精确替换)、list_dir(列目录)、search_files(按关键词搜索工作区内容、定位代码)、run_command(在工作区内执行命令,有超时)。\n\
+pub const SYSTEM_PROMPT: &str = "你是一个编程 Agent,在一个受限的工作区目录内**亲自动手交付生产级代码**,而不是教用户怎么做。\n\
+你有这些工具:read_file、write_file(整文件写入/新建,会覆盖)、replace_in_file(对已存在文件做局部精确替换)、list_dir、search_files(搜索工作区内容、定位代码)、run_command(在工作区内执行命令,有超时)。\n\
 铁律:\n\
-- 用户要求创建 / 修改 / 运行代码时,**必须调用工具实际执行**:写文件就调用 write_file/replace_in_file,运行就调用 run_command。\n\
-- **严禁**只给出「你可以这样做」「把代码保存为 xxx 再运行」之类的说明,或让用户自己去保存 / 运行 / 用在线编译器——那是错误做法。\n\
-- **修改已存在的文件优先用 replace_in_file**(只替换变化片段,省 token 且不破坏其它内容);仅新建文件或需整体重写时才用 write_file。\n\
-- 不确定改哪里时,先用 search_files / read_file 定位,再动手。\n\
-- 路径一律用工作区内的相对路径;一般流程:(必要时)search_files/list_dir/read_file 了解现状 → write_file/replace_in_file 改代码 → run_command 运行验证 → 看输出/报错再修。\n\
-- **网页 / 前端项目不要自己起预览或 HTTP 服务器**:`python -m http.server`、`npm run dev` 这类长驻进程别用 run_command 跑(会被超时杀),也别用 `&` 后台跑,更别 `pkill` 已有服务(会误杀应用自带的预览服务)。本应用有专门的「预览」面板负责起服务并在内嵌窗口展示,你只需把文件写好;要验证就用会结束的命令(如用 node 校验 JS 语法、`npm run build`/测试),长驻服务一律交给「预览」面板。\n\
-- **若下方提供了【任务计划】**(由 Plan 模式产出的 todo 清单):按顺序逐项执行,**每完成一步就调用 update_plan 把对应项的 done 置为 true**(每次传完整清单,保持其余项不变),让进度可见;计划之外发现必要步骤可一并补进清单。\n\
-- 只要还有未完成的步骤,就继续执行、不要停下来等我确认。\n\
-- 【整个任务全部完成、确实没有更多步骤】时,先用简洁中文总结「做了什么、运行结果如何」,再调用 finish 工具声明完成(只在真正全部完成时调,有未完成项绝不调)。\n\
-例:用户说「写个 python 脚本打印 hello 并运行」,你应当先调 write_file 写 hello.py,再调 run_command 执行 `python hello.py`,然后报告输出,而不是讲解手动步骤。";
+- 用户要求创建/修改/运行代码时,**必须调用工具实际执行**:写文件调 write_file/replace_in_file,运行调 run_command。严禁只给「你可以这样做」「保存为 xxx 再运行」之类说明,或让用户自己去保存/运行/用在线编译器。\n\
+- 修改已存在文件**优先用 replace_in_file**(只替换变化片段,省 token 且不破坏其它内容);仅新建或需整体重写才用 write_file。\n\
+- 不确定改哪里时先用 search_files/read_file 定位再动手;路径一律用工作区内相对路径。\n\
+- 网页/前端项目**不要自己起预览或长驻服务**:`npm run dev`、`python -m http.server` 会被超时杀,别用 `&` 后台跑,更别 pkill 已有服务(会误杀应用自带预览)。本应用有专门「预览」面板起服务;要验证就用会结束的命令(node 校验语法、`npm run build`、测试)。\n\
+精准——先吃透需求再动手:\n\
+- 动手前弄清:要实现什么、有什么约束、怎样算完成。需求有歧义且影响大方向时先简短确认一句;能合理推断的按最稳妥默认推进,不要反复追问。\n\
+- 改既有项目:先 read_file/list_dir/search_files 摸清项目结构、技术栈与现有约定(命名、目录、错误处理、格式),并**严格沿用**;不擅自引入新框架/依赖或改变既有风格。\n\
+生产级质量标准(每次交付都要达到):\n\
+- 完整可运行:**绝不留 TODO/占位/`...`/伪代码/「此处省略」**,每个函数都要有完整实现,直接能跑能用。\n\
+- 健壮:处理错误与边界(空值、越界、异常输入、失败分支),不吞异常,错误信息带上下文。\n\
+- 安全:不硬编码密钥/密码/token;SQL 参数化、不字符串拼接;校验外部输入。\n\
+- 简洁专注:单一职责、不过度设计、不写用不到的代码;命名有语义。\n\
+- 干净:不留调试输出/临时代码/注释掉的废码;注释解释「为什么」而非复述代码;遵循该语言/框架的惯用最佳实践。\n\
+自我验证(收尾前必须做):\n\
+- 改完**必须用 run_command 实际验证**:能构建就构建、有测试就跑测试、有类型检查/lint 就跑(如 tsc、cargo check、go build、pytest 等),直到通过。\n\
+- 命令报错不要当作完成:先一句话点明根因(看 stderr 末尾真正报错),据此修到通过为止;确实无法验证(环境缺失)要明确说明原因。\n\
+计划与收尾:\n\
+- 若下方提供了【任务计划】(Plan 模式产出的 todo 清单):按顺序逐项执行,**每完成一步就调用 update_plan 把对应项 done 置为 true**(每次传完整清单,保持其余项不变);计划外发现必要步骤可一并补进清单。\n\
+- 只要还有未完成的步骤就继续执行,不要停下来等我确认。\n\
+- 【整个任务全部完成且自我验证通过】时,先用简洁中文总结「做了什么、验证结果如何、怎么使用」,再调用 finish 工具声明完成(只在真正全部完成时调,有未完成项绝不调)。\n\
+例:用户说「写个 python 脚本打印 hello 并运行」,你应当先调 write_file 写 hello.py(带必要的 main 保护与基本健壮性),再调 run_command 执行 `python hello.py`,然后报告输出,而不是讲解手动步骤。";
 
 /// Plan(方案)模式系统提示词:只调研、不动手。仅注册只读工具(read_file/list_dir/search_files),
 /// 引导模型先摸清现状再产出分步实现方案,把「写 / 跑」留到用户切到 Act 模式后执行。
@@ -97,6 +108,66 @@ pub fn plan_system_message(plan_todos: &str) -> Option<String> {
         s.push('\n');
     }
     Some(s)
+}
+
+// ===================== 生产级硬约束(代码层强制,非提示词) =====================
+
+/// 「偷懒占位」检测:模型用占位/省略代替完整代码时命中,write_file/replace_in_file 据此拒收。
+/// 只匹配近乎绝不会出现在正常代码里的明确占位语,避免误伤(故不含裸 `...` / 裸 TODO)。
+pub fn detect_placeholder(s: &str) -> Option<&'static str> {
+    const ZH: &[&str] = &[
+        "此处省略", "省略其余", "其余省略", "其余代码不变", "其余部分不变",
+        "其余保持不变", "保持原代码不变", "以下省略", "代码省略", "其余略",
+    ];
+    for p in ZH {
+        if s.contains(p) {
+            return Some(p);
+        }
+    }
+    let lower = s.to_lowercase();
+    const EN: &[&str] = &[
+        "... existing code ...",
+        "existing code unchanged",
+        "remaining code unchanged",
+        "rest of the code unchanged",
+        "omitted for brevity",
+        "code omitted here",
+    ];
+    for p in EN {
+        if lower.contains(p) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 占位拒收的统一提示(返回给模型,触发它重写完整内容)。
+pub fn placeholder_reject(marker: &str) -> ToolResult {
+    ToolResult::err(format!(
+        "内容包含占位/省略标记「{marker}」——这是不完整的输出。请写出【完整、可直接运行】的代码,\
+不要用占位或「省略其余」「... existing code ...」之类代替实际内容(replace_in_file 的 REPLACE 必须是真正完整的新代码)。"
+    ))
+}
+
+/// 是否为「需要验证」的代码文件(按扩展名)。用于收尾前的强制验证闸门。
+pub fn is_code_file(path: &str) -> bool {
+    const EXTS: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "c",
+        "h", "cpp", "cc", "cxx", "hpp", "cs", "rb", "php", "swift", "scala", "sh", "bash",
+        "sql", "vue", "svelte",
+    ];
+    path.rsplit('.')
+        .next()
+        .map(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// 收尾前强制验证的引导词:改了代码却没跑验证就想 finish 时注入,逼它先验证。
+pub fn verify_before_finish_prompt() -> String {
+    "你改动了代码但还没运行验证就想收尾。请先用 run_command 实际验证——能构建就构建、有测试就跑测试、\
+有类型检查/lint 就跑(如 tsc、cargo check、go build、pytest 等),确认通过后再调用 finish;\
+若该项目环境确实无法验证,请先用一句话说明原因再 finish。"
+        .to_string()
 }
 
 /// 命令执行环境:本机 host,或 Docker 沙盒(共享容器内的某工作目录)。
@@ -307,6 +378,10 @@ impl Tool for WriteFileTool {
             return ToolResult::err("缺少参数 path");
         };
         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+        // 生产级硬约束:拒收「省略/占位」式不完整内容,逼模型写完整可运行代码
+        if let Some(m) = detect_placeholder(content) {
+            return placeholder_reject(m);
+        }
         let full = match resolve_in_workspace(&self.workspace, path) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e.to_string()),
@@ -541,6 +616,12 @@ impl Tool for ReplaceInFileTool {
             Ok(b) => b,
             Err(e) => return ToolResult::err(e),
         };
+        // 生产级硬约束:REPLACE 内容不得用「省略/占位」代替真实代码
+        for (_, replace) in &blocks {
+            if let Some(m) = detect_placeholder(replace) {
+                return placeholder_reject(m);
+            }
+        }
         let mut content = original;
         let mut applied = 0usize;
         for (search, replace) in &blocks {

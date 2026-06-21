@@ -5,27 +5,23 @@
 
 use crate::agent::coding::tools as coding;
 use crate::agent::core::shared::{
-    row_to_chat_msg, tool_calls_to_json, truncate_title, MessageView, MAX_ITERS,
+    begin_agent_turn, finalize_conversation_meta, insert_assistant_tool_calls,
+    insert_final_assistant, insert_tool_result, live_windowed_messages, load_agent_guidelines,
+    MessageView, MAX_ITERS,
 };
 use crate::agent::core::summary as conv_summary;
 use crate::agent::core::{
     provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef,
 };
 use crate::commands::{current_user, AppState};
-use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set,
-};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncBufReadExt;
-use veltrix_core::db::entity::{
-    chat_conversation as conv, chat_message as msg, provider as provider_entity,
-};
+use veltrix_core::db::entity::chat_conversation as conv;
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 自主续航(Act 模式)总步数硬上限:远大于 MAX_ITERS 让长任务一气呵成,但仍有界防失控。
@@ -300,6 +296,164 @@ pub async fn rollback_to_checkpoint(
     }
     let _ = coding::run_command_in(&ws, "git clean -fd", &exec).await;
     Ok("已回退到所选版本(文件已恢复,对话历史保留)".to_string())
+}
+
+/// 某版本里单个文件的改动:状态 + 路径 + 增删行数 + 该文件的 diff 正文。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointFileDiff {
+    /// added / modified / deleted / renamed
+    pub status: String,
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+    /// 该文件的 unified diff 正文(@@ hunk + 增删/上下文行;二进制为提示行)
+    pub diff: String,
+}
+
+/// 某版本(检查点)的完整改动详情:逐文件列出。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointDiffView {
+    pub files: Vec<CheckpointFileDiff>,
+}
+
+/// 取某检查点的改动详情(git show 该提交的 patch,逐文件解析)。hash 必须是十六进制(防 shell 注入)。
+#[tauri::command]
+pub async fn get_checkpoint_diff(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    hash: String,
+) -> Result<CheckpointDiffView> {
+    let h = hash.trim();
+    if h.is_empty() || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CrawlerError::Config("无效的版本标识".into()));
+    }
+    let (ws, exec) = resolve_exec(&state, &conversation_id).await?;
+    // 排除 node_modules / target 等重目录:它们若被提交,按字母序排在 src 前,会把用户真实改动挤出
+    // 输出截断窗口(且纯噪声)。双引号包裹 pathspec 对 cmd / sh 均安全。
+    let excludes: String = WS_SKIP_DIRS
+        .iter()
+        .map(|d| format!(" \":(exclude){d}\""))
+        .collect();
+    // --format= 去掉提交头只留 patch;-M 识别重命名;--no-color 输出纯文本便于解析
+    let out = coding::run_command_in(
+        &ws,
+        &format!("git show {h} --format= -M --no-color -- .{excludes}"),
+        &exec,
+    )
+    .await;
+    if out.is_error {
+        return Err(CrawlerError::Config(format!(
+            "读取版本改动失败(版本不存在 / 环境无 git): {}",
+            out.content.chars().take(200).collect::<String>()
+        )));
+    }
+    Ok(CheckpointDiffView {
+        files: parse_unified_diff(extract_command_stdout(&out.content)),
+    })
+}
+
+/// run_command_in 把输出包成 `exit: N\nstdout:\n<...>[\nstderr:\n<...>]`;取其中 stdout 段,
+/// 避免尾部 stderr 段被并入最后一个文件的 diff 正文。
+fn extract_command_stdout(wrapped: &str) -> &str {
+    let body = wrapped
+        .split_once("stdout:\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or(wrapped);
+    match body.rfind("\nstderr:\n") {
+        Some(i) => &body[..i],
+        None => body,
+    }
+}
+
+/// 解析 `git show --format=` 的 unified diff:按 `diff --git ` 切块,逐文件解析状态/路径/增删/正文。
+fn parse_unified_diff(patch: &str) -> Vec<CheckpointFileDiff> {
+    let lines: Vec<&str> = patch.lines().collect();
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].starts_with("diff --git ") {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < lines.len() && !lines[i].starts_with("diff --git ") {
+            i += 1;
+        }
+        files.push(parse_file_block(&lines[start..i]));
+    }
+    files
+}
+
+/// 解析单个文件 diff 块(从一行 `diff --git` 到下一块之前)。
+/// 须区分「文件头区」与「hunk 正文区」:文件头里取状态/路径,正文里才统计增删——否则正文中
+/// 内容恰为 `--- xxx` / `+++ xxx` 的删/增行会被误判为头行(致计数与正文错乱)。
+fn parse_file_block(block: &[&str]) -> CheckpointFileDiff {
+    let mut status = "modified";
+    let mut path = String::new();
+    let mut rename_to: Option<String> = None;
+    let mut additions = 0u32;
+    let mut deletions = 0u32;
+    // 正文起点:首个 `@@` hunk 头或 `Binary files` 行;此前为文件头区
+    let mut body_start: Option<usize> = None;
+    for (idx, &l) in block.iter().enumerate() {
+        if body_start.is_none() {
+            if l.starts_with("@@") || l.starts_with("Binary files ") {
+                body_start = Some(idx);
+            } else if l.starts_with("new file mode") {
+                status = "added";
+            } else if l.starts_with("deleted file mode") {
+                status = "deleted";
+            } else if l.starts_with("rename from ") {
+                status = "renamed";
+            } else if let Some(rest) = l.strip_prefix("rename to ") {
+                rename_to = Some(rest.trim().to_string());
+            } else if let Some(rest) = l.strip_prefix("+++ b/") {
+                if path.is_empty() {
+                    path = rest.trim().to_string();
+                }
+            } else if let Some(rest) = l.strip_prefix("--- a/") {
+                // 删除文件 +++ 为 /dev/null,改从 --- a/ 取路径
+                if path.is_empty() {
+                    path = rest.trim().to_string();
+                }
+            }
+        }
+        // 正文区(含起始 @@ 行):统计增删(@@ / 上下文 / `\ No newline` 行均不以 +/- 起,自然不计)
+        if body_start.is_some() {
+            if l.starts_with('+') {
+                additions += 1;
+            } else if l.starts_with('-') {
+                deletions += 1;
+            }
+        }
+    }
+    if let Some(to) = rename_to {
+        path = to;
+    }
+    if path.is_empty() {
+        // 兜底:从 "diff --git a/<p> b/<p>" 取 b/ 后路径(常规无空格情形)
+        path = block
+            .first()
+            .and_then(|l| l.rsplit(" b/").next())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    }
+    // 正文 = 首个 @@ / Binary 行起到块尾;无正文(纯重命名 / 模式变更)则为空
+    let diff = match body_start {
+        Some(s) => block[s..].join("\n"),
+        None => String::new(),
+    };
+    CheckpointFileDiff {
+        status: status.to_string(),
+        path,
+        additions,
+        deletions,
+        diff,
+    }
 }
 
 /// 文件面板:列出工作区真实文件的上限 / 跳过目录 / 单文件预览字节上限。
@@ -1042,10 +1196,7 @@ pub async fn get_dev_server_status(state: State<'_, AppState>) -> Result<DevServ
     Ok(DevServerStatus { running, port, command, logs, conversation_id })
 }
 
-/// 意图分类的 LLM 调用超时(秒):只回一个词,取较短值;超时即回退关键词结果,避免拖慢首条消息。
-const CLASSIFY_TIMEOUT_SECS: u64 = 8;
-
-/// 关键词启发式分类:明显编程的快路径 + LLM 不可用时的兜底。
+/// 关键词启发式分类:覆盖 coding / rpa / computer 信号,其余归 chat。
 fn classify_by_keywords(text: &str) -> &'static str {
     let lower = text.to_lowercase();
     // 浏览器自动化(RPA)信号优先判:这些词较明确,且可能混入 coding 词(打开 / 运行)
@@ -1056,12 +1207,38 @@ fn classify_by_keywords(text: &str) -> &'static str {
     if RPA_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "rpa";
     }
+    // 网页任务再判:命中「具体网站/平台名」或「网页语境」且带「网页动作」→ RPA(本应用 RPA = 内嵌浏览器操作网页)。
+    // 覆盖「打开抖音搜索…」「在淘宝查…」「访问某网址并…」这类——纯关键词难穷举,故用 站点/语境 × 动作 组合判定。
+    const SITE_NAMES: &[&str] = &[
+        "抖音", "快手", "小红书", "淘宝", "天猫", "京东", "拼多多", "闲鱼", "微博", "知乎",
+        "豆瓣", "哔哩", "bilibili", "b站", "百度", "谷歌", "google", "bing", "youtube",
+        "tiktok", "今日头条", "头条", "美团", "大众点评", "携程", "12306", "公众号", "网易",
+        "搜狐", "新浪", "优酷", "腾讯视频",
+    ];
+    const WEB_CONTEXT: &[&str] = &[
+        "网页", "网站", "官网", "网址", "url", "http", "www.", ".com", ".cn", ".net",
+        "浏览器", "平台", "页面",
+    ];
+    const WEB_ACTION: &[&str] = &[
+        "打开", "访问", "进入", "登录", "搜索", "搜一下", "查一下", "查找", "浏览", "点击",
+        "填写", "下单", "购买", "抓取", "爬取", "采集", "翻页", "滚动", "评论", "点赞", "关注",
+    ];
+    let has_web_action = WEB_ACTION.iter().any(|k| lower.contains(k));
+    if has_web_action
+        && (SITE_NAMES.iter().any(|k| lower.contains(k))
+            || WEB_CONTEXT.iter().any(|k| lower.contains(k)))
+    {
+        return "rpa";
+    }
     // 电脑操作(桌面级:截图 / 鼠标键盘 / 窗口 / 进程 / 启动程序),优先于 coding——
     // 避免"打开 / 运行 / 文件"这类词被 coding 信号吃掉。
     const COMPUTER_SIGNALS: &[&str] = &[
         "截图", "截屏", "屏幕", "桌面", "鼠标", "键盘", "剪贴板", "打开程序", "启动程序",
         "打开软件", "打开应用", "切换窗口", "关闭窗口", "任务管理器", "结束进程", "杀进程",
         "电脑操作", "操作电脑", "控制电脑", "识别屏幕", "看屏幕",
+        // 本地文件 / 磁盘类(纯统计 / 整理本地文件也归电脑操作:走 fs/system 工具,而非纯聊天空答)
+        "d盘", "c盘", "e盘", "f盘", "磁盘", "我的电脑", "此电脑", "本地文件",
+        "多少文件", "多少个文件", "文件数量", "统计文件",
     ];
     if COMPUTER_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "computer";
@@ -1085,9 +1262,10 @@ fn classify_by_keywords(text: &str) -> &'static str {
     }
 }
 
-/// 意图分类:判断首条消息走哪个 Agent,返回 "coding" / "rpa" / "chat"。
-/// 关键词明显命中 coding / rpa → 直接返回(省一次调用);否则用一次轻量 LLM 兜底三类;
-/// LLM 不可用 / 失败 / 乱答 → 回退 chat。provider_id/model 由前端传入(用当前选中的模型)。
+/// 意图分类:判断首条消息走哪个 Agent,返回 "coding" / "rpa" / "computer" / "chat"。
+/// 纯关键词判定——不再做 LLM 兜底分类,新会话首条少一次 LLM 往返、显著加快首条响应。
+/// 代价:个别无明显关键词的 agent 任务会被当普通聊天(用户可换措辞或直接进对应 Agent)。
+/// provider_id / model 保留以兼容前端调用签名(暂不使用)。
 #[tauri::command]
 pub async fn classify_agent_type(
     state: State<'_, AppState>,
@@ -1095,72 +1273,8 @@ pub async fn classify_agent_type(
     provider_id: Option<String>,
     model: Option<String>,
 ) -> Result<String> {
-    // 关键词明确命中 coding / rpa → 直接返回(省一次 LLM);否则交给 LLM 兜底
-    let kw = classify_by_keywords(&text);
-    if kw != "chat" {
-        return Ok(kw.to_string());
-    }
-    if let (Some(pid), Some(m)) = (provider_id.as_deref(), model.as_deref()) {
-        if let Some(r) = classify_via_llm(&state.db, pid, m, &text).await {
-            return Ok(r);
-        }
-    }
-    Ok("chat".to_string())
-}
-
-/// 一次 LLM 分类:只让模型回答 coding / chat。失败或乱答返回 None(由上层回退关键词结果)。
-/// 分类属杂活,优先走 Classify 角色单独配置的便宜模型;未配置则回退前端传入的会话模型。
-async fn classify_via_llm(
-    db: &sea_orm::DatabaseConnection,
-    provider_id: &str,
-    model: &str,
-    text: &str,
-) -> Option<String> {
-    let provider = provider_entity::Entity::find_by_id(provider_id.to_string())
-        .one(db)
-        .await
-        .ok()
-        .flatten()?;
-    if provider.api_key.trim().is_empty() {
-        return None;
-    }
-    // 前端传入的 provider/model 退化为回退档;命中 Classify 角色配置则改走便宜模型
-    let fallback = ProviderRef {
-        kind: ProviderKind::from_code(&provider.code),
-        api_url: provider.api_url.clone(),
-        api_key: provider.api_key.clone(),
-        model: model.to_string(),
-    };
-    let chosen =
-        crate::commands::resolve_role_provider(db, crate::llm::AgentRole::Classify, fallback).await;
-    let snippet: String = text.chars().take(1000).collect();
-    let prompt = format!(
-        "判断下面这条用户消息属于哪类任务,只回答一个词:\
-coding(编程 / 写代码 / 改代码 / 跑命令 / 做软件工具)、\
-rpa(操作浏览器或网页:打开网页、点击、填表单、网页自动化 / 抓取)、\
-chat(其它:闲聊 / 问答 / 写作等)。只回答 coding、rpa 或 chat,不要解释。\n\n消息:{snippet}"
-    );
-    let reply = crate::llm::chat::chat_completion(crate::llm::chat::ChatRequest {
-        api_url: &chosen.api_url,
-        api_key: &chosen.api_key,
-        model: &chosen.model,
-        messages: json!([{ "role": "user", "content": prompt }]),
-        extra_body: None,
-        timeout_secs: CLASSIFY_TIMEOUT_SECS,
-        retry_server_errors: false,
-    })
-    .await
-    .ok()?;
-    let lower = reply.to_lowercase();
-    if lower.contains("coding") {
-        Some("coding".to_string())
-    } else if lower.contains("rpa") {
-        Some("rpa".to_string())
-    } else if lower.contains("chat") {
-        Some("chat".to_string())
-    } else {
-        None
-    }
+    let _ = (&state, &provider_id, &model);
+    Ok(classify_by_keywords(&text).to_string())
 }
 
 /// 发送一条用户消息,驱动编程 Agent 的 ReAct 循环;过程逐步落库 + 推 `agent-step` 进度事件,
@@ -1180,47 +1294,9 @@ pub async fn send_coding_message(
     if text.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
     }
-
-    let conversation = conv::Entity::find_by_id(conversation_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
-    if conversation.owner != me.name {
-        return Err(CrawlerError::Config("无权操作该会话".into()));
-    }
-    let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
-    if provider.api_key.trim().is_empty() {
-        return Err(CrawlerError::Config(
-            "该模型厂商未配置 API Key,请到系统配置补全".into(),
-        ));
-    }
-
-    // 是否首轮(决定是否用首句起标题)
-    let had_messages = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
-    let now = Utc::now().timestamp();
-    // 落库 user 消息
-    msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("user".to_string()),
-        content: Set(text.clone()),
-        created_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
+    // 前奏(归属 / api_key 校验 + 首轮判定 + 落库 user 消息)统一走 core::shared
+    let (conversation, provider, had_messages) =
+        begin_agent_turn(&state.db, &me.name, &conversation_id, &text).await?;
 
     // 准备本会话工作区 + 执行环境(host 或 Docker 沙盒)+ 工具注册表
     let (workspace, exec) = resolve_exec(&state, &conversation_id).await?;
@@ -1229,31 +1305,16 @@ pub async fn send_coding_message(
     let registry = coding::build_registry(workspace, exec, agent_mode);
     let tool_defs = registry.defs();
 
-    // live 原文:id 大于已折叠进摘要的边界(含刚落库的 user 消息);更早的由会话滚动摘要承载,
-    // 长会话不再硬截断丢早期上下文(与 chat 一致的「live 窗口 + 滚动摘要」策略)。
-    let mut rows = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .filter(msg::Column::Id.gt(conversation.summarized_upto_id))
-        .order_by_desc(msg::Column::Id)
-        .limit(conv_summary::LIVE_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
-    // 取「最新」LIVE_HARD_CAP 条后翻回升序(与 chat 一致):desc+limit 保证未折叠消息超额时
-    // 尾部仍是刚落库的本轮 user,不会被挤出窗口(此前 asc+limit 取最旧会丢本轮提问)。
-    rows.reverse();
-    // 兜底:窗口须从第一条 user 开始——否则可能以 tool / assistant(tool_calls)开头
-    //(其配对消息已折进摘要),OpenAI 会报 400。找不到 user 则整窗为空(全靠摘要 + 本轮提问)。
-    let windowed: &[msg::Model] = match rows.iter().position(|m| m.role == "user") {
-        Some(start) => &rows[start..],
-        None => &[],
-    };
     // 按模式选系统提示词:Plan 只引导出方案(配合 build_registry 只挂只读工具),Act 亲自动手
     let system_prompt = match agent_mode {
         coding::AgentMode::Plan => coding::PLAN_SYSTEM_PROMPT,
         coding::AgentMode::Act => coding::SYSTEM_PROMPT,
     };
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(system_prompt.to_string())];
+    // 用户可编辑的附加规范(<config_dir>/agent-guidelines/coding.md):有则注入,无需改代码/硬编码
+    if let Some(g) = load_agent_guidelines(&state.config_dir, "coding").await {
+        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+    }
     // 会话滚动摘要:早期消息压缩后的前情提要,注入在原文之前(为空则不注入)
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(text) = sys.get("content").and_then(|v| v.as_str()) {
@@ -1266,7 +1327,7 @@ pub async fn send_coding_message(
             messages.push(ChatMsg::System(plan_sys));
         }
     }
-    messages.extend(windowed.iter().filter_map(row_to_chat_msg));
+    messages.extend(live_windowed_messages(&state.db, &conversation).await?);
 
     let provider_ref = ProviderRef {
         kind: ProviderKind::from_code(&provider.code),
@@ -1275,7 +1336,11 @@ pub async fn send_coding_message(
         model: conversation.model.clone(),
     };
     let llm = provider_for(provider_ref.kind);
-    let options = LlmOptions::default();
+    // 低温:编程 Agent 要的是精准、确定、可复现的代码与工具调用,而非发散创作
+    let options = LlmOptions {
+        temperature: Some(0.2),
+        ..LlmOptions::default()
+    };
 
     let emit = |label: String| {
         let _ = app.emit(
@@ -1296,11 +1361,17 @@ pub async fn send_coding_message(
 
     // ReAct 循环。auto_fix:run_command 失败后模型若想直接收尾,自动注入引导再修(有配额防卡死)
     let mut final_text = String::new();
+    // 模型「无工具调用、直接收尾」那步的思考过程(其余收尾路径无对应推理,保持 None)
+    let mut final_reasoning: Option<String> = None;
     let mut auto_fix_used = 0usize;
     let mut continue_used = 0usize;
     let mut last_run_failed = false;
     let mut goal_done = false;
     let mut finish_summary: Option<String> = None;
+    // 硬验证闸门:改了代码文件却没成功跑过验证命令就想收尾 → 打回强制先验证(有上限,避免困死)
+    let mut code_edited_since_verify = false;
+    let mut verify_gate_used = 0usize;
+    const MAX_VERIFY_GATE: usize = 2;
     for iter in 0..max_iters {
         // 手动停:命中即优雅收尾(下一步检查点生效)
         if autonomous && take_agent_cancel(&state, &conversation_id) {
@@ -1351,24 +1422,13 @@ pub async fn send_coding_message(
                 messages.push(ChatMsg::User(coding::auto_continue_prompt()));
                 continue;
             }
+            final_reasoning = resp.reasoning.clone();
             final_text = resp.content.unwrap_or_default();
             break;
         }
 
-        // 落库 assistant(带 tool_calls)
-        let assistant_text = resp.content.clone().unwrap_or_default();
-        let tc_json = tool_calls_to_json(&resp.tool_calls);
-        msg::ActiveModel {
-            conversation_id: Set(conversation_id.clone()),
-            role: Set("assistant".to_string()),
-            content: Set(assistant_text.clone()),
-            tool_calls: Set(Some(tc_json)),
-            created_at: Set(Utc::now().timestamp()),
-            ..Default::default()
-        }
-        .insert(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+        // 落库 assistant(带 tool_calls)+ 推入内存上下文
+        insert_assistant_tool_calls(&state.db, &conversation_id, &resp).await?;
         messages.push(ChatMsg::Assistant {
             text: resp.content.clone(),
             tool_calls: resp.tool_calls.clone(),
@@ -1383,6 +1443,24 @@ pub async fn send_coding_message(
             emit(format!("{flag} {}", call.name));
             if call.name == "run_command" && result.is_error {
                 run_failed = true;
+            }
+            // 追踪「改了代码但还没成功验证」:写/改代码文件置真,成功跑命令(视为验证)置假
+            if !result.is_error {
+                match call.name.as_str() {
+                    "write_file" | "replace_in_file" => {
+                        if call
+                            .arguments
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(coding::is_code_file)
+                            .unwrap_or(false)
+                        {
+                            code_edited_since_verify = true;
+                        }
+                    }
+                    "run_command" => code_edited_since_verify = false,
+                    _ => {}
+                }
             }
             // 拦截 update_plan:把模型给的完整 todo 清单落库到会话(工具层不碰 DB,持久化在此保持分层)
             if call.name == "update_plan" && !result.is_error {
@@ -1407,18 +1485,7 @@ pub async fn send_coding_message(
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
-            msg::ActiveModel {
-                conversation_id: Set(conversation_id.clone()),
-                role: Set("tool".to_string()),
-                content: Set(result.content.clone()),
-                tool_call_id: Set(Some(call.id.clone())),
-                tool_name: Set(Some(call.name.clone())),
-                created_at: Set(Utc::now().timestamp()),
-                ..Default::default()
-            }
-            .insert(&state.db)
-            .await
-            .map_err(|e| CrawlerError::Config(format!("保存工具结果失败: {e}")))?;
+            insert_tool_result(&state.db, &conversation_id, call, &result.content).await?;
             messages.push(ChatMsg::Tool {
                 tool_call_id: call.id.clone(),
                 content: result.content,
@@ -1428,6 +1495,15 @@ pub async fn send_coding_message(
 
         // 模型声明完成 → 收尾(用 finish 的 summary,否则给个默认收尾语)
         if goal_done {
+            // 硬验证闸门:改了代码却没成功跑过验证就想收尾 → 打回逼它先验证(有上限,避免困死)
+            if code_edited_since_verify && verify_gate_used < MAX_VERIFY_GATE {
+                verify_gate_used += 1;
+                goal_done = false;
+                finish_summary = None;
+                emit(format!("收尾前需先验证(第 {verify_gate_used} 次)"));
+                messages.push(ChatMsg::User(coding::verify_before_finish_prompt()));
+                continue;
+            }
             final_text = finish_summary
                 .clone()
                 .filter(|s| !s.trim().is_empty())
@@ -1446,25 +1522,12 @@ pub async fn send_coding_message(
     }
 
     // 落库最终 assistant 消息
-    let final_msg = msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("assistant".to_string()),
-        content: Set(final_text),
-        created_at: Set(Utc::now().timestamp()),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+    let final_msg =
+        insert_final_assistant(&state.db, &conversation_id, final_text, final_reasoning).await?;
     emit("完成".to_string());
 
-    // 更新会话时间;首轮用用户首句起标题(截断)
-    let mut am = conversation.into_active_model();
-    am.updated_at = Set(Utc::now().timestamp());
-    if !had_messages {
-        am.title = Set(truncate_title(&text));
-    }
-    let _ = am.update(&state.db).await;
+    // 更新会话时间;首轮用用户首句起标题(统一走 core::shared)
+    finalize_conversation_meta(&state.db, conversation, had_messages, &text).await;
 
     // 滚动摘要维护:本轮工具往返可能产生很多消息,live 过长时把较旧的折叠进会话摘要,
     // 异步进行不阻塞返回。会话模型作 fallback,命中 Summary 角色配置则改走便宜模型。

@@ -176,10 +176,10 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
     {
       title: "对话",
       // 会话列表在侧栏动态渲染(ChatConversationList);这里登记菜单项仅用于默认页与面包屑解析。
-      // 记忆中心为整页模块(记忆 / 知识库 / 知识图谱),从对话侧栏「记忆中心」入口进入。
+      // 记忆管理为整页模块(全局记忆 / 会话记忆),从对话侧栏「记忆管理」入口进入。
       items: [
         { key: "chat-sessions", label: "会话", icon: MessageSquare },
-        { key: "memory-center", label: "记忆中心", icon: Brain },
+        { key: "memory-center", label: "记忆管理", icon: Brain },
       ],
     },
   ],
@@ -364,7 +364,7 @@ function ChatConversationList({
           <SquarePen className="size-4" />
           新对话
         </button>
-        {/* 记忆中心:整页模块(记忆 / 知识库 / 知识图谱),点击进入整页而非弹窗 */}
+        {/* 记忆管理:整页模块(全局记忆 / 会话记忆),点击进入整页而非弹窗 */}
         <button
           type="button"
           onClick={() => onChange("memory-center")}
@@ -376,7 +376,7 @@ function ChatConversationList({
           )}
         >
           <Brain className="size-4" />
-          记忆中心
+          记忆管理
         </button>
       </div>
 
@@ -392,37 +392,29 @@ function ChatConversationList({
           </div>
         ) : (
           <SidebarGroup className="group/recent px-1 py-1">
-            {/* 分组标题「最近对话」可点击折叠;紧跟其后的「查看更多 / 折叠箭头」默认隐藏,悬浮分组才显示 */}
+            {/* 「最近对话」+ 折叠箭头合一(箭头紧跟文字右侧、常驻);「查看更多」推到最右,悬浮分组才显示 */}
             <div className="flex items-center gap-1 pr-1">
               <button
                 type="button"
+                aria-label={recentCollapsed ? "展开最近对话" : "折叠最近对话"}
                 onClick={() => setRecentCollapsed((v) => !v)}
-                className="rounded px-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                className="flex items-center gap-1 rounded px-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
               >
                 最近对话
-              </button>
-              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/recent:opacity-100">
-                <button
-                  type="button"
-                  onClick={() => onChange("chat-history")}
-                  className="flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
-                >
-                  查看更多
+                {recentCollapsed ? (
                   <ChevronRight className="size-3" />
-                </button>
-                <button
-                  type="button"
-                  aria-label={recentCollapsed ? "展开最近对话" : "折叠最近对话"}
-                  onClick={() => setRecentCollapsed((v) => !v)}
-                  className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
-                >
-                  {recentCollapsed ? (
-                    <ChevronRight className="size-3" />
-                  ) : (
-                    <ChevronDown className="size-3" />
-                  )}
-                </button>
-              </div>
+                ) : (
+                  <ChevronDown className="size-3" />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => onChange("chat-history")}
+                className="ml-auto flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover/recent:opacity-100"
+              >
+                查看更多
+                <ChevronRight className="size-3" />
+              </button>
             </div>
             {!recentCollapsed && (
               <SidebarGroupContent>

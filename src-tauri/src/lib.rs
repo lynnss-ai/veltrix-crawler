@@ -399,6 +399,11 @@ pub fn run() {
             registry.register(Arc::new(adapter::tiktok::TiktokAdapter::new()));
             registry.register(Arc::new(adapter::youtube::YoutubeAdapter::new()));
 
+            // 启动时探测一次 ffmpeg 可用性,写入录屏状态;后续录屏命令直接读标记,不再每次启子进程探测
+            let ffmpeg_available =
+                crate::media::probe_ffmpeg(cfg.media.ffmpeg_path.as_deref()).is_some();
+            tracing::info!("ffmpeg 启动探测:可用={ffmpeg_available}");
+
             app.manage(AppState {
                 config: std::sync::Mutex::new(cfg),
                 config_dir,
@@ -424,6 +429,12 @@ pub fn run() {
                 ),
                 app_handle: app.handle().clone(),
                 agent_cancel: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                agent_confirm: Arc::new(agent::core::shared::AgentConfirmChannel::new()),
+                recording: {
+                    let rec = agent::computer::recorder::RecordingState::new();
+                    rec.set_ffmpeg_available(ffmpeg_available);
+                    rec
+                },
             });
 
             // 任务调度器:每 30s 扫描 daily / watching 任务,到点自动启动采集
@@ -520,6 +531,8 @@ pub fn run() {
             commands::test_database_connection,
             commands::set_database_config,
             commands::set_storage_path,
+            commands::get_agent_guidelines,
+            commands::set_agent_guidelines,
             commands::set_intent_config,
             commands::set_transcription_config,
             commands::get_role_models,
@@ -616,6 +629,7 @@ pub fn run() {
             agent::chat::commands::list_chat_messages,
             agent::chat::commands::send_chat_message,
             agent::chat::commands::send_chat_message_stream,
+            agent::chat::commands::attach_recording_message,
             agent::chat::commands::transcribe_chat_audio,
             agent::chat::commands::build_content_attachments,
             // AI 对话:长期记忆
@@ -638,6 +652,7 @@ pub fn run() {
             agent::coding::commands::checkpoint_rollback,
             agent::coding::commands::list_coding_checkpoints,
             agent::coding::commands::rollback_to_checkpoint,
+            agent::coding::commands::get_checkpoint_diff,
             agent::coding::commands::list_workspace_files,
             agent::coding::commands::read_workspace_file,
             agent::coding::commands::write_workspace_file,
@@ -662,6 +677,13 @@ pub fn run() {
             agent::list_agent_tools,
             // 电脑操作 Agent:聚合全部工具的 ReAct 智能体
             agent::computer::commands::send_computer_message,
+            agent::computer::commands::resolve_agent_confirm,
+            // 屏幕录制:打开悬浮条 / 取消 / 开始(最小化主窗口 + ffmpeg 录全屏)/ 停止 / 查状态
+            agent::computer::recorder::open_recording_overlay,
+            agent::computer::recorder::cancel_recording_overlay,
+            agent::computer::recorder::start_screen_recording,
+            agent::computer::recorder::stop_screen_recording,
+            agent::computer::recorder::get_recording_status,
             // 拍照回传:截桌面屏幕 → base64 data URL(前端预览 / 将来喂视觉模型)
             agent::capture_desktop_screenshot,
             // 云端连接(配对 / WS / 远程指令)

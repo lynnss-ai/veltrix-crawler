@@ -16,6 +16,7 @@ import { api, type UserView } from "@/lib/api";
 import { save } from "@tauri-apps/plugin-dialog";
 import { generatePassword } from "@/lib/password";
 import { Button } from "@/components/ui/button";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { FieldError } from "@/components/FieldError";
@@ -414,29 +415,33 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
                     )}
                   </button>
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="size-11 shrink-0"
-                  title="重新生成"
-                  onClick={() => {
-                    setPassword(generatePassword());
-                    setShowPassword(true);
-                  }}
-                >
-                  <RefreshCw />
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="size-11 shrink-0"
-                  title="复制"
-                  onClick={copyPassword}
-                >
-                  <Copy />
-                </Button>
+                <SimpleTooltip content="重新生成">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="size-11 shrink-0"
+                    aria-label="重新生成"
+                    onClick={() => {
+                      setPassword(generatePassword());
+                      setShowPassword(true);
+                    }}
+                  >
+                    <RefreshCw />
+                  </Button>
+                </SimpleTooltip>
+                <SimpleTooltip content="复制">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="size-11 shrink-0"
+                    aria-label="复制"
+                    onClick={copyPassword}
+                  >
+                    <Copy />
+                  </Button>
+                </SimpleTooltip>
               </div>
               <FieldError
                 show={submitted && password.trim().length < MIN_PASSWORD_LENGTH}

@@ -9,27 +9,20 @@
 //! 本模块另提供 webview 的定位/显隐命令(set_agent_webview_bounds / show / hide)与拦截读取
 //! (get_agent_network)。复用 coding 的消息行 ↔ ChatMsg 转换 / 标题截断 / 滚动摘要。
 
-use crate::agent::core::shared::{row_to_chat_msg, tool_calls_to_json, truncate_title, MessageView};
+use crate::agent::core::shared::{
+    begin_agent_turn, finalize_conversation_meta, insert_assistant_tool_calls,
+    insert_final_assistant, insert_tool_result, live_windowed_messages, load_agent_guidelines,
+    MessageView, MAX_ITERS,
+};
 use crate::agent::core::summary as conv_summary;
 use crate::agent::core::{
     provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef,
 };
 use crate::agent::rpa::tools as browser;
 use crate::commands::{current_user, AppState};
-use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set,
-};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
-use veltrix_core::db::entity::{
-    chat_conversation as conv, chat_message as msg, provider as provider_entity,
-};
 use veltrix_core::error::{CrawlerError, Result};
-
-// 复用 core 一处定义的 ReAct 最大步数(防失控循环)。
-use crate::agent::core::shared::MAX_ITERS;
 
 /// get_agent_network 返回时单条响应体的截断长度(前端面板展示用)。
 const NET_VIEW_BODY_CAP: usize = 4000;
@@ -59,77 +52,27 @@ pub async fn send_browser_message(
     if text.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
     }
-
-    let conversation = conv::Entity::find_by_id(conversation_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
-    if conversation.owner != me.name {
-        return Err(CrawlerError::Config("无权操作该会话".into()));
-    }
-    let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
-    if provider.api_key.trim().is_empty() {
-        return Err(CrawlerError::Config(
-            "该模型厂商未配置 API Key,请到系统配置补全".into(),
-        ));
-    }
-
-    // 是否首轮(决定是否用首句起标题)
-    let had_messages = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
-    let now = Utc::now().timestamp();
-    // 落库 user 消息
-    msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("user".to_string()),
-        content: Set(text.clone()),
-        created_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
+    // 前奏(归属 / api_key 校验 + 首轮判定 + 落库 user 消息)统一走 core::shared
+    let (conversation, provider, had_messages) =
+        begin_agent_turn(&state.db, &me.name, &conversation_id, &text).await?;
 
     // 工具注册表:用 conversation_id 作为子 webview 隔离 key(内嵌主窗口右栏的 "agent" webview)。
     // 动作回读走 ExecuteScript(script_eval),不再依赖页面 invoke 回传通道。
     let registry = browser::build_registry(app.clone(), state.webviews.clone(), conversation_id.clone());
     let tool_defs = registry.defs();
 
-    // live 原文窗口 + 滚动摘要(与 coding / chat 一致):id 大于已折叠边界的为原文,更早的靠摘要承载
-    let mut rows = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .filter(msg::Column::Id.gt(conversation.summarized_upto_id))
-        .order_by_desc(msg::Column::Id)
-        .limit(conv_summary::LIVE_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
-    // 取最新 LIVE_HARD_CAP 条后翻回升序(与 chat 一致),保证超额时尾部仍是刚落库的本轮 user
-    rows.reverse();
-    // 兜底:窗口须从第一条 user 开始,否则可能以 tool / assistant(tool_calls)开头致 OpenAI 报 400
-    let windowed: &[msg::Model] = match rows.iter().position(|m| m.role == "user") {
-        Some(start) => &rows[start..],
-        None => &[],
-    };
-
+    // 系统提示词 + 滚动摘要 + live 原文窗口(窗口构建统一走 core::shared)
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(browser::SYSTEM_PROMPT.to_string())];
+    // 用户可编辑的附加规范(<config_dir>/agent-guidelines/rpa.md):有则注入
+    if let Some(g) = load_agent_guidelines(&state.config_dir, "rpa").await {
+        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+    }
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
             messages.push(ChatMsg::System(summary_text.to_string()));
         }
     }
-    messages.extend(windowed.iter().filter_map(row_to_chat_msg));
+    messages.extend(live_windowed_messages(&state.db, &conversation).await?);
 
     let provider_ref = ProviderRef {
         kind: ProviderKind::from_code(&provider.code),
@@ -138,7 +81,11 @@ pub async fn send_browser_message(
         model: conversation.model.clone(),
     };
     let llm = provider_for(provider_ref.kind);
-    let options = LlmOptions::default();
+    // 低温:浏览器 Agent 要的是精准、确定的选择器与动作,而非发散
+    let options = LlmOptions {
+        temperature: Some(0.2),
+        ..LlmOptions::default()
+    };
 
     let emit = |label: String| {
         let _ = app.emit(
@@ -149,6 +96,8 @@ pub async fn send_browser_message(
 
     // ReAct 循环。浏览器动作只发出、不回读成败,故无 coding 那套 run_command 自动续修。
     let mut final_text = String::new();
+    // 模型「无工具调用、直接收尾」那步的思考过程(达上限收尾路径无对应推理,保持 None)
+    let mut final_reasoning: Option<String> = None;
     for iter in 0..MAX_ITERS {
         emit(format!("思考中…(第 {} 步)", iter + 1));
         let resp = llm
@@ -162,24 +111,13 @@ pub async fn send_browser_message(
 
         // 无工具调用 → 模型收尾
         if resp.tool_calls.is_empty() {
+            final_reasoning = resp.reasoning.clone();
             final_text = resp.content.unwrap_or_default();
             break;
         }
 
-        // 落库 assistant(带 tool_calls)
-        let assistant_text = resp.content.clone().unwrap_or_default();
-        let tc_json = tool_calls_to_json(&resp.tool_calls);
-        msg::ActiveModel {
-            conversation_id: Set(conversation_id.clone()),
-            role: Set("assistant".to_string()),
-            content: Set(assistant_text.clone()),
-            tool_calls: Set(Some(tc_json)),
-            created_at: Set(Utc::now().timestamp()),
-            ..Default::default()
-        }
-        .insert(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+        // 落库 assistant(带 tool_calls)+ 推入内存上下文
+        insert_assistant_tool_calls(&state.db, &conversation_id, &resp).await?;
         messages.push(ChatMsg::Assistant {
             text: resp.content.clone(),
             tool_calls: resp.tool_calls.clone(),
@@ -200,18 +138,7 @@ pub async fn send_browser_message(
             } else {
                 result.content.clone()
             };
-            msg::ActiveModel {
-                conversation_id: Set(conversation_id.clone()),
-                role: Set("tool".to_string()),
-                content: Set(tool_text.clone()),
-                tool_call_id: Set(Some(call.id.clone())),
-                tool_name: Set(Some(call.name.clone())),
-                created_at: Set(Utc::now().timestamp()),
-                ..Default::default()
-            }
-            .insert(&state.db)
-            .await
-            .map_err(|e| CrawlerError::Config(format!("保存工具结果失败: {e}")))?;
+            insert_tool_result(&state.db, &conversation_id, call, &tool_text).await?;
             messages.push(ChatMsg::Tool {
                 tool_call_id: call.id.clone(),
                 content: tool_text,
@@ -236,25 +163,12 @@ pub async fn send_browser_message(
     }
 
     // 落库最终 assistant 消息
-    let final_msg = msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("assistant".to_string()),
-        content: Set(final_text),
-        created_at: Set(Utc::now().timestamp()),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+    let final_msg =
+        insert_final_assistant(&state.db, &conversation_id, final_text, final_reasoning).await?;
     emit("完成".to_string());
 
-    // 更新会话时间;首轮用用户首句起标题
-    let mut am = conversation.into_active_model();
-    am.updated_at = Set(Utc::now().timestamp());
-    if !had_messages {
-        am.title = Set(truncate_title(&text));
-    }
-    let _ = am.update(&state.db).await;
+    // 更新会话时间;首轮用用户首句起标题(统一走 core::shared)
+    finalize_conversation_meta(&state.db, conversation, had_messages, &text).await;
 
     // 滚动摘要维护:异步进行不阻塞返回。复用 coding 的强化提示无意义(非编程),用通用维护。
     spawn_browser_summary_maintenance(&state.db, &conversation_id, provider_ref);
