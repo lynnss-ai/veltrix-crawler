@@ -22,7 +22,8 @@ const MESSAGE_HARD_CAP: u64 = 500;
 // 发送给模型的 = [用户全局记忆] + [会话滚动摘要] + [live 原文消息] + [本次提问]。
 // live 原文 = id 大于 summarized_upto_id 的消息;更早的被压缩进会话 summary,聊多久都不丢前文。
 // 阈值常量与摘要折叠 / 注入实现已上移到 conversation_summary 模块,与 coding 共用。
-use crate::commands::conversation_summary::{
+use crate::agent::core::shared::{MessageAttachmentView, MessageView};
+use crate::agent::core::summary::{
     maintain_conversation_summary, summary_system_message, LIVE_HARD_CAP, MAX_SUMMARY_CHARS,
 };
 
@@ -59,36 +60,7 @@ impl From<conv::Model> for ConversationView {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MessageView {
-    pub id: i64,
-    pub conversation_id: String,
-    pub role: String,
-    pub content: String,
-    /// assistant 的工具调用(JSON 字符串,前端解析展示);纯文本为 None
-    pub tool_calls: Option<String>,
-    /// role=tool:对应的工具调用 id
-    pub tool_call_id: Option<String>,
-    /// role=tool:工具名
-    pub tool_name: Option<String>,
-    pub created_at: i64,
-}
-
-impl From<msg::Model> for MessageView {
-    fn from(m: msg::Model) -> Self {
-        Self {
-            id: m.id,
-            conversation_id: m.conversation_id,
-            role: m.role,
-            content: m.content,
-            tool_calls: m.tool_calls,
-            tool_call_id: m.tool_call_id,
-            tool_name: m.tool_name,
-            created_at: m.created_at,
-        }
-    }
-}
+// 消息视图(MessageView / MessageAttachmentView)已上移到 `crate::agent::core::shared`(见顶部 use)。
 
 /// 列出当前用户的会话,按最近更新倒序。
 #[tauri::command]
@@ -280,6 +252,12 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
         .exec(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("删除消息失败: {e}")))?;
+    // 顺手清理该会话落盘的图片附件目录(best-effort,失败忽略,不阻断删除)
+    let att_dir = state
+        .config_dir
+        .join("chat-attachments")
+        .join(safe_dir_name(&id));
+    let _ = tokio::fs::remove_dir_all(&att_dir).await;
     conv::Entity::delete_by_id(id)
         .exec(&state.db)
         .await
@@ -389,7 +367,7 @@ pub async fn send_chat_message(
     let mut arr: Vec<Value> = Vec::with_capacity(history.len() + 2);
     // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
     if let Some(sys) =
-        crate::commands::chat_memory::memory_system_message(&state.db, &me.name, &text).await
+        crate::agent::chat::memory::memory_system_message(&state.db, &me.name, &text).await
     {
         arr.push(sys);
     }
@@ -397,11 +375,10 @@ pub async fn send_chat_message(
     if let Some(sys) = summary_system_message(&conversation.summary) {
         arr.push(sys);
     }
-    arr.extend(
-        history
-            .iter()
-            .map(|m| json!({ "role": m.role, "content": m.content })),
-    );
+    // 历史里带图片的 user 消息重建为多模态,模型后续轮次仍"看得到"图(纯文本消息原样透传)
+    for m in &history {
+        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
+    }
     let messages = json!(arr);
 
     // 调大模型(失败时回滚刚插入的 user 消息会更干净,但保留也无碍——用户可重发)
@@ -548,24 +525,15 @@ pub async fn send_chat_message_stream(
         .flatten()
         .is_some();
 
-    // DB 存储用文本:正文 + 附件名提示(图片不持久化,历史里以名称展示)
-    let stored = if attachments.is_empty() {
-        text.clone()
-    } else {
-        let notes: Vec<String> = attachments
-            .iter()
-            .map(|a| format!("[附件: {}]", a.name))
-            .collect();
-        if text.is_empty() {
-            notes.join("\n")
-        } else {
-            format!("{text}\n{}", notes.join("\n"))
-        }
-    };
+    // 附件落盘并产出元数据 JSON:图片写入本地附件目录(供历史渲染 + 多轮重建),content 只存正文。
+    // 旧口径把 [附件:名] 塞进 content,导致历史只见文字占位、图片丢失;现改为图片单列存储。
+    let attachments_json =
+        persist_attachments(&state.config_dir, &conversation_id, &attachments).await;
     msg::ActiveModel {
         conversation_id: Set(conversation_id.clone()),
         role: Set("user".to_string()),
-        content: Set(stored),
+        content: Set(text.clone()),
+        attachments: Set(attachments_json),
         created_at: Set(now),
         ..Default::default()
     }
@@ -578,7 +546,7 @@ pub async fn send_chat_message_stream(
     let mut arr: Vec<Value> = Vec::with_capacity(prior.len() + 3);
     // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
     if let Some(sys) =
-        crate::commands::chat_memory::memory_system_message(&state.db, &me.name, &text).await
+        crate::agent::chat::memory::memory_system_message(&state.db, &me.name, &text).await
     {
         arr.push(sys);
     }
@@ -586,11 +554,10 @@ pub async fn send_chat_message_stream(
     if let Some(sys) = summary_system_message(&conversation.summary) {
         arr.push(sys);
     }
-    arr.extend(
-        prior
-            .iter()
-            .map(|m| json!({ "role": m.role, "content": m.content })),
-    );
+    // 历史里带图片的 user 消息重建为多模态(与非流式一致),让模型后续轮次仍"看得到"图
+    for m in &prior {
+        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
+    }
     arr.push(json!({ "role": "user", "content": current_content }));
     let messages = json!(arr);
 
@@ -607,19 +574,23 @@ pub async fn send_chat_message_stream(
             timeout_secs: crate::llm::http::CHAT_TIMEOUT_SECS,
             retry_server_errors: false,
         },
-        move |delta| {
+        move |kind, delta| {
+            // kind 区分正文(content)与思考过程(reasoning),前端分别渲染
             let _ = app_emit.emit(
                 "chat-stream",
-                json!({ "conversationId": cid_emit, "delta": delta }),
+                json!({ "conversationId": cid_emit, "kind": kind, "delta": delta }),
             );
         },
     )
     .await?;
+    let reply_text = reply.content;
+    let reply_reasoning = reply.reasoning;
 
     let assistant = msg::ActiveModel {
         conversation_id: Set(conversation_id.clone()),
         role: Set("assistant".to_string()),
-        content: Set(reply.clone()),
+        content: Set(reply_text.clone()),
+        reasoning: Set(reply_reasoning),
         created_at: Set(Utc::now().timestamp()),
         ..Default::default()
     }
@@ -631,7 +602,7 @@ pub async fn send_chat_message_stream(
     let fallback_ref = session_provider_ref(&provider, &conversation.model);
 
     // 自动记忆提取:从本轮对话抽取值得长期记住的事实,异步落库,不阻塞回复返回
-    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply);
+    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply_text);
 
     // 滚动摘要维护:live 过长时把较旧消息折叠进会话摘要,异步进行,不阻塞回复返回
     spawn_summary_maintenance(&state.db, &conversation_id, fallback_ref.clone());
@@ -649,7 +620,7 @@ pub async fn send_chat_message_stream(
                 &title_ref.api_key,
                 &title_ref.model,
                 &text,
-                &reply,
+                &reply_text,
             )
             .await
             .unwrap_or_else(|| truncate_title(&text)),
@@ -665,13 +636,60 @@ pub async fn send_chat_message_stream(
     Ok(assistant.into())
 }
 
+/// 把录制好的视频以附件方式作为一条 user 消息加入对话(引用本地路径,不重新上传 base64)。
+/// 录屏停止后前端按当前会话调用;返回新消息视图供前端追加渲染(内联播放器)。
+#[tauri::command]
+pub async fn attach_recording_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    path: String,
+) -> Result<MessageView> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(CrawlerError::Config("录制文件路径为空".into()));
+    }
+    let conversation = conv::Entity::find_by_id(conversation_id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
+    if conversation.owner != me.name {
+        return Err(CrawlerError::Config("无权操作该会话".into()));
+    }
+    let name = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "recording.mp4".to_string());
+    // 附件 JSON 与 persist_attachments 同口径:[{name,mime,path}](path 为本地绝对路径,走 asset 协议播放)
+    let attachments_json =
+        json!([{ "name": name, "mime": "video/mp4", "path": trimmed }]).to_string();
+    let now = Utc::now().timestamp();
+    let saved = msg::ActiveModel {
+        conversation_id: Set(conversation_id.clone()),
+        role: Set("user".to_string()),
+        content: Set(String::new()),
+        attachments: Set(Some(attachments_json)),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&state.db)
+    .await
+    .map_err(|e| CrawlerError::Config(format!("保存录制消息失败: {e}")))?;
+    // 抬升会话 updated_at,让其在侧栏置顶
+    let mut am = conversation.into_active_model();
+    am.updated_at = Set(now);
+    let _ = am.update(&state.db).await;
+    Ok(saved.into())
+}
+
 /// 把本轮对话的记忆提取放到后台 spawn 执行,避免阻塞回复返回。
 /// 入参均 clone 进任务,绕开生命周期约束(provider/conversation 随后会被消费)。
 /// 记忆提取属杂活,优先走 Summary 角色单独配置的便宜模型;未配置则回退会话模型(fallback)。
 fn spawn_memory_extraction(
     db: &sea_orm::DatabaseConnection,
     owner: &str,
-    fallback: crate::llm::agent::ProviderRef,
+    fallback: crate::agent::core::ProviderRef,
     user_text: &str,
     assistant_text: &str,
 ) {
@@ -686,7 +704,7 @@ fn spawn_memory_extraction(
             fallback,
         )
         .await;
-        crate::commands::chat_memory::extract_and_store_memories(
+        crate::agent::chat::memory::extract_and_store_memories(
             &db,
             &owner,
             &p.api_url,
@@ -703,9 +721,9 @@ fn spawn_memory_extraction(
 fn session_provider_ref(
     provider: &veltrix_core::db::entity::provider::Model,
     model: &str,
-) -> crate::llm::agent::ProviderRef {
-    crate::llm::agent::ProviderRef {
-        kind: crate::llm::agent::ProviderKind::from_code(&provider.code),
+) -> crate::agent::core::ProviderRef {
+    crate::agent::core::ProviderRef {
+        kind: crate::agent::core::ProviderKind::from_code(&provider.code),
         api_url: provider.api_url.clone(),
         api_key: provider.api_key.clone(),
         model: model.to_string(),
@@ -717,7 +735,7 @@ fn session_provider_ref(
 fn spawn_summary_maintenance(
     db: &sea_orm::DatabaseConnection,
     conversation_id: &str,
-    fallback: crate::llm::agent::ProviderRef,
+    fallback: crate::agent::core::ProviderRef,
 ) {
     let db = db.clone();
     let conversation_id = conversation_id.to_string();
@@ -792,6 +810,132 @@ fn is_text_name(name: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
+/// 把本条用户消息的附件落盘并产出元数据 JSON(供历史渲染 + 多轮重建)。
+/// 图片:解码 base64 写入 `{config_dir}/chat-attachments/{会话id}/{毫秒}-{序号}.{ext}`,记绝对 path;
+/// 非图片:不落盘(其内容已在本轮内联给模型),仅记 name/mime 供历史以文件 chip 展示。
+/// 无附件返回 None(attachments 列存 NULL)。
+async fn persist_attachments(
+    config_dir: &std::path::Path,
+    conversation_id: &str,
+    attachments: &[ChatAttachment],
+) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    let dir = config_dir
+        .join("chat-attachments")
+        .join(safe_dir_name(conversation_id));
+    let stamp = Utc::now().timestamp_millis();
+    let mut metas: Vec<Value> = Vec::with_capacity(attachments.len());
+    for (idx, a) in attachments.iter().enumerate() {
+        let path = if a.mime.starts_with("image/") {
+            // 图片落盘;失败降级为无 path(历史仍展示文件名,不阻断发送)
+            match write_image_file(&dir, stamp, idx, a).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("聊天图片落盘失败({}): {e}", a.name);
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        metas.push(json!({ "name": a.name, "mime": a.mime, "path": path }));
+    }
+    serde_json::to_string(&metas).ok()
+}
+
+/// 解码图片 base64 写入附件目录,返回绝对路径字符串。
+async fn write_image_file(
+    dir: &std::path::Path,
+    stamp: i64,
+    idx: usize,
+    a: &ChatAttachment,
+) -> Result<String> {
+    use base64::Engine;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("创建附件目录失败: {e}")))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(a.data.as_bytes())
+        .map_err(|e| CrawlerError::Config(format!("图片解码失败: {e}")))?;
+    let full = dir.join(format!("{stamp}-{idx}.{}", image_ext(&a.mime, &a.name)));
+    tokio::fs::write(&full, &bytes)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("写图片失败: {e}")))?;
+    Ok(full.to_string_lossy().into_owned())
+}
+
+/// 图片落盘扩展名:优先按 mime,回退文件名扩展名,再回退 jpg。
+fn image_ext(mime: &str, name: &str) -> String {
+    match mime {
+        "image/png" => return "png".to_string(),
+        "image/jpeg" => return "jpg".to_string(),
+        "image/webp" => return "webp".to_string(),
+        "image/gif" => return "gif".to_string(),
+        _ => {}
+    }
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "jpg".to_string())
+}
+
+/// 会话 id 作目录名的安全化:非字母数字 / - / _ 一律替换为 _(会话 id 通常为 UUID 已安全,防御性处理)。
+fn safe_dir_name(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 构造历史消息发给模型的 content:带图片的 user 消息重建为多模态数组(正文 + 各图 image_url,
+/// 图片从落盘 path 读回 base64);否则原样返回纯文本 content。读图失败降级为文字占位,不中断。
+async fn history_content(m: &msg::Model) -> Value {
+    use base64::Engine;
+    let metas: Vec<MessageAttachmentView> = m
+        .attachments
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let images: Vec<&MessageAttachmentView> = metas
+        .iter()
+        .filter(|a| a.mime.starts_with("image/") && !a.path.is_empty())
+        .collect();
+    if m.role != "user" || images.is_empty() {
+        return json!(m.content);
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    if !m.content.is_empty() {
+        parts.push(json!({ "type": "text", "text": m.content }));
+    }
+    for a in images {
+        match tokio::fs::read(&a.path).await {
+            Ok(bytes) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", a.mime, b64) }
+                }));
+            }
+            Err(e) => {
+                tracing::warn!("重建历史图片失败({}): {e}", a.path);
+                parts.push(json!({
+                    "type": "text",
+                    "text": format!("[图片: {}(本地已丢失)]", a.name)
+                }));
+            }
+        }
+    }
+    json!(parts)
+}
+
 /// 用 AI 概括一轮对话生成简短标题(≤16 字,无标点/引号)。失败返回 None 由上层回退。
 async fn generate_title(
     api_url: &str,
@@ -858,7 +1002,7 @@ pub async fn transcribe_chat_audio(
 
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
     // 地址/模型已有 MiMo 默认值,真正必填的是 API Key
-    let api_key = super::get_secret(&state.db, "transcription_api_key").await;
+    let api_key = crate::commands::get_secret(&state.db, "transcription_api_key").await;
     if api_key.trim().is_empty() {
         return Err(CrawlerError::Config(
             "未配置语音转写 API Key,请到系统设置 → 语音转写填写 API Key".into(),

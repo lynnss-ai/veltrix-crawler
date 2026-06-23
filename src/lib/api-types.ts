@@ -103,6 +103,16 @@ export interface UserInput {
   dataScope: string;
 }
 
+// 模型能力 code(与后端 llm/provider.rs::MODEL_CAPABILITIES 逐一对应):
+// 对话 / 图片(视觉) / 音频 / 视频 / 工具调用(function calling)。
+export type ModelCapability = "text" | "vision" | "audio" | "video" | "tools";
+
+// 单个模型 = 名称 + 能力集合。各智能体据能力挑模型:对话/角色要 text,coding/rpa 要 tools。
+export interface ModelSpec {
+  name: string;
+  capabilities: ModelCapability[];
+}
+
 // 模型厂商
 export interface ProviderDto {
   id: string;
@@ -110,7 +120,7 @@ export interface ProviderDto {
   name: string;
   apiUrl: string;
   apiKey: string;
-  models: string;
+  models: ModelSpec[];
 }
 
 // 角色模型:杂活(分类/摘要/套用)可单独配便宜模型,主任务仍走会话模型。
@@ -144,6 +154,16 @@ export interface ChatAttachment {
   data: string; // base64,无 data url 前缀
 }
 
+// AI 对话:历史消息里的一个附件(图片缩略图 + 文件 chip 渲染用)
+export interface MessageAttachment {
+  name: string;
+  mime: string;
+  // 后端落盘的本地绝对路径(图片);convertFileSrc 读取,空/缺则只展示文件名
+  path?: string;
+  // 乐观消息内联 base64(无 path 时即时预览用,无 data url 前缀)
+  data?: string;
+}
+
 // AI 对话:消息
 export interface ChatMessageView {
   id: number;
@@ -154,7 +174,17 @@ export interface ChatMessageView {
   toolCalls?: string | null;
   toolCallId?: string | null;
   toolName?: string | null;
+  // user 消息附件(图片 + 文件);无附件为空数组 / 缺省
+  attachments?: MessageAttachment[];
+  // assistant 思考过程(模型推理内容);仅推理型模型非空,前端折叠展示
+  reasoning?: string | null;
   createdAt: number;
+}
+
+// 浏览器 / RPA Agent:内嵌 webview 拦截到的一条接口响应(右栏拦截面板用)
+export interface NetworkEntryView {
+  url: string;
+  body: string;
 }
 
 // 编程 Agent:开发服务器(预览-开发服务器模式)状态
@@ -167,6 +197,27 @@ export interface DevServerStatus {
   conversationId: string;
 }
 
+// 编程 Agent:一个回退版本(git 检查点;每轮任务前的工作区快照)
+export interface CheckpointView {
+  hash: string;
+  time: number; // 提交时间(unix 秒)
+  message: string; // 该轮任务标签
+}
+
+// 编程 Agent:某版本里单个文件的改动
+export interface CheckpointFileDiff {
+  status: "added" | "modified" | "deleted" | "renamed" | string;
+  path: string;
+  additions: number;
+  deletions: number;
+  diff: string; // 该文件的 unified diff 正文
+}
+
+// 编程 Agent:某版本(检查点)的完整改动详情
+export interface CheckpointDiffView {
+  files: CheckpointFileDiff[];
+}
+
 // 编程 Agent:沙盒配置(默认 Docker;Docker 不可用时命令自动回退本机执行)
 export interface SandboxConfigView {
   image: string;
@@ -174,6 +225,23 @@ export interface SandboxConfigView {
   dockerAvailable: boolean; // false → 命令在本机执行(未隔离)
   containerRunning: boolean;
 }
+
+// 沙盒容器实时资源占用(docker stats);容器未运行时 running=false、其余空
+export interface SandboxStatsView {
+  running: boolean;
+  cpuPerc: string; // 如 "12.34%"
+  memUsage: string; // 如 "120MiB / 7.5GiB"
+  memPerc: string; // 如 "1.56%"
+}
+
+// 记忆分类:身份 / 偏好 / 项目 / 人际 / 习惯 / 其它(与后端 MEM_TYPES 对应)
+export type MemoryType =
+  | "identity"
+  | "preference"
+  | "project"
+  | "relationship"
+  | "habit"
+  | "other";
 
 // AI 对话:长期记忆(跨会话,按用户归属)
 export interface ChatMemoryView {
@@ -183,6 +251,14 @@ export interface ChatMemoryView {
   enabled: boolean;
   /** 置顶:每轮恒注入,不参与相似度淘汰 */
   pinned: boolean;
+  /** 分类 */
+  memType: MemoryType;
+  /** 重要度 1-5 */
+  importance: number;
+  /** 置信度 1-5 */
+  confidence: number;
+  /** 命中次数(被注入的累计次数) */
+  hitCount: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -642,4 +718,14 @@ export interface CloudPairView {
   qr_payload: string;
   expires_in: number;
   base_url: string;
+}
+
+// 屏幕录制状态(对应后端 RecordingStatus)
+export interface RecordingStatus {
+  // 是否正在录制
+  recording: boolean;
+  // 开始时间(Unix 秒);未录制为 null
+  startedAt: number | null;
+  // 输出 MP4 路径;未录制为 null
+  outputPath: string | null;
 }

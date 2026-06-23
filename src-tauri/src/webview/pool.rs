@@ -23,7 +23,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::webview::WebviewBuilder;
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Rect, Webview, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
+};
+
+/// 主窗口 label(tauri.conf.json 首个未命名窗口默认即 "main");内嵌 Agent webview 挂到它下面。
+const MAIN_WINDOW_LABEL: &str = "main";
 
 /// 「接口有响应却无新增」连续 N 轮 → 起逐轮预警(疑似到底/风控,可手动验证)。
 const STAGNANT_LIMIT: u32 = 1;
@@ -99,14 +106,15 @@ fn time_labels(time_range: &str) -> Vec<String> {
 /// 选项在结果页直接可见的平台(快手等)返回空,跳过展开步骤。
 fn filter_panel_labels(platform_id: &str) -> Vec<String> {
     match platform_id {
-        // 抖音排序依据/发布时间都收在右上角「筛选」浮层里,不展开则全 DOM 找不到文案点不到,需先点开
-        "douyin" => vec!["筛选".into()],
+        // 抖音 / 小红书:排序依据(综合/最新/最多点赞…)、发布时间等都收在「筛选」浮层里,
+        // 不展开则全 DOM 找不到文案、点不到,需先点「筛选」展开。小红书改版后也走此浮层。
+        "douyin" | "xhs" => vec!["筛选".into()],
         _ => Vec::new(),
     }
 }
 
-/// 展开筛选面板后等其渲染到位的停顿(毫秒)。
-const FILTER_PANEL_OPEN_MS: u64 = 900;
+/// 展开筛选面板后等其渲染到位的停顿(毫秒)。hover 触发的 React 下拉是异步重渲染,留足时间。
+const FILTER_PANEL_OPEN_MS: u64 = 1300;
 
 /// 在结果页按任务排序/时间做 RPA 文案点击(综合/不限默认不点)。点击后留停顿等结果刷新。
 /// 抖音等选项藏在「筛选」浮层里的平台,先展开面板再点;面板同时含排序与时间两段,展开一次即可。
@@ -372,6 +380,9 @@ pub struct WebviewPool {
     windows: Mutex<HashMap<String, WebviewWindow>>,
     /// label -> 原生网络拦截缓冲。每窗口装一次拦截器,采集时清空/取走。
     sinks: Mutex<HashMap<String, ResponseSink>>,
+    /// convId -> 内嵌主窗口右栏的浏览器 Agent 子 webview(`Window::add_child`)。
+    /// 与采集独立窗口分开管理:Agent 不弹独立窗口,真实 webview 直接贴在主窗口右栏区域。
+    agent_webviews: Mutex<HashMap<String, Webview>>,
 }
 
 impl WebviewPool {
@@ -389,7 +400,7 @@ impl WebviewPool {
         if let Some(existing) = app.get_webview_window(&label) {
             self.remember(&label, existing.clone())?;
             bring_to_front(&existing);
-            self.ensure_intercept(&label, &existing, spec.patterns);
+            self.ensure_intercept(&label, existing.as_ref(), spec.patterns, None);
             return Ok(existing);
         }
         // 走到这:窗口从未创建,或上次采集后已被关闭。清掉可能残留的失效句柄与拦截缓冲,
@@ -452,7 +463,7 @@ impl WebviewPool {
             .map_err(|e| CrawlerError::Config(format!("创建 WebView 失败: {e}")))?;
 
         self.remember(&label, window.clone())?;
-        self.ensure_intercept(&label, &window, spec.patterns);
+        self.ensure_intercept(&label, window.as_ref(), spec.patterns, None);
         Ok(window)
     }
 
@@ -466,12 +477,14 @@ impl WebviewPool {
         }
     }
 
-    /// 给窗口确保装了原生响应拦截器(同 label 只装一次),返回其缓冲。
+    /// 给 webview 确保装了原生响应拦截器(同 label 只装一次),返回其缓冲。
+    /// `emit` 为 Some 时(浏览器 Agent)命中响应额外实时推前端;采集传 None。
     fn ensure_intercept(
         &self,
         label: &str,
-        window: &WebviewWindow,
+        webview: &Webview,
         patterns: &[String],
+        emit: Option<native_intercept::EmitCtx>,
     ) -> ResponseSink {
         if let Ok(map) = self.sinks.lock() {
             if let Some(sink) = map.get(label) {
@@ -479,7 +492,7 @@ impl WebviewPool {
             }
         }
         let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
-        native_intercept::install(window, Arc::new(patterns.to_vec()), sink.clone());
+        native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit);
         if let Ok(mut map) = self.sinks.lock() {
             map.insert(label.to_string(), sink.clone());
         }
@@ -543,7 +556,8 @@ impl WebviewPool {
                 return Ok(());
             }
             for attempt in 0..5 {
-                match std::fs::remove_dir_all(&dir) {
+                // 递归删目录是阻塞 IO,用 tokio::fs(内部 spawn_blocking)避免阻塞 tokio 工作线程
+                match tokio::fs::remove_dir_all(&dir).await {
                     Ok(()) => return Ok(()),
                     Err(_) if attempt < 4 => {
                         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -617,30 +631,144 @@ impl WebviewPool {
         Ok(window)
     }
 
-    /// 确保某浏览器 Agent 会话的可见窗口存在(已存在则复用)。
-    /// 用固定平台名 `"agent"` + 会话标识做 per-window data_directory 隔离,**不复用**采集的
-    /// per-account 窗口(那绑登录态 + 注入采集 HUD)。窗口不注入拦截 / HUD / 登录自检——
-    /// 浏览器 Agent 只发动作(navigate/click/type),MVP 不回读结果。
-    pub fn ensure_agent_window(
+    /// 确保某浏览器 Agent 会话的**内嵌子 webview** 存在(已存在则复用),返回其句柄。
+    /// 不再弹独立窗口:经 `Window::add_child` 把真实 webview 贴进主窗口,具体位置由前端按
+    /// 右栏 DOM 区域调 `set_agent_bounds` 定位。新建时:① 装全量原生拦截(命中 json 响应写 sink +
+    /// 推 `agent-network` 事件);② 先 hide,待前端 `agent-webview-ready` 后定位再 show,避免初始
+    /// 覆盖左栏对话。回读不靠页面 invoke(走 ExecuteScriptAsync),故子 webview 无需注入脚本。
+    pub fn ensure_agent_webview(
         &self,
         app: &AppHandle,
-        session_id: &str,
+        conversation_id: &str,
         initial_url: &str,
-    ) -> Result<WebviewWindow> {
-        let title = format!("浏览器 Agent - {session_id}");
-        let spec = WindowSpec {
-            platform: "agent",
-            account_id: session_id,
-            initial_url,
-            // 浏览器 Agent 不做接口拦截(只发动作),无拦截特征
-            patterns: &[],
-            // 不是采集窗口,不注入采集 HUD 浮层
-            with_hud: false,
-            title: &title,
-            // 不做登录态自检(浏览器 Agent 与账号登录态无关)
-            login_check_script: None,
+    ) -> Result<Webview> {
+        let label = window_label("agent", conversation_id);
+        let emit = native_intercept::EmitCtx {
+            app: app.clone(),
+            conversation_id: conversation_id.to_string(),
         };
-        self.ensure_window(app, &spec)
+        // 复用:Tauri 仍持有该子 webview 即直接返回(保留浏览状态)
+        if let Some(existing) = app.get_webview(&label) {
+            if let Ok(mut m) = self.agent_webviews.lock() {
+                m.insert(label.clone(), existing.clone());
+            }
+            self.ensure_intercept(&label, &existing, &[], Some(emit));
+            return Ok(existing);
+        }
+        // 走到这:从未建过或已被移除。清掉可能残留的失效拦截缓冲,确保下面重装拦截。
+        self.forget(&label);
+
+        let parsed: tauri::Url = initial_url
+            .parse()
+            .map_err(|e| CrawlerError::Config(format!("非法 URL {initial_url}: {e}")))?;
+        // 协议白名单:initial_url 来自 Agent,javascript:/data: 等会在 webview 内执行任意脚本
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(CrawlerError::Config(format!(
+                "非法 URL 协议「{}」:仅允许 http/https",
+                parsed.scheme()
+            )));
+        }
+
+        let main = app
+            .get_webview_window(MAIN_WINDOW_LABEL)
+            .ok_or_else(|| CrawlerError::Config("主窗口不存在,无法内嵌浏览器 Agent".into()))?;
+        let builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed));
+        // 初始位置/大小占位,前端挂载后立即按右栏区域 set_agent_bounds 覆盖
+        let webview = main
+            .as_ref()
+            .window()
+            .add_child(
+                builder,
+                LogicalPosition::new(0.0, 0.0),
+                LogicalSize::new(800.0, 600.0),
+            )
+            .map_err(|e| CrawlerError::Config(format!("内嵌浏览器 Agent webview 失败: {e}")))?;
+        // 先藏起来,等前端定位后再显示(避免初始 (0,0) 盖住左栏对话)
+        let _ = webview.hide();
+        self.ensure_intercept(&label, &webview, &[], Some(emit));
+        if let Ok(mut m) = self.agent_webviews.lock() {
+            m.insert(label.clone(), webview.clone());
+        }
+        // 通知前端:子 webview 已就绪 → 去按右栏区域定位并显示
+        let _ = app.emit(
+            "agent-webview-ready",
+            serde_json::json!({ "conversationId": conversation_id }),
+        );
+        Ok(webview)
+    }
+
+    /// 取某会话的内嵌 Agent webview 句柄。
+    pub fn agent_webview(&self, conversation_id: &str) -> Option<Webview> {
+        let label = window_label("agent", conversation_id);
+        self.agent_webviews
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&label).cloned())
+    }
+
+    /// 取某会话 Agent webview 的原生拦截缓冲(get_network 工具读它)。
+    pub fn agent_sink(&self, conversation_id: &str) -> Option<ResponseSink> {
+        let label = window_label("agent", conversation_id);
+        self.window_sink(&label)
+    }
+
+    /// 按前端传来的右栏 DOM 区域(逻辑坐标,相对主窗口客户区)定位子 webview。
+    /// webview 尚未创建(还没 navigate)则静默忽略。
+    pub fn set_agent_bounds(
+        &self,
+        conversation_id: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<()> {
+        if let Some(wv) = self.agent_webview(conversation_id) {
+            wv.set_bounds(Rect {
+                position: LogicalPosition::new(x, y).into(),
+                size: LogicalSize::new(width.max(1.0), height.max(1.0)).into(),
+            })
+            .map_err(|e| CrawlerError::Config(format!("设置 webview 位置失败: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// 显示某会话的内嵌 Agent webview(进入/返回 RPA 页时)。
+    pub fn show_agent_webview(&self, conversation_id: &str) -> Result<()> {
+        if let Some(wv) = self.agent_webview(conversation_id) {
+            wv.show()
+                .map_err(|e| CrawlerError::Config(format!("显示 webview 失败: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// 隐藏某会话的内嵌 Agent webview(离开 RPA 页 / 切到其它会话 / 弹出模态时)。
+    pub fn hide_agent_webview(&self, conversation_id: &str) -> Result<()> {
+        if let Some(wv) = self.agent_webview(conversation_id) {
+            wv.hide()
+                .map_err(|e| CrawlerError::Config(format!("隐藏 webview 失败: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// 隐藏全部内嵌 Agent webview(离开 RPA 工作区时一把藏掉,防原生层盖住其它页面)。
+    pub fn hide_all_agent_webviews(&self) {
+        if let Ok(m) = self.agent_webviews.lock() {
+            for wv in m.values() {
+                let _ = wv.hide();
+            }
+        }
+    }
+
+    /// 关闭并移除某会话的内嵌 Agent webview(会话删除时调用)。
+    pub fn drop_agent_webview(&self, conversation_id: &str) -> Result<()> {
+        let label = window_label("agent", conversation_id);
+        if let Ok(mut m) = self.agent_webviews.lock() {
+            if let Some(wv) = m.remove(&label) {
+                let _ = wv.close();
+            }
+        }
+        self.forget(&label);
+        Ok(())
     }
 
     /// 关闭并移除某窗口(账号被删除时调用,避免句柄泄漏)。

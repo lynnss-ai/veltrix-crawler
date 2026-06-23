@@ -1,13 +1,10 @@
-// 记忆中心:对话工作区下的整页模块。左侧分区导航,右侧分区内容。
-// 记忆分区:全局记忆(控制台式:数字条+工具栏+列表)/ 会话记忆(左右双栏 master-detail)。
-// 知识库、知识图谱为占位,未来作为平级子模块接入,与记忆「串联」。
+// 记忆管理:对话工作区下的整页模块。
+// 全局记忆(控制台式:数字条 + 工具栏 + 列表)/ 会话记忆(左右双栏 master-detail)两个标签。
 import { useEffect, useMemo, useState } from "react";
 import {
   Brain,
-  Library,
   Loader2,
   MessageSquare,
-  Network,
   Pin,
   Plus,
   Search,
@@ -51,64 +48,20 @@ import {
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 
-const SECTIONS = [
-  { key: "memory", label: "记忆", icon: Brain },
-  { key: "knowledge-base", label: "知识库", icon: Library },
-  { key: "knowledge-graph", label: "知识图谱", icon: Network },
-] as const;
-type SectionKey = (typeof SECTIONS)[number]["key"];
+// 记忆分类的中文标签(与后端 MEM_TYPES 对应)
+const MEMORY_TYPE_LABELS: Record<string, string> = {
+  identity: "身份",
+  preference: "偏好",
+  project: "项目",
+  relationship: "人际",
+  habit: "习惯",
+  other: "其它",
+};
 
 export function MemoryCenterPage() {
-  const [active, setActive] = useState<SectionKey>("memory");
-
   return (
-    <div className="flex min-h-0 flex-1 gap-4">
-      {/* 左侧分区导航 */}
-      <div className="flex w-40 shrink-0 flex-col gap-0.5 rounded-xl border bg-card p-2 lg:w-48">
-        <div className="px-3 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          记忆中心
-        </div>
-        {SECTIONS.map((s) => {
-          const Icon = s.icon;
-          return (
-            <button
-              key={s.key}
-              onClick={() => setActive(s.key)}
-              className={cn(
-                "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors",
-                active === s.key
-                  ? "bg-accent font-medium text-accent-foreground"
-                  : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-              )}
-            >
-              <Icon className="size-4 shrink-0" />
-              {s.label}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* 右侧分区内容 */}
-      <div
-        key={active}
-        className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden p-0.5 duration-200 animate-in fade-in-50"
-      >
-        {active === "memory" && <MemorySection />}
-        {active === "knowledge-base" && (
-          <EmptyState
-            icon={Library}
-            title="知识库 · 建设中"
-            description="未来在此管理文档、笔记、网址等结构化知识,供对话按需检索引用(RAG)。"
-          />
-        )}
-        {active === "knowledge-graph" && (
-          <EmptyState
-            icon={Network}
-            title="知识图谱 · 建设中"
-            description="未来从记忆与知识库中抽取实体与关系并可视化,把分散信息串联起来,增强对话推理。"
-          />
-        )}
-      </div>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden p-0.5">
+      <MemorySection />
     </div>
   );
 }
@@ -158,6 +111,7 @@ function GlobalMemorySection() {
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [typeFilter, setTypeFilter] = useState<string>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   // 添加用行内展开的撰写区(不常占位),点「添加」展开
   const [composing, setComposing] = useState(false);
@@ -248,11 +202,12 @@ function GlobalMemorySection() {
     return memories.filter((m) => {
       if (q && !m.content.toLowerCase().includes(q)) return false;
       if (sourceFilter !== "all" && m.source !== sourceFilter) return false;
+      if (typeFilter !== "all" && m.memType !== typeFilter) return false;
       if (statusFilter === "enabled" && !m.enabled) return false;
       if (statusFilter === "disabled" && m.enabled) return false;
       return true;
     });
-  }, [memories, search, sourceFilter, statusFilter]);
+  }, [memories, search, sourceFilter, typeFilter, statusFilter]);
 
   const stats = useMemo(() => {
     const total = memories.length;
@@ -486,6 +441,20 @@ function GlobalMemorySection() {
             <SelectItem value="manual">手动添加</SelectItem>
           </SelectContent>
         </Select>
+        <Select value={typeFilter} onValueChange={setTypeFilter}>
+          <SelectTrigger className="w-28">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部分类</SelectItem>
+            <SelectItem value="identity">身份</SelectItem>
+            <SelectItem value="preference">偏好</SelectItem>
+            <SelectItem value="project">项目</SelectItem>
+            <SelectItem value="relationship">人际</SelectItem>
+            <SelectItem value="habit">习惯</SelectItem>
+            <SelectItem value="other">其它</SelectItem>
+          </SelectContent>
+        </Select>
         <Select
           value={statusFilter}
           onValueChange={(v) => setStatusFilter(v as StatusFilter)}
@@ -689,14 +658,33 @@ function GlobalMemorySection() {
                     >
                       {m.content}
                     </p>
-                    <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
                       {m.pinned && (
                         <>
                           <span className="font-medium text-primary">置顶</span>
                           <span>·</span>
                         </>
                       )}
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-foreground/70">
+                        {MEMORY_TYPE_LABELS[m.memType] ?? m.memType}
+                      </span>
+                      <span>·</span>
                       <span>{m.source === "auto" ? "自动" : "手动"}</span>
+                      <span>·</span>
+                      <SimpleTooltip content={`重要度 ${m.importance}/5`}>
+                        <span className="text-amber-500">
+                          {"★".repeat(Math.max(0, Math.min(5, m.importance)))}
+                          <span className="text-muted-foreground/40">
+                            {"★".repeat(Math.max(0, 5 - m.importance))}
+                          </span>
+                        </span>
+                      </SimpleTooltip>
+                      {m.hitCount > 0 && (
+                        <>
+                          <span>·</span>
+                          <span>命中 {m.hitCount}</span>
+                        </>
+                      )}
                       <span>·</span>
                       <span>
                         {new Date(m.updatedAt * 1000).toLocaleDateString("zh-CN")}
@@ -788,6 +776,9 @@ function GlobalMemorySection() {
   );
 }
 
+// 会话记忆列表每次滚动加载的条数(虚拟分页)
+const SESSION_PAGE_SIZE = 50;
+
 // 会话按最近更新时间分桶(今天/昨天/近 7 天/更早),桶内保持后端的倒序
 function groupConversationsByTime(
   conversations: ConversationView[],
@@ -816,19 +807,30 @@ function groupConversationsByTime(
 
 // 会话记忆(左右双栏):左选会话,右大编辑区查看/编辑该会话滚动摘要
 function ConversationMemorySection() {
-  const { conversations } = useChat();
+  const { conversations, reload } = useChat();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 滚动虚拟分页:先渲染前 N 条,滚动到底再加载下一批
+  const [visibleCount, setVisibleCount] = useState(SESSION_PAGE_SIZE);
+  const [deleteTarget, setDeleteTarget] = useState<ConversationView | null>(null);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return conversations;
     return conversations.filter((c) => (c.title || "").toLowerCase().includes(q));
   }, [conversations, search]);
-  const groups = useMemo(() => groupConversationsByTime(filtered), [filtered]);
+  // 搜索变化时重置已加载量
+  useEffect(() => {
+    setVisibleCount(SESSION_PAGE_SIZE);
+  }, [search]);
+  const groups = useMemo(
+    () => groupConversationsByTime(filtered.slice(0, visibleCount)),
+    [filtered, visibleCount],
+  );
+  const hasMore = filtered.length > visibleCount;
   const selectedTitle =
     conversations.find((c) => c.id === selectedId)?.title || "新对话";
 
@@ -858,6 +860,24 @@ function ConversationMemorySection() {
     }
   }
 
+  // 删除会话记忆 = 删除该会话(后端级联删消息 / 摘要 / 附件),再刷新列表
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    const id = deleteTarget.id;
+    try {
+      await api.deleteConversation(id);
+      if (selectedId === id) {
+        setSelectedId(null);
+        setDraft("");
+      }
+      setDeleteTarget(null);
+      await reload();
+      toast.success("已删除会话及其记忆");
+    } catch (e) {
+      toast.error(`删除失败: ${e}`);
+    }
+  }
+
   if (conversations.length === 0) {
     return (
       <EmptyState
@@ -871,7 +891,7 @@ function ConversationMemorySection() {
   return (
     <div className="flex min-h-[60vh] gap-3">
       {/* 左:会话列表 */}
-      <div className="flex w-60 shrink-0 flex-col rounded-lg border bg-card">
+      <div className="flex w-80 shrink-0 flex-col rounded-lg border bg-card">
         <div className="border-b p-2">
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -883,35 +903,70 @@ function ConversationMemorySection() {
             />
           </div>
         </div>
-        <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+        <div
+          className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
+              setVisibleCount((c) =>
+                c < filtered.length ? c + SESSION_PAGE_SIZE : c,
+              );
+            }
+          }}
+        >
           {groups.length === 0 ? (
             <div className="py-8 text-center text-xs text-muted-foreground">
               没有匹配的会话
             </div>
           ) : (
-            groups.map((g) => (
-              <div key={g.label} className="mb-1">
-                <div className="px-2 py-1 text-[11px] font-medium text-muted-foreground">
-                  {g.label}
+            <>
+              {groups.map((g) => (
+                <div key={g.label} className="mb-1">
+                  <div className="px-2 py-1 text-[11px] font-medium text-muted-foreground">
+                    {g.label}
+                  </div>
+                  {g.items.map((c) => (
+                    <div
+                      key={c.id}
+                      className={cn(
+                        "group flex items-center gap-1 rounded-md pr-1 transition-colors",
+                        selectedId === c.id
+                          ? "bg-primary/10"
+                          : "hover:bg-accent/50",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => void select(c.id)}
+                        className={cn(
+                          "flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-sm",
+                          selectedId === c.id
+                            ? "font-medium text-primary"
+                            : "text-foreground",
+                        )}
+                      >
+                        <MessageSquare className="size-3.5 shrink-0 opacity-70" />
+                        <span className="truncate">{c.title || "新对话"}</span>
+                      </button>
+                      <SimpleTooltip content="删除会话及其记忆">
+                        <button
+                          type="button"
+                          onClick={() => setDeleteTarget(c)}
+                          className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </SimpleTooltip>
+                    </div>
+                  ))}
                 </div>
-                {g.items.map((c) => (
-                  <button
-                    key={c.id}
-                    type="button"
-                    onClick={() => void select(c.id)}
-                    className={cn(
-                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
-                      selectedId === c.id
-                        ? "bg-primary/10 font-medium text-primary"
-                        : "text-foreground hover:bg-accent/50",
-                    )}
-                  >
-                    <MessageSquare className="size-3.5 shrink-0 opacity-70" />
-                    <span className="truncate">{c.title || "新对话"}</span>
-                  </button>
-                ))}
-              </div>
-            ))
+              ))}
+              {hasMore && (
+                <div className="py-2 text-center text-[11px] text-muted-foreground">
+                  下滑加载更多…
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -955,6 +1010,30 @@ function ConversationMemorySection() {
           </>
         )}
       </div>
+
+      {/* 删除会话记忆确认(级联删消息 / 摘要 / 附件) */}
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除会话记忆</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除「{deleteTarget?.title || "新对话"}」整个会话(含全部消息与记忆摘要),不可恢复。确定?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => void confirmDelete()}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

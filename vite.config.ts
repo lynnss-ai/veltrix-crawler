@@ -14,6 +14,16 @@ export default defineConfig(async () => ({
     },
   },
 
+  // 多页入口:主应用 + 录屏悬浮条独立轻量入口(悬浮窗只加载后者,秒开)
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        "recording-overlay": path.resolve(__dirname, "recording-overlay.html"),
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

@@ -4,7 +4,6 @@
 //! 语音识别按 provider code 分发(目前仅小米 MiMo),经 `speech::transcribe`。
 //! 统一超时 + 指数退避重试在 `http`,稳定高可用;能力元数据在 `provider`,便于扩展。
 
-pub mod agent;
 pub mod chat;
 pub mod embedding;
 pub mod http;

@@ -34,6 +34,15 @@ html,
 body,
 #root {
   height: 100%;
+  /* 锁死根滚动:内容滚动都发生在各页面内部容器(overflow-y-auto),根本身不滚。 */
+  overflow: hidden;
+  /* 禁止触摸板 swipe 的 overscroll / 前进后退导航手势,否则整页(含标题栏)会被一起位移。 */
+  overscroll-behavior: none;
+}
+
+/* 触摸板横向 swipe 默认会触发 WebView 的前进/后退导航(表现为整页横滑),桌面应用一律禁用。 */
+html {
+  overscroll-behavior-x: none;
 }
 
 body {

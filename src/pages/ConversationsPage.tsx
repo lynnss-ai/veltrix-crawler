@@ -50,6 +50,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Pagination } from "@/components/Pagination";
 
 function formatTime(ts: number): string {
   const d = new Date(ts * 1000);
@@ -80,6 +81,8 @@ export function ConversationsPage({
   );
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [range, setRange] = useState<DateRange | undefined>();
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
   // 当前分栏 + 搜索 + 日期区间过滤后的列表(按更新时间倒序)
   const list = useMemo(() => {
@@ -109,8 +112,25 @@ export function ConversationsPage({
     });
   }, [list]);
 
+  // 过滤条件(分栏 / 搜索 / 日期)变化时回到第一页
+  useEffect(() => {
+    setPage(1);
+  }, [tab, query, range]);
+
+  // 前端分页:总页数 + 当前页(防越界)+ 本页切片
+  const pageCount = Math.max(1, Math.ceil(list.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const pageItems = list.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
+
   const selectedCount = list.filter((c) => selected.has(c.id)).length;
-  const allSelected = list.length > 0 && selectedCount === list.length;
+  // 「全选」只针对当前页可见项(pageItems):表头复选框就在本页之上,
+  // 若勾选跨页全部,用户会误删翻不到的会话(批量删除不可恢复)。跨页累计选择仍可逐行勾选。
+  const pageSelectedCount = pageItems.filter((c) => selected.has(c.id)).length;
+  const allPageSelected =
+    pageItems.length > 0 && pageSelectedCount === pageItems.length;
   const rangeLabel =
     range?.from && range?.to
       ? `${fmtMd(range.from)} ~ ${fmtMd(range.to)}`
@@ -128,7 +148,13 @@ export function ConversationsPage({
   }
 
   function toggleSelectAll() {
-    setSelected(allSelected ? new Set() : new Set(list.map((c) => c.id)));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      // 本页已全选 → 取消本页;否则把本页全部加入(其它页已选项保留)
+      if (allPageSelected) pageItems.forEach((c) => next.delete(c.id));
+      else pageItems.forEach((c) => next.add(c.id));
+      return next;
+    });
   }
 
   function openConversation(c: ConversationView) {
@@ -233,19 +259,10 @@ export function ConversationsPage({
             <TabsTrigger value="archived">归档</TabsTrigger>
           </TabsList>
         </Tabs>
-        <div className="relative w-56">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索对话标题"
-            className="pl-8"
-          />
-        </div>
-        {/* 日期筛选:按会话更新时间落在所选区间过滤 */}
+        {/* 日期筛选:放在搜索框前;去掉 size=sm,高度与搜索框一致 */}
         <Popover>
           <PopoverTrigger asChild>
-            <Button variant="outline" size="sm" className="cursor-pointer">
+            <Button variant="outline" className="cursor-pointer">
               <CalendarDays className="size-4" />
               {rangeLabel}
               {range?.from && (
@@ -282,6 +299,15 @@ export function ConversationsPage({
             </div>
           </PopoverContent>
         </Popover>
+        <div className="relative w-56">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索对话标题"
+            className="pl-8"
+          />
+        </div>
         <div className="ml-auto flex items-center gap-2">
           {selectedCount > 0 && (
             <>
@@ -331,25 +357,25 @@ export function ConversationsPage({
           </span>
         </div>
       ) : (
-        <div className="veltrix-card flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm">
           {/* 表头:全选 */}
           <div className="flex items-center gap-3 border-b px-3 py-2 text-xs text-muted-foreground">
             <Checkbox
-              checked={allSelected}
+              checked={allPageSelected}
               onCheckedChange={toggleSelectAll}
-              aria-label="全选"
+              aria-label="全选本页"
             />
-            <span>标题</span>
-            <span className="ml-auto">更新时间</span>
-            <span className="w-7" />
+            <span className="flex-1">标题</span>
+            <span className="w-32 shrink-0 text-left">更新时间</span>
+            <span className="w-7 shrink-0" />
           </div>
           <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto">
-            {list.map((c) => {
+            {pageItems.map((c) => {
               const checked = selected.has(c.id);
               return (
                 <div
                   key={c.id}
-                  className="group flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0 hover:bg-muted/50"
+                  className="group flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0"
                 >
                   <Checkbox
                     checked={checked}
@@ -361,19 +387,18 @@ export function ConversationsPage({
                     onClick={() => openConversation(c)}
                     className="flex min-w-0 flex-1 items-center gap-2 text-left"
                   >
-                    <MessageSquare className="size-4 shrink-0 text-muted-foreground" />
                     <span className="truncate text-sm text-foreground">
                       {c.title || "新对话"}
                     </span>
                   </button>
-                  <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                  <span className="w-32 shrink-0 text-left font-mono text-xs text-muted-foreground">
                     {formatTime(c.updatedAt)}
                   </span>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        className="rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100 data-[state=open]:opacity-100"
+                        className="flex w-7 shrink-0 items-center justify-center rounded py-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100 data-[state=open]:opacity-100"
                       >
                         <MoreHorizontal className="size-4" />
                       </button>
@@ -408,6 +433,22 @@ export function ConversationsPage({
                 </div>
               );
             })}
+          </div>
+          {/* 分页:统一组件 */}
+          <div className="border-t px-3 py-2">
+            <Pagination
+              pageIndex={currentPage - 1}
+              pageCount={pageCount}
+              onPageChange={(i) => setPage(i + 1)}
+              totalCount={list.length}
+              itemLabel="条"
+              pageSize={pageSize}
+              pageSizeOptions={[50, 100, 200]}
+              onPageSizeChange={(size) => {
+                setPageSize(size);
+                setPage(1);
+              }}
+            />
           </div>
         </div>
       )}

@@ -5,6 +5,7 @@ import { useChat } from "@/hooks/use-chat";
 import { ChatPage } from "@/pages/ChatPage";
 import { CodingLayout } from "@/components/coding-layout";
 import { RpaLayout } from "@/components/rpa-layout";
+import { ComputerLayout } from "@/components/computer-layout";
 
 export function ConversationShell() {
   const { conversations, activeId, pendingAgentType } = useChat();
@@ -13,5 +14,6 @@ export function ConversationShell() {
 
   if (agentType === "coding") return <CodingLayout />;
   if (agentType === "rpa") return <RpaLayout />;
+  if (agentType === "computer") return <ComputerLayout />;
   return <ChatPage />;
 }

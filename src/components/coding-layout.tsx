@@ -4,20 +4,32 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
+  BatteryFull,
   Box,
   ChevronDown,
   ChevronRight,
+  Copy,
   ExternalLink,
   Eye,
   FileCode,
+  FileText,
   FolderOpen,
+  History,
   Loader2,
+  Monitor,
+  Pencil,
   Play,
+  RectangleHorizontal,
+  RectangleVertical,
   RotateCw,
   Send,
+  Signal,
+  Smartphone,
   Square,
   SquareTerminal,
-  Undo2,
+  Tablet,
+  Trash2,
+  Wifi,
   Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -25,16 +37,32 @@ import { toast } from "sonner";
 import {
   api,
   type ChatMessageView,
+  type CheckpointView,
+  type CheckpointDiffView,
+  type CheckpointFileDiff,
   type DevServerStatus,
   type SandboxConfigView,
+  type SandboxStatsView,
 } from "@/lib/api";
 import { useChat } from "@/hooks/use-chat";
+import { useAgentStepListener } from "@/hooks/use-agent-step-listener";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
+import { ReasoningBlock } from "@/components/ReasoningBlock";
 import { CodeEditor } from "@/components/code-editor";
 import { EmptyState } from "@/components/EmptyState";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useSidebar } from "@/components/ui/sidebar";
 import {
   Dialog,
@@ -44,11 +72,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 
 // 左栏占比低于此值(百分比)视为「过窄」,联动自动收起侧边菜单给左栏腾空间。
 // 用占比而非像素:不受窗口 / 侧栏宽度影响,拖到足够窄一定会触发(分割条拖动下限为 28%)
 const LEFT_NARROW_PCT = 38;
+// 消息列表初始只渲染最近 N 条(长 ReAct 对话切换时避免一次性解析全部),可「加载更早」
+const MSG_PAGE_SIZE = 30;
 
 interface ToolCallJson {
   id: string;
@@ -82,21 +128,56 @@ export function CodingLayout() {
   // 当前是否有待交接的首条消息(读最新值,避免把它加进 load 副作用的依赖里导致重复加载)
   const pendingRef = useRef(pendingFirstMessage);
   pendingRef.current = pendingFirstMessage;
+  // 抑制「本次发送自建的新会话」触发加载 effect:setActiveId 会让加载与发送抢跑致首条消息重复/闪烁
+  const skipLoadRef = useRef<string | null>(null);
+  // 供异步发送闭包读「当前激活会话」:切走后不把结果刷回错误会话,也用于过滤 agent-step
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
 
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
+  // 当前会话只渲染最近 visibleCount 条;切会话重置,「加载更早」时增加
+  const [visibleCount, setVisibleCount] = useState(MSG_PAGE_SIZE);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  // 按会话维度的运行态:某会话在后台跑时,开/切到别的会话互不影响(后端本就并发执行)
+  const [runningIds, setRunningIds] = useState<Set<string>>(() => new Set());
+  const activeSending = activeId ? runningIds.has(activeId) : false;
   const [steps, setSteps] = useState<string[]>([]);
+  // 会话标题操作(与普通对话一致):重命名弹框 + 删除二次确认
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  // 版本管理:检查点列表(下拉打开时拉取)+ 待确认回退的目标版本
+  const [checkpoints, setCheckpoints] = useState<CheckpointView[]>([]);
+  const [rollbackTarget, setRollbackTarget] = useState<CheckpointView | null>(
+    null,
+  );
+  // 版本管理下拉:受控开合 + 当前展开查看改动的版本 hash + 各版本改动详情缓存(按 hash)
+  const [versionMenuOpen, setVersionMenuOpen] = useState(false);
+  const [expandedHash, setExpandedHash] = useState<string | null>(null);
+  const [diffCache, setDiffCache] = useState<Record<string, CheckpointDiffView>>(
+    {},
+  );
+  // 标记/清除某会话的运行态(增删 Set 元素,触发按会话渲染)。名取 ConvRunning 避开终端的 setRunning
+  function setConvRunning(id: string, on: boolean) {
+    setRunningIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
   // Plan / Act 临时态:仅前端局部,不持久化;Plan 只调研出方案,Act 亲自动手执行。默认 act。
   const [mode, setMode] = useState<"plan" | "act">("act");
-  // 可用模型由共享 providers 派生(避免重挂载重拉导致竞态)
+  // 可用模型由共享 providers 派生(避免重挂载重拉导致竞态)。
+  // 编程智能体走 ReAct + function calling,故只列具备「工具调用」能力的模型。
   const models = useMemo(() => {
     const opts: { providerId: string; model: string }[] = [];
     for (const p of providers) {
       if (!p.apiKey.trim()) continue;
-      for (const line of p.models.split("\n")) {
-        const m = line.trim();
-        if (m) opts.push({ providerId: p.id, model: m });
+      for (const spec of p.models) {
+        const m = spec.name.trim();
+        if (m && spec.capabilities.includes("tools"))
+          opts.push({ providerId: p.id, model: m });
       }
     }
     return opts;
@@ -112,25 +193,29 @@ export function CodingLayout() {
   const [fileRefresh, setFileRefresh] = useState(0);
   // 预览刷新信号:文件保存后 +1,通知 PreviewServer 重新加载 iframe(实时反映编译结果)
   const [previewReload, setPreviewReload] = useState(0);
-  // 自动预览信号:每次 act 模式生成结束 +1,通知 PreviewServer「自动编译并打开预览」(未跑则启动,已跑则重载)
+  // 自动预览信号:每次 act 模式生成结束 +1,通知预览「自动编译并打开」(未跑则启动,已跑则重载)
   const [previewAutoStart, setPreviewAutoStart] = useState(0);
+  // 预览 dev server 控制(状态轮询 + 启停/日志/刷新);在此持有,头部按钮与预览面板共享同一实例
+  const dev = useDevServer(activeId ?? null, previewReload, previewAutoStart);
   // 用户在终端直接执行的命令(与 Agent 跑过的命令合并展示)
   const [userRuns, setUserRuns] = useState<{ command: string; output: string }[]>([]);
   const [termInput, setTermInput] = useState("");
   const [running, setRunning] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
-  // 沙盒可用性(用于头部「未隔离」提示);null=未知
+  // 沙盒可用性(用于头部「未隔离」提示)+ 容器运行状态(用于「沙盒」按钮状态点);null=未知
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
+  const [sandboxRunning, setSandboxRunning] = useState(false);
   useEffect(() => {
     api
       .getSandboxConfig()
-      .then((c) => setDockerOk(c.dockerAvailable))
+      .then((c) => {
+        setDockerOk(c.dockerAvailable);
+        setSandboxRunning(c.containerRunning);
+      })
       .catch(() => {});
   }, [sandboxOpen]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  // 当前发送归属会话(过滤 agent-step 事件)
-  const sendingConvRef = useRef<string | null>(null);
-  // 发送重入锁:state 更新异步,挡住极快连点/交接与手动发送撞车造成的重复发送
+  // 发送重入锁:state 更新异步,挡住极快连点/交接与手动发送撞车造成的重复发送(仅护建会话窗口)
   const dispatchingRef = useRef(false);
   // 左右栏宽度(左栏百分比)+ 拖动态,中间分割条可拖动调整
   const [leftPct, setLeftPct] = useState(46);
@@ -162,6 +247,11 @@ export function CodingLayout() {
       return;
     }
     if (pendingRef.current) return;
+    // 本次发送刚自建的会话:消息由发送流程维护,跳过这次加载
+    if (skipLoadRef.current === activeId) {
+      skipLoadRef.current = null;
+      return;
+    }
     api
       .listChatMessages(activeId)
       .then(setMessages)
@@ -176,6 +266,7 @@ export function CodingLayout() {
     setSteps([]);
     setTermInput("");
     setSelectedFile(null);
+    setVisibleCount(MSG_PAGE_SIZE); // 切会话回到「只渲染最近 N 条」
   }, [activeId]);
 
   // 交接的首条消息:建好 coding 会话后自动发送一次
@@ -189,25 +280,9 @@ export function CodingLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingFirstMessage, activeId]);
 
-  // 监听 Agent 进度事件(逐步标签),仅取当前发送会话
-  useEffect(() => {
-    let dispose: (() => void) | undefined;
-    let disposed = false;
-    listen<{ conversationId: string; label: string }>("agent-step", (e) => {
-      if (sendingConvRef.current !== e.payload.conversationId) return;
-      setSteps((prev) => [...prev, e.payload.label]);
-    }).then(
-      (fn) => {
-        if (disposed) fn();
-        else dispose = fn;
-      },
-      () => {},
-    );
-    return () => {
-      disposed = true;
-      dispose?.();
-    };
-  }, []);
+  // 监听 Agent 进度事件(逐步标签):只显示「当前正在查看的会话」的步骤,
+  // 其他会话在后台跑、步骤不抢占视图。统一走 useAgentStepListener。
+  useAgentStepListener(activeIdRef, setSteps);
 
   // 监听「Docker 沙盒不可用,已回退本机执行」事件 → 弹窗提示(后端在重新探测且回退时推送)。
   // 用固定 toast id:即便短时多次回退也只刷新同一条提示,不堆叠刷屏。
@@ -238,7 +313,7 @@ export function CodingLayout() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, steps, sending]);
+  }, [messages, steps, activeSending]);
 
   // 分割条拖动:全程在 document 上监听 move/up(鼠标移到 iframe 上也不丢事件,配合容器 select-none + iframe 禁指针)
   useEffect(() => {
@@ -316,7 +391,7 @@ export function CodingLayout() {
     return () => {
       alive = false;
     };
-  }, [workTab, activeId, fileRefresh, sending]);
+  }, [workTab, activeId, fileRefresh, activeSending]);
 
   // 拉当前选中文件内容
   useEffect(() => {
@@ -362,15 +437,16 @@ export function CodingLayout() {
   // 发送一条消息驱动编程 Agent;text 来自输入框或交接的首条消息。
   // sendMode 缺省 act:交接来的首条消息默认走 act(动手执行),手动发送由调用方传当前段控值。
   async function doSend(text: string, sendMode: "plan" | "act" = "act") {
-    if (dispatchingRef.current || !text || sending) return;
+    if (!text || dispatchingRef.current) return;
+    // 当前会话正在跑 → 忽略(同一会话不重复发送);其他会话在后台跑不影响本次
+    if (activeId && runningIds.has(activeId)) return;
     // 仅「在本页新建会话」时才要求已配模型;交接来的会话(activeId 已存在)已绑定模型,
     // 此时本页的 models 可能尚未加载完,不能据此误报「尚无可用模型」
     if (!activeId && models.length === 0) {
-      toast.error("尚无可用模型,请先到系统配置 → 模型厂商填好 API Key 与模型");
+      toast.error("尚无可用模型:编程 Agent 需具备「工具调用」能力的模型,请到系统配置 → 模型厂商勾选");
       return;
     }
     dispatchingRef.current = true;
-    setSending(true);
     setSteps([]);
     setInput("");
     // 乐观追加用户消息
@@ -382,8 +458,8 @@ export function CodingLayout() {
       createdAt: Math.floor(Date.now() / 1000),
     };
     setMessages((prev) => [...prev, optimistic]);
+    let convId = activeId;
     try {
-      let convId = activeId;
       if (!convId) {
         const opt = models[0];
         const conv = await api.createConversation(
@@ -393,33 +469,83 @@ export function CodingLayout() {
           "coding",
         );
         convId = conv.id;
+        skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的本会话加载,防首条消息重复
         setActiveId(conv.id);
       }
-      sendingConvRef.current = convId;
+      setConvRunning(convId, true); // 标记该会话运行中(按会话维度,不锁其他会话)
+      dispatchingRef.current = false; // 会话已建/已知,释放瞬时建会话锁
       await api.sendCodingMessage(convId, text, sendMode);
-      // 重载完整线程(含工具往返)
-      const fresh = await api.listChatMessages(convId);
-      setMessages(fresh);
-      await reload();
-      // 生成完成:act 模式自动切到预览并触发自动编译/重载(plan 模式只产方案、不写代码,跳过)
-      if (sendMode === "act") {
-        setWorkTab("preview");
-        setPreviewAutoStart((k) => k + 1);
+      // 跑完:仅当仍停留在该会话才刷新视图与预览,切走了就只在后台完成、不串台
+      if (activeIdRef.current === convId) {
+        const fresh = await api.listChatMessages(convId);
+        setMessages(fresh);
+        if (sendMode === "act") {
+          setWorkTab("preview");
+          setPreviewAutoStart((k) => k + 1);
+        }
       }
+      await reload(); // 刷新侧栏会话列表(标题/排序),与当前视图无关
     } catch (e) {
       toast.error(`执行失败: ${e}`);
-      setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
-      setInput(text);
+      if (activeIdRef.current === convId) {
+        setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+        setInput(text);
+      }
     } finally {
-      sendingConvRef.current = null;
-      setSending(false);
-      setSteps([]);
+      if (convId) setConvRunning(convId, false);
+      if (activeIdRef.current === convId) setSteps([]);
       dispatchingRef.current = false;
     }
   }
 
   function handleSend() {
     void doSend(input.trim(), mode);
+  }
+
+  // 停止自主续航:请求后端在下一步检查点优雅收尾(不强杀,已落库改动保留)
+  async function handleStop() {
+    if (!activeId) return;
+    try {
+      await api.stopCodingAgent(activeId);
+      toast("已请求停止,正在收尾当前步骤…");
+    } catch (e) {
+      toast.error(`停止失败: ${e}`);
+    }
+  }
+
+  // 会话标题:重命名(弹框)/ 删除(二次确认),与普通对话一致
+  function openRename() {
+    if (!active) return;
+    setRenameValue(active.title);
+    setRenameOpen(true);
+  }
+  async function submitRename() {
+    if (!active) return;
+    const title = renameValue.trim();
+    if (!title || title === active.title) {
+      setRenameOpen(false);
+      return;
+    }
+    try {
+      await api.renameConversation(active.id, title);
+      await reload();
+      setRenameOpen(false);
+    } catch (e) {
+      toast.error(`重命名失败: ${e}`);
+    }
+  }
+  async function confirmDelete() {
+    if (!active) return;
+    try {
+      await api.deleteConversation(active.id);
+      setActiveId(null);
+      setMessages([]);
+      await reload();
+      setDeleteOpen(false);
+      toast.success("已删除会话");
+    } catch (e) {
+      toast.error(`删除失败: ${e}`);
+    }
   }
 
   // 当前会话的分步计划(Plan 产出 / Act 勾选);从 active.planTodos(JSON)解析
@@ -437,7 +563,7 @@ export function CodingLayout() {
 
   // 「按方案执行」:切到 Act 并让 Agent 按已产出的计划逐步落地
   function handleRunPlan() {
-    if (!activeId || sending) return;
+    if (!activeId || activeSending) return;
     setMode("act");
     void doSend(
       "请按上面的【任务计划】逐步执行,每完成一步用 update_plan 勾选进度。",
@@ -445,25 +571,41 @@ export function CodingLayout() {
     );
   }
 
-  // 回退:确认后丢弃本轮 Agent 的文件改动,回到最近检查点(发送前状态)
-  function handleRollback() {
-    const id = activeId;
-    if (!id) return;
-    toast("回退到本轮发送前?将丢弃本轮 Agent 的文件改动(历史记录保留)", {
-      action: {
-        label: "回退",
-        onClick: () => {
-          void (async () => {
-            try {
-              toast.success(await api.checkpointRollback(id));
-              setFileRefresh((k) => k + 1); // 回退后刷新文件面板,反映真实文件状态
-            } catch (e) {
-              toast.error(`回退失败: ${e}`);
-            }
-          })();
-        },
-      },
-    });
+  // 版本管理:打开下拉时拉取检查点列表;展开某版本看其改动详情;选中某版本 → 二次确认 → reset 到该提交
+  async function loadCheckpoints() {
+    if (!activeId) return;
+    try {
+      setCheckpoints(await api.listCodingCheckpoints(activeId));
+    } catch (e) {
+      toast.error(`读取版本失败: ${e}`);
+    }
+  }
+  // 展开/收起某版本:展开时懒加载该版本改动详情(已缓存则直接用)
+  async function toggleVersion(hash: string) {
+    if (expandedHash === hash) {
+      setExpandedHash(null);
+      return;
+    }
+    setExpandedHash(hash);
+    if (!activeId || diffCache[hash]) return;
+    try {
+      const detail = await api.getCheckpointDiff(activeId, hash);
+      setDiffCache((prev) => ({ ...prev, [hash]: detail }));
+    } catch (e) {
+      toast.error(`读取版本改动失败: ${e}`);
+    }
+  }
+  async function doRollback() {
+    if (!activeId || !rollbackTarget) return;
+    try {
+      const msg = await api.rollbackToCheckpoint(activeId, rollbackTarget.hash);
+      setRollbackTarget(null);
+      setFileRefresh((k) => k + 1); // 回退后刷新文件面板
+      setPreviewReload((k) => k + 1); // 预览重载反映回退结果
+      toast.success(msg);
+    } catch (e) {
+      toast.error(`回退失败: ${e}`);
+    }
   }
 
   // 文件面板保存:写回真实文件 → 重读(dirty 归零)+ 触发预览实时刷新/重编译
@@ -485,6 +627,80 @@ export function CodingLayout() {
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <SandboxDialog open={sandboxOpen} onOpenChange={setSandboxOpen} />
 
+      {/* 会话重命名(与普通对话一致) */}
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>重命名会话</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submitRename();
+              }
+            }}
+            placeholder="输入会话标题"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={() => void submitRename()}>确定</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 删除会话:二次确认 */}
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除会话</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定删除「{active?.title || "编程 Agent"}」?此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => void confirmDelete()}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 版本回退:二次确认 */}
+      <AlertDialog
+        open={!!rollbackTarget}
+        onOpenChange={(o) => {
+          if (!o) setRollbackTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>回退到该版本</AlertDialogTitle>
+            <AlertDialogDescription>
+              将把工作区文件恢复到「{rollbackTarget?.message}」时的状态;该版本之后的文件改动会丢失(对话历史保留)。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => void doRollback()}
+            >
+              回退
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* 双栏(中间分割条可拖动调整宽度) */}
       <div
         ref={splitRef}
@@ -498,6 +714,35 @@ export function CodingLayout() {
           className="flex min-h-0 min-w-0 shrink-0 flex-col"
           style={{ width: `${leftPct}%` }}
         >
+          {/* 会话标题:与普通对话一致——无分隔栏 + 可点下拉(重命名/删除) */}
+          {active && (
+            <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-2">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="inline-flex max-w-[70%] items-center gap-1 rounded-md px-1.5 py-1 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+                  >
+                    <span className="truncate">{active.title || "编程 Agent"}</span>
+                    <ChevronDown className="size-4 shrink-0 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem onClick={openRename}>
+                    <Pencil className="size-4" />
+                    重命名
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => setDeleteOpen(true)}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    <Trash2 className="size-4" />
+                    删除
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          )}
           {/* 任务计划:Plan 产出的 todo + 进度;Plan 模式下还有未完成项时给「按方案执行」 */}
           {planTodos.length > 0 && (
             <div className="shrink-0 border-b px-4 py-2">
@@ -510,7 +755,7 @@ export function CodingLayout() {
                     size="sm"
                     variant="default"
                     className="h-6 shrink-0 gap-1 px-2 text-[11px]"
-                    disabled={sending}
+                    disabled={activeSending}
                     onClick={handleRunPlan}
                   >
                     <Play className="size-3" />
@@ -537,14 +782,16 @@ export function CodingLayout() {
           )}
           <div
             ref={scrollRef}
-            className="veltrix-thin-scrollbar min-h-0 flex-1 space-y-2.5 overflow-y-auto px-5 py-3"
+            className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto px-8 py-3"
           >
-            {messages.length === 0 && !sending ? (
+            {/* 内容限宽居中:对话内容宽度 == 输入框宽度,与普通对话一致 */}
+            <div className="mx-auto max-w-3xl space-y-2.5">
+            {messages.length === 0 && !activeSending ? (
               models.length === 0 ? (
                 <EmptyState
                   icon={Wrench}
-                  title="尚未配置模型"
-                  description="请到系统配置 → 模型厂商,填好 API Key 与模型后再开始。"
+                  title="尚无可用模型"
+                  description="编程 Agent 需具备「工具调用」能力的模型。请到系统配置 → 模型厂商,为模型勾选该能力后再开始。"
                 />
               ) : (
                 <EmptyState
@@ -554,10 +801,29 @@ export function CodingLayout() {
                 />
               )
             ) : (
-              messages.map((m) => <CodingMessage key={m.id} message={m} />)
+              <>
+                {messages.length > visibleCount && (
+                  <div className="flex justify-center">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs text-muted-foreground"
+                      onClick={() => setVisibleCount((c) => c + MSG_PAGE_SIZE)}
+                    >
+                      加载更早的消息({messages.length - visibleCount})
+                    </Button>
+                  </div>
+                )}
+                {(messages.length > visibleCount
+                  ? messages.slice(messages.length - visibleCount)
+                  : messages
+                ).map((m) => (
+                  <CodingMessage key={m.id} message={m} />
+                ))}
+              </>
             )}
-            {/* 进行中:实时思考过程(逐步累计,可滚动) */}
-            {sending && (
+            {/* 进行中:实时思考过程(逐步累计,可滚动)——仅当前查看的会话 */}
+            {activeSending && (
               <div className="rounded-md border bg-muted/20 p-2 text-xs text-muted-foreground">
                 <div className="flex items-center gap-2">
                   <Loader2 className="size-3.5 animate-spin" />
@@ -572,9 +838,11 @@ export function CodingLayout() {
                 </div>
               </div>
             )}
+            </div>
           </div>
           {/* 输入:与对话输入框风格一致(圆角卡片 + 无边框 textarea + 发送) */}
-          <div className="shrink-0 px-5 pb-2">
+          <div className="shrink-0 px-8 pb-2">
+            <div className="mx-auto max-w-3xl">
             <div className="flex flex-col gap-1 rounded-2xl border bg-card p-2 shadow-lg">
               <Textarea
                 value={input}
@@ -582,7 +850,7 @@ export function CodingLayout() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    if (!sending) void handleSend();
+                    if (!activeSending) void handleSend();
                   }
                 }}
                 placeholder={
@@ -596,44 +864,61 @@ export function CodingLayout() {
               <div className="flex items-center justify-between gap-2">
                 {/* Plan / Act 段控:Plan 只产出实现方案,Act 亲自动手执行(临时态,不持久化) */}
                 <div className="flex shrink-0 items-center rounded-lg border bg-muted/40 p-0.5 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setMode("plan")}
-                    disabled={sending}
-                    className={cn(
-                      "rounded-md px-2.5 py-1 font-medium transition-colors",
-                      mode === "plan"
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                    title="方案模式:只调研并产出分步实现方案,不改动 / 不运行"
-                  >
-                    Plan
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setMode("act")}
-                    disabled={sending}
-                    className={cn(
-                      "rounded-md px-2.5 py-1 font-medium transition-colors",
-                      mode === "act"
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                    title="执行模式:在工作区内读写文件、运行命令并自我验证"
-                  >
-                    Act
-                  </button>
+                  <SimpleTooltip content="方案模式:只调研并产出分步实现方案,不改动 / 不运行">
+                    <button
+                      type="button"
+                      onClick={() => setMode("plan")}
+                      disabled={activeSending}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 font-medium transition-colors",
+                        mode === "plan"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      Plan
+                    </button>
+                  </SimpleTooltip>
+                  <SimpleTooltip content="执行模式:在工作区内读写文件、运行命令并自我验证">
+                    <button
+                      type="button"
+                      onClick={() => setMode("act")}
+                      disabled={activeSending}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 font-medium transition-colors",
+                        mode === "act"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      Act
+                    </button>
+                  </SimpleTooltip>
                 </div>
-                <Button
-                  size="icon"
-                  className="size-9 shrink-0 cursor-pointer rounded-xl"
-                  disabled={sending || !input.trim()}
-                  onClick={() => void handleSend()}
-                >
-                  {sending ? <Loader2 className="animate-spin" /> : <Send />}
-                </Button>
+                {/* 自主续航中 → 可点的「停止」(下一步检查点收尾);否则 → 发送 */}
+                {activeSending ? (
+                  <SimpleTooltip content="停止自主续航(下一步收尾,已落库改动保留)">
+                    <Button
+                      size="icon"
+                      variant="destructive"
+                      className="size-9 shrink-0 cursor-pointer rounded-xl"
+                      onClick={() => void handleStop()}
+                    >
+                      <Square className="size-3.5" />
+                    </Button>
+                  </SimpleTooltip>
+                ) : (
+                  <Button
+                    size="icon"
+                    className="size-9 shrink-0 cursor-pointer rounded-xl"
+                    disabled={!input.trim()}
+                    onClick={() => void handleSend()}
+                  >
+                    <Send />
+                  </Button>
+                )}
               </div>
+            </div>
             </div>
           </div>
         </div>
@@ -670,32 +955,148 @@ export function CodingLayout() {
                   未隔离·本机
                 </span>
               )}
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 gap-1 text-xs"
-                disabled={!activeId}
-                title="回退到本轮发送前(丢弃本轮文件改动)"
-                onClick={handleRollback}
-              >
-                <Undo2 className="size-3.5" />
-                回退
-              </Button>
+              {/* 顺序:沙盒 → 启动/停止 → 回退。按钮自带图标+文字标签+悬浮态,不再额外加 tooltip */}
               <Button
                 variant="ghost"
                 size="sm"
                 className="h-7 shrink-0 gap-1 text-xs"
                 onClick={() => setSandboxOpen(true)}
               >
-                <Box className="size-3.5" />
+                <Box
+                  className={cn(
+                    "size-3.5",
+                    dockerOk === false
+                      ? "text-muted-foreground/60"
+                      : sandboxRunning
+                        ? "text-emerald-500"
+                        : "text-amber-500",
+                  )}
+                />
                 沙盒
               </Button>
+              {/* 预览服务启停:仅预览 tab 显示(dev server 全局单实例,状态来自 useDevServer;日志按钮在预览工具栏内) */}
+              {workTab === "preview" &&
+                (dev.running ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1 text-xs text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
+                    disabled={dev.busy}
+                    onClick={() => void dev.stop()}
+                  >
+                    <Square className="size-3.5" />
+                    停止
+                  </Button>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1 text-xs text-emerald-600 hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-400"
+                    disabled={dev.busy}
+                    onClick={() => void dev.start()}
+                  >
+                    <Play className="size-3.5" />
+                    启动
+                  </Button>
+                ))}
+              {/* 版本管理:点开列出版本历史(每轮任务前的快照),展开看该版本改动详情,选一个 → 二次确认 → reset */}
+              <DropdownMenu
+                open={versionMenuOpen}
+                onOpenChange={(open) => {
+                  setVersionMenuOpen(open);
+                  if (open) {
+                    setExpandedHash(null);
+                    void loadCheckpoints();
+                  }
+                }}
+              >
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1 text-xs text-amber-600 hover:text-amber-600 dark:text-amber-500 dark:hover:text-amber-500"
+                    disabled={!activeId}
+                  >
+                    <History className="size-3.5" />
+                    版本管理
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="end"
+                  className="max-h-[70vh] w-[34rem] overflow-y-auto p-0"
+                >
+                  {checkpoints.length === 0 ? (
+                    <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+                      暂无版本(发送任务后会自动建立检查点)
+                    </div>
+                  ) : (
+                    checkpoints.map((c) => {
+                      const expanded = expandedHash === c.hash;
+                      const detail = diffCache[c.hash];
+                      return (
+                        <div key={c.hash} className="border-b last:border-b-0">
+                          {/* 版本行:点击展开/收起其改动详情 */}
+                          <button
+                            type="button"
+                            onClick={() => void toggleVersion(c.hash)}
+                            className="flex w-full items-start gap-2 px-3 py-2 text-left transition-colors hover:bg-accent"
+                          >
+                            <ChevronRight
+                              className={cn(
+                                "mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-transform",
+                                expanded && "rotate-90",
+                              )}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="line-clamp-1 text-xs">{c.message}</div>
+                              <div className="text-[10px] text-muted-foreground">
+                                {new Date(c.time * 1000).toLocaleString()}
+                              </div>
+                            </div>
+                          </button>
+                          {expanded && (
+                            <div className="px-3 pb-2.5">
+                              {!detail ? (
+                                <div className="py-2 text-center text-xs text-muted-foreground">
+                                  <Loader2 className="mr-1 inline size-3 animate-spin" />
+                                  加载改动…
+                                </div>
+                              ) : detail.files.length === 0 ? (
+                                <div className="py-2 text-xs text-muted-foreground">
+                                  该版本无文件改动
+                                </div>
+                              ) : (
+                                <div className="space-y-1.5">
+                                  {detail.files.map((f) => (
+                                    <CheckpointFileItem key={f.path} file={f} />
+                                  ))}
+                                </div>
+                              )}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="mt-2 h-7 w-full gap-1 text-xs text-amber-600 hover:text-amber-600 dark:text-amber-500 dark:hover:text-amber-500"
+                                onClick={() => {
+                                  setVersionMenuOpen(false);
+                                  setRollbackTarget(c);
+                                }}
+                              >
+                                <History className="size-3.5" />
+                                回退到此版本
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
               <Button
                 variant="ghost"
                 size="sm"
                 className="h-7 shrink-0 gap-1 text-xs"
                 disabled={!workspace}
-                title="在系统文件管理器中打开工作区目录"
                 onClick={() =>
                   void openPath(workspace).catch((e) => toast.error(`打开目录失败: ${e}`))
                 }
@@ -710,16 +1111,17 @@ export function CodingLayout() {
               <div className="flex min-h-0 flex-1 flex-col">
                 <div className="flex shrink-0 items-center justify-between border-b px-2 py-1 text-[11px] text-muted-foreground">
                   <span>工作区文件{wsFiles.length > 0 ? `(${wsFiles.length})` : ""}</span>
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="ghost"
-                    className="size-6"
-                    title="刷新文件列表"
-                    onClick={() => setFileRefresh((k) => k + 1)}
-                  >
-                    <RotateCw className="size-3" />
-                  </Button>
+                  <SimpleTooltip content="刷新文件列表">
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="size-6"
+                      onClick={() => setFileRefresh((k) => k + 1)}
+                    >
+                      <RotateCw className="size-3" />
+                    </Button>
+                  </SimpleTooltip>
                 </div>
                 {wsFiles.length === 0 ? (
                   <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-muted-foreground">
@@ -729,20 +1131,20 @@ export function CodingLayout() {
                   <div className="flex min-h-0 flex-1">
                     <div className="veltrix-thin-scrollbar w-44 shrink-0 overflow-y-auto border-r p-1.5">
                       {wsFiles.map((f) => (
-                        <button
-                          key={f}
-                          type="button"
-                          onClick={() => setSelectedFile(f)}
-                          className={cn(
-                            "block w-full truncate rounded px-2 py-1 text-left text-xs transition-colors",
-                            shownFile === f
-                              ? "bg-primary/10 font-medium text-primary"
-                              : "text-foreground hover:bg-accent/50",
-                          )}
-                          title={f}
-                        >
-                          {f}
-                        </button>
+                        <SimpleTooltip key={f} content={f} side="right">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedFile(f)}
+                            className={cn(
+                              "block w-full truncate rounded px-2 py-1 text-left text-xs transition-colors",
+                              shownFile === f
+                                ? "bg-primary/10 font-medium text-primary"
+                                : "text-foreground hover:bg-accent/50",
+                            )}
+                          >
+                            {f}
+                          </button>
+                        </SimpleTooltip>
                       ))}
                     </div>
                     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -759,7 +1161,7 @@ export function CodingLayout() {
                 )}
               </div>
             ) : workTab === "preview" ? (
-              <PreviewServer reloadSignal={previewReload} autoStart={previewAutoStart} />
+              <PreviewServer dev={dev} />
             ) : (
               <div className="flex min-h-0 flex-1 flex-col">
                 <div className="veltrix-thin-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
@@ -837,21 +1239,58 @@ function WorkTab({
   );
 }
 
-// 预览统一走「预览服务」:在沙盒内常驻起一个服务进程并经 <名>.localhost:<port> 给出访问地址。
-// 不再区分静态 / 开发服务器——前端项目用 `npm run dev`,单个 HTML / 纯静态目录用内置静态服务器,
-// 二者都得到一个真实访问地址(单 HTML 不再用本地 file 协议直开)。轮询状态,检测到端口后 iframe 接入。
-function PreviewServer({
-  reloadSignal,
-  autoStart,
-}: {
-  reloadSignal?: number;
-  autoStart?: number;
-}) {
-  const { activeId } = useChat();
+// 预览设备模拟器:宽高为「竖屏」CSS 视口尺寸(横屏时由代码对调);width=0 表示响应式铺满。
+// 取主流真机的逻辑像素(CSS px,非物理像素),iframe 按此宽度渲染即触发被预览站点的响应式断点。
+// frame:顶部形态——island(灵动岛)/ notch(刘海)/ punch(挖孔)/ none(无,SE / 平板)。
+type DeviceGroup = "桌面" | "iPhone" | "Android" | "平板";
+interface PreviewDevice {
+  id: string;
+  label: string;
+  width: number;
+  height: number;
+  group: DeviceGroup;
+  frame: "island" | "notch" | "punch" | "none";
+}
+// 分组展示顺序
+const DEVICE_GROUPS: DeviceGroup[] = ["桌面", "iPhone", "Android", "平板"];
+// 尺寸为各机型「竖屏 CSS 逻辑分辨率(点)」,经 yesviz 核对(2026-06)。
+// 苹果覆盖最近 2 代(iPhone 17 / 16)全系;灵动岛(island)/刘海(16e notch)按真机区分。
+const PREVIEW_DEVICES: PreviewDevice[] = [
+  { id: "responsive", label: "响应式(铺满)", width: 0, height: 0, group: "桌面", frame: "none" },
+  // —— iPhone(新代在前)——
+  { id: "iphone-17-pro-max", label: "iPhone 17 Pro Max", width: 440, height: 956, group: "iPhone", frame: "island" },
+  { id: "iphone-17-pro", label: "iPhone 17 Pro", width: 402, height: 874, group: "iPhone", frame: "island" },
+  { id: "iphone-17-air", label: "iPhone 17 Air", width: 420, height: 912, group: "iPhone", frame: "island" },
+  { id: "iphone-17", label: "iPhone 17", width: 402, height: 874, group: "iPhone", frame: "island" },
+  { id: "iphone-16-pro-max", label: "iPhone 16 Pro Max", width: 440, height: 956, group: "iPhone", frame: "island" },
+  { id: "iphone-16-pro", label: "iPhone 16 Pro", width: 402, height: 874, group: "iPhone", frame: "island" },
+  { id: "iphone-16-plus", label: "iPhone 16 Plus", width: 430, height: 932, group: "iPhone", frame: "island" },
+  { id: "iphone-16", label: "iPhone 16", width: 393, height: 852, group: "iPhone", frame: "island" },
+  { id: "iphone-16e", label: "iPhone 16e", width: 390, height: 844, group: "iPhone", frame: "notch" },
+  // —— Android ——
+  { id: "pixel-7", label: "Pixel 7", width: 412, height: 915, group: "Android", frame: "punch" },
+  { id: "galaxy-s8", label: "Galaxy S8+", width: 360, height: 740, group: "Android", frame: "punch" },
+  // —— 平板 ——
+  { id: "ipad-mini", label: "iPad Mini", width: 744, height: 1133, group: "平板", frame: "none" },
+  { id: "ipad-air", label: "iPad Air", width: 820, height: 1180, group: "平板", frame: "none" },
+  { id: "ipad-pro-11", label: 'iPad Pro 11"', width: 834, height: 1194, group: "平板", frame: "none" },
+  { id: "ipad-pro-13", label: 'iPad Pro 12.9"', width: 1024, height: 1366, group: "平板", frame: "none" },
+  { id: "surface-pro", label: "Surface Pro", width: 912, height: 1368, group: "平板", frame: "none" },
+];
+// 设备帧四周留白(px):缩放计算时从可用区扣除,避免设备贴边(需容纳边框+阴影)
+const DEVICE_FRAME_PADDING = 40;
+
+// 预览服务(dev server)控制:轮询状态 + 启动/停止/日志/刷新 + 访问地址派生。
+// 抽成 hook 让「预览面板」与「工作区头部的启动/停止/日志按钮」共享同一份状态(单实例)。
+function useDevServer(
+  activeId: string | null,
+  reloadSignal: number,
+  autoStart: number,
+) {
   // 默认前端项目(Vite)预览;容器内服务须绑 0.0.0.0(--host),宿主已发布端口,经 localhost:<port> 访问。
   // 加 CHOKIDAR_USEPOLLING:Docker(尤其 Win/WSL2)bind mount 的文件变更事件常不传播,开轮询让 Vite 感知保存并热更新。
   // --port + --strictPort:命令里的端口号会被后端按会话改写为「自定义且未被占用」的端口(本机模式查占用、
-  // 多程序不撞 5173),strictPort 保证撞端口时直接报错可见,而非静默爬升到未知端口。实际端口见下方状态行。
+  // 多程序不撞 5173),strictPort 保证撞端口时直接报错可见,而非静默爬升到未知端口。实际端口在地址栏显示。
   const DEV_CMD =
     "CHOKIDAR_USEPOLLING=true npm run dev -- --host --port 5173 --strictPort";
   const [command, setCommand] = useState(DEV_CMD);
@@ -884,24 +1323,21 @@ function PreviewServer({
     if (reloadSignal) setIframeKey((k) => k + 1);
   }, [reloadSignal]);
 
-  // 生成完成信号(autoStart 自增)→ 自动编译并打开预览(由 startSilently 据后端真实状态决定起 / 重载)。
-  // 仅以 autoStart 自增为触发沿,故意不纳入其它依赖避免重复触发。
+  // 生成完成信号(autoStart 自增)→ 自动编译并打开预览(由 startSilently 据后端真实状态决定起 / 重载)
   useEffect(() => {
     if (!autoStart) return;
     void startSilently();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoStart]);
 
-  // dev server 是全局单实例;仅当其归属当前会话时才认它,否则切到别的会话不串台(防显示他会话内容)
+  // dev server 是全局单实例;仅当其归属当前会话时才认它,否则切到别的会话不串台
   const belongsToThis =
     !status?.conversationId || status.conversationId === activeId;
   const running = (status?.running ?? false) && belongsToThis;
   const port = belongsToThis ? (status?.port ?? null) : null;
-  // 直连本机回环:Vite 新版会按 Host 头做 allowedHosts 校验,非 localhost/127.0.0.1 的子域会被拒
-  // (返回 "Blocked request"),而 <slug>.localhost 并无反代按子域路由,纯属多余,故统一用 localhost。
+  // 直连本机回环(Vite 新版按 Host 头做 allowedHosts 校验,localhost 最稳)
   const host = "localhost";
   const src = port ? `http://${host}:${port}/?_=${iframeKey}` : "";
-  // 在外部浏览器打开用干净地址(不带 iframe 缓存破坏参数)
   const externalUrl = port ? `http://${host}:${port}/` : "";
 
   async function start() {
@@ -925,9 +1361,7 @@ function PreviewServer({
       setBusy(false);
     }
   }
-  // 自动启动(静默):用于「生成完成自动预览」。先查后端真实状态——已在跑就只重载,
-  // 避免切 tab 重挂载时把正在跑的 dev server 重启(闪烁);未跑才启动。
-  // 工作区可能尚无可预览内容(纯方案 / 空目录),失败不弹错(区别于手动「启动」按钮),避免每轮无谓打扰。
+  // 自动启动(静默):已在跑只重载,未跑才启;空目录 / 纯方案失败不弹错
   async function startSilently() {
     if (busy) return;
     setBusy(true);
@@ -945,94 +1379,236 @@ function PreviewServer({
       setBusy(false);
     }
   }
+  const refresh = () => setIframeKey((k) => k + 1);
+
+  return {
+    command,
+    setCommand,
+    status,
+    busy,
+    iframeKey,
+    refresh,
+    showLogs,
+    setShowLogs,
+    running,
+    port,
+    src,
+    externalUrl,
+    start,
+    stop,
+  };
+}
+
+type DevServerController = ReturnType<typeof useDevServer>;
+
+// 预览面板:地址栏(URL + 复制/刷新/打开)+ 右侧移动端模拟器(机型 / 横竖屏 / 状态栏)+ iframe。
+// dev server 的启停 / 日志由父组件 useDevServer 提供并在工作区头部呈现(此处只渲染地址栏与画面)。
+function PreviewServer({ dev }: { dev: DevServerController }) {
+  // 设备模拟器:选中设备 + 横竖屏 + 自动缩放(按预览区大小把设备帧缩到能放下)
+  const [deviceId, setDeviceId] = useState("responsive");
+  const [orientation, setOrientation] = useState<"portrait" | "landscape">("portrait");
+  const [showStatusBar, setShowStatusBar] = useState(true);
+  const [scale, setScale] = useState(1);
+  const previewAreaRef = useRef<HTMLDivElement>(null);
+
+  const device = PREVIEW_DEVICES.find((d) => d.id === deviceId) ?? PREVIEW_DEVICES[0];
+  const isResponsive = device.width === 0;
+  // 横屏时对调宽高
+  const frameW = orientation === "portrait" ? device.width : device.height;
+  const frameH = orientation === "portrait" ? device.height : device.width;
+  // 下拉框内的机型图标:按当前设备分组(手机 / 平板 / 桌面)切换
+  const DeviceGroupIcon =
+    device.group === "平板" ? Tablet : device.group === "桌面" ? Monitor : Smartphone;
+
+  // 自动缩放:量预览区可用尺寸,把设备帧等比缩到能放下(只缩不放,最大 100%)。
+  // 预览区尺寸变化(拖分割条等)经 ResizeObserver 重算;响应式模式无需缩放。
+  useEffect(() => {
+    if (isResponsive) {
+      setScale(1);
+      return;
+    }
+    const el = previewAreaRef.current;
+    if (!el) return;
+    const compute = () => {
+      const availW = el.clientWidth - DEVICE_FRAME_PADDING;
+      const availH = el.clientHeight - DEVICE_FRAME_PADDING;
+      if (availW <= 0 || availH <= 0) return;
+      const s = Math.min(1, availW / frameW, availH / frameH);
+      setScale(s > 0 ? s : 1);
+    };
+    compute();
+    const ro = new ResizeObserver(compute);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [isResponsive, frameW, frameH]);
+
+  // dev server 状态与控制由父组件 useDevServer 提供(与头部启动/停止/日志共享同一实例)
+  const { command, setCommand, status, iframeKey, refresh, showLogs, setShowLogs, running, port, src, externalUrl } =
+    dev;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-        <input
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          placeholder="服务命令(在工作区 / 沙盒内常驻运行)"
-          className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 font-mono text-xs outline-none"
-        />
+        {/* 地址栏:运行且有端口 → 访问 URL + 复制/刷新/打开;探测端口中 → 提示;未运行 → 可编辑命令 */}
         {running ? (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-7 shrink-0 gap-1"
-            disabled={busy}
-            onClick={() => void stop()}
-          >
-            <Square className="size-3.5" />
-            停止
-          </Button>
+          port ? (
+            <div className="group flex h-7 min-w-0 flex-1 items-center gap-0.5 rounded border bg-muted/40 pl-2 pr-0.5">
+              <span className="min-w-0 flex-1 select-all truncate font-mono text-xs text-foreground">
+                {externalUrl}
+              </span>
+              {/* 动作按钮:默认隐藏,悬浮地址栏(或聚焦)才浮出——去掉 tooltip,靠图标 + 显隐交互 */}
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="复制访问地址"
+                className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+                onClick={() =>
+                  void navigator.clipboard
+                    .writeText(externalUrl)
+                    .then(() => toast.success("已复制访问地址"))
+                    .catch(() => toast.error("复制失败"))
+                }
+              >
+                <Copy className="size-3.5" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="刷新预览"
+                className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+                onClick={refresh}
+              >
+                <RotateCw className="size-3.5" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="在外部浏览器打开"
+                className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+                onClick={() =>
+                  void openUrl(externalUrl).catch((e) => toast.error(`打开浏览器失败: ${e}`))
+                }
+              >
+                <ExternalLink className="size-3.5" />
+              </Button>
+            </div>
+          ) : (
+            <div className="flex h-7 min-w-0 flex-1 items-center rounded border bg-muted/40 px-2 text-xs text-muted-foreground">
+              正在探测访问端口…
+            </div>
+          )
         ) : (
+          <input
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+            placeholder="服务命令(在工作区 / 沙盒内常驻运行)"
+            className="h-7 min-w-0 flex-1 rounded border bg-transparent px-2 font-mono text-xs outline-none"
+          />
+        )}
+        {/* 右侧:移动端模拟器机型选择 */}
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Select value={deviceId} onValueChange={setDeviceId}>
+            <SelectTrigger
+              size="sm"
+              aria-label="选择预览设备"
+              className="w-[13.5rem] px-2 text-[11px]"
+            >
+              <span className="flex min-w-0 items-center gap-1.5">
+                <DeviceGroupIcon className="size-3.5 shrink-0 text-primary" />
+                <SelectValue />
+              </span>
+            </SelectTrigger>
+            <SelectContent>
+              {DEVICE_GROUPS.map((group) => (
+                <SelectGroup key={group}>
+                  <SelectLabel>{group}</SelectLabel>
+                  {PREVIEW_DEVICES.filter((d) => d.group === group).map((d) => (
+                    <SelectItem key={d.id} value={d.id} className="text-xs">
+                      {d.label}
+                      {d.width > 0 ? ` · ${d.width}×${d.height}` : ""}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              ))}
+            </SelectContent>
+          </Select>
           <Button
             type="button"
+            variant="outline"
             size="sm"
-            className="h-7 shrink-0 gap-1"
-            disabled={busy}
-            onClick={() => void start()}
+            className={cn("h-7 shrink-0 gap-1 px-2 text-[11px]", showLogs && "text-primary")}
+            onClick={() => setShowLogs((v) => !v)}
           >
-            <Play className="size-3.5" />
-            启动
+            <FileText className="size-3.5" />
+            日志
           </Button>
+        </div>
+      </div>
+      <div
+        ref={previewAreaRef}
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-muted/20 dark:bg-black/30"
+      >
+        {/* 设备控制浮层(内容区右上角):横竖屏 / 状态栏 / 当前比例;高度与设备筛选一致(h-7),分割线分组 */}
+        {!isResponsive && (
+          <div className="absolute right-2 top-2 z-10 flex h-7 items-center gap-0.5 rounded-md border bg-background/90 pl-1 pr-2 shadow-sm backdrop-blur">
+            <SimpleTooltip content={orientation === "portrait" ? "切换为横屏" : "切换为竖屏"}>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-6"
+                onClick={() =>
+                  setOrientation((o) => (o === "portrait" ? "landscape" : "portrait"))
+                }
+              >
+                {orientation === "portrait" ? (
+                  <RectangleVertical className="size-4" />
+                ) : (
+                  <RectangleHorizontal className="size-4" />
+                )}
+              </Button>
+            </SimpleTooltip>
+            <SimpleTooltip content={showStatusBar ? "隐藏状态栏" : "显示状态栏"}>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={cn("size-6", showStatusBar && "text-primary")}
+                onClick={() => setShowStatusBar((v) => !v)}
+              >
+                <Signal className="size-4" />
+              </Button>
+            </SimpleTooltip>
+            {/* 分割线 */}
+            <span className="mx-1 h-4 w-px shrink-0 bg-border" />
+            <span className="text-[11px] tabular-nums text-muted-foreground">
+              {frameW}×{frameH} · {Math.round(scale * 100)}%
+            </span>
+          </div>
         )}
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          className="size-7 shrink-0"
-          title="刷新预览"
-          onClick={() => setIframeKey((k) => k + 1)}
-        >
-          <RotateCw className="size-3.5" />
-        </Button>
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          className="size-7 shrink-0"
-          disabled={!externalUrl}
-          title={externalUrl ? `在外部浏览器打开 ${host}:${port}` : "服务运行后可在外部浏览器打开"}
-          onClick={() =>
-            void openUrl(externalUrl).catch((e) => toast.error(`打开浏览器失败: ${e}`))
-          }
-        >
-          <ExternalLink className="size-3.5" />
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="h-7 shrink-0"
-          onClick={() => setShowLogs((v) => !v)}
-        >
-          日志
-        </Button>
-      </div>
-      <div className="flex shrink-0 items-center gap-1.5 px-2 py-1 text-[11px] text-muted-foreground">
-        <span
-          className={cn(
-            "size-2 rounded-full",
-            running ? "bg-emerald-500" : "bg-muted-foreground/40",
-          )}
-        />
-        {running
-          ? port
-            ? `运行中 · ${host}:${port}`
-            : "运行中 · 正在探测端口…"
-          : "未运行"}
-      </div>
-      <div className="min-h-0 flex-1">
         {port ? (
-          <iframe
-            key={iframeKey}
-            src={src}
-            title="预览"
-            className="size-full border-0 bg-white"
-          />
+          isResponsive ? (
+            <iframe
+              key={iframeKey}
+              src={src}
+              title="预览"
+              className="size-full border-0 bg-white"
+            />
+          ) : (
+            <DeviceFrame
+              device={device}
+              frameW={frameW}
+              frameH={frameH}
+              scale={scale}
+              orientation={orientation}
+              showStatusBar={showStatusBar}
+              src={src}
+              iframeKey={iframeKey}
+            />
+          )
         ) : (
           <div className="flex h-full items-center justify-center px-6 text-center text-xs text-muted-foreground">
             {running
@@ -1050,6 +1626,189 @@ function PreviewServer({
   );
 }
 
+// 设备外框:深色边框 + 圆角屏幕 + 刘海/灵动岛/挖孔 + 底部 Home 指示条,按机型渲染。
+// 屏幕容器尺寸 = 缩放后视口(sw×sh)、overflow-hidden 裁圆角;iframe 仍按真实视口渲染再 transform 缩放,
+// 并比屏幕宽出 SCROLLBAR_HIDE_PX 把纵向滚动条挤出屏幕被裁掉(内容布局宽度仍 = 设备宽,断点准)。
+function DeviceFrame({
+  device,
+  frameW,
+  frameH,
+  scale,
+  orientation,
+  showStatusBar,
+  src,
+  iframeKey,
+}: {
+  device: PreviewDevice;
+  frameW: number;
+  frameH: number;
+  scale: number;
+  orientation: "portrait" | "landscape";
+  showStatusBar: boolean;
+  src: string;
+  iframeKey: number;
+}) {
+  const sw = frameW * scale;
+  const sh = frameH * scale;
+  const isPortrait = orientation === "portrait";
+  // 边框/圆角固定 px(不随缩放,保证外观一致):平板更方、现代手机更圆、SE 居中
+  const isTablet = device.group === "平板";
+  const bezel = isTablet ? 14 : 12;
+  const screenRadius = isTablet ? 12 : device.frame === "none" ? 16 : 38;
+  const outerRadius = screenRadius + bezel;
+  // 顶部形态仅竖屏渲染(横屏刘海在侧边,简化为不画);现代全面屏(岛/挖孔)显示底部 Home 指示条
+  const showTop = isPortrait && device.frame !== "none";
+  const showHomeBar = isPortrait && (device.frame === "island" || device.frame === "punch");
+  // 状态栏高度:全面屏(岛/刘海/挖孔)更高(容纳岛),SE/平板矮一些
+  const statusH = device.frame === "none" ? sh * 0.032 : sh * 0.048;
+  // 状态栏是否需要为顶部岛/刘海让出中间(竖屏全面屏才有)
+  const statusHasCenterGap = isPortrait && (device.frame === "island" || device.frame === "notch");
+
+  return (
+    <div
+      className="relative shrink-0 bg-neutral-900 shadow-2xl ring-1 ring-black/30 dark:bg-neutral-950"
+      style={{ padding: bezel, borderRadius: outerRadius }}
+    >
+      <div
+        className="relative overflow-hidden bg-white"
+        style={{ width: sw, height: sh, borderRadius: screenRadius }}
+      >
+        <iframe
+          key={iframeKey}
+          src={src}
+          title="预览"
+          // 精确按设备视口 frameW×frameH 渲染再等比 transform 缩放:屏幕容器 = sw×sh,
+          // 比例严格 = frameW:frameH,内容不裁切;页面若滚动,其滚动条也随 scale 一并缩小,不突兀。
+          className="block border-0 bg-white"
+          style={{
+            width: frameW,
+            height: frameH,
+            transform: `scale(${scale})`,
+            transformOrigin: "top left",
+          }}
+        />
+        {/* 状态栏(时间 + 信号/WiFi/电池),竖屏渲染,覆盖在内容顶部 */}
+        {showStatusBar && isPortrait && (
+          <StatusBar
+            width={sw}
+            height={statusH}
+            centerGap={statusHasCenterGap}
+          />
+        )}
+        {/* 灵动岛(iPhone 14 Pro / 15 / 16 / 17 等) */}
+        {showTop && device.frame === "island" && (
+          <div
+            className="pointer-events-none absolute left-1/2 z-20 -translate-x-1/2 rounded-full bg-black"
+            style={{ top: sw * 0.026, width: sw * 0.3, height: sw * 0.072 }}
+          />
+        )}
+        {/* 刘海(顶边凸起,iPhone 14 / 16e 等) */}
+        {showTop && device.frame === "notch" && (
+          <div
+            className="pointer-events-none absolute left-1/2 top-0 z-20 -translate-x-1/2 bg-black"
+            style={{
+              width: sw * 0.46,
+              height: sw * 0.058,
+              borderBottomLeftRadius: sw * 0.05,
+              borderBottomRightRadius: sw * 0.05,
+            }}
+          />
+        )}
+        {/* 挖孔摄像头(Android) */}
+        {showTop && device.frame === "punch" && (
+          <div
+            className="pointer-events-none absolute left-1/2 z-20 -translate-x-1/2 rounded-full bg-black"
+            style={{ top: sw * 0.03, width: sw * 0.05, height: sw * 0.05 }}
+          />
+        )}
+        {/* 底部 Home 指示条 */}
+        {showHomeBar && (
+          <div
+            className="pointer-events-none absolute left-1/2 z-20 -translate-x-1/2 rounded-full bg-black/35"
+            style={{ bottom: sh * 0.013, width: sw * 0.33, height: Math.max(3, sw * 0.012) }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// 真机状态栏:左侧实时时间,右侧信号/WiFi/电池;覆盖在页面顶部(半透明深色 + 白字,跨内容可读)。
+// centerGap=true(灵动岛/刘海机型)时左右元素分居两侧,给中间的岛/刘海让位。
+function StatusBar({
+  width,
+  height,
+  centerGap,
+}: {
+  width: number;
+  height: number;
+  centerGap: boolean;
+}) {
+  const [time, setTime] = useState("");
+  useEffect(() => {
+    const fmt = () => {
+      const d = new Date();
+      return `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
+    };
+    setTime(fmt());
+    const timer = setInterval(() => setTime(fmt()), 20000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const fontSize = Math.max(9, height * 0.42);
+  const iconSize = Math.max(10, height * 0.5);
+  const padX = centerGap ? width * 0.08 : width * 0.06;
+
+  return (
+    <div
+      className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between bg-gradient-to-b from-black/30 to-transparent font-semibold text-white"
+      style={{ height, paddingLeft: padX, paddingRight: padX, fontSize }}
+    >
+      <span className="tabular-nums">{time}</span>
+      <span className="flex items-center" style={{ gap: iconSize * 0.35 }}>
+        <Signal style={{ width: iconSize, height: iconSize }} />
+        <Wifi style={{ width: iconSize, height: iconSize }} />
+        <BatteryFull style={{ width: iconSize * 1.3, height: iconSize }} />
+      </span>
+    </div>
+  );
+}
+
+// 把 docker stats 的百分比字符串(如 "12.34%")解析为 0~100 的数值(供进度条宽度;CPU 多核可 >100,夹到 100)。
+function statPct(s?: string): number {
+  if (!s) return 0;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+}
+
+// 沙盒资源占用单条:标签 + 数值 + 细进度条(按占用高低变色:绿 / 黄 / 红)。
+function SandboxStatBar({
+  label,
+  value,
+  percent,
+}: {
+  label: string;
+  value: string;
+  percent: number;
+}) {
+  const color =
+    percent >= 85 ? "bg-red-500" : percent >= 60 ? "bg-amber-500" : "bg-emerald-500";
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[11px]">
+        <span className="text-muted-foreground">{label}</span>
+        <span className="tabular-nums text-foreground">{value || "—"}</span>
+      </div>
+      <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn("h-full rounded-full transition-all", color)}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 // 编程沙盒设置:本机 / Docker(每会话共享容器内独立目录);镜像/容器名 + 启停 + 状态。
 function SandboxDialog({
   open,
@@ -1059,6 +1818,7 @@ function SandboxDialog({
   onOpenChange: (o: boolean) => void;
 }) {
   const [cfg, setCfg] = useState<SandboxConfigView | null>(null);
+  const [stats, setStats] = useState<SandboxStatsView | null>(null);
   const [image, setImage] = useState("node:20-bookworm");
   const [container, setContainer] = useState("veltrix-sandbox");
   const [busy, setBusy] = useState(false);
@@ -1075,6 +1835,28 @@ function SandboxDialog({
   }
   useEffect(() => {
     if (open) void refresh();
+  }, [open]);
+  // 资源占用:弹窗打开期间定时采样(docker stats 每次约 1~2s,3s 一轮足够);关闭即停
+  useEffect(() => {
+    if (!open) {
+      setStats(null);
+      return;
+    }
+    let alive = true;
+    const tick = async () => {
+      try {
+        const s = await api.getSandboxStats();
+        if (alive) setStats(s);
+      } catch {
+        // 忽略
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), 3000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
   }, [open]);
 
   async function withBusy(fn: () => Promise<void>) {
@@ -1129,72 +1911,113 @@ function SandboxDialog({
             </label>
           </div>
           <div className="rounded-md border bg-muted/20 px-2.5 py-2 text-xs text-muted-foreground">
-            Docker:
-            <b className={cfg?.dockerAvailable ? "text-emerald-500" : "text-destructive"}>
-              {cfg?.dockerAvailable ? "可用" : "不可用 / 未安装"}
-            </b>
-            {" · "}容器:
-            <b className={cfg?.containerRunning ? "text-emerald-500" : "text-foreground"}>
-              {cfg?.containerRunning ? "运行中" : "未运行"}
-            </b>
+            <div>
+              Docker:
+              <b className={cfg?.dockerAvailable ? "text-emerald-500" : "text-destructive"}>
+                {cfg?.dockerAvailable ? "可用" : "不可用 / 未安装"}
+              </b>
+              {" · "}容器:
+              <b className={cfg?.containerRunning ? "text-emerald-500" : "text-foreground"}>
+                {cfg?.containerRunning ? "运行中" : "未运行"}
+              </b>
+            </div>
+            {/* 资源占用:容器运行中显示 docker stats 实时采样(CPU / 内存各一条细进度条) */}
+            <div className="mt-1.5 space-y-1.5 border-t pt-1.5">
+              <SandboxStatBar
+                label="CPU"
+                value={stats?.running ? stats.cpuPerc : ""}
+                percent={statPct(stats?.running ? stats.cpuPerc : undefined)}
+              />
+              <SandboxStatBar
+                label="内存"
+                value={
+                  stats?.running
+                    ? `${stats.memUsage}${stats.memPerc ? ` · ${stats.memPerc}` : ""}`
+                    : ""
+                }
+                percent={statPct(stats?.running ? stats.memPerc : undefined)}
+              />
+            </div>
           </div>
-          <div className="flex gap-2">
-            {/* 启动/停止合并为一个开关:运行中显示「停止」,否则显示「启动」 */}
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1"
-              disabled={busy || !cfg?.dockerAvailable}
-              onClick={() =>
-                void withBusy(async () => {
-                  try {
-                    if (cfg?.containerRunning) {
-                      await api.sandboxStop();
-                      toast.success("已停止沙盒容器");
-                    } else {
+          <div className="flex justify-end gap-2">
+            {/* 运行中 → 红色「停止」(二次确认);否则 → 绿色「启动」 */}
+            {cfg?.containerRunning ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1 text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
+                disabled={busy || !cfg?.dockerAvailable}
+                onClick={() =>
+                  toast("停止沙盒容器?运行中的预览 / 命令会中断(工作区文件保留)", {
+                    action: {
+                      label: "停止",
+                      onClick: () =>
+                        void withBusy(async () => {
+                          try {
+                            await api.sandboxStop();
+                            toast.success("已停止沙盒容器");
+                            await refresh();
+                          } catch (e) {
+                            toast.error(`停止失败: ${e}`);
+                          }
+                        }),
+                    },
+                  })
+                }
+              >
+                <Square className="size-3.5" />
+                停止
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1 text-emerald-600 hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-400"
+                disabled={busy || !cfg?.dockerAvailable}
+                onClick={() =>
+                  void withBusy(async () => {
+                    try {
                       // 启动前先落盘当前镜像 / 容器名,确保用的是最新编辑值(后端按已保存配置拉容器)
                       await persistConfig();
                       toast.success(await api.sandboxStart());
+                      await refresh();
+                    } catch (e) {
+                      toast.error(`启动失败: ${e}`);
                     }
-                    await refresh();
-                  } catch (e) {
-                    toast.error(`${cfg?.containerRunning ? "停止" : "启动"}失败: ${e}`);
-                  }
-                })
-              }
-            >
-              {cfg?.containerRunning ? (
-                <>
-                  <Square className="size-3.5" />
-                  停止沙盒
-                </>
-              ) : (
-                <>
-                  <Play className="size-3.5" />
-                  启动沙盒
-                </>
-              )}
-            </Button>
+                  })
+                }
+              >
+                <Play className="size-3.5" />
+                启动
+              </Button>
+            )}
+            {/* 重建:红色 + 二次确认(删容器重建) */}
             <Button
               size="sm"
               variant="outline"
-              className="gap-1"
+              className="gap-1 text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
               disabled={busy || !cfg?.dockerAvailable}
               onClick={() =>
-                void withBusy(async () => {
-                  try {
-                    // 重建前先落盘当前镜像 / 容器名,确保按最新编辑值重建
-                    await persistConfig();
-                    toast.success(await api.sandboxRecreate());
-                    await refresh();
-                  } catch (e) {
-                    toast.error(`重建失败: ${e}`);
-                  }
+                toast("重建沙盒容器?将删除现有容器并重新创建(工作区文件保留)", {
+                  action: {
+                    label: "重建",
+                    onClick: () =>
+                      void withBusy(async () => {
+                        try {
+                          // 重建前先落盘当前镜像 / 容器名,确保按最新编辑值重建
+                          await persistConfig();
+                          toast.success(await api.sandboxRecreate());
+                          await refresh();
+                        } catch (e) {
+                          toast.error(`重建失败: ${e}`);
+                        }
+                      }),
+                  },
                 })
               }
             >
               <RotateCw className="size-3.5" />
-              重建容器
+              重建
             </Button>
           </div>
           <p className="text-[11px] text-muted-foreground">
@@ -1204,11 +2027,6 @@ function SandboxDialog({
             若「生成的文件不在沙盒 / 无法预览」:多为旧容器挂载错误,点「重建容器」用正确挂载重建一次即可(文件保留在工作区)。
           </p>
         </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            关闭
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -1243,9 +2061,9 @@ function CollapsibleCode({
         )}
         <FileCode className="size-3.5 shrink-0 text-primary" />
         <span className="shrink-0 font-medium text-foreground">{label}</span>
-        <span className="truncate text-muted-foreground" title={path}>
-          {path}
-        </span>
+        <SimpleTooltip content={path}>
+          <span className="truncate text-muted-foreground">{path}</span>
+        </SimpleTooltip>
         <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
           {lineCount} 行
         </span>
@@ -1253,6 +2071,75 @@ function CollapsibleCode({
       {open && (
         <pre className="veltrix-thin-scrollbar max-h-80 overflow-auto whitespace-pre-wrap break-words border-t bg-background/60 p-2 font-mono text-[11px] leading-5 text-muted-foreground">
           {code}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+// 版本管理:单个文件的改动条目——状态徽标 + 路径 + 增删行数 + 可展开的完整 diff(按行着色)
+const FILE_STATUS_META: Record<string, { label: string; cls: string }> = {
+  added: { label: "新增", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" },
+  modified: { label: "修改", cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400" },
+  deleted: { label: "删除", cls: "bg-red-500/15 text-red-600 dark:text-red-400" },
+  renamed: { label: "重命名", cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400" },
+};
+
+function CheckpointFileItem({ file }: { file: CheckpointFileDiff }) {
+  const [open, setOpen] = useState(false);
+  const meta = FILE_STATUS_META[file.status] ?? {
+    label: file.status,
+    cls: "bg-muted text-muted-foreground",
+  };
+  return (
+    <div className="overflow-hidden rounded border bg-muted/20">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] transition-colors hover:bg-accent"
+      >
+        <span className={cn("shrink-0 rounded px-1 py-0.5 text-[10px] font-medium", meta.cls)}>
+          {meta.label}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono">{file.path}</span>
+        {file.additions > 0 && (
+          <span className="shrink-0 text-emerald-600 dark:text-emerald-400">
+            +{file.additions}
+          </span>
+        )}
+        {file.deletions > 0 && (
+          <span className="shrink-0 text-red-600 dark:text-red-400">
+            -{file.deletions}
+          </span>
+        )}
+        {file.diff && (
+          <ChevronRight
+            className={cn(
+              "size-3 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90",
+            )}
+          />
+        )}
+      </button>
+      {open && file.diff && (
+        <pre className="veltrix-thin-scrollbar max-h-72 overflow-auto border-t bg-background/40 px-2 py-1 font-mono text-[10px] leading-relaxed">
+          {file.diff.split("\n").map((line, i) => (
+            <div
+              key={i}
+              className={cn(
+                "whitespace-pre",
+                line.startsWith("@@")
+                  ? "text-sky-600 dark:text-sky-400"
+                  : line.startsWith("+")
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : line.startsWith("-")
+                      ? "text-red-600 dark:text-red-400"
+                      : "text-muted-foreground",
+              )}
+            >
+              {line || " "}
+            </div>
+          ))}
         </pre>
       )}
     </div>
@@ -1276,14 +2163,16 @@ function CodingMessage({ message: m }: { message: ChatMessageView }) {
   if (m.role !== "assistant") return null;
 
   const hasText = m.content.trim().length > 0;
+  const hasReasoning = !!m.reasoning?.trim();
   // 仅保留写代码类工具(write_file / replace_in_file)折叠展示;读取 / 列目录 / 跑命令 / 搜索 / 计划等隐藏
   const codeCalls = parseToolCalls(m.toolCalls).filter((c) =>
     (CODE_TOOLS as readonly string[]).includes(c.name),
   );
-  // 既无文字又无编码 → 纯工具调用步骤,整条隐藏
-  if (!hasText && codeCalls.length === 0) return null;
+  // 既无文字、无编码、也无思考过程 → 纯工具调用步骤,整条隐藏
+  if (!hasText && codeCalls.length === 0 && !hasReasoning) return null;
   return (
     <div className="space-y-1.5">
+      {hasReasoning && <ReasoningBlock reasoning={m.reasoning ?? ""} />}
       {hasText && (
         <div className="text-sm text-foreground">
           <MarkdownMessage content={m.content} />

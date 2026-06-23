@@ -1,6 +1,8 @@
 // SettingsPage 的共享基础:导航分组、厂商类型、清空确认词、字节格式化。
 // 从 SettingsPage.tsx 拆出,作为后续 section 组件拆分的共享依赖(尤其 Provider 类型)。
-import { AudioLines, Bot, Brain, Layers, NotebookPen, Settings2, Smartphone, Sparkles } from "lucide-react";
+import { AudioLines, Bot, Image, Layers, MessageSquare, NotebookPen, Settings2, Smartphone, Sparkles, Video, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import type { ModelCapability, ModelSpec } from "@/lib/api";
 
 export const SECTION_GROUPS = [
   {
@@ -18,7 +20,6 @@ export const SECTION_GROUPS = [
       { key: "role-models", label: "角色模型", icon: Layers },
       { key: "transcription", label: "语音转写", icon: AudioLines },
       { key: "intent", label: "意向分析", icon: Sparkles },
-      { key: "memory", label: "AI 记忆", icon: Brain },
     ],
   },
 ] as const;
@@ -31,7 +32,22 @@ export interface Provider {
   name: string;
   apiUrl: string;
   apiKey: string;
-  models: string; // 每行一个模型
+  models: ModelSpec[]; // 结构化模型列表(名称 + 能力)
+}
+
+// 模型能力展示元数据(单一真相源,与后端 MODEL_CAPABILITIES 顺序一致):code → 中文标签 + 图标。
+// 厂商表单用它渲染能力勾选;表格/下拉用它渲染能力小标。
+export const MODEL_CAPABILITIES: { code: ModelCapability; label: string; icon: LucideIcon }[] = [
+  { code: "text", label: "对话", icon: MessageSquare },
+  { code: "vision", label: "图片", icon: Image },
+  { code: "audio", label: "音频", icon: AudioLines },
+  { code: "video", label: "视频", icon: Video },
+  { code: "tools", label: "工具调用", icon: Wrench },
+];
+
+// 判断模型是否具备某能力
+export function modelHasCapability(model: ModelSpec, cap: ModelCapability): boolean {
+  return model.capabilities.includes(cap);
 }
 
 // 模型厂商预设(code/name/apiUrl/asr)由后端 list_provider_capabilities 提供(单一真相源):

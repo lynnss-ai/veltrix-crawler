@@ -376,7 +376,8 @@ pub struct ProviderDto {
     pub name: String,
     pub api_url: String,
     pub api_key: String,
-    pub models: String,
+    /// 结构化模型列表(名称 + 能力集合);列里以 JSON 存,经 parse/serialize 转换。
+    pub models: Vec<crate::llm::provider::ModelSpec>,
 }
 
 /// api_key 列表展示用打码:保留尾部 4 位,前面打码
@@ -401,7 +402,7 @@ impl From<provider::Model> for ProviderDto {
             name: m.name,
             api_url: m.api_url,
             api_key: mask_api_key(&m.api_key),
-            models: m.models,
+            models: crate::llm::provider::parse_models(&m.models),
         }
     }
 }
@@ -450,7 +451,7 @@ pub async fn upsert_provider(state: State<'_, AppState>, provider: ProviderDto) 
             am.name = Set(provider.name);
             am.api_url = Set(provider.api_url);
             am.api_key = Set(api_key_to_save);
-            am.models = Set(provider.models);
+            am.models = Set(crate::llm::provider::serialize_models(&provider.models));
             am.updated_at = Set(now);
             am.update(db)
                 .await
@@ -463,7 +464,7 @@ pub async fn upsert_provider(state: State<'_, AppState>, provider: ProviderDto) 
                 name: Set(provider.name),
                 api_url: Set(provider.api_url),
                 api_key: Set(provider.api_key),
-                models: Set(provider.models),
+                models: Set(crate::llm::provider::serialize_models(&provider.models)),
                 created_at: Set(now),
                 updated_at: Set(now),
             };

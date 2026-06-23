@@ -31,10 +31,11 @@ import {
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  Video,
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import html2canvas from "html2canvas-pro";
 import { jsPDF } from "jspdf";
 import { toast } from "sonner";
@@ -44,6 +45,7 @@ import {
   type ChatAttachment,
   type ChatMessageView,
   type ContentView,
+  type MessageAttachment,
   type ProviderDto,
 } from "@/lib/api";
 import {
@@ -76,16 +78,20 @@ import {
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { EmptyState } from "@/components/EmptyState";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
+import { ReasoningBlock } from "@/components/ReasoningBlock";
+import { RecordingChip } from "@/components/RecordingChip";
 import {
   ContentPickerDialog,
   type AssetPickMode,
   type AssetPickResult,
 } from "@/components/content-picker-dialog";
 import { useChat } from "@/hooks/use-chat";
+import { useScreenRecording } from "@/hooks/use-screen-recording";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -100,9 +106,31 @@ interface ModelOption {
   value: string;
 }
 
+// 记住用户上次选用的模型(value=providerId::model),作为下次新会话的默认。
+// 桌面端 UI 偏好,与登录态一致存 localStorage;localStorage 不可用时静默回退。
+const LAST_MODEL_KEY = "veltrix:chat:last-model";
+function readLastModel(): string {
+  try {
+    return localStorage.getItem(LAST_MODEL_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+function rememberLastModel(value: string) {
+  try {
+    localStorage.setItem(LAST_MODEL_KEY, value);
+  } catch {
+    // 隐私模式等 localStorage 不可用时跳过,不影响模型选择本身
+  }
+}
+
 // 附件限制:最多 12 个,单个 ≤ 10MB
 const MAX_ATTACHMENTS = 12;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+// 流式增量刷新节流间隔(ms):约 20 次/秒,远少于逐帧(~60),大幅降低 Markdown 重解析开销
+const FLUSH_INTERVAL_MS = 50;
+// 消息列表初始只渲染最近 N 条(避免切到长对话时一次性解析全部 Markdown 卡顿);可「加载更早」
+const CHAT_PAGE_SIZE = 30;
 
 // 外部附件可选类型:图片 / PDF / Word / Excel / Markdown
 const EXTERNAL_ACCEPT =
@@ -171,14 +199,15 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-// 从厂商列表展开出可用模型(有 apiKey + models 行才算可用)
+// 从厂商列表展开出可用模型(有 apiKey + 具备「对话」能力的模型才算可用)
 function buildModelOptions(providers: ProviderDto[]): ModelOption[] {
   const opts: ModelOption[] = [];
   for (const p of providers) {
     if (!p.apiKey.trim()) continue;
-    for (const line of p.models.split("\n")) {
-      const model = line.trim();
-      if (!model) continue;
+    for (const spec of p.models) {
+      const model = spec.name.trim();
+      // 对话场景只列能「对话」的模型
+      if (!model || !spec.capabilities.includes("text")) continue;
       opts.push({
         providerId: p.id,
         providerName: p.name,
@@ -352,14 +381,23 @@ export function ChatPage() {
     setPendingFirstMessage,
     reload,
   } = useChat();
+  // 屏幕录制(输入框加号里的「屏幕录制」):加号只打开悬浮条,开始/停止在悬浮条上手动操作
+  const { openOverlay: openScreenRecording } =
+    useScreenRecording(handleRecordingSaved);
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
+  // 当前会话只渲染最近 visibleCount 条;切会话重置,「加载更早」时增加
+  const [visibleCount, setVisibleCount] = useState(CHAT_PAGE_SIZE);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // 待发送录屏(本地视频路径):录屏停止后挂起到输入区,发送时才一并加入对话
+  const [pendingRecording, setPendingRecording] = useState<string | null>(null);
+  // 历史消息里点开的图片(全屏预览);null=未预览。与输入区附件灯箱(previewIndex)相互独立
+  const [historyImagePreview, setHistoryImagePreview] = useState<string | null>(
+    null,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [sending, setSending] = useState(false);
-  // 意图判断(新会话首条消息分类)进行中:此阶段较慢且会发 LLM 请求,需挡住连点造成的重复发送
-  const [classifying, setClassifying] = useState(false);
-  // 发送动作的同步重入锁:state 更新是异步的,光靠 sending/classifying 挡不住极快连点,用 ref 兜底
+  // 发送动作的同步重入锁:state 更新是异步的,光靠 sending 挡不住极快连点,用 ref 兜底
   const dispatchingRef = useRef(false);
   // 可用模型由共享 providers 派生(避免布局重挂载时各自重拉导致「尚无可用模型」竞态)
   const models = useMemo(() => buildModelOptions(providers), [providers]);
@@ -369,10 +407,18 @@ export function ChatPage() {
   const [smartSearch, setSmartSearch] = useState(false);
   // 流式输出:正在生成的 assistant 文本(null=未在生成);streamingConvRef 记录归属会话
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
+  // 流式思考过程(推理型模型):与正文分轨,先于正文出现
+  const [streamingReasoning, setStreamingReasoning] = useState<string | null>(null);
   const streamingConvRef = useRef<string | null>(null);
-  // 流式增量按帧批处理:增量先攒到 ref,每帧合并刷一次,避免每 token 全量重渲染/重解析
+  // 抑制「本次发送自建的新会话」触发加载 effect:setActiveId 会让 [activeId] 加载 effect 与
+  // 本次发送的乐观追加/回复抢跑,导致首条消息重复或被清空。记下新会话 id,加载 effect 命中即跳过一次。
+  const skipLoadRef = useRef<string | null>(null);
+  // 流式增量按节流批处理:增量先攒到 ref,最多每 FLUSH_INTERVAL_MS 合并刷一次。
+  // 比逐帧(~16ms)刷新少得多的 Markdown 重解析/重渲染,显著缓解长回复时的蹦字/卡顿。
   const pendingDeltaRef = useRef("");
-  const rafRef = useRef<number | null>(null);
+  const pendingReasoningRef = useRef("");
+  const flushTimerRef = useRef<number | null>(null);
+  const lastFlushRef = useRef(0);
   // 用户是否贴在底部:决定流式时要不要自动滚到底(向上翻阅时不打断)
   const atBottomRef = useRef(true);
   // 录音状态
@@ -409,22 +455,35 @@ export function ChatPage() {
 
   const active = conversations.find((c) => c.id === activeId) ?? null;
   // 发送相关「忙碌」总开关:意图判断 + 发送中都算,统一控制发送按钮禁用与回车拦截
-  const busy = sending || classifying;
+  const busy = sending;
 
-  // 监听后端流式增量事件:增量先攒到 ref,每帧(rAF)合并刷一次,避免每 token 全量重渲染
+  // 监听后端流式增量事件:增量先攒到 ref,最多每 FLUSH_INTERVAL_MS 合并刷一次(节流),
+  // 把 Markdown 重解析/重渲染从约 60 次/秒压到约 20 次/秒,缓解长回复蹦字/卡顿。
   useEffect(() => {
     let dispose: (() => void) | undefined;
     let disposed = false;
-    listen<{ conversationId: string; delta: string }>("chat-stream", (e) => {
+    const flush = () => {
+      flushTimerRef.current = null;
+      lastFlushRef.current = Date.now();
+      const chunk = pendingDeltaRef.current;
+      pendingDeltaRef.current = "";
+      if (chunk) setStreamingContent((prev) => (prev ?? "") + chunk);
+      const rChunk = pendingReasoningRef.current;
+      pendingReasoningRef.current = "";
+      if (rChunk) setStreamingReasoning((prev) => (prev ?? "") + rChunk);
+    };
+    listen<{ conversationId: string; kind?: string; delta: string }>("chat-stream", (e) => {
       if (streamingConvRef.current !== e.payload.conversationId) return;
-      pendingDeltaRef.current += e.payload.delta;
-      if (rafRef.current == null) {
-        rafRef.current = requestAnimationFrame(() => {
-          rafRef.current = null;
-          const chunk = pendingDeltaRef.current;
-          pendingDeltaRef.current = "";
-          if (chunk) setStreamingContent((prev) => (prev ?? "") + chunk);
-        });
+      // kind=reasoning 走思考过程轨,其余(含旧后端无 kind)按正文处理
+      if (e.payload.kind === "reasoning") {
+        pendingReasoningRef.current += e.payload.delta;
+      } else {
+        pendingDeltaRef.current += e.payload.delta;
+      }
+      if (flushTimerRef.current == null) {
+        const elapsed = Date.now() - lastFlushRef.current;
+        const delay = Math.max(0, FLUSH_INTERVAL_MS - elapsed);
+        flushTimerRef.current = window.setTimeout(flush, delay);
       }
     }).then(
       (fn) => {
@@ -436,19 +495,28 @@ export function ChatPage() {
     return () => {
       disposed = true;
       dispose?.();
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      if (flushTimerRef.current != null) clearTimeout(flushTimerRef.current);
     };
   }, []);
 
-  // providers 加载后默认选中首个可用模型
+  // providers 加载后初始化默认模型:优先上次记住的(仍有效),否则回退首个可用
   useEffect(() => {
-    if (models.length > 0 && !pickedModel) setPickedModel(models[0].value);
+    if (models.length === 0 || pickedModel) return;
+    const remembered = readLastModel();
+    const valid = remembered && models.some((m) => m.value === remembered);
+    setPickedModel(valid ? remembered : models[0].value);
   }, [models, pickedModel]);
 
   // 切换会话时加载消息
   useEffect(() => {
+    setVisibleCount(CHAT_PAGE_SIZE); // 切会话回到「只渲染最近 N 条」,避免长对话一次性解析全部 Markdown
     if (!activeId) {
       setMessages([]);
+      return;
+    }
+    // 本次发送刚自建的会话:消息由发送流程维护,跳过这次加载(避免与乐观追加/回复抢跑致重复)
+    if (skipLoadRef.current === activeId) {
+      skipLoadRef.current = null;
       return;
     }
     api
@@ -462,7 +530,7 @@ export function ChatPage() {
     if (!atBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, sending, streamingContent]);
+  }, [messages, sending, streamingContent, streamingReasoning]);
 
   // 记录用户是否贴在底部(滚动时更新)
   function onMessagesScroll() {
@@ -472,13 +540,14 @@ export function ChatPage() {
     }
   }
 
-  // 清空流式增量缓冲与待刷帧(开始/结束流式前调用,避免残留增量误刷出气泡)
+  // 清空流式增量缓冲与待刷定时器(开始/结束流式前调用,避免残留增量误刷出气泡)
   function resetStreamingBuffer() {
-    if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+    if (flushTimerRef.current != null) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
     }
     pendingDeltaRef.current = "";
+    pendingReasoningRef.current = "";
   }
 
   // 模型选择器选项:已有会话若绑定了已不在可用列表里的模型(厂商删了 Key / 改了模型行),
@@ -532,6 +601,8 @@ export function ChatPage() {
   // - 已有会话且已产生消息 → 开一个新会话(不改当前会话绑定),避免同会话混用模型
   // - 已有会话但空(无消息)→ 直接回写后端绑定模型
   async function handleModelChange(value: string) {
+    // 记住本次选择,作为下次新会话的默认(占位的失效模型不记)
+    if (models.some((m) => m.value === value)) rememberLastModel(value);
     if (!active) {
       setPickedModel(value);
       return;
@@ -716,6 +787,43 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewIndex, imageAttachments.length]);
 
+  // 录屏停止后:把视频「挂起」到输入区(待发送),由用户决定何时连同文字一并加入对话
+  function handleRecordingSaved(path: string) {
+    setPendingRecording(path);
+    toast.success("屏幕录制已就绪,将随下条消息一并加入对话");
+  }
+
+  // 仅发送待发送的录屏(输入框无文字无附件时):落库视频消息,不触发问答
+  async function sendRecordingOnly() {
+    const recording = pendingRecording;
+    if (!recording) return;
+    try {
+      let convId = activeId;
+      if (!convId) {
+        if (models.length === 0) {
+          toast.error("尚无可用模型:请先配置模型或开始一个对话,再录屏");
+          return;
+        }
+        const opt = models.find((m) => m.value === pickedModel) ?? models[0];
+        const conv = await api.createConversation(
+          crypto.randomUUID(),
+          opt.providerId,
+          opt.model,
+        );
+        convId = conv.id;
+        skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的加载,消息由本流程维护
+        setActiveId(conv.id);
+      }
+      const msg = await api.attachRecordingMessage(convId, recording);
+      atBottomRef.current = true;
+      setMessages((prev) => [...prev, msg]);
+      setPendingRecording(null);
+      await reload();
+    } catch (e) {
+      toast.error(`添加录屏到对话失败: ${e}`);
+    }
+  }
+
   // 发送核心:乐观追加用户消息 → 建会话(必要时)→ 流式取回复落库。返回是否成功。
   async function sendMessage(
     text: string,
@@ -726,17 +834,19 @@ export function ChatPage() {
       toast.error("尚无可用模型,请先到系统配置 → 模型厂商填好 API Key 与模型");
       return false;
     }
+    const recording = pendingRecording; // 本次随消息一并发送的待发送录屏(若有)
     setSending(true);
-    // 乐观追加用户消息(正文 + 附件名提示,与后端落库口径一致)
-    const optimisticContent =
-      atts.length > 0
-        ? [text, ...atts.map((a) => `[附件: ${a.name}]`)].filter(Boolean).join("\n")
-        : text;
+    // 乐观追加用户消息:正文 + 附件(图片带内联 base64 即时预览,落库后由后端 path 接管)
     const optimistic: ChatMessageView = {
       id: Date.now(),
       conversationId: activeId ?? "",
       role: "user",
-      content: optimisticContent,
+      content: text,
+      attachments: atts.map((a) => ({
+        name: a.name,
+        mime: a.mime,
+        data: a.data,
+      })),
       createdAt: Math.floor(Date.now() / 1000),
     };
     // 发送即视为回到底部,确保新消息与回复滚动可见
@@ -751,12 +861,24 @@ export function ChatPage() {
         const id = crypto.randomUUID();
         const conv = await api.createConversation(id, opt.providerId, opt.model);
         convId = conv.id;
+        skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的本会话加载,防首条消息重复
         setActiveId(conv.id);
+      }
+      // 待发送录屏:先落库为视频消息(插到本条文字之前),清除挂起态
+      if (recording) {
+        const videoMsg = await api.attachRecordingMessage(convId, recording);
+        setPendingRecording(null);
+        setMessages((prev) => {
+          const idx = prev.findIndex((m) => m.id === optimistic.id);
+          if (idx < 0) return [...prev, videoMsg];
+          return [...prev.slice(0, idx), videoMsg, ...prev.slice(idx)];
+        });
       }
       // 标记本次流式归属会话,准备接收增量
       streamingConvRef.current = convId;
       resetStreamingBuffer();
       setStreamingContent("");
+      setStreamingReasoning(null);
       const reply = await api.sendChatMessageStream(
         convId,
         text,
@@ -774,30 +896,40 @@ export function ChatPage() {
       streamingConvRef.current = null;
       resetStreamingBuffer();
       setStreamingContent(null);
+      setStreamingReasoning(null);
       setSending(false);
     }
   }
 
   async function handleSend() {
-    // 重入锁:意图判断阶段较慢,挡住连点造成的重复发送(state 异步,需 ref 同步兜底)
+    // 重入锁:挡住连点造成的重复发送(state 异步,需 ref 同步兜底)
     if (dispatchingRef.current) return;
     const text = input.trim();
-    if ((!text && attachments.length === 0) || sending) return;
+    if ((!text && attachments.length === 0 && !pendingRecording) || sending) return;
     dispatchingRef.current = true;
     try {
-      // 新会话且纯文本:先按意图判断,编程 / 浏览器任务自动转交对应 Agent(页面切对应布局)
-      if (!activeId && text && attachments.length === 0 && models.length > 0) {
+      // 仅录屏、无文字无附件:只落库视频,不走问答 / 不做意图分类
+      if (!text && attachments.length === 0 && pendingRecording) {
+        await sendRecordingOnly();
+        return;
+      }
+      // 新会话且纯文本:先做瞬时关键词意图判定(无 LLM、基本零延迟),命中 编程/RPA/电脑
+      // 直接切到对应 Agent(不弹提示),否则按普通对话发送。
+      if (
+        !activeId &&
+        text &&
+        attachments.length === 0 &&
+        !pendingRecording &&
+        models.length > 0
+      ) {
         const opt = models.find((m) => m.value === pickedModel) ?? models[0];
         let type = "chat";
-        setClassifying(true);
         try {
           type = await api.classifyAgentType(text, opt.providerId, opt.model);
         } catch {
-          // 分类失败按普通对话继续
-        } finally {
-          setClassifying(false);
+          // 判定失败按普通对话继续
         }
-        if (type === "coding" || type === "rpa") {
+        if (type === "coding" || type === "rpa" || type === "computer") {
           const id = crypto.randomUUID();
           try {
             await api.createConversation(id, opt.providerId, opt.model, type);
@@ -806,7 +938,7 @@ export function ChatPage() {
             return;
           }
           setInput("");
-          // 交接:建好对应会话后切布局,首条消息由 CodingLayout / RpaLayout 自动发送
+          // 交接:建好对应会话后切布局,首条由 CodingLayout / RpaLayout / ComputerLayout 自动发送
           setPendingFirstMessage(text);
           setPendingAgentType(type);
           setActiveId(id);
@@ -889,6 +1021,13 @@ export function ChatPage() {
   // 分页(避免拦腰截断)→ jsPDF 加页边距 + 首页标题 → 后端保存对话框写文件。
   async function downloadPdf() {
     if (messages.length === 0) return;
+    // 导出需完整内容:消息列表平时只渲染最近 N 条,先展开全部并等 DOM 提交后再截图
+    if (messages.length > visibleCount) {
+      setVisibleCount(messages.length);
+      await new Promise((r) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => r(null))),
+      );
+    }
     const el = messagesContentRef.current;
     if (!el) return;
     const t = toast.loading("正在生成 PDF…");
@@ -1219,7 +1358,23 @@ export function ChatPage() {
             </div>
           ) : (
             <div ref={messagesContentRef} className="mx-auto max-w-3xl space-y-3.5">
-              {messages.map((m) => (
+              {/* 只渲染最近 visibleCount 条;更早的折叠在「加载更早」后(切到长对话不卡) */}
+              {messages.length > visibleCount && (
+                <div className="flex justify-center">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs text-muted-foreground"
+                    onClick={() => setVisibleCount((c) => c + CHAT_PAGE_SIZE)}
+                  >
+                    加载更早的消息({messages.length - visibleCount})
+                  </Button>
+                </div>
+              )}
+              {(messages.length > visibleCount
+                ? messages.slice(messages.length - visibleCount)
+                : messages
+              ).map((m) => (
                 <MessageBubble
                   key={m.id}
                   message={m}
@@ -1227,11 +1382,18 @@ export function ChatPage() {
                   onCopy={copyToClipboard}
                   onRegenerate={regenerate}
                   onToggleFeedback={toggleFeedback}
+                  onPreviewImage={setHistoryImagePreview}
                 />
               ))}
-              {/* 流式生成中:无头像,Markdown 实时渲染;首 token 前显示三点跳动 loading 动画 */}
+              {/* 流式生成中:思考过程(推理型模型)先于正文实时展示;首 token 前显示三点跳动 loading 动画 */}
               {sending && (
                 <div>
+                  {streamingReasoning != null && (
+                    <ReasoningBlock
+                      reasoning={streamingReasoning}
+                      streaming={!streamingContent}
+                    />
+                  )}
                   {streamingContent ? (
                     <div className="text-foreground">
                       <MarkdownMessage content={streamingContent} streaming />
@@ -1243,11 +1405,13 @@ export function ChatPage() {
                       </div>
                     </div>
                   ) : (
-                    // 首 token 前:思考中(转圈)
-                    <div className="inline-flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
-                      <Loader2 className="size-4 animate-spin" />
-                      思考中…
-                    </div>
+                    // 首 token 前且尚无思考过程:思考中(转圈)
+                    streamingReasoning == null && (
+                      <div className="inline-flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
+                        <Loader2 className="size-4 animate-spin" />
+                        思考中…
+                      </div>
+                    )
                   )}
                 </div>
               )}
@@ -1269,6 +1433,10 @@ export function ChatPage() {
             }}
           />
           <div className="mx-auto max-w-3xl">
+            {/* 待发送录屏:挂在输入框上方,发送时随消息一并加入对话,可移除 */}
+            {pendingRecording && (
+              <RecordingChip onRemove={() => setPendingRecording(null)} />
+            )}
             {/* 附件 / 图片预览:输入框外侧上方。12 格栅格与输入框等宽、单行不换行;
                 图片显示缩略图(可点开预览),其余文件显示方形图标块,均可移除 */}
             {attachments.length > 0 && (
@@ -1324,13 +1492,11 @@ export function ChatPage() {
               placeholder={
                 recording
                   ? "录音中,再次点击麦克风结束…"
-                  : classifying
-                    ? "正在判断任务类型…"
-                    : sending
-                      ? "回复生成中,可继续输入,完成后发送…"
-                      : smartSearch
-                        ? "智能搜索:输入要搜索的内容,Enter 发送 / Shift+Enter 换行"
-                        : "输入消息,Enter 发送 / Shift+Enter 换行"
+                  : sending
+                    ? "回复生成中,可继续输入,完成后发送…"
+                    : smartSearch
+                      ? "智能搜索:输入要搜索的内容,Enter 发送 / Shift+Enter 换行"
+                      : "输入消息,Enter 发送 / Shift+Enter 换行"
               }
               className="veltrix-thin-scrollbar max-h-52 min-h-10 w-full resize-none border-0 bg-transparent px-2 py-2 text-[15px] leading-6 tracking-normal shadow-none focus-visible:ring-0 dark:bg-transparent"
               rows={1}
@@ -1364,6 +1530,12 @@ export function ChatPage() {
                     <DropdownMenuItem onClick={() => setAssetPickerMode("copy")}>
                       <FileText className="size-4" />
                       资产文案
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    {/* 屏幕录制:打开悬浮控制条,开始/停止/现场录音在悬浮条上手动操作 */}
+                    <DropdownMenuItem onClick={() => void openScreenRecording()}>
+                      <Video className="size-4" />
+                      屏幕录制
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -1447,8 +1619,8 @@ export function ChatPage() {
                     )}
                   </Button>
                 </SimpleTooltip>
-                {/* 发送:有文字或附件(或正在发送/判断中)时才出现在语音右侧 */}
-                {(busy || input.trim() || attachments.length > 0) && (
+                {/* 发送:有文字 / 附件 / 待发送录屏(或正在发送/判断中)时才出现在语音右侧 */}
+                {(busy || input.trim() || attachments.length > 0 || pendingRecording) && (
                   <Button
                     type="button"
                     size="icon"
@@ -1547,6 +1719,28 @@ export function ChatPage() {
                 {previewIndex + 1} / {imageAttachments.length}
               </span>
             )}
+          </div>
+        )}
+
+        {/* 历史消息图片全屏预览:点消息里的缩略图打开;点背景关闭 */}
+        {historyImagePreview && (
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-10"
+            onClick={() => setHistoryImagePreview(null)}
+          >
+            <button
+              type="button"
+              className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white transition-colors hover:bg-white/20"
+              onClick={() => setHistoryImagePreview(null)}
+            >
+              <X className="size-5" />
+            </button>
+            <img
+              src={historyImagePreview}
+              alt="预览"
+              className="max-h-full max-w-full object-contain"
+              onClick={(e) => e.stopPropagation()}
+            />
           </div>
         )}
 
@@ -1651,43 +1845,108 @@ function IconBtn({
   children: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      title={title}
-      onClick={onClick}
-      className={`rounded p-1 transition-colors hover:bg-accent hover:text-foreground ${
-        active ? "text-primary" : ""
-      }`}
-    >
-      {children}
-    </button>
+    <SimpleTooltip content={title}>
+      <button
+        type="button"
+        aria-label={title}
+        onClick={onClick}
+        className={`rounded p-1 transition-colors hover:bg-accent hover:text-foreground ${
+          active ? "text-primary" : ""
+        }`}
+      >
+        {children}
+      </button>
+    </SimpleTooltip>
   );
 }
 
 // 单条消息:用户右侧气泡(纯文本),助手左侧全宽(Markdown);各带时间 + 操作栏。
 // memo + 稳定回调:流式时已完成消息不重渲染(性能)。
+// 历史附件取显示 src:有本地 path 走 asset 协议;否则用乐观消息的内联 base64;都没有返回空。
+function messageAttachmentSrc(a: MessageAttachment): string {
+  if (a.path) return convertFileSrc(a.path);
+  if (a.data) return `data:${a.mime};base64,${a.data}`;
+  return "";
+}
+
 const MessageBubble = memo(function MessageBubble({
   message,
   feedback,
   onCopy,
   onRegenerate,
   onToggleFeedback,
+  onPreviewImage,
 }: {
   message: ChatMessageView;
   feedback?: "like" | "dislike";
   onCopy: (text: string, okMsg?: string) => void;
   onRegenerate: (content: string) => void;
   onToggleFeedback: (id: number, v: "like" | "dislike") => void;
+  onPreviewImage: (src: string) => void;
 }) {
   const isUser = message.role === "user";
   const time = fmtMsgTime(message.createdAt);
 
   if (isUser) {
+    const atts = message.attachments ?? [];
+    const images = atts.filter((a) => a.mime.startsWith("image/"));
+    const videos = atts.filter((a) => a.mime.startsWith("video/"));
+    const files = atts.filter(
+      (a) => !a.mime.startsWith("image/") && !a.mime.startsWith("video/"),
+    );
     return (
       <div className="group flex flex-col items-end gap-1">
-        <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3.5 py-2 text-sm leading-relaxed text-foreground">
-          {message.content}
-        </div>
+        {/* 图片附件:右对齐缩略图,点击全屏预览 */}
+        {images.length > 0 && (
+          <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+            {images.map((a, i) => {
+              const src = messageAttachmentSrc(a);
+              return (
+                <img
+                  key={i}
+                  src={src}
+                  alt={a.name}
+                  className="size-24 cursor-zoom-in rounded-lg border border-border/60 object-cover"
+                  onClick={() => src && onPreviewImage(src)}
+                />
+              );
+            })}
+          </div>
+        )}
+        {/* 视频附件(如屏幕录制):内联播放器,右对齐 */}
+        {videos.length > 0 && (
+          <div className="flex max-w-[80%] flex-col items-end gap-1.5">
+            {videos.map((a, i) => (
+              <video
+                key={i}
+                src={messageAttachmentSrc(a)}
+                controls
+                preload="metadata"
+                className="max-h-72 w-full max-w-md rounded-lg border border-border/60 bg-black"
+              />
+            ))}
+          </div>
+        )}
+        {/* 非图片 / 非视频附件:文件名 chip */}
+        {files.length > 0 && (
+          <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+            {files.map((a, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs text-foreground"
+              >
+                <FileText className="size-4 shrink-0 text-muted-foreground" />
+                <span className="max-w-[160px] truncate">{a.name}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* 正文气泡:纯图片消息(空正文)不渲染空气泡 */}
+        {message.content && (
+          <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3.5 py-2 text-sm leading-relaxed text-foreground">
+            {message.content}
+          </div>
+        )}
         {/* 时间 + 操作图标:都默认隐藏,悬浮在消息上才显示 */}
         <div className="flex items-center gap-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
           <span className="mr-0.5 text-[11px]">{time}</span>
@@ -1706,6 +1965,9 @@ const MessageBubble = memo(function MessageBubble({
     <div className="group flex flex-col items-start gap-1">
       {/* 助手回复:宽度与输入框一致(占满 max-w-3xl 容器),不显示时间 */}
       <div className="w-full">
+        {message.reasoning?.trim() && (
+          <ReasoningBlock reasoning={message.reasoning} />
+        )}
         <MarkdownMessage content={message.content} />
       </div>
       {/* 操作图标:悬浮在回复上才显示 */}

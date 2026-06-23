@@ -3,13 +3,8 @@
 //! 阶段0 提供平台管理;阶段1 追加账号管理与签名回调;后续追加用户/系统配置 CRUD(admin)。
 
 pub mod admin;
-pub mod browser;
-pub mod chat;
-pub mod chat_memory;
 pub mod cloud;
-pub mod coding;
 pub mod collect;
-pub mod conversation_summary;
 pub mod dashboard;
 pub mod task;
 // 再导出采集执行引擎的全部命令与类型,保持 commands::X 路径不变(lib.rs invoke_handler 依赖)。
@@ -68,13 +63,18 @@ pub struct AppState {
     /// 登录窗口关闭时据此决定终态:最近为 "out"(仍明确未登录)→ invalid;其余 → 乐观 active。
     pub login_verdicts: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// 编程 Agent 的常驻开发服务器状态(预览-开发服务器模式)。
-    pub dev_server: Arc<Mutex<coding::DevServer>>,
+    pub dev_server: Arc<Mutex<crate::agent::coding::commands::DevServer>>,
     /// 沙盒容器「就绪结论」缓存:避免每个编程动作都重跑一串 docker 探测(慢且放大挂死面)。
-    pub sandbox_ready: Mutex<coding::SandboxReady>,
+    pub sandbox_ready: Mutex<crate::agent::coding::commands::SandboxReady>,
     /// 应用句柄:供后台 / 非命令上下文(如 resolve_exec 回退本机时)向前端推送事件(弹窗等)。
     pub app_handle: AppHandle,
-    /// 浏览器 Agent 动作回读通道:navigate/click/read 等动作经此按 req_id 等待页面回传结果。
-    pub agent_actions: Arc<crate::webview::AgentActionChannel>,
+    /// 自主续航编程 Agent 的「请求停止」会话集合(stop_coding_agent 写入,续航循环每步消费)。
+    pub agent_cancel: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Agent 危险操作「暂停 — 等用户确认」通道(ReAct 循环命中危险工具时等待,前端
+    /// `resolve_agent_confirm` 回执)。
+    pub agent_confirm: Arc<crate::agent::core::shared::AgentConfirmChannel>,
+    /// 电脑操作 Agent 的屏幕录制状态(同一时刻仅一个录制会话)。
+    pub recording: crate::agent::computer::recorder::RecordingState,
 }
 
 /// 全局同时进行的采集任务数上限(占用 WebView 窗口的阶段)。取 3:兼顾吞吐与资源占用,
@@ -99,7 +99,7 @@ pub(crate) fn current_user(state: &AppState) -> Option<CurrentUser> {
         .and_then(|guard| guard.clone())
 }
 
-fn lock_config(state: &AppState) -> Result<std::sync::MutexGuard<'_, AppConfig>> {
+pub(crate) fn lock_config(state: &AppState) -> Result<std::sync::MutexGuard<'_, AppConfig>> {
     state
         .config
         .lock()
@@ -221,6 +221,42 @@ pub fn set_storage_path(state: State<'_, AppState>, path: String) -> Result<()> 
     cfg.save(&state.config_dir)
 }
 
+/// 读取某 agent(coding/computer/rpa)的用户自定义附加规范文本(无则空串)。供设置页回填。
+#[tauri::command]
+pub async fn get_agent_guidelines(state: State<'_, AppState>, kind: String) -> Result<String> {
+    use crate::agent::core::shared::{is_valid_guidelines_kind, load_agent_guidelines};
+    if !is_valid_guidelines_kind(&kind) {
+        return Err(CrawlerError::Config("无效的 agent 类型".into()));
+    }
+    Ok(load_agent_guidelines(&state.config_dir, &kind)
+        .await
+        .unwrap_or_default())
+}
+
+/// 保存某 agent 的用户自定义附加规范(写入 <config_dir>/agent-guidelines/<kind>.md;空串=清空)。
+/// 下一轮该 agent 对话即注入生效,无需重启。
+#[tauri::command]
+pub async fn set_agent_guidelines(
+    state: State<'_, AppState>,
+    kind: String,
+    text: String,
+) -> Result<()> {
+    use crate::agent::core::shared::{agent_guidelines_path, is_valid_guidelines_kind};
+    if !is_valid_guidelines_kind(&kind) {
+        return Err(CrawlerError::Config("无效的 agent 类型".into()));
+    }
+    let path = agent_guidelines_path(&state.config_dir, &kind);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("创建规范目录失败: {e}")))?;
+    }
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("保存规范失败: {e}")))?;
+    Ok(())
+}
+
 /// 保存评论意向分析配置(系统设置「意向分析」)。只存对 providers/prompts 的 id 引用 +
 /// 模型名 + 批大小;api_key 仍存数据库,不落配置文件。写入后重启或下次任务运行生效。
 #[tauri::command]
@@ -269,7 +305,7 @@ pub async fn set_transcription_config(
 }
 
 // 密钥读写(api_key 存数据库 app_secrets,不落配置文件)
-async fn set_secret(db: &sea_orm::DatabaseConnection, key: &str, value: &str) -> Result<()> {
+pub(crate) async fn set_secret(db: &sea_orm::DatabaseConnection, key: &str, value: &str) -> Result<()> {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::Set;
     use veltrix_core::db::entity::app_secret;
@@ -288,7 +324,7 @@ async fn set_secret(db: &sea_orm::DatabaseConnection, key: &str, value: &str) ->
     Ok(())
 }
 
-async fn get_secret(db: &sea_orm::DatabaseConnection, key: &str) -> String {
+pub(crate) async fn get_secret(db: &sea_orm::DatabaseConnection, key: &str) -> String {
     use veltrix_core::db::entity::app_secret;
     app_secret::Entity::find_by_id(key.to_owned())
         .one(db)
@@ -301,7 +337,7 @@ async fn get_secret(db: &sea_orm::DatabaseConnection, key: &str) -> String {
 
 // ===================== 角色模型(Provider 角色化) =====================
 
-use crate::llm::agent::{ProviderKind, ProviderRef};
+use crate::agent::core::{ProviderKind, ProviderRef};
 use crate::llm::AgentRole;
 
 /// 把角色解析为具体的厂商引用:杂活可走单独配置的便宜模型,主任务用会话绑定模型。

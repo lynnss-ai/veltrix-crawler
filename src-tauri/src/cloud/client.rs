@@ -23,6 +23,16 @@ const REPORT_INTERVAL_SECS: u64 = 30;
 const PING_INTERVAL_SECS: u64 = 25;
 const RECONNECT_MIN_SECS: u64 = 1;
 const RECONNECT_MAX_SECS: u64 = 30;
+/// 云端 HTTP(登录/配对)总超时:防止后端不通时永久挂起。
+const CLOUD_HTTP_TIMEOUT_SECS: u64 = 20;
+
+/// 带超时的 HTTP 客户端(登录/配对用);构建失败回退默认 client(默认即无超时,极端兜底)。
+fn cloud_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_HTTP_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ConnectionState {
@@ -89,7 +99,7 @@ impl CloudClient {
         }
         let url = format!("{}/api/v1/auth/login", base.trim_end_matches('/'));
         let body = json!({ "username": username, "password": password });
-        let resp = reqwest::Client::new()
+        let resp = cloud_http_client()
             .post(&url)
             .json(&body)
             .send()
@@ -124,7 +134,7 @@ impl CloudClient {
         }
         let token = user_token.ok_or_else(|| "尚未登录云端".to_string())?;
         let url = format!("{}/api/v1/pair/init", base.trim_end_matches('/'));
-        let resp = reqwest::Client::new()
+        let resp = cloud_http_client()
             .post(&url)
             .bearer_auth(&token)
             .json(&json!({ "device_id": device_id }))

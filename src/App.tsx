@@ -409,7 +409,7 @@ function App() {
   // 无边框窗口:最外层纵向布局 = 标题栏 + 主体;--titlebar-h 供侧栏定位复用
   return (
     <div
-      className="flex h-svh flex-col overflow-hidden"
+      className="flex h-svh flex-col overflow-hidden pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]"
       style={{ "--titlebar-h": "2.25rem" } as CSSProperties}
     >
       <TitleBar

@@ -2,6 +2,8 @@ import { useState } from "react";
 import {
   Brain,
   CalendarClock,
+  ChevronDown,
+  ChevronRight,
   ChevronsUpDown,
   Clapperboard,
   Contact,
@@ -14,7 +16,7 @@ import {
   MessageSquare,
   LayoutDashboard,
   LogOut,
-  MoreHorizontal,
+  MoreVertical,
   Radar,
   Rocket,
   Settings,
@@ -174,10 +176,10 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
     {
       title: "对话",
       // 会话列表在侧栏动态渲染(ChatConversationList);这里登记菜单项仅用于默认页与面包屑解析。
-      // 记忆中心为整页模块(记忆 / 知识库 / 知识图谱),从对话侧栏「记忆中心」入口进入。
+      // 记忆管理为整页模块(全局记忆 / 会话记忆),从对话侧栏「记忆管理」入口进入。
       items: [
         { key: "chat-sessions", label: "会话", icon: MessageSquare },
-        { key: "memory-center", label: "记忆中心", icon: Brain },
+        { key: "memory-center", label: "记忆管理", icon: Brain },
       ],
     },
   ],
@@ -256,6 +258,8 @@ function ChatConversationList({
   const [deleteTarget, setDeleteTarget] = useState<ConversationView | null>(
     null,
   );
+  // 「最近对话」分组折叠态(默认展开)
+  const [recentCollapsed, setRecentCollapsed] = useState(false);
 
   // 开新会话:设场景类型 + 清当前会话 + 切到对话页(首条消息时按场景建会话)
   function startNew(agentType: string) {
@@ -318,7 +322,6 @@ function ChatConversationList({
           }}
           className="pr-7 data-active:bg-primary/10 data-active:font-medium data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:[&_svg]:text-primary"
         >
-          <MessageSquare />
           <span className="truncate">{c.title}</span>
         </SidebarMenuButton>
         <DropdownMenu>
@@ -327,7 +330,7 @@ function ChatConversationList({
               type="button"
               className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover/conv:opacity-100 data-[state=open]:opacity-100"
             >
-              <MoreHorizontal className="size-4" />
+              <MoreVertical className="size-4" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -361,7 +364,7 @@ function ChatConversationList({
           <SquarePen className="size-4" />
           新对话
         </button>
-        {/* 记忆中心:整页模块(记忆 / 知识库 / 知识图谱),点击进入整页而非弹窗 */}
+        {/* 记忆管理:整页模块(全局记忆 / 会话记忆),点击进入整页而非弹窗 */}
         <button
           type="button"
           onClick={() => onChange("memory-center")}
@@ -373,7 +376,7 @@ function ChatConversationList({
           )}
         >
           <Brain className="size-4" />
-          记忆中心
+          记忆管理
         </button>
       </div>
 
@@ -388,29 +391,42 @@ function ChatConversationList({
             </span>
           </div>
         ) : (
-          <SidebarGroup className="px-1 py-1">
-            {/* 分组标题「最近对话」+ 右侧小入口「查看更多」(进入对话记录管理页) */}
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="text-[11px]">
+          <SidebarGroup className="group/recent px-1 py-1">
+            {/* 「最近对话」+ 折叠箭头合一(箭头紧跟文字右侧、常驻);「查看更多」推到最右,悬浮分组才显示 */}
+            <div className="flex items-center gap-1 pr-1">
+              <button
+                type="button"
+                aria-label={recentCollapsed ? "展开最近对话" : "折叠最近对话"}
+                onClick={() => setRecentCollapsed((v) => !v)}
+                className="flex items-center gap-1 rounded px-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+              >
                 最近对话
-              </SidebarGroupLabel>
+                {recentCollapsed ? (
+                  <ChevronRight className="size-3" />
+                ) : (
+                  <ChevronDown className="size-3" />
+                )}
+              </button>
               <button
                 type="button"
                 onClick={() => onChange("chat-history")}
-                className="rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+                className="ml-auto flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover/recent:opacity-100"
               >
                 查看更多
+                <ChevronRight className="size-3" />
               </button>
             </div>
-            <SidebarGroupContent>
-              {recent.length > 0 ? (
-                <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
-              ) : (
-                <div className="px-2 py-3 text-[11px] text-muted-foreground">
-                  最近对话已全部归档,点「查看更多」管理
-                </div>
-              )}
-            </SidebarGroupContent>
+            {!recentCollapsed && (
+              <SidebarGroupContent>
+                {recent.length > 0 ? (
+                  <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
+                ) : (
+                  <div className="px-2 py-3 text-[11px] text-muted-foreground">
+                    最近对话已全部归档,点「查看更多」管理
+                  </div>
+                )}
+              </SidebarGroupContent>
+            )}
           </SidebarGroup>
         )}
       </div>

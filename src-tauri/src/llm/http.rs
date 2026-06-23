@@ -3,6 +3,7 @@
 //! 稳定/高可用取向:连接与总超时分离;仅对「网络错误 / 429 / 5xx」退避重试,
 //! 4xx(除 429)立即返回——客户端错误(key 错/参数错/体过大被拒)重试无意义。
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -18,6 +19,18 @@ const MAX_RETRIES: u32 = 3;
 /// 指数退避基数(毫秒)。
 const RETRY_BASE_MS: u64 = 800;
 
+/// 幂等拼接厂商 endpoint:base 已以 suffix 结尾则原样返回,否则去尾斜杠后追加。
+/// suffix 以 / 开头(如 `/chat/completions`、`/embeddings`)。统一「填 base 或填完整 URL 都对」的逻辑,
+/// 供 chat / embedding / agent core 共用,避免三处各写一份拼接规则后分叉。
+pub fn join_endpoint(base: &str, suffix: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with(suffix) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{suffix}")
+    }
+}
+
 /// 构造带连接/总超时的 reqwest client。
 pub fn build_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -25,6 +38,28 @@ pub fn build_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(total_timeout_secs))
         .build()
         .map_err(|e| CrawlerError::Config(format!("创建 HTTP 客户端失败: {e}")))
+}
+
+/// CHAT 超时档的共享 client:reqwest::Client 内部是连接池(Arc),复用同一实例即可跨请求 keep-alive,
+/// 免去每条消息重新 TCP+TLS 握手——直接降低首 token 等待。
+static CHAT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// 取 HTTP client:最常用的 CHAT 超时档复用同一实例(连接保活);其余超时(如 ASR,频次低、体量大)
+/// 按需新建、不缓存。client 持有连接池,clone 仅复制 Arc,开销可忽略。
+pub fn shared_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
+    if total_timeout_secs != CHAT_TIMEOUT_SECS {
+        return build_client(total_timeout_secs);
+    }
+    if let Some(client) = CHAT_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    // 首次:构建并存入;并发首调可能各 build 一个,set 只成功一次,统一返回最终留存实例
+    let client = build_client(total_timeout_secs)?;
+    let _ = CHAT_CLIENT.set(client);
+    Ok(CHAT_CLIENT
+        .get()
+        .expect("CHAT_CLIENT 刚 set 后必有值")
+        .clone())
 }
 
 /// 发送请求 + 重试。`build` 每次重试重建 RequestBuilder(请求体不可跨次复用)。

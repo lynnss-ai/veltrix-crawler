@@ -26,6 +26,16 @@ pub struct Model {
     pub embed_model: Option<String>,
     /// 置顶:每轮对话恒注入,不参与相似度淘汰(给「称呼/职业」等永远要带的事实)。
     pub pinned: bool,
+    /// 分类:identity(身份)/preference(偏好)/project(项目)/relationship(人际)/habit(习惯)/other(其它)。
+    pub mem_type: String,
+    /// 重要度 1-5:越高越优先注入、淘汰时越靠后。
+    pub importance: i32,
+    /// 置信度 1-5:模型对该记忆的确定程度;低置信优先被淘汰。
+    pub confidence: i32,
+    /// 命中次数:每次被注入 +1,衡量记忆实际有用程度。
+    pub hit_count: i64,
+    /// 最后命中时间(Unix 秒):时间衰减用,久未命中的逐渐降权。
+    pub last_hit_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }

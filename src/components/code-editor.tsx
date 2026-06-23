@@ -14,6 +14,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { Loader2, Save } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { SimpleTooltip } from "@/components/SimpleTooltip";
 
 // 按文件扩展名挑选语言高亮扩展(覆盖前端主力 + 常见脚本;未知类型不高亮)
 function langExt(path: string) {
@@ -123,26 +124,29 @@ export function CodeEditor({
       }}
     >
       <div className="flex shrink-0 items-center justify-between border-b px-2 py-1 text-[11px] text-muted-foreground">
-        <span className="truncate font-mono" title={path}>
-          {path}
-          {dirty ? " ●" : ""}
-        </span>
-        <Button
-          type="button"
-          size="sm"
-          variant={dirty ? "default" : "outline"}
-          className="h-6 shrink-0 gap-1 px-2 text-[11px]"
-          disabled={!dirty || saving}
-          onClick={() => void save()}
-          title="保存(Ctrl/Cmd+S)"
-        >
-          {saving ? (
-            <Loader2 className="size-3 animate-spin" />
-          ) : (
-            <Save className="size-3" />
-          )}
-          保存
-        </Button>
+        <SimpleTooltip content={path}>
+          <span className="truncate font-mono">
+            {path}
+            {dirty ? " ●" : ""}
+          </span>
+        </SimpleTooltip>
+        <SimpleTooltip content="保存(Ctrl/Cmd+S)">
+          <Button
+            type="button"
+            size="sm"
+            variant={dirty ? "default" : "outline"}
+            className="h-6 shrink-0 gap-1 px-2 text-[11px]"
+            disabled={!dirty || saving}
+            onClick={() => void save()}
+          >
+            {saving ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <Save className="size-3" />
+            )}
+            保存
+          </Button>
+        </SimpleTooltip>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
         <CodeMirror

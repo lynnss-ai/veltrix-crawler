@@ -9,7 +9,8 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Toaster } from "./components/ui/sonner";
 import "./index.css";
 
-// 托盘弹出面板窗口与主窗口加载同一前端,按窗口 label 区分渲染哪一个根组件
+// 托盘弹出面板窗口与主窗口加载同一前端,按窗口 label 区分渲染哪一个根组件。
+// 录屏悬浮条已拆为独立入口(recording-overlay.html),不再走这里。
 let windowLabel = "main";
 try {
   windowLabel = getCurrentWindow().label;
@@ -17,11 +18,17 @@ try {
   // 非 Tauri 环境(纯浏览器调试)下取不到窗口,按主窗口处理
 }
 const isTrayPopup = windowLabel === "tray-popup";
+// 透明无边框小窗(托盘面板):根 html/body 背景透明,圆角外不显示底色
+const isTransparentWindow = isTrayPopup;
 
-// 托盘面板窗口透明:根 html/body 背景透明,圆角外不显示底色
-if (isTrayPopup) {
+if (isTransparentWindow) {
   document.documentElement.style.background = "transparent";
   document.body.style.background = "transparent";
+}
+
+function RootView() {
+  if (isTrayPopup) return <TrayPopup />;
+  return <App />;
 }
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
@@ -29,8 +36,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <ErrorBoundary>
       <ThemeProvider defaultTheme="system" storageKey="veltrix-theme">
         <TooltipProvider delayDuration={200}>
-          {isTrayPopup ? <TrayPopup /> : <App />}
-          {!isTrayPopup && <Toaster richColors position="top-center" />}
+          <RootView />
+          {!isTransparentWindow && <Toaster richColors position="top-center" />}
         </TooltipProvider>
       </ThemeProvider>
     </ErrorBoundary>

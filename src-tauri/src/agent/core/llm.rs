@@ -4,14 +4,14 @@
 //! 屏蔽各厂商 function-calling / 消息 / 流式差异;换模型只改 `ProviderRef`。
 //! 现状:OpenAI 兼容(DeepSeek/Qwen/MiMo/GLM/MiniMax)已实现;Anthropic 原生先占位。
 //! 不影响现有 `llm::chat`(意向 / 标题 / 摘要 / 记忆提取仍走旧函数)。
-#![allow(dead_code)] // 地基先落,编程 Agent 落地后即被使用
+#![allow(dead_code)] // Anthropic 原生实现等为占位,暂未全部启用
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use veltrix_core::error::{CrawlerError, Result};
 
-use super::http;
+use crate::llm::http;
 
 /// 厂商协议类型:决定请求 / 响应 / 工具 / 流式的具体格式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,11 +55,17 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// 统一消息(含工具往返)。多模态(图片)后续在 User 上扩展。
+/// 统一消息(含工具往返 + 多模态视觉)。
 #[derive(Clone, Debug)]
 pub enum ChatMsg {
     System(String),
     User(String),
+    /// 带图片的用户消息(多模态):`text` 为正文,`images` 为图片 data URL(`data:image/png;base64,...`)。
+    /// 让走统一链路的 Agent 把截屏 / 图片喂给视觉模型(需模型具备 vision 能力)。
+    UserWithImages {
+        text: String,
+        images: Vec<String>,
+    },
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
@@ -88,6 +94,9 @@ pub struct TokenUsage {
 #[derive(Clone, Debug)]
 pub struct LlmResponse {
     pub content: Option<String>,
+    /// 模型推理内容(思考过程):Claude thinking 块 / OpenAI 兼容厂商的 reasoning_content。
+    /// 仅推理型模型非空;供「思考过程」展示与落库,不参与后续对话上下文重建。
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
@@ -167,22 +176,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["max_tokens"] = json!(m);
         }
 
-        let client = http::build_client(http::CHAT_TIMEOUT_SECS)?;
-        let resp = client
-            .post(&endpoint)
-            .bearer_auth(&req.provider.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CrawlerError::Config(format!("大模型请求失败: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(CrawlerError::Config(format!(
-                "大模型返回 {status}: {}",
-                text.chars().take(300).collect::<String>()
-            )));
-        }
+        // 复用 CHAT 档共享 client(连接池保活,免每步重握手)+ 统一 429/5xx 退避重试,
+        // 与 llm/chat.rs、llm/embedding.rs 一致;send_with_retry 已处理非 2xx 的错误体提取。
+        let client = http::shared_client(http::CHAT_TIMEOUT_SECS)?;
+        let api_key = &req.provider.api_key;
+        let resp = http::send_with_retry(
+            || client.post(&endpoint).bearer_auth(api_key).json(&body),
+            "大模型",
+            true,
+        )
+        .await?;
         let payload: Value = resp
             .json()
             .await
@@ -217,7 +220,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["max_tokens"] = json!(m);
         }
 
-        let client = http::build_client(http::CHAT_TIMEOUT_SECS)?;
+        // 流式:复用 CHAT 档共享 client(连接池保活);流式重试涉及半截流,故此处不退避,仅连接层快速失败。
+        let client = http::shared_client(http::CHAT_TIMEOUT_SECS)?;
         let resp = client
             .post(&endpoint)
             .bearer_auth(&req.provider.api_key)
@@ -237,6 +241,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut text = String::new();
+        // 推理内容增量累积(reasoning_content / reasoning):推理型模型分帧返回,拼成完整思考过程
+        let mut reasoning = String::new();
         // 工具调用按 index 累积:(id, name, arguments 字符串分片)
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
         let mut finish = FinishReason::Stop;
@@ -270,10 +276,28 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             text.push_str(&piece);
                             on_delta(piece);
                         }
+                        // 推理增量:厂商字段不一,优先 reasoning_content,回退 reasoning(仅累积,不经 on_delta)
+                        if let Some(r) = delta
+                            .get("reasoning_content")
+                            .or_else(|| delta.get("reasoning"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            reasoning.push_str(r);
+                        }
                         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
                             for tc in tcs {
-                                let idx =
-                                    tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                // 厂商给了 index 就按 index;没给时不能一律塞 slot 0(会把并行工具调用
+                                // 的参数串到一起):有非空 id 视为新调用开一个槽,否则续接最后一个槽。
+                                let has_new_id = tc
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|s| !s.is_empty());
+                                let idx = match tc.get("index").and_then(Value::as_u64) {
+                                    Some(i) => i as usize,
+                                    None if has_new_id || tool_acc.is_empty() => tool_acc.len(),
+                                    None => tool_acc.len() - 1,
+                                };
                                 while tool_acc.len() <= idx {
                                     tool_acc.push((String::new(), String::new(), String::new()));
                                 }
@@ -332,6 +356,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
         Ok(LlmResponse {
             content: if text.is_empty() { None } else { Some(text) },
+            reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
             tool_calls,
             finish_reason: finish,
             usage,
@@ -344,6 +369,17 @@ fn msg_to_openai(m: &ChatMsg) -> Value {
     match m {
         ChatMsg::System(s) => json!({ "role": "system", "content": s }),
         ChatMsg::User(s) => json!({ "role": "user", "content": s }),
+        // 多模态:正文 + 各图片拼成 OpenAI content 数组(text part + image_url part)
+        ChatMsg::UserWithImages { text, images } => {
+            let mut parts: Vec<Value> = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            for url in images {
+                parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+            }
+            json!({ "role": "user", "content": parts })
+        }
         ChatMsg::Assistant { text, tool_calls } => {
             let mut v = json!({ "role": "assistant", "content": text });
             if !tool_calls.is_empty() {
@@ -401,6 +437,14 @@ fn parse_openai_response(payload: &Value) -> Result<LlmResponse> {
         .map(str::to_string)
         .filter(|s| !s.is_empty());
 
+    // 推理内容(思考过程):厂商字段不一,优先 reasoning_content,回退 reasoning
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+
     let tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -435,6 +479,7 @@ fn parse_openai_response(payload: &Value) -> Result<LlmResponse> {
 
     Ok(LlmResponse {
         content,
+        reasoning,
         tool_calls,
         finish_reason,
         usage,
@@ -443,12 +488,7 @@ fn parse_openai_response(payload: &Value) -> Result<LlmResponse> {
 
 /// 拼接 chat completions endpoint(api_url 已含该路径时不重复拼)。
 fn chat_endpoint(api_url: &str) -> String {
-    let trimmed = api_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
-    }
+    http::join_endpoint(api_url, "/chat/completions")
 }
 
 // ===================== Anthropic 原生(占位) =====================
@@ -457,12 +497,204 @@ struct AnthropicProvider;
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
-    async fn chat(&self, _req: LlmRequest<'_>) -> Result<LlmResponse> {
-        // Anthropic Messages API:content blocks + input_schema 工具 + 不同流式。待实现。
-        Err(CrawlerError::Config(
-            "Anthropic 原生 Messages API 尚未实现(占位,先用 OpenAI 兼容厂商)".into(),
-        ))
+    async fn chat(&self, req: LlmRequest<'_>) -> Result<LlmResponse> {
+        if req.provider.api_url.trim().is_empty() {
+            return Err(CrawlerError::Config("厂商 api_url 为空".into()));
+        }
+        let endpoint = anthropic_endpoint(&req.provider.api_url);
+        // Anthropic 与 OpenAI 差异:system 是顶层字段;工具往返用 tool_use / tool_result 内容块;
+        // 一轮里多个 tool_result(+截图)须并进同一条 user 消息(user/assistant 必须交替)。
+        let (system, msgs) = msgs_to_anthropic(req.messages);
+        let mut body = json!({
+            "model": req.provider.model,
+            "max_tokens": req.options.max_tokens.unwrap_or(4096), // Anthropic 必填
+            "messages": msgs,
+        });
+        if !system.is_empty() {
+            body["system"] = json!(system);
+        }
+        if !req.tools.is_empty() {
+            body["tools"] = Value::Array(req.tools.iter().map(tool_to_anthropic).collect());
+        }
+        if let Some(t) = req.options.temperature {
+            body["temperature"] = json!(t);
+        }
+
+        let client = http::shared_client(http::CHAT_TIMEOUT_SECS)?;
+        let api_key = &req.provider.api_key;
+        let resp = http::send_with_retry(
+            || {
+                client
+                    .post(&endpoint)
+                    .header("x-api-key", api_key.as_str())
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+            },
+            "Anthropic",
+            true,
+        )
+        .await?;
+        let payload: Value = resp
+            .json()
+            .await
+            .map_err(|e| CrawlerError::Config(format!("解析 Anthropic 响应失败: {e}")))?;
+        parse_anthropic_response(&payload)
     }
+}
+
+/// 拼接 Anthropic Messages endpoint:兼容用户填 base / base+/v1 / 完整 URL 三种写法。
+fn anthropic_endpoint(api_url: &str) -> String {
+    let trimmed = api_url.trim_end_matches('/');
+    if trimmed.ends_with("/messages") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
+/// 统一消息序列 → (system 文本, Anthropic messages 数组)。
+/// 关键:相邻 user 内容(普通文本 / 图片 / tool_result)合并进同一条 user 消息,保证 user/assistant 交替。
+fn msgs_to_anthropic(messages: &[ChatMsg]) -> (String, Vec<Value>) {
+    let mut system = String::new();
+    let mut out: Vec<Value> = Vec::new();
+    // 把一个内容块追加到「当前 user 消息」:上一条已是 user 则并入,否则新开一条
+    fn push_user(out: &mut Vec<Value>, block: Value) {
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some("user") {
+                if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                    arr.push(block);
+                    return;
+                }
+            }
+        }
+        out.push(json!({ "role": "user", "content": [block] }));
+    }
+    for m in messages {
+        match m {
+            ChatMsg::System(s) => {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(s);
+            }
+            ChatMsg::User(s) => push_user(&mut out, json!({ "type": "text", "text": s })),
+            ChatMsg::UserWithImages { text, images } => {
+                if !text.is_empty() {
+                    push_user(&mut out, json!({ "type": "text", "text": text }));
+                }
+                for img in images {
+                    if let Some(block) = anthropic_image_block(img) {
+                        push_user(&mut out, block);
+                    }
+                }
+            }
+            ChatMsg::Assistant { text, tool_calls } => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": t }));
+                    }
+                }
+                for tc in tool_calls {
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    }));
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+            ChatMsg::Tool { tool_call_id, content } => push_user(
+                &mut out,
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                }),
+            ),
+        }
+    }
+    (system, out)
+}
+
+/// data URL(`data:image/png;base64,...`)→ Anthropic image 块;解析失败返回 None。
+fn anthropic_image_block(data_url: &str) -> Option<Value> {
+    let rest = data_url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    Some(json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": media_type, "data": data },
+    }))
+}
+
+/// 工具定义 → Anthropic tool JSON(注意是 input_schema,非 OpenAI 的 parameters)。
+fn tool_to_anthropic(t: &ToolDef) -> Value {
+    json!({
+        "name": t.name,
+        "description": t.description,
+        "input_schema": t.input_schema,
+    })
+}
+
+/// 解析 Anthropic Messages 响应 → LlmResponse(text 块拼正文,tool_use 块转 ToolCall)。
+fn parse_anthropic_response(payload: &Value) -> Result<LlmResponse> {
+    let blocks = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CrawlerError::Config("Anthropic 响应缺少 content(可能被风控或鉴权失败)".into()))?;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            // 思考块:正文在 thinking 字段(redacted_thinking 已加密,无明文可展示,跳过)
+            Some("thinking") => {
+                if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                    reasoning.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                let id = b.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                let name = b.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let arguments = b.get("input").cloned().unwrap_or_else(|| json!({}));
+                if !name.is_empty() {
+                    tool_calls.push(ToolCall { id, name, arguments });
+                }
+            }
+            _ => {}
+        }
+    }
+    let finish_reason = match payload.get("stop_reason").and_then(Value::as_str) {
+        Some("tool_use") => FinishReason::ToolCalls,
+        Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
+        Some("max_tokens") => FinishReason::Length,
+        _ => FinishReason::Other,
+    };
+    let usage = payload
+        .get("usage")
+        .map(|u| TokenUsage {
+            prompt: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            completion: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+        })
+        .unwrap_or_default();
+    Ok(LlmResponse {
+        content: if text.is_empty() { None } else { Some(text) },
+        reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
+        tool_calls,
+        finish_reason,
+        usage,
+    })
 }
 
 // ===================== 工具:定义 + 执行 + 注册表 =====================
@@ -502,6 +734,10 @@ impl ToolRegistry {
     }
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);
+    }
+    /// 合并另一个注册表的全部工具:组装「全能 Agent」时把多个独立工具模块聚合成一个注册表。
+    pub fn merge(&mut self, other: ToolRegistry) {
+        self.tools.extend(other.tools);
     }
     /// 所有工具定义(发给 LLM)。
     pub fn defs(&self) -> Vec<ToolDef> {

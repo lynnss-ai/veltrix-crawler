@@ -24,7 +24,6 @@ import {
   type CloudConnectionState,
   type RoleModelConfig,
 } from "@/lib/api";
-import { ChatMemoryManager } from "@/components/chat-memory-manager";
 import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { ErrorBanner } from "@/components/ErrorBanner";
@@ -229,7 +228,6 @@ export function SettingsPage() {
             {active === "intent" && (
               <IntentSection initial={cfg?.intent} />
             )}
-            {active === "memory" && <MemorySection />}
             {active === "obsidian" && <ObsidianSection />}
           </div>
         )}
@@ -1282,14 +1280,15 @@ function IntentSection({
 // 角色模型:一个可选模型 = 厂商 + 模型名(value 用 "providerId::model" 编码,与对话页一致)。
 type RoleModelOption = { value: string; label: string };
 
-// 从厂商列表展开出可用模型(有 apiKey + models 行才算可用);编码同对话页 buildModelOptions。
+// 从厂商列表展开出可用模型(有 apiKey + 具备「对话」能力的模型才算可用);编码同对话页 buildModelOptions。
+// 角色模型(分类/摘要/套用)都是文本任务,按「对话」能力过滤。
 function buildRoleModelOptions(providers: Provider[]): RoleModelOption[] {
   const out: RoleModelOption[] = [];
   for (const p of providers) {
     if (!p.apiKey.trim()) continue;
-    for (const line of p.models.split("\n")) {
-      const model = line.trim();
-      if (!model) continue;
+    for (const spec of p.models) {
+      const model = spec.name.trim();
+      if (!model || !spec.capabilities.includes("text")) continue;
       out.push({ value: `${p.id}::${model}`, label: `${p.name} · ${model}` });
     }
   }
@@ -1411,19 +1410,6 @@ function RoleModelSection({ providers }: { providers: Provider[] }) {
           />
         </div>
       )}
-    </SettingsCard>
-  );
-}
-
-// AI 记忆:跨会话长期记忆管理(全局开关 + 自动/手动条目的增删改查)。
-// 自动记忆由对话每轮提取后台落库;此处用于查看、手动补充与清理。
-function MemorySection() {
-  return (
-    <SettingsCard
-      title="AI 记忆"
-      description="让对话拥有跨会话的长期记忆:AI 会自动从聊天中提取关于你的稳定信息(身份、偏好、习惯等),在之后所有对话中参考。你也可以手动添加、编辑或删除。"
-    >
-      <ChatMemoryManager />
     </SettingsCard>
   );
 }

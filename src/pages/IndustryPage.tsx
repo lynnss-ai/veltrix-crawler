@@ -608,28 +608,30 @@ function IndustryFormSheet({
                   readOnly
                   className="font-mono"
                 />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="shrink-0"
-                  title="重新生成"
-                  onClick={() => setCode(generateIndustryCode())}
-                >
-                  <RefreshCw />
-                  <span className="sr-only">重新生成</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="shrink-0"
-                  title={copied ? "已复制" : "复制"}
-                  onClick={handleCopyCode}
-                >
-                  {copied ? <Check /> : <Copy />}
-                  <span className="sr-only">复制</span>
-                </Button>
+                <SimpleTooltip content="重新生成">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="shrink-0"
+                    aria-label="重新生成"
+                    onClick={() => setCode(generateIndustryCode())}
+                  >
+                    <RefreshCw />
+                  </Button>
+                </SimpleTooltip>
+                <SimpleTooltip content={copied ? "已复制" : "复制"}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="shrink-0"
+                    aria-label="复制"
+                    onClick={handleCopyCode}
+                  >
+                    {copied ? <Check /> : <Copy />}
+                  </Button>
+                </SimpleTooltip>
               </div>
               <p className="text-xs text-muted-foreground">
                 系统自动生成,可点刷新重新生成
