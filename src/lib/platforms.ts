@@ -180,6 +180,21 @@ export function platformLabel(id: string): string {
   return PLATFORM_LABELS[id] ?? id;
 }
 
+/** 平台 id → 作者「用户编码」的平台叫法(复制提示 / tooltip 用)。
+ *  抖音=抖音号,小红书=小红书号……未知平台回退通用「用户编码」。 */
+const PLATFORM_UID_LABELS: Record<string, string> = {
+  douyin: "抖音号",
+  xhs: "小红书号",
+  kuaishou: "快手号",
+  tiktok: "TikTok ID",
+  bilibili: "B站 UID",
+  youtube: "频道 ID",
+};
+
+export function platformUidLabel(id: string): string {
+  return PLATFORM_UID_LABELS[id] ?? "用户编码";
+}
+
 /** 平台 id 的展示排序权重;未列入的平台返回末位权重,排到最后。 */
 export function platformOrder(id: string): number {
   const index = PLATFORM_ORDER.indexOf(id);

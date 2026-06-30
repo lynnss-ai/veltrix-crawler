@@ -37,7 +37,16 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <ThemeProvider defaultTheme="system" storageKey="veltrix-theme">
         <TooltipProvider delayDuration={200}>
           <RootView />
-          {!isTransparentWindow && <Toaster richColors position="top-center" />}
+          {!isTransparentWindow && (
+            // 顶部偏移 = 标题栏高度 + 余量,避免 top-center 的 toast 压住自定义标题栏
+            <Toaster
+              richColors
+              position="top-center"
+              closeButton={false}
+              offset={{ top: "calc(var(--titlebar-h) + 12px)" }}
+              mobileOffset={{ top: "calc(var(--titlebar-h) + 12px)" }}
+            />
+          )}
         </TooltipProvider>
       </ThemeProvider>
     </ErrorBoundary>

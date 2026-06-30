@@ -5,18 +5,19 @@
 // - 列表 tab 显示 pending/running/paused;归档 tab 显示 completed/failed/cancelled
 // - 操作按钮按状态动态:running → 暂停/停止,paused → 启动/停止,pending → 启动/停止
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import { api } from "@/lib/api";
 import type { IndustryView, PlatformConfig, TaskInput, TaskView } from "@/lib/api";
-import { sortLabelOf, timeLabelOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime } from "./collect-meta";
-import type { TaskItem, PlatformOption } from "./collect-meta";
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime, type TaskContentFilter } from "./collect-meta";
+import type { PageKey } from "@/components/app-sidebar";
+import type { TaskItem, PlatformOption, KeywordState } from "./collect-meta";
 import { TaskDetailPage } from "@/pages/TaskDetailPage";
 import { listen } from "@tauri-apps/api/event";
 import { platformClass, platformChipClass } from "@/lib/platforms";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Archive, ChevronLeft, Eye, Filter, MoreHorizontal, SquarePen, Play, Plus, Radar, RotateCcw, Search, Square, Trash2, Wrench, X } from "lucide-react";
+import { Archive, Check, ChevronLeft, Clock, Database, Eye, Filter, Loader2, MoreHorizontal, SquarePen, Play, Plus, RotateCcw, Search, Square, Trash2, Wrench, X, type LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,10 +28,27 @@ import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
+import { IndustryFilterItem, IndustryFilterToggle } from "@/components/library-filters";
+import { EmptyState } from "@/components/EmptyState";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TaskFormSheet } from "./TaskFormSheet";
 
 // ---- 数据模型(沿用后端 TaskView,本地 alias 为 TaskItem 方便引用) ----
+
+// 采集明细里每个关键词的状态徽标:圆底包裹图标。
+// done=采集成功 / failed=采集失败 / running=采集中(转圈)/ pending=等待
+const KEYWORD_STATE_ICON: Record<KeywordState, LucideIcon> = {
+  done: Check,
+  running: Loader2,
+  pending: Clock,
+  failed: X,
+};
+const KEYWORD_STATE_BADGE: Record<KeywordState, string> = {
+  done: "bg-emerald-500 text-white",
+  running: "bg-emerald-500 text-white",
+  pending: "bg-muted-foreground/60 text-white",
+  failed: "bg-destructive text-white",
+};
 
 function CountdownCell({ t }: { t: TaskItem }) {
   const inProgress = isInProgress(t);
@@ -106,7 +124,12 @@ function CountdownCell({ t }: { t: TaskItem }) {
 }
 
 
-export function CollectPage() {
+export function CollectPage({
+  onNavigate,
+}: {
+  // 数据穿透:跳全量库查看本任务采集的内容(总任务 / 单次运行)
+  onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
+}) {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
@@ -126,7 +149,7 @@ export function CollectPage() {
   };
   useEffect(() => {
     reload();
-    api.listIndustries().then(setIndustries).catch(() => {});
+    api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
     api
       .listPlatforms()
       .then(async (list) => {
@@ -147,7 +170,7 @@ export function CollectPage() {
         );
         setPlatformOptions(opts);
       })
-      .catch(() => {});
+      .catch((e) => console.warn("加载平台列表失败:", e));
   }, []);
 
   // 采集 + 素材下载都在后端异步进行,任一处于进行态(running / downloading_media)就轮询刷新进度。
@@ -193,7 +216,7 @@ export function CollectPage() {
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch(() => {});
+      .catch((e) => console.warn("监听采集进度事件失败:", e));
     return () => {
       cancelled = true;
       unlisten?.();
@@ -318,6 +341,10 @@ export function CollectPage() {
         setEditingTask(null);
         toast.success(editingTask ? "任务已更新" : "任务已创建");
         reload();
+        // 新建「立即一次」任务自动开始采集
+        if (!editingTask && input.trigger === "once-now") {
+          api.runTask(input.id).catch((e) => toast.error(`自动启动失败: ${e}`));
+        }
       })
       .catch((e) => toast.error(`保存失败: ${e}`));
   }
@@ -337,6 +364,9 @@ export function CollectPage() {
         id: "run-control",
         header: "执行",
         enableSorting: false,
+        enableHiding: false,
+        enableResizing: false,
+        size: 56,
         cell: ({ row }) => {
           const t = row.original;
           // 已归档:显示「恢复」,点击移回任务列表
@@ -393,78 +423,118 @@ export function CollectPage() {
       {
         id: "name",
         accessorKey: "name",
+        size: 220,
+        meta: { title: "任务名" },
         header: ({ column }) => (
           <DataTableColumnHeader column={column} title="任务名" />
         ),
-        cell: ({ row }) => (
-          <span className="block min-w-[160px] max-w-[260px] truncate font-medium text-foreground">
-            {row.original.name}
-          </span>
-        ),
+        cell: ({ row, table }) => {
+          // 未设过列宽 → auto 自适应(min/max-w);设过任一列宽 → fixed 填充列宽
+          const fixed = Object.keys(table.getState().columnSizing).length > 0;
+          return (
+            <span
+              className={`block truncate font-medium text-foreground ${
+                fixed ? "w-full" : "min-w-[160px] max-w-[260px]"
+              }`}
+            >
+              {row.original.name}
+            </span>
+          );
+        },
       },
       {
         id: "collect-params",
         header: "采集参数",
         enableSorting: false,
-        cell: ({ row }) => {
+        size: 340,
+        // 收掉本列右内边距,缩小与「采集结果」列之间的间距
+        meta: { title: "采集参数", cellClassName: "pr-0", headerClassName: "pr-0" },
+        cell: ({ row, table }) => {
           const t = row.original;
           const TriggerIcon = TRIGGER_META[t.trigger].icon;
-          // AI文案 / 评论 / 意向分析:涉及到(开启)时才单独占一行
-          const hasSwitches =
-            t.aiExtract || t.collectComments || t.analyzeCommentIntent;
+          // 未设过列宽 → auto 自适应(w-max 单行);设过 → fixed 填充列宽并裁剪
+          const fixed = Object.keys(table.getState().columnSizing).length > 0;
           return (
-            <div className="flex max-w-[240px] flex-col gap-1.5">
-              {/* 第一行:平台 + 触发方式 */}
-              <div className="flex flex-wrap items-center gap-1.5">
+            <div
+              className={`flex flex-col gap-1.5 ${
+                fixed ? "w-full overflow-hidden" : "w-max"
+              }`}
+            >
+              {/* 第一行:平台 + 触发方式 + 开关组(AI文案 / 评论 / 意向分析 / 同步Obsidian,开启时显示) */}
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                 <span
-                  className={`inline-block w-20 truncate rounded px-1.5 py-0.5 text-center text-[11px] font-medium ${platformClass(t.platform)}`}
+                  className={`inline-block w-20 truncate rounded px-1.5 py-0.5 text-center font-medium ${platformClass(t.platform)}`}
                 >
                   {platformName(t.platform)}
                 </span>
-                <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded bg-muted px-1.5 py-0.5 text-muted-foreground">
                   <TriggerIcon className="size-3" />
                   {TRIGGER_META[t.trigger].label}
+                  {/* 触发对应的时间数据:定时显示时刻,监听显示间隔 */}
+                  {t.trigger === "daily" && t.scheduledAt && (
+                    <span className="ml-0.5 font-mono text-foreground">
+                      {t.scheduledAt}
+                    </span>
+                  )}
+                  {t.trigger === "watching" && t.watchIntervalMin && (
+                    <span className="ml-0.5 text-foreground">
+                      每{t.watchIntervalMin}分
+                    </span>
+                  )}
                 </span>
+                {t.aiExtract && (
+                  <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-primary">
+                    AI文案
+                  </span>
+                )}
+                {t.collectComments && (
+                  <span className="whitespace-nowrap rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-600 dark:text-violet-400">
+                    评论
+                    {t.commentTimeRange && t.commentTimeRange !== "any"
+                      ? ` ${COMMENT_TIME_RANGE_META[t.commentTimeRange].label}`
+                      : ""}
+                    {t.commentLimit ? ` ≤${t.commentLimit}` : ""}
+                  </span>
+                )}
+                {t.analyzeCommentIntent && (
+                  <span className="whitespace-nowrap rounded bg-fuchsia-500/10 px-1.5 py-0.5 text-fuchsia-600 dark:text-fuchsia-400">
+                    意向分析
+                  </span>
+                )}
+                {t.autoSyncObsidian && (
+                  <span className="whitespace-nowrap rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-600 dark:text-sky-400">
+                    同步Obsidian
+                  </span>
+                )}
               </div>
-              {/* 第二行:基础采集策略(排序 / 时间 / 目标数 / 最低赞) */}
+              {/* 基础采集策略(排序 / 时间 / 目标数 / 最低赞) */}
               <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
-                <span className="rounded bg-muted px-1.5 py-0.5">
+                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
                   {sortLabelOf(t.platform, t.sortMode)}
                 </span>
-                <span className="rounded bg-muted px-1.5 py-0.5">
+                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
                   {timeLabelOf(t.platform, t.timeRange)}
                 </span>
-                <span className="rounded bg-muted px-1.5 py-0.5">
+                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
                   ≤ {t.perKeywordLimit}
                 </span>
                 {t.minLikes > 0 && (
-                  <span className="rounded bg-muted px-1.5 py-0.5">
+                  <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
                     ≥{t.minLikes}赞
                   </span>
                 )}
               </div>
-              {/* 第三行:AI文案 / 评论 / 意向分析(开启时单独成行) */}
-              {hasSwitches && (
-                <div className="flex flex-wrap items-center gap-1 text-[11px]">
-                  {t.aiExtract && (
-                    <span className="rounded bg-primary/10 px-1.5 py-0.5 text-primary">
-                      AI文案
+              {/* 平台专属额外筛选(小红书 笔记类型/搜索范围/位置距离;抖音 视频时长 等):选了非「不限」才展示 */}
+              {extraFilterChipsOf(t.platform, t.extraFilters).length > 0 && (
+                <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                  {extraFilterChipsOf(t.platform, t.extraFilters).map((c) => (
+                    <span
+                      key={c.label}
+                      className="whitespace-nowrap rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-600 dark:text-amber-400"
+                    >
+                      {c.label}:{c.value}
                     </span>
-                  )}
-                  {t.collectComments && (
-                    <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-600 dark:text-violet-400">
-                      评论
-                      {t.commentTimeRange && t.commentTimeRange !== "any"
-                        ? ` ${COMMENT_TIME_RANGE_META[t.commentTimeRange].label}`
-                        : ""}
-                      {t.commentLimit ? ` ≤${t.commentLimit}` : ""}
-                    </span>
-                  )}
-                  {t.analyzeCommentIntent && (
-                    <span className="rounded bg-fuchsia-500/10 px-1.5 py-0.5 text-fuchsia-600 dark:text-fuchsia-400">
-                      意向分析
-                    </span>
-                  )}
+                  ))}
                 </div>
               )}
             </div>
@@ -475,16 +545,32 @@ export function CollectPage() {
         id: "collected",
         header: "采集结果",
         enableSorting: false,
+        size: 120,
+        meta: { title: "采集结果" },
         cell: ({ row }) => {
           const t = row.original;
           return (
             <div className="flex flex-col gap-0.5 text-xs">
-              <div className="flex items-center gap-1">
+              {/* 数据穿透:点「内容」数 → 全量库按本任务过滤,查看该任务采集的全部内容 */}
+              <button
+                type="button"
+                disabled={!onNavigate || t.totalContents === 0}
+                onClick={() =>
+                  onNavigate?.("assets-all", {
+                    taskId: t.id,
+                    taskName: t.name,
+                  })
+                }
+                title={
+                  t.totalContents > 0 ? "查看该任务采集的全部内容" : undefined
+                }
+                className="group flex items-center gap-1 disabled:cursor-default enabled:cursor-pointer enabled:hover:text-primary"
+              >
                 <span className="text-muted-foreground">内容</span>
-                <span className="inline-block w-12 text-right font-mono font-medium text-foreground tabular-nums">
+                <span className="inline-block w-12 text-right font-mono font-medium tabular-nums underline-offset-2 group-hover:underline">
                   {t.totalContents.toLocaleString()}
                 </span>
-              </div>
+              </button>
               <div className="flex items-center gap-1">
                 <span className="text-muted-foreground">评论</span>
                 <span className="inline-block w-12 text-right font-mono font-medium text-foreground tabular-nums">
@@ -497,59 +583,93 @@ export function CollectPage() {
       },
       {
         id: "keyword-stats",
-        header: "采集明细",
+        header: () => <div className="pr-6">采集明细</div>,
         enableSorting: false,
-        cell: ({ row }) => {
+        size: 360,
+        meta: { title: "采集明细" },
+        cell: ({ row, table }) => {
           const t = row.original;
           const states = keywordRowStates(t);
           // keywordStats 与 keywords 同序(后端按任务 keywords 顺序生成);缺失退回 0
           const statOf = (i: number) =>
             t.keywordStats?.[i] ?? { contentCount: 0, commentCount: 0 };
+          // 未设过列宽 → auto 自适应(min/max-w);设过 → fixed 填充列宽并裁剪
+          const fixed = Object.keys(table.getState().columnSizing).length > 0;
           return (
-            <div className="flex min-w-[300px] max-w-[420px] flex-col divide-y divide-dashed divide-border">
+            <div
+              className={`flex flex-col divide-y divide-dashed divide-border pr-6 ${
+                fixed ? "w-full overflow-hidden" : "min-w-[300px] max-w-[420px]"
+              }`}
+            >
               {t.keywords.map((keyword, i) => {
                 const state = states[i];
                 const meta = KEYWORD_STATE_META[state];
+                const StateIcon = KEYWORD_STATE_ICON[state];
                 const { contentCount, commentCount } = statOf(i);
                 const pct = keywordRowProgress(
                   state,
                   contentCount,
                   t.perKeywordLimit,
                 );
+                // 数据穿透:该关键词采到内容(contentCount>0)且能导航时,整行可点 → 全量库按任务+关键词过滤
+                const canDrill = !!onNavigate && contentCount > 0;
                 return (
-                  <div
+                  <button
+                    type="button"
                     key={keyword}
-                    className="flex flex-col gap-0.5 py-1.5 first:pt-0 last:pb-0"
+                    disabled={!canDrill}
+                    onClick={() =>
+                      onNavigate?.("assets-all", {
+                        taskId: t.id,
+                        taskName: t.name,
+                        keyword,
+                      })
+                    }
+                    title={
+                      canDrill ? `穿透查看「${keyword}」采集的内容` : undefined
+                    }
+                    className={`group flex flex-col gap-0.5 py-1.5 text-left first:pt-0 last:pb-0 ${
+                      canDrill ? "cursor-pointer" : "cursor-default"
+                    }`}
                   >
                     <div className="flex items-center gap-1.5 text-xs">
+                      {/* 状态徽标(放关键词前):圆底包裹图标,成功 ✓ / 失败 ✗ / 采集中转圈 / 等待 */}
                       <span
-                        className={`size-1.5 shrink-0 rounded-full ${meta.dot}`}
-                      />
+                        className={`flex size-4 shrink-0 items-center justify-center rounded-full ${KEYWORD_STATE_BADGE[state]}`}
+                        title={meta.label}
+                        aria-label={meta.label}
+                      >
+                        <StateIcon
+                          className={`size-2.5 ${state === "running" ? "animate-spin" : ""}`}
+                        />
+                      </span>
                       <span
-                        className="min-w-0 flex-1 truncate font-medium text-foreground"
+                        className={`min-w-0 flex-1 truncate font-medium text-foreground ${
+                          canDrill ? "group-hover:text-primary" : ""
+                        }`}
                         title={keyword}
                       >
                         {keyword}
                       </span>
-                      <span className={`shrink-0 text-[10px] ${meta.text}`}>
-                        {meta.label}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Progress value={pct} className="h-1 flex-1" />
+                      {/* 内容 / 评论数:紧跟关键词 */}
                       <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
                         内容
-                        <span className="ml-0.5 inline-block w-10 text-right text-foreground">
+                        <span
+                          className={`ml-0.5 text-foreground underline-offset-2 ${
+                            canDrill ? "group-hover:underline" : ""
+                          }`}
+                        >
                           {contentCount.toLocaleString()}
                         </span>
                         <span className="mx-1">·</span>
                         评论
-                        <span className="ml-0.5 inline-block w-10 text-right text-foreground">
+                        <span className="ml-0.5 text-foreground">
                           {commentCount.toLocaleString()}
                         </span>
                       </span>
                     </div>
-                  </div>
+                    <Progress value={pct} className="h-1 w-full" />
+                  </button>
                 );
               })}
             </div>
@@ -559,6 +679,8 @@ export function CollectPage() {
       {
         id: "status",
         accessorKey: "status",
+        size: 150,
+        meta: { title: "状态" },
         header: ({ column }) => (
           <DataTableColumnHeader column={column} title="状态" />
         ),
@@ -639,6 +761,9 @@ export function CollectPage() {
       id: "actions",
       header: () => <div className="text-right">操作</div>,
       enableSorting: false,
+      enableHiding: false,
+      enableResizing: false,
+      size: 80,
       cell: ({ row }) => (
         <TaskActionsCell
           task={row.original}
@@ -647,6 +772,7 @@ export function CollectPage() {
           onDelete={deleteTask}
           onEdit={onEdit}
           onDetail={onDetail}
+          onNavigate={onNavigate}
         />
       ),
     });
@@ -669,9 +795,27 @@ export function CollectPage() {
         task={detailTask}
         platformName={platformName}
         onBack={() => setDetailId(null)}
+        onNavigate={onNavigate}
       />
     );
   }
+
+  // 平台筛选条作为表格工具栏渲染:与右侧「列设置」同排(列设置由 DataTable 在工具栏右侧渲染)
+  const renderPlatformBar = () => (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {platforms.map((p) => (
+        <PlatformChip
+          key={p.id}
+          id={p.id}
+          label={p.name}
+          active={platformFilter === p.id}
+          onClick={() =>
+            setPlatformFilter((prev) => (prev === p.id ? "" : p.id))
+          }
+        />
+      ))}
+    </div>
+  );
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
@@ -697,16 +841,9 @@ export function CollectPage() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 {sidebarCollapsed && (
-                  <SimpleTooltip content="展开行业筛选">
-                    <Button
-                      variant="outline"
-                      className="cursor-pointer"
-                      onClick={() => setSidebarCollapsed(false)}
-                    >
-                      <Filter />
-                      行业
-                    </Button>
-                  </SimpleTooltip>
+                  <IndustryFilterToggle
+                    onExpand={() => setSidebarCollapsed(false)}
+                  />
                 )}
                 <TabsList className="h-10 max-w-full overflow-x-auto">
                 <TabsTrigger value="active">
@@ -767,27 +904,12 @@ export function CollectPage() {
                     setEditingTask(null);
                     setFormOpen(true);
                   }}
-                  className="shrink-0 cursor-pointer"
+                  className="h-10 shrink-0 cursor-pointer"
                 >
                   <Plus />
                   创建采集任务
                 </Button>
               </div>
-            </div>
-
-            {/* 平台筛选条:横向铺开所有平台;不选即全部,点击已选 chip 可取消 */}
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              {platforms.map((p) => (
-                <PlatformChip
-                  key={p.id}
-                  id={p.id}
-                  label={p.name}
-                  active={platformFilter === p.id}
-                  onClick={() =>
-                    setPlatformFilter((prev) => (prev === p.id ? "" : p.id))
-                  }
-                />
-              ))}
             </div>
 
             <TabsContent value="active" className="mt-2 flex min-h-0 flex-1 flex-col">
@@ -796,8 +918,10 @@ export function CollectPage() {
                 data={filtered}
                 itemLabel="任务"
                 getRowId={(t) => t.id}
+                renderToolbar={renderPlatformBar}
+                customizeKey="veltrix.collect-tasks-columns"
                 emptyState={
-                  <EmptyHint text="暂无任务,点击右上角「创建采集任务」开始" />
+                  <EmptyState title="暂无任务,点击右上角「创建采集任务」开始" />
                 }
               />
             </TabsContent>
@@ -807,8 +931,10 @@ export function CollectPage() {
                 data={filtered}
                 itemLabel="任务"
                 getRowId={(t) => t.id}
+                renderToolbar={renderPlatformBar}
+                customizeKey="veltrix.collect-tasks-columns"
                 emptyState={
-                  <EmptyHint text="暂无快速任务,创建采集任务选「立即一次」即可" />
+                  <EmptyState title="暂无快速任务,创建采集任务选「立即一次」即可" />
                 }
               />
             </TabsContent>
@@ -818,8 +944,10 @@ export function CollectPage() {
                 data={filtered}
                 itemLabel="任务"
                 getRowId={(t) => t.id}
+                renderToolbar={renderPlatformBar}
+                customizeKey="veltrix.collect-tasks-columns"
                 emptyState={
-                  <EmptyHint text="暂无定时任务,创建采集任务选「每日定时」即可排入队列" />
+                  <EmptyState title="暂无定时任务,创建采集任务选「每日定时」即可排入队列" />
                 }
               />
             </TabsContent>
@@ -829,8 +957,10 @@ export function CollectPage() {
                 data={filtered}
                 itemLabel="任务"
                 getRowId={(t) => t.id}
+                renderToolbar={renderPlatformBar}
+                customizeKey="veltrix.collect-tasks-columns"
                 emptyState={
-                  <EmptyHint text="暂无持续监听任务,创建采集任务选「持续监听」即可" />
+                  <EmptyState title="暂无持续监听任务,创建采集任务选「持续监听」即可" />
                 }
               />
             </TabsContent>
@@ -840,7 +970,9 @@ export function CollectPage() {
                 data={filtered}
                 itemLabel="归档任务"
                 getRowId={(t) => t.id}
-                emptyState={<EmptyHint text="暂无归档任务" />}
+                renderToolbar={renderPlatformBar}
+                customizeKey="veltrix.collect-tasks-columns"
+                emptyState={<EmptyState title="暂无归档任务" />}
               />
             </TabsContent>
           </Tabs>
@@ -918,7 +1050,7 @@ function IndustryFilterSidebar({
 }
 
 // 平台筛选 chip:全局统一品牌色(选中实色 / 未选浅色淡显)
-function PlatformChip({
+const PlatformChip = memo(function PlatformChip({
   id,
   label,
   active,
@@ -934,53 +1066,18 @@ function PlatformChip({
       {label}
     </button>
   );
-}
-
-function IndustryFilterItem({
-  label,
-  count,
-  active,
-  onClick,
-}: {
-  label: string;
-  count: number;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      onClick={onClick}
-      className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors ${
-        active
-          ? "bg-accent font-medium text-accent-foreground"
-          : "hover:bg-accent/50"
-      }`}
-    >
-      <span className="flex-1 truncate">{label}</span>
-      <span className="text-xs text-muted-foreground">{count}</span>
-    </div>
-  );
-}
-
+});
 
 // ---- 新建 / 编辑 任务 Sheet ----
 
-function EmptyHint({ text }: { text: string }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
-      <Radar className="size-8 opacity-30" />
-      <p className="text-sm text-muted-foreground">{text}</p>
-    </div>
-  );
-}
-
-function TaskActionsCell({
+const TaskActionsCell = memo(function TaskActionsCell({
   task,
   isArchive,
   onUpdate,
   onDelete,
   onEdit,
   onDetail,
+  onNavigate,
 }: {
   task: TaskItem;
   isArchive: boolean;
@@ -988,6 +1085,8 @@ function TaskActionsCell({
   onDelete: (id: string) => void;
   onEdit: (t: TaskItem) => void;
   onDetail: (t: TaskItem) => void;
+  // 数据穿透:跳全量库按本任务过滤,仅有采集内容时可用
+  onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
 }) {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -1008,6 +1107,21 @@ function TaskActionsCell({
             <Eye className="size-3.5" />
             详情
           </DropdownMenuItem>
+          {/* 数据穿透:仅当采集到内容(totalContents>0)时显示,跳全量库按本任务过滤 */}
+          {onNavigate && task.totalContents > 0 && (
+            <DropdownMenuItem
+              className="cursor-pointer"
+              onClick={() =>
+                onNavigate("assets-all", {
+                  taskId: task.id,
+                  taskName: task.name,
+                })
+              }
+            >
+              <Database className="size-3.5" />
+              内容穿透
+            </DropdownMenuItem>
+          )}
           {!isArchive && (
             <DropdownMenuItem
               className="cursor-pointer"
@@ -1087,4 +1201,4 @@ function TaskActionsCell({
       </AlertDialog>
     </div>
   );
-}
+});

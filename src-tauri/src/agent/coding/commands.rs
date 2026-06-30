@@ -1,27 +1,31 @@
-//! 编程 Agent 命令:send_coding_message(ReAct 循环 + 工具往返落库 + 进度事件)、工作区读写。
+//! 编程 Agent 命令:send_coding_message(基于通用 ReAct 运行器)、工作区读写。
 //!
-//! 复用 `agent::core::llm`(LlmProvider + ToolRegistry)与 `agent::coding::tools`(工具集 + 提示词)。
-//! 工具与 run_command 限定在「编程工作区」目录内(沙箱)。
+//! 工具集来自 `agent::coding::tools`,工具与 run_command 限定在「编程工作区」目录内(沙箱)。
+//! 特殊逻辑:Plan/Act 模式、自主续航、run_command 自动修复、计划续航、验证闸门。
 
 use crate::agent::coding::tools as coding;
+use crate::agent::core::react::{
+    FinishDecision, IterDecision, ReactConfig, ReactHooks, ToolPostAction,
+};
 use crate::agent::core::shared::{
-    begin_agent_turn, finalize_conversation_meta, insert_assistant_tool_calls,
-    insert_final_assistant, insert_tool_result, live_windowed_messages, load_agent_guidelines,
-    MessageView, MAX_ITERS,
+    begin_agent_turn, finalize_conversation_meta, insert_final_assistant, live_windowed_messages,
+    load_agent_guidelines, MessageView, MAX_ITERS,
 };
 use crate::agent::core::summary as conv_summary;
 use crate::agent::core::{
-    provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef,
+    provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef, ToolResult,
 };
 use crate::commands::{current_user, AppState};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncBufReadExt;
-use veltrix_core::db::entity::chat_conversation as conv;
+use veltrix_core::db::entity::{
+    agent_route_log, chat_conversation as conv, provider as provider_entity,
+};
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 自主续航(Act 模式)总步数硬上限:远大于 MAX_ITERS 让长任务一气呵成,但仍有界防失控。
@@ -30,6 +34,8 @@ const MAX_AUTO_ITERS: usize = 50;
 const MAX_CONTINUES: usize = 4;
 /// run_command 失败后,模型若想直接收尾,自动注入引导逼它修复重试的最大次数(防卡死)。
 const AUTO_FIX_MAX: usize = 2;
+/// 硬验证闸门:改了代码文件却没成功跑过验证命令就想收尾 → 打回强制先验证的最大次数。
+const MAX_VERIFY_GATE: usize = 2;
 /// 工作区根目录在 app_secrets 的 key;空 = 默认 `<app_data>/coding-workspaces`(每会话一个子目录)。
 const CODING_WORKSPACE_KEY: &str = "coding_workspace_path";
 /// 沙盒配置:镜像、共享容器名。(默认即用 Docker 沙盒,Docker 不可用时自动回退本机,无手动模式开关)
@@ -67,9 +73,9 @@ pub struct SandboxReady {
 }
 
 /// 工作区根目录(自定义优先,否则默认数据目录下 coding-workspaces)。
-fn workspace_base(state: &AppState, custom: &str) -> PathBuf {
+fn workspace_base(config_dir: &Path, custom: &str) -> PathBuf {
     if custom.trim().is_empty() {
-        state.config_dir.join("coding-workspaces")
+        config_dir.join("coding-workspaces")
     } else {
         PathBuf::from(custom.trim())
     }
@@ -109,7 +115,7 @@ pub async fn get_coding_workspace(
     state: State<'_, AppState>,
     conversation_id: Option<String>,
 ) -> Result<String> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let p = match conversation_id {
         Some(id) if !id.trim().is_empty() => conv_workspace(&base, &id),
         _ => base,
@@ -123,20 +129,52 @@ pub async fn set_coding_workspace(state: State<'_, AppState>, path: String) -> R
     crate::commands::set_secret(&state.db, CODING_WORKSPACE_KEY, path.trim()).await
 }
 
+/// 编程执行环境解析所需的 clonable 句柄:供委派工具在 react 循环内(无 &AppState)惰性解析。
+#[derive(Clone)]
+pub struct CodingExecCtx {
+    pub db: sea_orm::DatabaseConnection,
+    pub config_dir: PathBuf,
+    pub sandbox_ready: Arc<Mutex<SandboxReady>>,
+    pub app_handle: AppHandle,
+}
+
+impl CodingExecCtx {
+    /// 从 AppState 构造(命令层用;均为廉价 clone)。
+    pub fn from_state(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+            config_dir: state.config_dir.clone(),
+            sandbox_ready: state.sandbox_ready.clone(),
+            app_handle: state.app_handle.clone(),
+        }
+    }
+}
+
 /// 解析某会话的执行环境:返回(宿主工作区目录, ExecConfig)。
-/// docker 模式确保共享容器就绪(容器内 /workspace/<会话id>);容器不可用则回退本机执行(同一目录,只是不隔离)。
 async fn resolve_exec(state: &AppState, conv_id: &str) -> Result<(PathBuf, coding::ExecConfig)> {
-    let base = workspace_base(state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    resolve_exec_ctx(&CodingExecCtx::from_state(state), conv_id).await
+}
+
+/// resolve_exec 的句柄版(供委派工具调用)。
+/// docker 模式确保共享容器就绪(容器内 /workspace/<会话id>);容器不可用则回退本机执行(同一目录,只是不隔离)。
+pub async fn resolve_exec_ctx(
+    ctx: &CodingExecCtx,
+    conv_id: &str,
+) -> Result<(PathBuf, coding::ExecConfig)> {
+    let base = workspace_base(
+        &ctx.config_dir,
+        &crate::commands::get_secret(&ctx.db, CODING_WORKSPACE_KEY).await,
+    );
     let ws = conv_workspace(&base, conv_id);
     tokio::fs::create_dir_all(&ws)
         .await
         .map_err(|e| CrawlerError::Config(format!("创建工作区失败: {e}")))?;
-    let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
-    let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
+    let image = secret_or(&ctx.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
+    let container = secret_or(&ctx.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let workdir = format!("/workspace/{}", safe_id(conv_id));
 
     // 就绪缓存命中(同容器 / 镜像、TTL 内):直接复用上次结论,免去每个动作 4 连击 docker(慢且放大挂死面)
-    if let Some(docker_ok) = sandbox_cached(state, &container, &image) {
+    if let Some(docker_ok) = sandbox_cached(&ctx.sandbox_ready, &container, &image) {
         return Ok((ws, exec_for(docker_ok, container, workdir)));
     }
 
@@ -145,16 +183,15 @@ async fn resolve_exec(state: &AppState, conv_id: &str) -> Result<(PathBuf, codin
         Ok(()) => true,
         Err(e) => {
             // 仅在「重新探测」(缓存未命中)时走到这里,故 30s 内最多推一次,不会刷屏。
-            // 同步推前端弹窗:让用户明确知道命令已退回本机(未隔离),而不是只埋在日志里。
             let reason = e.to_string();
             tracing::warn!("Docker 沙盒不可用,回退本机执行: {reason}");
-            let _ = state
+            let _ = ctx
                 .app_handle
                 .emit("coding-sandbox-fallback", json!({ "reason": reason }));
             false
         }
     };
-    sandbox_cache_store(state, &container, &image, docker_ok);
+    sandbox_cache_store(&ctx.sandbox_ready, &container, &image, docker_ok);
     Ok((ws, exec_for(docker_ok, container, workdir)))
 }
 
@@ -168,8 +205,8 @@ fn exec_for(docker_ok: bool, container: String, workdir: String) -> coding::Exec
 }
 
 /// 读就绪缓存:命中(同容器 / 镜像 + 未过期)返回 Some(docker_ok),否则 None(需重验)。
-fn sandbox_cached(state: &AppState, container: &str, image: &str) -> Option<bool> {
-    let g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+fn sandbox_cached(ready: &Mutex<SandboxReady>, container: &str, image: &str) -> Option<bool> {
+    let g = ready.lock().unwrap_or_else(|e| e.into_inner());
     let fresh = g
         .verified_at
         .map(|t| t.elapsed() < SANDBOX_VERIFY_TTL)
@@ -182,8 +219,8 @@ fn sandbox_cached(state: &AppState, container: &str, image: &str) -> Option<bool
 }
 
 /// 写就绪缓存。
-fn sandbox_cache_store(state: &AppState, container: &str, image: &str, docker_ok: bool) {
-    let mut g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+fn sandbox_cache_store(ready: &Mutex<SandboxReady>, container: &str, image: &str, docker_ok: bool) {
+    let mut g = ready.lock().unwrap_or_else(|e| e.into_inner());
     g.verified_at = Some(std::time::Instant::now());
     g.docker_ok = docker_ok;
     g.container = container.to_string();
@@ -191,14 +228,14 @@ fn sandbox_cache_store(state: &AppState, container: &str, image: &str, docker_ok
 }
 
 /// 失效就绪缓存(配置变更 / 手动启停后强制下次重验)。
-fn sandbox_cache_invalidate(state: &AppState) {
-    let mut g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+fn sandbox_cache_invalidate(ready: &Mutex<SandboxReady>) {
+    let mut g = ready.lock().unwrap_or_else(|e| e.into_inner());
     g.verified_at = None;
 }
 
 /// 缓存里当前是否判定为 Docker 模式(供 dev server 清残留时判断要不要进容器操作)。
-fn sandbox_uses_docker(state: &AppState) -> bool {
-    let g = state.sandbox_ready.lock().unwrap_or_else(|e| e.into_inner());
+fn sandbox_uses_docker(ready: &Mutex<SandboxReady>) -> bool {
+    let g = ready.lock().unwrap_or_else(|e| e.into_inner());
     g.verified_at.is_some() && g.docker_ok
 }
 
@@ -469,7 +506,7 @@ pub async fn list_workspace_files(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<String>> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let mut files: Vec<String> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.clone()];
@@ -507,7 +544,7 @@ pub async fn read_workspace_file(
     conversation_id: String,
     path: String,
 ) -> Result<String> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     let bytes = tokio::fs::read(&full)
@@ -534,7 +571,7 @@ pub async fn write_workspace_file(
     path: String,
     content: String,
 ) -> Result<()> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     if let Some(parent) = full.parent() {
@@ -666,12 +703,12 @@ async fn create_container(base: &Path, image: &str, container: &str) -> Result<(
 /// 强制重建沙盒容器(删旧 + 用正确挂载新建)。用于旧容器挂载错误 / 想换镜像时一键修复。
 #[tauri::command]
 pub async fn sandbox_recreate(state: State<'_, AppState>) -> Result<String> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let _ = docker(&["rm", "-f", &container]).await;
     create_container(&base, &image, &container).await?;
-    sandbox_cache_invalidate(&state); // 容器已重建,下次动作重验
+    sandbox_cache_invalidate(&state.sandbox_ready); // 容器已重建,下次动作重验
     Ok(format!("沙盒容器 {container} 已重建并正确挂载工作区"))
 }
 
@@ -766,18 +803,18 @@ pub async fn set_sandbox_config(
         if c.is_empty() { DEFAULT_SANDBOX_CONTAINER } else { c },
     )
     .await?;
-    sandbox_cache_invalidate(&state); // 容器名 / 镜像变了,旧就绪结论作废
+    sandbox_cache_invalidate(&state.sandbox_ready); // 容器名 / 镜像变了,旧就绪结论作废
     Ok(())
 }
 
 /// 手动拉起沙盒容器(按需 pull 镜像)。返回状态文本。
 #[tauri::command]
 pub async fn sandbox_start(state: State<'_, AppState>) -> Result<String> {
-    let base = workspace_base(&state, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
     let image = secret_or(&state.db, SANDBOX_IMAGE_KEY, DEFAULT_SANDBOX_IMAGE).await;
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     ensure_container(&base, &image, &container).await?;
-    sandbox_cache_invalidate(&state); // 手动拉起后重验,确保结论与实际一致
+    sandbox_cache_invalidate(&state.sandbox_ready); // 手动拉起后重验,确保结论与实际一致
     Ok(format!("沙盒容器 {container} 已就绪(镜像 {image})"))
 }
 
@@ -786,7 +823,7 @@ pub async fn sandbox_start(state: State<'_, AppState>) -> Result<String> {
 pub async fn sandbox_stop(state: State<'_, AppState>) -> Result<()> {
     let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
     let _ = docker(&["stop", "-t", "2", &container]).await;
-    sandbox_cache_invalidate(&state); // 容器已停,下次动作重验(会重新 start)
+    sandbox_cache_invalidate(&state.sandbox_ready); // 容器已停,下次动作重验(会重新 start)
     Ok(())
 }
 
@@ -873,7 +910,7 @@ fn strip_ansi(s: &str) -> String {
             // CSI 序列 `ESC [ 参数… 字母`:吞到结束字母(如 m / K)为止
             if chars.peek() == Some(&'[') {
                 chars.next();
-                while let Some(c2) = chars.next() {
+                for c2 in chars.by_ref() {
                     if c2.is_ascii_alphabetic() {
                         break;
                     }
@@ -1132,7 +1169,7 @@ pub async fn start_dev_server(
 pub async fn stop_dev_server(state: State<'_, AppState>) -> Result<()> {
     stop_dev_inner(&state.dev_server);
     // Docker 模式:连容器内残留一并清掉(host 模式不进容器,避免无谓的 docker exec 调用)
-    if sandbox_uses_docker(&state) {
+    if sandbox_uses_docker(&state.sandbox_ready) {
         let container = secret_or(&state.db, SANDBOX_CONTAINER_KEY, DEFAULT_SANDBOX_CONTAINER).await;
         cleanup_container_dev(&container).await;
     }
@@ -1196,7 +1233,7 @@ pub async fn get_dev_server_status(state: State<'_, AppState>) -> Result<DevServ
     Ok(DevServerStatus { running, port, command, logs, conversation_id })
 }
 
-/// 关键词启发式分类:覆盖 coding / rpa / computer 信号,其余归 chat。
+/// 关键词启发式分类:覆盖 coding / rpa / computer / local 信号,其余归 chat。
 fn classify_by_keywords(text: &str) -> &'static str {
     let lower = text.to_lowercase();
     // 浏览器自动化(RPA)信号优先判:这些词较明确,且可能混入 coding 词(打开 / 运行)
@@ -1230,15 +1267,29 @@ fn classify_by_keywords(text: &str) -> &'static str {
     {
         return "rpa";
     }
-    // 电脑操作(桌面级:截图 / 鼠标键盘 / 窗口 / 进程 / 启动程序),优先于 coding——
-    // 避免"打开 / 运行 / 文件"这类词被 coding 信号吃掉。
+    // 本机助手(文件 / 进程 / 终端,纯文本工具、不看屏):优先于 computer 与 coding 判定,
+    // 让「读写删本机文件 / 查杀进程 / 跑命令」这类**不看屏**的请求落到 local,而非 GUI computer 或沙箱 coding。
+    const LOCAL_SIGNALS: &[&str] = &[
+        // 文件 / 磁盘
+        "本机文件", "本地文件", "读取文件", "写入文件", "写文件", "删除文件", "移动文件",
+        "重命名文件", "复制文件", "查找文件", "列目录", "列出目录", "新建文件夹", "建文件夹",
+        "d盘", "c盘", "e盘", "f盘", "磁盘", "我的电脑", "此电脑", "多少文件", "多少个文件",
+        "文件数量", "统计文件",
+        // 进程 / 系统
+        "进程", "任务管理器", "结束进程", "杀进程", "查进程", "进程列表", "环境变量",
+        "系统信息",
+        // 终端(限定「本机/本地」语境,避免抢走 coding 的工作区终端请求)
+        "本机终端", "本地终端", "本机命令", "本地命令", "在本机", "在本地",
+    ];
+    if LOCAL_SIGNALS.iter().any(|k| lower.contains(k)) {
+        return "local";
+    }
+    // 电脑操作(GUI:看屏 / 鼠标键盘 / 窗口 / 控件 / 启动程序),优先于 coding——
+    // 避免"打开 / 运行"这类词被 coding 信号吃掉。文件 / 进程 / 终端类已在上面归 local。
     const COMPUTER_SIGNALS: &[&str] = &[
         "截图", "截屏", "屏幕", "桌面", "鼠标", "键盘", "剪贴板", "打开程序", "启动程序",
-        "打开软件", "打开应用", "切换窗口", "关闭窗口", "任务管理器", "结束进程", "杀进程",
+        "打开软件", "打开应用", "切换窗口", "关闭窗口",
         "电脑操作", "操作电脑", "控制电脑", "识别屏幕", "看屏幕",
-        // 本地文件 / 磁盘类(纯统计 / 整理本地文件也归电脑操作:走 fs/system 工具,而非纯聊天空答)
-        "d盘", "c盘", "e盘", "f盘", "磁盘", "我的电脑", "此电脑", "本地文件",
-        "多少文件", "多少个文件", "文件数量", "统计文件",
     ];
     if COMPUTER_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "computer";
@@ -1262,10 +1313,79 @@ fn classify_by_keywords(text: &str) -> &'static str {
     }
 }
 
-/// 意图分类:判断首条消息走哪个 Agent,返回 "coding" / "rpa" / "computer" / "chat"。
-/// 纯关键词判定——不再做 LLM 兜底分类,新会话首条少一次 LLM 往返、显著加快首条响应。
-/// 代价:个别无明显关键词的 agent 任务会被当普通聊天(用户可换措辞或直接进对应 Agent)。
-/// provider_id / model 保留以兼容前端调用签名(暂不使用)。
+/// LLM 兜底路由提示词:把每个 Agent 写成「负责什么 + 何时选 + 何时别选」三段式(负向边界防误路由)。
+/// description 几乎等于路由准确率本身,优先打磨这里的「不要选我」部分。
+const ROUTER_PROMPT: &str = "你是一个意图路由器。把用户这句话归到下面某一个助手,只输出它的英文 key,不要任何解释或标点。\n\
+- chat:普通对话 / 知识问答 / 闲聊 / 写作建议。用户只是聊天、问知识、要想法时选它;要在本机或网页上「实际执行操作」时不要选它。\n\
+- coding:写 / 改 / 调试代码,在隔离工作区里跑项目命令。涉及代码、脚本、报错、某编程语言或框架时选它;只是操作本机文件 / 进程或网页时不要选它。\n\
+- rpa:在内嵌浏览器里自动操作网页(打开网站、点按钮、填表单、抓页面数据)。任务发生在某个网站 / 网页上时选它;是本机文件 / 程序操作、不涉及网页时不要选它。\n\
+- computer:看屏幕 + 操作鼠标键盘 / 窗口 / 控件(GUI 自动化)。需要截图看屏、点桌面程序的按钮、操作窗口时选它;只是读写文件 / 查进程 / 跑命令(不看屏)时不要选它。\n\
+- local:本机文件 / 进程 / 终端操作(读写删文件、查 / 杀进程、跑命令行)。在本机管理文件、查系统、跑命令时选它;任务在网页里、或需要看屏点 GUI 时不要选它。\n\
+只输出一个 key:chat、coding、rpa、computer 或 local。";
+
+/// 关键词落到 chat 时,判断这句话是否「像个可执行任务」(值得用 LLM 复核),而非纯闲聊 / 知识问答。
+/// 用一小撮祈使动作词作门槛:纯问候 / 知识问题不带这些词 → 直接走 chat,不浪费一次 LLM 往返。
+fn looks_actionable(lower: &str) -> bool {
+    const ACTION_HINTS: &[&str] = &[
+        "帮我", "帮忙", "打开", "运行", "执行", "启动", "查一下", "查询", "查找", "搜一下",
+        "搜索", "找一下", "下载", "安装", "生成", "写个", "写一个", "创建", "新建", "删除",
+        "整理", "统计", "操作", "处理", "把", "给我", "自动",
+    ];
+    ACTION_HINTS.iter().any(|k| lower.contains(k))
+}
+
+/// 从 LLM 输出里解析路由标签(容忍多余文字 / 标点):命中 5 个 key 之一返回,否则 None。
+/// 各 key 互不为子串,按出现即取,顺序不影响正确性。
+fn parse_route_label(content: &str) -> Option<&'static str> {
+    let lower = content.to_lowercase();
+    ["coding", "computer", "local", "rpa", "chat"]
+        .into_iter()
+        .find(|k| lower.contains(k))
+}
+
+/// LLM 兜底意图分类:把 5 个 Agent 当「带三段式 description 的选项」让模型二选一。
+/// 用会话选用的厂商 / 模型做一次低温短输出;调用 / 解析失败返回 None,由调用方回退关键词结果。
+async fn llm_route_tiebreak(
+    db: &sea_orm::DatabaseConnection,
+    provider_id: &str,
+    model: &str,
+    text: &str,
+) -> Option<&'static str> {
+    let provider = provider_entity::Entity::find_by_id(provider_id.to_string())
+        .one(db)
+        .await
+        .ok()??;
+    let provider_ref = ProviderRef {
+        kind: ProviderKind::from_code(&provider.code),
+        api_url: provider.api_url,
+        api_key: provider.api_key,
+        model: model.to_string(),
+    };
+    let messages = [
+        ChatMsg::System(ROUTER_PROMPT.to_string()),
+        ChatMsg::User(text.to_string()),
+    ];
+    // 低温 + 极短输出:只要一个 key
+    let options = LlmOptions {
+        temperature: Some(0.0),
+        max_tokens: Some(16),
+    };
+    let resp = provider_for(provider_ref.kind)
+        .chat(LlmRequest {
+            provider: &provider_ref,
+            messages: &messages,
+            tools: &[],
+            options: &options,
+        })
+        .await
+        .ok()?;
+    parse_route_label(resp.content.as_deref().unwrap_or_default())
+}
+
+/// 意图分类:判断首条消息走哪个 Agent,返回 "coding" / "rpa" / "computer" / "local" / "chat"。
+/// 混合策略:先关键词(零延迟);仅当关键词落到 chat、且这句话像个「可执行任务」时,才用一次
+/// LLM 在「agent 即 tool(三段式 description)」里二选一——把 LLM 成本只花在不确定的少数 case,
+/// 既保留首条响应快、又兜住无明显关键词的 agent 任务。每次决策都落 agent_route_logs 遥测。
 #[tauri::command]
 pub async fn classify_agent_type(
     state: State<'_, AppState>,
@@ -1273,8 +1393,206 @@ pub async fn classify_agent_type(
     provider_id: Option<String>,
     model: Option<String>,
 ) -> Result<String> {
-    let _ = (&state, &provider_id, &model);
-    Ok(classify_by_keywords(&text).to_string())
+    let keyword = classify_by_keywords(&text);
+    let lower = text.to_lowercase();
+
+    // 兜底闸门:仅关键词没命中任何领域(chat)、且像可执行任务时,才用 LLM 复核
+    let mut llm_route: Option<&'static str> = None;
+    let mut used_model = String::new();
+    if keyword == "chat" && looks_actionable(&lower) {
+        if let (Some(pid), Some(m)) = (provider_id.as_deref(), model.as_deref()) {
+            if let Some(route) = llm_route_tiebreak(&state.db, pid, m, &text).await {
+                llm_route = Some(route);
+                used_model = m.to_string();
+            }
+        }
+    }
+    let final_route = llm_route.unwrap_or(keyword);
+
+    // 落遥测(失败仅忽略,不影响路由):路由优化的唯一抓手
+    let owner = current_user(&state).map(|u| u.name).unwrap_or_default();
+    let _ = agent_route_log::Model::record(
+        &state.db,
+        &owner,
+        &text,
+        keyword,
+        llm_route,
+        final_route,
+        &used_model,
+    )
+    .await;
+
+    Ok(final_route.to_string())
+}
+
+/// 一条路由遥测的对外视图(字段对应前端 camelCase)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteLogView {
+    pub id: i64,
+    pub text: String,
+    pub keyword_route: String,
+    pub llm_used: bool,
+    pub llm_route: String,
+    pub final_route: String,
+    pub model: String,
+    pub owner: String,
+    pub created_at: i64,
+}
+
+/// 列出最近的意图路由遥测(默认 200 条、上限 2000,按时间倒序),供分析路由准确率 / 排查误路由。
+#[tauri::command]
+pub async fn list_agent_route_logs(
+    state: State<'_, AppState>,
+    limit: Option<u64>,
+) -> Result<Vec<RouteLogView>> {
+    let rows = agent_route_log::Entity::find()
+        .order_by_desc(agent_route_log::Column::Id)
+        .limit(limit.unwrap_or(200).min(2000))
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("读取路由遥测失败: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RouteLogView {
+            id: r.id,
+            text: r.text,
+            keyword_route: r.keyword_route,
+            llm_used: r.llm_used,
+            llm_route: r.llm_route,
+            final_route: r.final_route,
+            model: r.model,
+            owner: r.owner,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Coding Agent 钩子:处理 Plan/Act 模式、自主续航、自动修复、验证闸门等。
+struct CodingHooks {
+    db: sea_orm::DatabaseConnection,
+    conversation_id: String,
+    /// 与 AppState 共享的「请求停止」集合句柄:on_iter_end 每步消费本会话的取消标志。
+    agent_cancel: Arc<Mutex<std::collections::HashSet<String>>>,
+    autonomous: bool,
+    auto_fix_used: usize,
+    continue_used: usize,
+    last_run_failed: bool,
+    goal_done: bool,
+    finish_summary: Option<String>,
+    code_edited_since_verify: bool,
+    verify_gate_used: usize,
+    latest_todos: Value,
+}
+
+impl CodingHooks {
+    /// 取出并消费本会话的「请求停止」标志:存在则移除并返回 true(供自主续航每步检查)。
+    fn take_cancel(&self) -> bool {
+        let mut set = self.agent_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.conversation_id)
+    }
+}
+
+// on_before_tool 不覆盖(用默认放行),故无需 async_trait;其余钩子均为同步。
+impl ReactHooks for CodingHooks {
+    fn on_after_tool(&mut self, name: &str, args: &Value, result: &ToolResult) -> ToolPostAction {
+        // 追踪 run_command 失败
+        if name == "run_command" && result.is_error {
+            self.last_run_failed = true;
+        }
+        // 追踪「改了代码但还没成功验证」
+        if !result.is_error {
+            match name {
+                "write_file" | "replace_in_file" => {
+                    if let Some(path) = args.get("path").and_then(Value::as_str) {
+                        if coding::is_code_file(path) {
+                            self.code_edited_since_verify = true;
+                        }
+                    }
+                }
+                "run_command" => self.code_edited_since_verify = false,
+                _ => {}
+            }
+        }
+        // 拦截 update_plan:把模型给的完整 todo 清单落库到会话
+        if name == "update_plan" && !result.is_error {
+            if let Some(todos) = args.get("todos") {
+                self.latest_todos = todos.clone();
+                let db = self.db.clone();
+                let cid = self.conversation_id.clone();
+                let todos_str = todos.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let _ = conv::Entity::update_many()
+                        .col_expr(conv::Column::PlanTodos, sea_orm::sea_query::Expr::value(todos_str))
+                        .filter(conv::Column::Id.eq(cid))
+                        .exec(&db)
+                        .await;
+                });
+            }
+        }
+        // 拦截 finish:模型显式声明整个任务完成
+        if name == "finish" && !result.is_error {
+            self.goal_done = true;
+            self.finish_summary = args
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        ToolPostAction::Continue
+    }
+
+    fn on_model_finish(&mut self, content: Option<String>) -> FinishDecision {
+        // run_command 失败后自动修复
+        if self.last_run_failed && self.auto_fix_used < AUTO_FIX_MAX {
+            self.auto_fix_used += 1;
+            self.last_run_failed = false;
+            return FinishDecision::ContinueWithPrompt(coding::auto_fix_prompt(self.auto_fix_used));
+        }
+        // 自主续航:模型过早收尾但计划仍有未完成项
+        if self.autonomous
+            && !self.goal_done
+            && has_unfinished_todos(&self.latest_todos)
+            && self.continue_used < MAX_CONTINUES
+        {
+            self.continue_used += 1;
+            return FinishDecision::ContinueWithPrompt(coding::auto_continue_prompt());
+        }
+        FinishDecision::Finish(content.unwrap_or_default())
+    }
+
+    fn on_iter_end(&mut self, iter: usize) -> IterDecision {
+        let max_iters = if self.autonomous { MAX_AUTO_ITERS } else { MAX_ITERS };
+        // 用户手动停止:每步检查并消费取消标志,命中则优雅收尾(不强杀,保证落库一致)。
+        // 旧实现把此检查丢在循环外只跑一次,导致「停止」按钮对续航中的 Agent 失效。
+        if self.take_cancel() {
+            return IterDecision::Finish("已按用户请求停止。".to_string());
+        }
+        // 模型声明完成 → 收尾
+        if self.goal_done {
+            // 硬验证闸门:改了代码却没成功跑过验证就想收尾 → 注入验证提示,逼它先验证再收尾
+            if self.code_edited_since_verify && self.verify_gate_used < MAX_VERIFY_GATE {
+                self.verify_gate_used += 1;
+                self.goal_done = false;
+                self.finish_summary = None;
+                return IterDecision::InjectAndContinue(coding::verify_before_finish_prompt());
+            }
+            return IterDecision::Finish(
+                self.finish_summary
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "任务已完成。".to_string()),
+            );
+        }
+        // 达上限
+        if iter == max_iters - 1 {
+            return IterDecision::Finish(if self.autonomous {
+                format!("(已达自主续航上限 {max_iters} 步,先停下。可继续追问以推进。)")
+            } else {
+                format!("(已达最大步数 {max_iters},已停止。可继续追问以推进。)")
+            });
+        }
+        IterDecision::Continue
+    }
 }
 
 /// 发送一条用户消息,驱动编程 Agent 的 ReAct 循环;过程逐步落库 + 推 `agent-step` 进度事件,
@@ -1303,30 +1621,32 @@ pub async fn send_coding_message(
     // 本轮开始前打检查点(git commit,带本轮提问作标签),供版本回退识别快照对应哪次任务
     coding::checkpoint(&workspace, &exec, &text).await;
     let registry = coding::build_registry(workspace, exec, agent_mode);
-    let tool_defs = registry.defs();
 
+    // 构建上下文:系统提示词 + 滚动摘要 + live 原文窗口
+    let mut messages: Vec<ChatMsg> = Vec::new();
     // 按模式选系统提示词:Plan 只引导出方案(配合 build_registry 只挂只读工具),Act 亲自动手
     let system_prompt = match agent_mode {
         coding::AgentMode::Plan => coding::PLAN_SYSTEM_PROMPT,
         coding::AgentMode::Act => coding::SYSTEM_PROMPT,
     };
-    let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(system_prompt.to_string())];
-    // 用户可编辑的附加规范(<config_dir>/agent-guidelines/coding.md):有则注入,无需改代码/硬编码
+    messages.push(ChatMsg::System(system_prompt.to_string()));
+    // 用户可编辑的附加规范(<config_dir>/agent-guidelines/coding.md):有则注入
     if let Some(g) = load_agent_guidelines(&state.config_dir, "coding").await {
         messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
     }
-    // 会话滚动摘要:早期消息压缩后的前情提要,注入在原文之前(为空则不注入)
+    // 会话滚动摘要
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
-        if let Some(text) = sys.get("content").and_then(|v| v.as_str()) {
-            messages.push(ChatMsg::System(text.to_string()));
+        if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
+            messages.push(ChatMsg::System(summary_text.to_string()));
         }
     }
-    // Act 模式且已有计划:注入当前 todo 清单,引导按序执行并用 update_plan 勾选进度
+    // Act 模式且已有计划:注入当前 todo 清单
     if matches!(agent_mode, coding::AgentMode::Act) {
         if let Some(plan_sys) = coding::plan_system_message(&conversation.plan_todos) {
             messages.push(ChatMsg::System(plan_sys));
         }
     }
+    // live 原文窗口
     messages.extend(live_windowed_messages(&state.db, &conversation).await?);
 
     let provider_ref = ProviderRef {
@@ -1335,205 +1655,144 @@ pub async fn send_coding_message(
         api_key: provider.api_key.clone(),
         model: conversation.model.clone(),
     };
-    let llm = provider_for(provider_ref.kind);
-    // 低温:编程 Agent 要的是精准、确定、可复现的代码与工具调用,而非发散创作
-    let options = LlmOptions {
-        temperature: Some(0.2),
-        ..LlmOptions::default()
-    };
 
-    let emit = |label: String| {
-        let _ = app.emit(
-            "agent-step",
-            json!({ "conversationId": &conversation_id, "label": label }),
-        );
-    };
-
-    // 自主续航:Act 模式默认开启——内层步数跑满或模型「过早收尾但计划仍有未完成项」时自动续写,
-    // 直到模型调 finish / 计划全完 / 触发预算 / 被手动停。Plan 模式只出方案,不续航。
+    // 自主续航:Act 模式默认开启
     let autonomous = matches!(agent_mode, coding::AgentMode::Act);
     let max_iters = if autonomous { MAX_AUTO_ITERS } else { MAX_ITERS };
     // 进入前清除可能残留的取消标志,避免误停本次
     let _ = take_agent_cancel(&state, &conversation_id);
-    // 计划进度:初始化为会话已存 todos,update_plan 时同步;用于「是否还有未完成项」判定续航
-    let mut latest_todos: Value =
-        serde_json::from_str(&conversation.plan_todos).unwrap_or(Value::Null);
 
-    // ReAct 循环。auto_fix:run_command 失败后模型若想直接收尾,自动注入引导再修(有配额防卡死)
-    let mut final_text = String::new();
-    // 模型「无工具调用、直接收尾」那步的思考过程(其余收尾路径无对应推理,保持 None)
-    let mut final_reasoning: Option<String> = None;
-    let mut auto_fix_used = 0usize;
-    let mut continue_used = 0usize;
-    let mut last_run_failed = false;
-    let mut goal_done = false;
-    let mut finish_summary: Option<String> = None;
-    // 硬验证闸门:改了代码文件却没成功跑过验证命令就想收尾 → 打回强制先验证(有上限,避免困死)
-    let mut code_edited_since_verify = false;
-    let mut verify_gate_used = 0usize;
-    const MAX_VERIFY_GATE: usize = 2;
-    for iter in 0..max_iters {
-        // 手动停:命中即优雅收尾(下一步检查点生效)
-        if autonomous && take_agent_cancel(&state, &conversation_id) {
-            final_text = "(已手动停止自主续航。可继续追问以推进。)".to_string();
-            break;
-        }
-        emit(format!("思考中…(第 {} 步)", iter + 1));
-        let resp = llm
-            .chat(LlmRequest {
-                provider: &provider_ref,
-                messages: &messages,
-                tools: &tool_defs,
-                options: &options,
-            })
-            .await?;
+    let config = ReactConfig {
+        max_iters,
+        temperature: 0.2, // 低温:编程 Agent 要精准、确定、可复现的代码与工具调用
+        enable_streaming: true, // 启用流式输出
+        context_window_size: 120, // 编程场景需要更大的上下文窗口
+        enable_parallel_tools: false, // 编程场景禁用并行，确保执行顺序
+        max_retries: 2, // LLM 调用失败时重试 2 次
+        auto_fix_on_tool_error: false, // 编程场景已有自己的自动修复逻辑
+    };
 
-        // 无工具调用 → 模型想收尾
-        if resp.tool_calls.is_empty() {
-            // 但若刚才有 run_command 失败且仍有配额 → 不收尾,注入引导逼它修复后重试
-            if last_run_failed && auto_fix_used < AUTO_FIX_MAX {
-                auto_fix_used += 1;
-                last_run_failed = false;
-                emit(format!("命令未通过,自动尝试修复…(第 {auto_fix_used} 次)"));
-                // 把模型这轮的话纳入上下文(让它记得刚说过什么),再追加修复引导
-                if resp.content.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
-                    messages.push(ChatMsg::Assistant {
-                        text: resp.content.clone(),
-                        tool_calls: vec![],
-                    });
-                }
-                messages.push(ChatMsg::User(coding::auto_fix_prompt(auto_fix_used)));
-                continue;
-            }
-            // 自主续航:模型过早收尾但计划仍有未完成项 → 注入续写提示推进(限次数防空转)
-            if autonomous
-                && !goal_done
-                && has_unfinished_todos(&latest_todos)
-                && continue_used < MAX_CONTINUES
-            {
-                continue_used += 1;
-                emit(format!("自主推进下一步…(第 {continue_used} 次)"));
-                if resp.content.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
-                    messages.push(ChatMsg::Assistant {
-                        text: resp.content.clone(),
-                        tool_calls: vec![],
-                    });
-                }
-                messages.push(ChatMsg::User(coding::auto_continue_prompt()));
-                continue;
-            }
-            final_reasoning = resp.reasoning.clone();
-            final_text = resp.content.unwrap_or_default();
-            break;
-        }
+    let mut hooks = CodingHooks {
+        db: state.db.clone(),
+        conversation_id: conversation_id.clone(),
+        agent_cancel: state.agent_cancel.clone(),
+        autonomous,
+        auto_fix_used: 0,
+        continue_used: 0,
+        last_run_failed: false,
+        goal_done: false,
+        finish_summary: None,
+        code_edited_since_verify: false,
+        verify_gate_used: 0,
+        latest_todos: serde_json::from_str(&conversation.plan_todos).unwrap_or(Value::Null),
+    };
 
-        // 落库 assistant(带 tool_calls)+ 推入内存上下文
-        insert_assistant_tool_calls(&state.db, &conversation_id, &resp).await?;
-        messages.push(ChatMsg::Assistant {
-            text: resp.content.clone(),
-            tool_calls: resp.tool_calls.clone(),
-        });
+    let result = crate::agent::core::react::react_run(
+        &state.db,
+        &app,
+        &conversation_id,
+        &provider_ref,
+        config,
+        &mut hooks,
+        &registry,
+        &mut messages,
+    )
+    .await?;
 
-        // 逐个执行工具,结果落库 + 回灌;记录本轮是否有 run_command 失败(供自动续修判定)
-        let mut run_failed = false;
-        for call in &resp.tool_calls {
-            emit(format!("🔧 {}", call.name));
-            let result = registry.run(&call.name, call.arguments.clone()).await;
-            let flag = if result.is_error { "✗" } else { "✓" };
-            emit(format!("{flag} {}", call.name));
-            if call.name == "run_command" && result.is_error {
-                run_failed = true;
-            }
-            // 追踪「改了代码但还没成功验证」:写/改代码文件置真,成功跑命令(视为验证)置假
-            if !result.is_error {
-                match call.name.as_str() {
-                    "write_file" | "replace_in_file" => {
-                        if call
-                            .arguments
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .map(coding::is_code_file)
-                            .unwrap_or(false)
-                        {
-                            code_edited_since_verify = true;
-                        }
-                    }
-                    "run_command" => code_edited_since_verify = false,
-                    _ => {}
-                }
-            }
-            // 拦截 update_plan:把模型给的完整 todo 清单落库到会话(工具层不碰 DB,持久化在此保持分层)
-            if call.name == "update_plan" && !result.is_error {
-                if let Some(todos) = call.arguments.get("todos") {
-                    latest_todos = todos.clone(); // 同步本地进度,供续航判定
-                    let _ = conv::Entity::update_many()
-                        .col_expr(
-                            conv::Column::PlanTodos,
-                            sea_orm::sea_query::Expr::value(todos.to_string()),
-                        )
-                        .filter(conv::Column::Id.eq(&conversation_id))
-                        .exec(&state.db)
-                        .await;
-                }
-            }
-            // 拦截 finish:模型显式声明整个任务完成 → 结束自主续航
-            if call.name == "finish" && !result.is_error {
-                goal_done = true;
-                finish_summary = call
-                    .arguments
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-            insert_tool_result(&state.db, &conversation_id, call, &result.content).await?;
-            messages.push(ChatMsg::Tool {
-                tool_call_id: call.id.clone(),
-                content: result.content,
-            });
-        }
-        last_run_failed = run_failed;
-
-        // 模型声明完成 → 收尾(用 finish 的 summary,否则给个默认收尾语)
-        if goal_done {
-            // 硬验证闸门:改了代码却没成功跑过验证就想收尾 → 打回逼它先验证(有上限,避免困死)
-            if code_edited_since_verify && verify_gate_used < MAX_VERIFY_GATE {
-                verify_gate_used += 1;
-                goal_done = false;
-                finish_summary = None;
-                emit(format!("收尾前需先验证(第 {verify_gate_used} 次)"));
-                messages.push(ChatMsg::User(coding::verify_before_finish_prompt()));
-                continue;
-            }
-            final_text = finish_summary
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "任务已完成。".to_string());
-            break;
-        }
-
-        // 达上限:强制收尾
-        if iter == max_iters - 1 {
-            final_text = if autonomous {
-                format!("(已达自主续航上限 {max_iters} 步,先停下。可继续追问以推进。)")
-            } else {
-                format!("(已达最大步数 {max_iters},已停止。可继续追问以推进。)")
-            };
-        }
-    }
+    // 记录 token 用量(多步 ReAct 累计;source=coding 供账单按场景拆分)
+    let _ = veltrix_core::db::entity::model_usage_record::Model::record(
+        &state.db,
+        &conversation.model,
+        &provider.id,
+        result.usage.prompt,
+        result.usage.completion,
+        "coding",
+        &me.name,
+    )
+    .await;
 
     // 落库最终 assistant 消息
-    let final_msg =
-        insert_final_assistant(&state.db, &conversation_id, final_text, final_reasoning).await?;
-    emit("完成".to_string());
+    let final_msg = insert_final_assistant(
+        &state.db,
+        &conversation_id,
+        result.final_text,
+        result.final_reasoning,
+    )
+    .await?;
 
-    // 更新会话时间;首轮用用户首句起标题(统一走 core::shared)
+    // 更新会话时间;首轮用用户首句起标题
     finalize_conversation_meta(&state.db, conversation, had_messages, &text).await;
 
-    // 滚动摘要维护:本轮工具往返可能产生很多消息,live 过长时把较旧的折叠进会话摘要,
-    // 异步进行不阻塞返回。会话模型作 fallback,命中 Summary 角色配置则改走便宜模型。
+    // 滚动摘要维护
     spawn_coding_summary_maintenance(&state.db, &conversation_id, provider_ref);
 
     Ok(final_msg.into())
+}
+
+/// 把一段编程任务作为「子任务」在指定会话(通常是编排器会话)下跑完,返回最终文本。供编排器委派工具调用。
+/// 与 send_coding_message 的区别:固定 Act + 自主续航、不带会话历史(仅 system+task)、不落最终消息 / 不收尾。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_coding_subtask(
+    db: &sea_orm::DatabaseConnection,
+    app: &AppHandle,
+    exec_ctx: &CodingExecCtx,
+    config_dir: &Path,
+    agent_cancel: &Arc<Mutex<std::collections::HashSet<String>>>,
+    conversation_id: &str,
+    owner: &str,
+    provider_ref: &ProviderRef,
+    provider_id: &str,
+    task: &str,
+) -> Result<String> {
+    // 惰性解析执行环境(只有真委派 coding 才探测 docker)
+    let (workspace, exec) = resolve_exec_ctx(exec_ctx, conversation_id).await?;
+    coding::checkpoint(&workspace, &exec, task).await;
+    let registry = coding::build_registry(workspace, exec, coding::AgentMode::Act);
+
+    let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(coding::SYSTEM_PROMPT.to_string())];
+    if let Some(g) = load_agent_guidelines(config_dir, "coding").await {
+        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+    }
+    messages.push(ChatMsg::User(task.to_string()));
+
+    let config = ReactConfig {
+        max_iters: MAX_AUTO_ITERS,
+        temperature: 0.2,
+        enable_streaming: true,
+        context_window_size: 120,
+        enable_parallel_tools: false,
+        max_retries: 2,
+        auto_fix_on_tool_error: false,
+    };
+    let mut hooks = CodingHooks {
+        db: db.clone(),
+        conversation_id: conversation_id.to_string(),
+        agent_cancel: agent_cancel.clone(),
+        autonomous: true,
+        auto_fix_used: 0,
+        continue_used: 0,
+        last_run_failed: false,
+        goal_done: false,
+        finish_summary: None,
+        code_edited_since_verify: false,
+        verify_gate_used: 0,
+        latest_todos: Value::Null,
+    };
+    let result = crate::agent::core::react::react_run(
+        db, app, conversation_id, provider_ref, config, &mut hooks, &registry, &mut messages,
+    )
+    .await?;
+    let _ = veltrix_core::db::entity::model_usage_record::Model::record(
+        db,
+        &provider_ref.model,
+        provider_id,
+        result.usage.prompt,
+        result.usage.completion,
+        "coding",
+        owner,
+    )
+    .await;
+    Ok(result.final_text)
 }
 
 /// 取出并消费某会话的「请求停止」标志:存在则移除并返回 true(供自主续航循环每步检查点调用)。

@@ -65,7 +65,8 @@ pub async fn analyze_intent(req: IntentRequest<'_>) -> Result<Vec<IntentVerdict>
         // 评论文本体小,429/5xx 重试代价低
         retry_server_errors: true,
     })
-    .await?;
+    .await?
+    .content;
 
     Ok(parse_verdicts(&content))
 }

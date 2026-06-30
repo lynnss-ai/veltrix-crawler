@@ -6,6 +6,7 @@ import { ChatPage } from "@/pages/ChatPage";
 import { CodingLayout } from "@/components/coding-layout";
 import { RpaLayout } from "@/components/rpa-layout";
 import { ComputerLayout } from "@/components/computer-layout";
+import { LocalLayout } from "@/components/local-layout";
 
 export function ConversationShell() {
   const { conversations, activeId, pendingAgentType } = useChat();
@@ -15,5 +16,7 @@ export function ConversationShell() {
   if (agentType === "coding") return <CodingLayout />;
   if (agentType === "rpa") return <RpaLayout />;
   if (agentType === "computer") return <ComputerLayout />;
+  if (agentType === "local") return <LocalLayout />;
+  // orchestrator(默认)与 legacy chat 都走 ChatPage,由其内部按 agentType 切换发送/渲染
   return <ChatPage />;
 }

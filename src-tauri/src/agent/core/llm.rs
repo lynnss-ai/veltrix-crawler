@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -204,10 +205,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             return Err(CrawlerError::Config("厂商 api_url 为空".into()));
         }
         let endpoint = chat_endpoint(&req.provider.api_url);
+        // stream_options.include_usage:让厂商在流末发一帧 usage,否则多步 Agent 拿不到 token 用量
+        //(下方 SSE 解析已处理该帧);account/计费依赖此值。
         let mut body = json!({
             "model": req.provider.model,
             "messages": req.messages.iter().map(msg_to_openai).collect::<Vec<_>>(),
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
         if !req.tools.is_empty() {
             body["tools"] = Value::Array(req.tools.iter().map(tool_to_openai).collect());
@@ -723,21 +727,36 @@ pub trait Tool: Send + Sync {
 }
 
 /// 工具注册表:按 name 提供 schema 列表 + 分发执行。
-#[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    name_index: HashMap<String, usize>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            name_index: HashMap::new(),
+        }
     }
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        let idx = self.tools.len();
+        self.name_index.insert(tool.def().name.clone(), idx);
         self.tools.push(tool);
     }
     /// 合并另一个注册表的全部工具:组装「全能 Agent」时把多个独立工具模块聚合成一个注册表。
     pub fn merge(&mut self, other: ToolRegistry) {
+        let base = self.tools.len();
         self.tools.extend(other.tools);
+        for (name, idx) in other.name_index {
+            self.name_index.insert(name, base + idx);
+        }
     }
     /// 所有工具定义(发给 LLM)。
     pub fn defs(&self) -> Vec<ToolDef> {
@@ -745,7 +764,7 @@ impl ToolRegistry {
     }
     /// 按 name 执行;未知工具返回 is_error 结果(回灌模型而非中断)。
     pub async fn run(&self, name: &str, args: Value) -> ToolResult {
-        match self.tools.iter().find(|t| t.def().name == name) {
+        match self.name_index.get(name).and_then(|&idx| self.tools.get(idx)) {
             Some(t) => t.run(args).await,
             None => ToolResult::err(format!("未知工具: {name}")),
         }

@@ -1,4 +1,4 @@
-//! 智能体平台:每个智能体一个模块(chat / coding / rpa),共用 `core` 地基。
+//! 智能体平台:每个智能体一个模块(chat / coding / rpa / computer / local),共用 `core` 地基。
 //! 各智能体 = 一组工具 + 提示词 + IPC 命令 + ReAct 循环(命令、记忆、工具自洽于各自目录)。
 //! 横向扩展(加智能体)= 新增 `agent/<name>/` 并在此注册一行;纵向扩展(单智能体加深)在各模块内进行。
 
@@ -8,8 +8,10 @@ pub mod computer;
 pub mod core;
 pub mod desktop;
 pub mod fs;
+pub mod local;
 pub mod net;
 pub mod ocr;
+pub mod orchestrator;
 pub mod rpa;
 pub mod shell;
 pub mod system;
@@ -70,9 +72,9 @@ pub async fn capture_desktop_screenshot(target: Option<String>) -> std::result::
         .map_err(|e| format!("截屏任务异常: {e}"))?
 }
 
-/// 列出「电脑操作」基础设施提供的全部工具(桌面 GUI + 跨平台终端)。
-/// 这些工具是独立模块、尚未绑定到具体 Agent;本命令只读取工具定义(不触发任何实际操作),
-/// 供前端展示或将来编排 Agent 时挑选挂载。
+/// 列出各工具模块提供的全部工具(供前端展示工具清单 / 调试)。
+/// 这些模块已分别编排进具体 Agent:desktop/ocr/uia → computer(GUI);fs/system/shell → local(本机助手);
+/// net → rpa。本命令只读取工具定义(不触发任何实际操作),按模块罗列以便核对。
 #[tauri::command]
 pub fn list_agent_tools(app: AppHandle) -> Vec<AgentToolInfo> {
     let mut out = Vec::new();

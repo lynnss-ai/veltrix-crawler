@@ -12,7 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { checkForUpdate } from "@/lib/updater";
+import { checkForUpdate, currentVersion } from "@/lib/updater";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { ModeToggle } from "@/components/mode-toggle";
 import { DownloadHistory } from "@/components/DownloadHistory";
@@ -57,6 +57,14 @@ export function TitleBar({
 }: TitleBarProps) {
   // 最大化状态决定还原/最大化图标;监听窗口尺寸变化保持同步(拖拽贴边、双击标题栏等)
   const [isMaximized, setIsMaximized] = useState(false);
+  // 当前应用版本:用于「检查更新」按钮悬浮提示展示
+  const [appVersion, setAppVersion] = useState("");
+
+  useEffect(() => {
+    currentVersion()
+      .then(setAppVersion)
+      .catch((error) => console.warn("获取应用版本失败:", error));
+  }, []);
 
   useEffect(() => {
     const appWindow = getCurrentWindow();
@@ -81,7 +89,12 @@ export function TitleBar({
   }, []);
 
   return (
-    <header className="flex h-(--titlebar-h) shrink-0 items-center border-b bg-background select-none">
+    // 模态弹层(Sheet/Dialog)打开时 Radix 会给 body 设 pointer-events:none;这里显式放行 +
+    // data-app-titlebar 标记,保证窗口最小化/最大化/关闭与拖拽始终可用,并让弹层「点外部关闭」逻辑识别并忽略标题栏点击。
+    <header
+      data-app-titlebar
+      className="pointer-events-auto flex h-(--titlebar-h) shrink-0 items-center border-b bg-background select-none"
+    >
       {showSidebarTrigger && (
         <div className="flex items-center gap-0.5 pr-1 pl-2">
           <button
@@ -123,7 +136,12 @@ export function TitleBar({
             </SimpleTooltip>
           )}
           {showSidebarTrigger && (
-            <SimpleTooltip content="检查软件更新" side="bottom">
+            <SimpleTooltip
+              content={
+                appVersion ? `检查版本更新: V${appVersion}` : "检查软件更新"
+              }
+              side="bottom"
+            >
               <button
                 type="button"
                 onClick={() => checkForUpdate(false)}

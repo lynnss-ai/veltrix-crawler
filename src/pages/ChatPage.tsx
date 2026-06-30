@@ -6,7 +6,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import {
   Check,
@@ -28,6 +27,7 @@ import {
   RotateCcw,
   Send,
   Share,
+  Square,
   ThumbsDown,
   ThumbsUp,
   Trash2,
@@ -46,6 +46,7 @@ import {
   type ChatMessageView,
   type ContentView,
   type MessageAttachment,
+  type ModelCapability,
   type ProviderDto,
 } from "@/lib/api";
 import {
@@ -76,6 +77,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
+import { IconBtn } from "@/components/IconBtn";
 import { EmptyState } from "@/components/EmptyState";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
 import { ReasoningBlock } from "@/components/ReasoningBlock";
@@ -85,6 +87,8 @@ import {
   type AssetPickMode,
   type AssetPickResult,
 } from "@/components/content-picker-dialog";
+import { CodingWorkPanel } from "@/components/coding-work-panel";
+import { RpaWorkPanel } from "@/components/rpa-work-panel";
 import { useChat } from "@/hooks/use-chat";
 import { useScreenRecording } from "@/hooks/use-screen-recording";
 import {
@@ -98,12 +102,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-// 一个可选模型 = 厂商 + 模型名(value 用 "providerId::model" 编码)
+// 一个可选模型 = 厂商 + 模型名(value 用 "providerId::model" 编码)+ 能力集合
 interface ModelOption {
   providerId: string;
   providerName: string;
   model: string;
   value: string;
+  // 模型能力(text/vision/audio/video/tools):用于按能力开关「加号」里的图片项等
+  capabilities: ModelCapability[];
 }
 
 // 记住用户上次选用的模型(value=providerId::model),作为下次新会话的默认。
@@ -132,9 +138,52 @@ const FLUSH_INTERVAL_MS = 50;
 // 消息列表初始只渲染最近 N 条(避免切到长对话时一次性解析全部 Markdown 卡顿);可「加载更早」
 const CHAT_PAGE_SIZE = 30;
 
+// 「带工具的专门 Agent」类型(区别于纯对话 chat),用于意图分类后的交接判断
+function isAgentType(
+  type: string,
+): type is "coding" | "rpa" | "computer" | "local" {
+  return (
+    type === "coding" ||
+    type === "rpa" ||
+    type === "computer" ||
+    type === "local"
+  );
+}
+
+// 专门 Agent 的中文名(中途交接提示用)
+const AGENT_LABELS: Record<string, string> = {
+  coding: "编程",
+  rpa: "RPA 浏览器",
+  computer: "电脑操作",
+  local: "本机助手",
+};
+
+// AI 生成中加载:流光进度条(纯 CSS,无图标)。一道渐变高光在细胶囊条上从左扫到右、循环,无闪烁。
+// compact=只显示细条(输出中的「仍在生成」);否则细条 + 文字(首 token 前)。
+function ShimmerBar({ label, compact }: { label?: string; compact?: boolean }) {
+  const bar = (
+    <span
+      className={`relative inline-block h-1.5 overflow-hidden rounded-full bg-muted ${
+        compact ? "w-16" : "w-24"
+      }`}
+    >
+      <span className="absolute inset-y-0 left-0 w-1/3 rounded-full bg-gradient-to-r from-transparent via-primary to-transparent animate-[veltrix-shimmer_1.4s_linear_infinite]" />
+    </span>
+  );
+  if (compact) return bar;
+  return (
+    <div className="inline-flex items-center gap-2.5 text-sm text-muted-foreground">
+      {bar}
+      {label ?? "正在生成…"}
+    </div>
+  );
+}
+
 // 外部附件可选类型:图片 / PDF / Word / Excel / Markdown
 const EXTERNAL_ACCEPT =
   "image/*,.pdf,.doc,.docx,.xls,.xlsx,.md,.markdown";
+// 模型不支持图片时,外部附件去掉图片类型,只允许文档(与「资产图片」置灰一致,让加号内容匹配模型)
+const EXTERNAL_ACCEPT_NO_IMAGE = ".pdf,.doc,.docx,.xls,.xlsx,.md,.markdown";
 
 // 外部附件允许的扩展名(accept 仅是对话框默认过滤,落库前再按此校验拦截非法类型;
 // 图片优先按 MIME 判断,扩展名兜底)
@@ -213,6 +262,7 @@ function buildModelOptions(providers: ProviderDto[]): ModelOption[] {
         providerName: p.name,
         model,
         value: `${p.id}::${model}`,
+        capabilities: spec.capabilities,
       });
     }
   }
@@ -399,12 +449,35 @@ export function ChatPage() {
   const [sending, setSending] = useState(false);
   // 发送动作的同步重入锁:state 更新是异步的,光靠 sending 挡不住极快连点,用 ref 兜底
   const dispatchingRef = useRef(false);
+  // 中途交接提示:在 chat 会话里发出的消息被判为别的 Agent 的活时,暂存待发文本 + 目标类型,等用户拍板
+  const [handoffPrompt, setHandoffPrompt] = useState<{
+    text: string;
+    type: string;
+  } | null>(null);
+  // 危险操作待确认(编排器委派 computer/local 命中高危工具时,前端弹框回执;否则后端 180s 超时按拒绝)
+  const [confirmReq, setConfirmReq] = useState<{
+    confirmId: number;
+    tool: string;
+    args: Record<string, unknown>;
+  } | null>(null);
+  const pendingConfirmRef = useRef<number | null>(null);
   // 可用模型由共享 providers 派生(避免布局重挂载时各自重拉导致「尚无可用模型」竞态)
   const models = useMemo(() => buildModelOptions(providers), [providers]);
   // 新会话默认模型(value);开新会话时用它
   const [pickedModel, setPickedModel] = useState("");
   // 智能搜索开关(输入框加号右侧):开启后本轮对话走智能搜索增强(后端能力接入前先作为状态保留)
   const [smartSearch, setSmartSearch] = useState(false);
+  // 思考模式:开启才显示思考过程(实时 + 历史,默认展开);关闭则全部隐藏(原文仍保留,可再开回看)
+  const [thinkingMode, setThinkingMode] = useState(() => {
+    try { return localStorage.getItem("veltrix.thinking") === "on"; } catch { return false; }
+  });
+  const toggleThinking = () => {
+    setThinkingMode((v) => {
+      const next = !v;
+      try { localStorage.setItem("veltrix.thinking", next ? "on" : "off"); } catch {}
+      return next;
+    });
+  };
   // 流式输出:正在生成的 assistant 文本(null=未在生成);streamingConvRef 记录归属会话
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
   // 流式思考过程(推理型模型):与正文分轨,先于正文出现
@@ -423,10 +496,13 @@ export function ChatPage() {
   const atBottomRef = useRef(true);
   // 录音状态
   const [recording, setRecording] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 主动式 Agent:用户活动检测与建议提示
+  const lastActivityRef = useRef(Date.now());
+  const [proactiveSuggestion, setProactiveSuggestion] = useState<string | null>(null);
+  const proactiveTimerRef = useRef<number | null>(null);
   // 消息内容容器(导出 PDF 时截这块渲染后的内容)
   const messagesContentRef = useRef<HTMLDivElement>(null);
   // 资产选择弹窗:null=未开;否则区分文案/图片两种用途
@@ -454,8 +530,63 @@ export function ChatPage() {
   const [summarySaving, setSummarySaving] = useState(false);
 
   const active = conversations.find((c) => c.id === activeId) ?? null;
+  // 编排器:默认对话(新会话 / 非 legacy chat 都是)。它靠模型在对话内委派子智能体,不再走关键词分类+移交。
+  const isOrchestrator = active?.agentType !== "chat";
   // 发送相关「忙碌」总开关:意图判断 + 发送中都算,统一控制发送按钮禁用与回车拦截
   const busy = sending;
+  // 编排器会话:隐藏 tool 结果行与纯工具调用(无正文)的 assistant,保持 transcript 干净
+  // (子智能体逐步往返的内联富渲染在 Phase 2)。legacy chat 不过滤。
+  const shownMessages = isOrchestrator
+    ? messages.filter(
+        (m) =>
+          m.role === "user" ||
+          (m.role === "assistant" && !!(m.content?.trim() || m.reasoning?.trim())),
+      )
+    : messages;
+  // 右侧富面板:取最近一次委派的子智能体(coding/rpa 才有面板;computer/local 无)
+  const activeSubAgent = useMemo<"coding" | "rpa" | null>(() => {
+    if (!isOrchestrator) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role !== "assistant" || !m.toolCalls) continue;
+      try {
+        const calls = JSON.parse(m.toolCalls) as { name?: string }[];
+        for (let j = calls.length - 1; j >= 0; j--) {
+          const n = calls[j]?.name;
+          if (n === "delegate_to_coding") return "coding";
+          if (n === "delegate_to_rpa") return "rpa";
+          if (n === "delegate_to_computer" || n === "delegate_to_local") return null;
+        }
+      } catch {
+        /* 忽略坏 JSON */
+      }
+    }
+    return null;
+  }, [isOrchestrator, messages]);
+  // 左右分栏宽度(%)+ 拖拽分隔
+  const [leftPct, setLeftPct] = useState(48);
+  const splitRef = useRef<HTMLDivElement>(null);
+  function startSplitDrag() {
+    const el = splitRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const onMove = (ev: MouseEvent) => {
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      setLeftPct(Math.min(75, Math.max(30, pct)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+  const workPanel =
+    activeSubAgent === "coding" ? (
+      <CodingWorkPanel conversationId={activeId} />
+    ) : activeSubAgent === "rpa" ? (
+      <RpaWorkPanel conversationId={activeId} sending={sending} />
+    ) : null;
 
   // 监听后端流式增量事件:增量先攒到 ref,最多每 FLUSH_INTERVAL_MS 合并刷一次(节流),
   // 把 Markdown 重解析/重渲染从约 60 次/秒压到约 20 次/秒,缓解长回复蹦字/卡顿。
@@ -499,6 +630,49 @@ export function ChatPage() {
     };
   }, []);
 
+  // 危险操作确认事件(仅本次发送会话):编排器委派的 computer/local 命中高危工具时弹框等回执
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    listen<{
+      conversationId: string;
+      confirmId: number;
+      tool: string;
+      args: Record<string, unknown>;
+    }>("agent-confirm", (e) => {
+      if (streamingConvRef.current !== e.payload.conversationId) return;
+      pendingConfirmRef.current = e.payload.confirmId;
+      setConfirmReq({
+        confirmId: e.payload.confirmId,
+        tool: e.payload.tool,
+        args: e.payload.args ?? {},
+      });
+    }).then(
+      (fn) => {
+        if (disposed) fn();
+        else dispose = fn;
+      },
+      () => {},
+    );
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, []);
+
+  // 回执危险操作确认:允许则后端执行,拒绝则跳过。ref 同步守卫,避免按钮与 onOpenChange 各触发一次。
+  async function resolveConfirm(approved: boolean) {
+    const id = pendingConfirmRef.current;
+    if (id == null) return;
+    pendingConfirmRef.current = null;
+    setConfirmReq(null);
+    try {
+      await api.resolveAgentConfirm(id, approved);
+    } catch (e) {
+      toast.error(`确认失败: ${e}`);
+    }
+  }
+
   // providers 加载后初始化默认模型:优先上次记住的(仍有效),否则回退首个可用
   useEffect(() => {
     if (models.length === 0 || pickedModel) return;
@@ -531,6 +705,43 @@ export function ChatPage() {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, sending, streamingContent, streamingReasoning]);
+
+  // 主动式 Agent:检测用户活动，长时间未操作时提供建议
+  useEffect(() => {
+    const PROACTIVE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟无操作触发
+    const CHECK_INTERVAL_MS = 30 * 1000; // 每 30 秒检查一次
+
+    const updateActivity = () => {
+      lastActivityRef.current = Date.now();
+      setProactiveSuggestion(null); // 有新活动时清除建议
+    };
+
+    // 监听用户活动
+    window.addEventListener('keydown', updateActivity);
+    window.addEventListener('mousedown', updateActivity);
+    window.addEventListener('touchstart', updateActivity);
+
+    // 定期检查是否需要提供建议
+    proactiveTimerRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - lastActivityRef.current;
+      if (elapsed > PROACTIVE_TIMEOUT_MS && messages.length > 0 && !sending) {
+        // 根据上下文生成建议
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage?.role === 'assistant') {
+          setProactiveSuggestion('需要我帮你做什么吗？可以继续提问或开始新任务。');
+        }
+      }
+    }, CHECK_INTERVAL_MS);
+
+    return () => {
+      window.removeEventListener('keydown', updateActivity);
+      window.removeEventListener('mousedown', updateActivity);
+      window.removeEventListener('touchstart', updateActivity);
+      if (proactiveTimerRef.current) {
+        clearInterval(proactiveTimerRef.current);
+      }
+    };
+  }, [messages, sending]);
 
   // 记录用户是否贴在底部(滚动时更新)
   function onMessagesScroll() {
@@ -565,6 +776,8 @@ export function ChatPage() {
           providerId: active.providerId,
           providerName: "已失效厂商",
           model: active.model,
+          // 失效模型能力未知:仅保留对话能力,图片等按「不支持」处理(更安全)
+          capabilities: ["text"] as ModelCapability[],
           value: `${active.providerId}::${active.model}`,
         },
       ];
@@ -595,6 +808,13 @@ export function ChatPage() {
   // 触发按钮只显示模型名(厂商不展示)
   const currentModel = modelOptions.find((m) => m.value === selectedModelValue);
   const currentModelLabel = currentModel ? currentModel.model : "选择模型";
+  // 当前所选模型是否支持图片(vision 能力):决定「加号」里的资产图片/外部附件图片可否选择。
+  // 未选到模型时按「不支持」处理,避免在能力未知时放行图片。
+  const currentModelSupportsImage =
+    currentModel?.capabilities.includes("vision") ?? false;
+  // 当前所选模型是否支持工具调用(tools):编排器靠它委派子智能体;不支持则只能纯对话
+  const currentModelSupportsTools =
+    currentModel?.capabilities.includes("tools") ?? false;
 
   // 切换模型:
   // - 新会话(未建)→ 只改本地待用值
@@ -603,6 +823,14 @@ export function ChatPage() {
   async function handleModelChange(value: string) {
     // 记住本次选择,作为下次新会话的默认(占位的失效模型不记)
     if (models.some((m) => m.value === value)) rememberLastModel(value);
+    // 切到不支持图片的模型:剥离已挂载的图片附件,保证「加号内容」与模型能力一致
+    const nextSupportsImage =
+      modelOptions.find((m) => m.value === value)?.capabilities.includes("vision") ??
+      false;
+    if (!nextSupportsImage && attachments.some((a) => a.mime.startsWith("image/"))) {
+      setAttachments((prev) => prev.filter((a) => !a.mime.startsWith("image/")));
+      toast.info("已移除图片附件:所选模型不支持图片");
+    }
     if (!active) {
       setPickedModel(value);
       return;
@@ -638,6 +866,11 @@ export function ChatPage() {
     // 类型校验:非允许类型直接跳过并提示(accept 可能被系统绕过)
     const incoming: File[] = [];
     for (const f of Array.from(files)) {
+      // 模型不支持图片:拦截图片文件(accept 已收窄,这里再兜底防止绕过)
+      if (!currentModelSupportsImage && f.type.startsWith("image/")) {
+        toast.error(`当前模型不支持图片,「${f.name}」已跳过`);
+        continue;
+      }
       if (isAllowedAttachment(f)) {
         incoming.push(f);
       } else {
@@ -767,12 +1000,12 @@ export function ChatPage() {
     const idx = imageAttachments.findIndex((x) => x === att);
     if (idx >= 0) setPreviewIndex(idx);
   }
-  const stepPreview = (delta: number) =>
+  const stepPreview = useCallback((delta: number) =>
     setPreviewIndex((i) =>
       i === null || imageAttachments.length === 0
         ? null
         : (i + delta + imageAttachments.length) % imageAttachments.length,
-    );
+    ), [imageAttachments.length]);
 
   // 灯箱打开时支持键盘:Esc 关闭,←/→ 上/下一张
   useEffect(() => {
@@ -784,8 +1017,7 @@ export function ChatPage() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewIndex, imageAttachments.length]);
+  }, [previewIndex, imageAttachments.length, stepPreview]);
 
   // 录屏停止后:把视频「挂起」到输入区(待发送),由用户决定何时连同文字一并加入对话
   function handleRecordingSaved(path: string) {
@@ -853,6 +1085,7 @@ export function ChatPage() {
     atBottomRef.current = true;
     setMessages((prev) => [...prev, optimistic]);
 
+    let isNewConv = false;
     try {
       let convId = activeId;
       // 新会话:先按所选模型建会话
@@ -861,6 +1094,7 @@ export function ChatPage() {
         const id = crypto.randomUUID();
         const conv = await api.createConversation(id, opt.providerId, opt.model);
         convId = conv.id;
+        isNewConv = true;
         skipLoadRef.current = conv.id; // 抑制 setActiveId 触发的本会话加载,防首条消息重复
         setActiveId(conv.id);
       }
@@ -879,18 +1113,32 @@ export function ChatPage() {
       resetStreamingBuffer();
       setStreamingContent("");
       setStreamingReasoning(null);
-      const reply = await api.sendChatMessageStream(
-        convId,
-        text,
-        atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })),
-      );
-      setMessages((prev) => [...prev, reply]);
+      if (isOrchestrator) {
+        // 编排器:子智能体在同会话落库 tool 往返,发送完整重载消息以拿回全部步骤(附件 Phase 1 暂不传)
+        await api.sendOrchestratorMessage(convId, text);
+        const fresh = await api.listChatMessages(convId);
+        setMessages(fresh);
+      } else {
+        const reply = await api.sendChatMessageStream(
+          convId,
+          text,
+          atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })),
+        );
+        setMessages((prev) => [...prev, reply]);
+      }
       // 刷新侧栏会话列表(标题由 AI 概括生成 + 排序更新)
       await reload();
       return true;
     } catch (e) {
-      toast.error(`发送失败: ${e}`);
+      // 提取核心错误信息:去掉 "发送失败:" / "配置错误:" 等前缀
+      const raw = String(e);
+      const msg = raw.replace(/^.*?(?:错误|失败)[:：]\s*/u, "") || raw;
+      toast.error(msg);
       setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+      // 新建会话发送失败:重置 activeId,下次发送重新建会话(避免残留脏会话导致切换模型仍失败)
+      if (isNewConv) {
+        setActiveId(null);
+      }
       return false;
     } finally {
       streamingConvRef.current = null;
@@ -901,21 +1149,64 @@ export function ChatPage() {
     }
   }
 
+  // 交接到对应 Agent:建一个该类型的新会话接手这条消息(原 chat 会话保留),首条由对应 Layout 自动发送。
+  // 模型沿用当前所选(与首条自动路由一致);若该模型无 tools 能力,目标 Agent 端会自行提示。
+  async function startAgentHandoff(text: string, type: string) {
+    const opt = models.find((m) => m.value === pickedModel) ?? models[0];
+    if (!opt) {
+      toast.error("尚无可用模型");
+      return;
+    }
+    const id = crypto.randomUUID();
+    try {
+      await api.createConversation(id, opt.providerId, opt.model, type);
+    } catch (e) {
+      toast.error(`创建会话失败: ${e}`);
+      return;
+    }
+    setInput("");
+    setPendingFirstMessage(text);
+    setPendingAgentType(type);
+    setActiveId(id);
+    await reload();
+  }
+
+  // 中途交接提示的三个动作:切过去 / 仍在对话回答 / 取消放回输入框
+  function confirmHandoff() {
+    const h = handoffPrompt;
+    if (!h) return;
+    setHandoffPrompt(null);
+    void startAgentHandoff(h.text, h.type);
+  }
+  function answerInChat() {
+    const h = handoffPrompt;
+    if (!h) return;
+    setHandoffPrompt(null);
+    void sendMessage(h.text, []);
+  }
+  function cancelHandoff() {
+    const h = handoffPrompt;
+    setHandoffPrompt(null);
+    if (h) setInput(h.text);
+  }
+
   async function handleSend() {
     // 重入锁:挡住连点造成的重复发送(state 异步,需 ref 同步兜底)
     if (dispatchingRef.current) return;
     const text = input.trim();
     if ((!text && attachments.length === 0 && !pendingRecording) || sending) return;
     dispatchingRef.current = true;
+    setHandoffPrompt(null); // 新的一次发送:作废上一条悬而未决的交接提示
     try {
       // 仅录屏、无文字无附件:只落库视频,不走问答 / 不做意图分类
       if (!text && attachments.length === 0 && pendingRecording) {
         await sendRecordingOnly();
         return;
       }
-      // 新会话且纯文本:先做瞬时关键词意图判定(无 LLM、基本零延迟),命中 编程/RPA/电脑
-      // 直接切到对应 Agent(不弹提示),否则按普通对话发送。
+      // 新会话且纯文本:意图判定命中 编程/RPA/电脑/本机 → 直接切到对应 Agent(首条不打扰、自动交接)。
+      // 编排器会话不走这条:它靠模型在对话内委派子智能体,不需要关键词分类 + 跨会话移交。
       if (
+        !isOrchestrator &&
         !activeId &&
         text &&
         attachments.length === 0 &&
@@ -929,20 +1220,31 @@ export function ChatPage() {
         } catch {
           // 判定失败按普通对话继续
         }
-        if (type === "coding" || type === "rpa" || type === "computer") {
-          const id = crypto.randomUUID();
-          try {
-            await api.createConversation(id, opt.providerId, opt.model, type);
-          } catch (e) {
-            toast.error(`创建会话失败: ${e}`);
-            return;
-          }
+        if (isAgentType(type)) {
+          await startAgentHandoff(text, type);
+          return;
+        }
+      }
+      // 已在 chat 会话里发新消息:若这条明显属于别的 Agent,弹「是否切过去」提示(中途 handoff),
+      // 而不是闷头用没有工具的 chat 去答(避免「打开浏览器搜索」被 chat 编造结果)。
+      if (
+        activeId &&
+        active?.agentType === "chat" &&
+        text &&
+        attachments.length === 0 &&
+        !pendingRecording &&
+        models.length > 0
+      ) {
+        const opt = models.find((m) => m.value === pickedModel) ?? models[0];
+        let type = "chat";
+        try {
+          type = await api.classifyAgentType(text, opt.providerId, opt.model);
+        } catch {
+          // 判定失败按普通对话继续
+        }
+        if (isAgentType(type)) {
+          setHandoffPrompt({ text, type });
           setInput("");
-          // 交接:建好对应会话后切布局,首条由 CodingLayout / RpaLayout / ComputerLayout 自动发送
-          setPendingFirstMessage(text);
-          setPendingAgentType(type);
-          setActiveId(id);
-          await reload();
           return;
         }
       }
@@ -957,6 +1259,19 @@ export function ChatPage() {
       }
     } finally {
       dispatchingRef.current = false;
+    }
+  }
+
+  // 停止当前正在进行的流式输出
+  async function handleStopSending() {
+    // 使用 streamingConvRef 获取当前正在发送的会话 ID
+    const convId = streamingConvRef.current ?? activeId;
+    if (!convId) return;
+    try {
+      await api.stopChatAgent(convId);
+      toast("已请求停止,正在收尾…");
+    } catch (e) {
+      toast.error(`停止失败: ${e}`);
     }
   }
 
@@ -977,15 +1292,33 @@ export function ChatPage() {
     }
   }, []);
 
-  // 点赞 / 点踩:同值再点取消(纯前端态)
-  const toggleFeedback = useCallback((id: number, v: "like" | "dislike") => {
+  // 点赞 / 点踩:同值再点取消，持久化到后端
+  const toggleFeedback = useCallback(async (id: number, v: "like" | "dislike") => {
+    const current = feedback[id];
+    const newFeedback = current === v ? null : v;
+
+    // 乐观更新前端状态
     setFeedback((prev) => {
       const next = { ...prev };
-      if (next[id] === v) delete next[id];
-      else next[id] = v;
+      if (newFeedback) next[id] = newFeedback;
+      else delete next[id];
       return next;
     });
-  }, []);
+
+    // 持久化到后端
+    try {
+      await api.updateMessageFeedback(id, newFeedback);
+    } catch (e) {
+      // 回滚前端状态
+      setFeedback((prev) => {
+        const next = { ...prev };
+        if (current) next[id] = current;
+        else delete next[id];
+        return next;
+      });
+      toast.error(`反馈失败: ${e}`);
+    }
+  }, [feedback]);
 
   // 整段对话拼成 markdown(分享/下载共用)
   function conversationMarkdown(): string {
@@ -1208,53 +1541,96 @@ export function ChatPage() {
   }
 
   // 语音输入:开始/停止录音;停止后转写并填入输入框
+  // 实时语音输入:录音过程中定时转写，实时显示结果
+  const realtimeTranscriptRef = useRef<string>("");
+  const realtimeTimerRef = useRef<number | null>(null);
+
   async function toggleRecording() {
     if (recording) {
+      // 停止录音
+      if (realtimeTimerRef.current) {
+        clearInterval(realtimeTimerRef.current);
+        realtimeTimerRef.current = null;
+      }
       recorderRef.current?.stop();
       return;
     }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+
+      // 录音状态（浏览器 MediaRecorder 内置降噪：echoCancellation/noiseSuppression/autoGainControl）
+      const recorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
       chunksRef.current = [];
+      realtimeTranscriptRef.current = "";
+
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
+        if (e.data.size >0) chunksRef.current.push(e.data);
       };
-      recorder.onstop = async () => {
+
+      recorder.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
         setRecording(false);
+        if (realtimeTimerRef.current) {
+          clearInterval(realtimeTimerRef.current);
+          realtimeTimerRef.current = null;
+        }
+      };
+
+      // 开始录音
+      recorder.start(1000); // 每秒触发一次 ondataavailable
+      recorderRef.current = recorder;
+      setRecording(true);
+
+      // 定时转写（每3秒）
+      realtimeTimerRef.current = window.setInterval(async () => {
+        if (chunksRef.current.length === 0) return;
+
         const blob = new Blob(chunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
-        if (blob.size === 0) return;
-        // 从 mimeType 推扩展名(audio/webm;codecs=opus → webm)
-        const fmt =
-          (recorder.mimeType || "audio/webm")
-            .split(";")[0]
-            .split("/")[1] || "webm";
-        setTranscribing(true);
+        if (blob.size < 1000) return; // 太小的音频跳过
+
+        chunksRef.current = []; // 清空已处理的块
+
         try {
           const buf = await blob.arrayBuffer();
           const b64 = bytesToBase64(new Uint8Array(buf));
-          const text = await api.transcribeChatAudio(b64, fmt);
-          setInput((prev) => (prev ? `${prev} ${text}` : text));
+          const fmt = (recorder.mimeType || "audio/webm")
+            .split(";")[0]
+            .split("/")[1] || "webm";
+
+          const text = await api.transcribeAudioChunk(b64, fmt);
+          if (text && text.trim()) {
+            realtimeTranscriptRef.current += text + " ";
+            setInput(() => realtimeTranscriptRef.current.trim());
+          }
         } catch (e) {
-          toast.error(`语音转写失败: ${e}`);
-        } finally {
-          setTranscribing(false);
+          // 实时转写失败不中断录音，只记录警告
+          console.warn("实时转写失败:", e);
         }
-      };
-      recorder.start();
-      recorderRef.current = recorder;
-      setRecording(true);
+      }, 3000);
+
     } catch {
       toast.error("无法访问麦克风,请检查权限");
     }
   }
 
   return (
-    // 整页全幅:会话列表在侧栏,这里只有消息流 + 输入(模型选择内嵌在输入框第二行),无标题栏、无外层卡片边框
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    // 整页:左对话列;编排器委派 coding/rpa 时右侧出现对应富面板(可拖拽分隔)
+    <div ref={splitRef} className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+      <div
+        className={`flex min-h-0 min-w-0 flex-col overflow-hidden ${workPanel ? "shrink-0" : "flex-1"}`}
+        style={workPanel ? { width: `${leftPct}%` } : undefined}
+      >
         {/* 左上角:会话标题(AI 概括)+ 下拉(重命名/删除);右侧分享整段对话。无分隔栏 */}
         {active && (
           <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-2">
@@ -1359,7 +1735,7 @@ export function ChatPage() {
           ) : (
             <div ref={messagesContentRef} className="mx-auto max-w-3xl space-y-3.5">
               {/* 只渲染最近 visibleCount 条;更早的折叠在「加载更早」后(切到长对话不卡) */}
-              {messages.length > visibleCount && (
+              {shownMessages.length > visibleCount && (
                 <div className="flex justify-center">
                   <Button
                     variant="ghost"
@@ -1367,28 +1743,29 @@ export function ChatPage() {
                     className="h-7 text-xs text-muted-foreground"
                     onClick={() => setVisibleCount((c) => c + CHAT_PAGE_SIZE)}
                   >
-                    加载更早的消息({messages.length - visibleCount})
+                    加载更早的消息({shownMessages.length - visibleCount})
                   </Button>
                 </div>
               )}
-              {(messages.length > visibleCount
-                ? messages.slice(messages.length - visibleCount)
-                : messages
+              {(shownMessages.length > visibleCount
+                ? shownMessages.slice(shownMessages.length - visibleCount)
+                : shownMessages
               ).map((m) => (
                 <MessageBubble
                   key={m.id}
                   message={m}
                   feedback={feedback[m.id]}
+                  thinkingMode={thinkingMode}
                   onCopy={copyToClipboard}
                   onRegenerate={regenerate}
                   onToggleFeedback={toggleFeedback}
                   onPreviewImage={setHistoryImagePreview}
                 />
               ))}
-              {/* 流式生成中:思考过程(推理型模型)先于正文实时展示;首 token 前显示三点跳动 loading 动画 */}
+              {/* 流式生成中:思考过程仅在「思考模式」开启时实时展示;始终显示波浪下划线直到完成 */}
               {sending && (
                 <div>
-                  {streamingReasoning != null && (
+                  {thinkingMode && streamingReasoning != null && (
                     <ReasoningBlock
                       reasoning={streamingReasoning}
                       streaming={!streamingContent}
@@ -1397,21 +1774,18 @@ export function ChatPage() {
                   {streamingContent ? (
                     <div className="text-foreground">
                       <MarkdownMessage content={streamingContent} streaming />
-                      {/* 流式生成中:内容下方持续显示三点跳动 loading */}
-                      <div className="mt-1.5 inline-flex items-center gap-1">
-                        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/70 [animation-delay:-0.3s]" />
-                        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/70 [animation-delay:-0.15s]" />
-                        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/70" />
-                      </div>
                     </div>
                   ) : (
-                    // 首 token 前且尚无思考过程:思考中(转圈)
-                    streamingReasoning == null && (
-                      <div className="inline-flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
-                        <Loader2 className="size-4 animate-spin" />
-                        思考中…
-                      </div>
+                    // 尚无正文:显示生成中加载;思考模式开启且已有实时思考时由 ReasoningBlock 代替
+                    !(thinkingMode && streamingReasoning != null) && (
+                      <ShimmerBar label="正在生成…" />
                     )
+                  )}
+                  {/* 输出中:流光细条作「仍在生成」脉冲 */}
+                  {streamingContent && (
+                    <div className="mt-1.5">
+                      <ShimmerBar compact />
+                    </div>
                   )}
                 </div>
               )}
@@ -1475,6 +1849,70 @@ export function ChatPage() {
                 ))}
               </div>
             )}
+            {/* 主动式 Agent 建议 */}
+            {proactiveSuggestion && !sending && (
+              <div className="mb-2 flex items-center gap-2 rounded-lg bg-primary/10 px-3 py-2 text-sm text-primary">
+                <Radar className="size-4 shrink-0 animate-pulse" />
+                <span className="flex-1">{proactiveSuggestion}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProactiveSuggestion(null);
+                    setInput(proactiveSuggestion);
+                  }}
+                  className="shrink-0 text-xs underline hover:text-primary/80"
+                >
+                  用这个提问
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProactiveSuggestion(null)}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+            )}
+            {/* 中途交接提示:这条更像别的 Agent 的活,让用户决定切过去还是留在对话里 */}
+            {handoffPrompt && (
+              <div className="mb-2 flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-sm text-primary">
+                <Radar className="size-4 shrink-0" />
+                <span className="flex-1">
+                  这条更像「{AGENT_LABELS[handoffPrompt.type] ?? handoffPrompt.type}
+                  」的活,切过去用对应智能体实际执行?
+                </span>
+                <button
+                  type="button"
+                  onClick={confirmHandoff}
+                  className="shrink-0 rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                >
+                  切到「{AGENT_LABELS[handoffPrompt.type] ?? handoffPrompt.type}」
+                </button>
+                <button
+                  type="button"
+                  onClick={answerInChat}
+                  className="shrink-0 text-xs underline hover:text-primary/80"
+                >
+                  仍在此对话回答
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelHandoff}
+                  title="取消并放回输入框"
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+            )}
+            {/* 编排器:当前模型不支持工具调用时提示——只能纯对话,无法委派子智能体实际执行 */}
+            {isOrchestrator && !currentModelSupportsTools && models.length > 0 && (
+              <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                <span className="flex-1">
+                  当前模型不支持「工具调用」。若已配置带工具能力的模型,委派子智能体时会自动改用它执行;否则只能纯对话。建议直接选用带「工具调用」能力的模型。
+                </span>
+              </div>
+            )}
             {/* 输入卡片 */}
             <div className="flex flex-col gap-1 rounded-2xl border bg-card p-2 shadow-lg">
             {/* 第一行:纯文本输入。field-sizing-content 随内容增高,
@@ -1491,7 +1929,7 @@ export function ChatPage() {
               }}
               placeholder={
                 recording
-                  ? "录音中,再次点击麦克风结束…"
+                  ? "语音输入中，实时转写中…点击麦克风结束"
                   : sending
                     ? "回复生成中,可继续输入,完成后发送…"
                     : smartSearch
@@ -1517,15 +1955,31 @@ export function ChatPage() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="start" side="top">
-                    {/* 外部附件:从磁盘选文件,限图片 / PDF / Word / Excel / Markdown */}
-                    <DropdownMenuItem onClick={() => openPicker(EXTERNAL_ACCEPT)}>
+                    {/* 外部附件:从磁盘选文件;模型不支持图片时仅文档,否则含图片 */}
+                    <DropdownMenuItem
+                      onClick={() =>
+                        openPicker(
+                          currentModelSupportsImage
+                            ? EXTERNAL_ACCEPT
+                            : EXTERNAL_ACCEPT_NO_IMAGE,
+                        )
+                      }
+                    >
                       <Paperclip className="size-4" />
                       外部附件
                     </DropdownMenuItem>
-                    {/* 资产两项:从全量库已采集内容引入(封面与图片已合并到「资产图片」) */}
-                    <DropdownMenuItem onClick={() => setAssetPickerMode("image")}>
+                    {/* 资产图片:从全量库引入封面/图片;模型不支持图片时置灰不可选 */}
+                    <DropdownMenuItem
+                      disabled={!currentModelSupportsImage}
+                      onClick={() => setAssetPickerMode("image")}
+                    >
                       <Images className="size-4" />
                       资产图片
+                      {!currentModelSupportsImage && (
+                        <span className="ml-auto text-[10px] text-muted-foreground">
+                          需支持图片的模型
+                        </span>
+                      )}
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => setAssetPickerMode("copy")}>
                       <FileText className="size-4" />
@@ -1556,6 +2010,25 @@ export function ChatPage() {
                     }`}
                   >
                     智能搜索
+                  </Button>
+                </SimpleTooltip>
+                {/* 思考模式开关:开启后历史消息的思考过程默认展开 */}
+                <SimpleTooltip
+                  content={thinkingMode ? "思考模式已开启:显示思考过程" : "开启思考模式后显示思考过程"}
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-pressed={thinkingMode}
+                    onClick={toggleThinking}
+                    className={`h-8 shrink-0 gap-1 rounded-xl border px-2 text-xs transition-colors ${
+                      thinkingMode
+                        ? "border-primary/40 bg-primary/10 text-primary hover:bg-primary/15"
+                        : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
+                    }`}
+                  >
+                    思考模式
                   </Button>
                 </SimpleTooltip>
               </div>
@@ -1603,32 +2076,28 @@ export function ChatPage() {
                   </span>
                 )}
                 {/* 语音:默认就在右侧显示 */}
-                <SimpleTooltip content={recording ? "结束录音" : "语音输入"}>
+                <SimpleTooltip content={recording ? "结束语音输入" : "语音输入"}>
                   <Button
                     type="button"
                     variant={recording ? "destructive" : "ghost"}
                     size="icon"
                     className="size-9 shrink-0 cursor-pointer rounded-xl"
-                    disabled={transcribing}
                     onClick={toggleRecording}
                   >
-                    {transcribing ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <Mic className={recording ? "animate-pulse" : ""} />
-                    )}
+                    <Mic className={recording ? "animate-pulse" : ""} />
                   </Button>
                 </SimpleTooltip>
-                {/* 发送:有文字 / 附件 / 待发送录屏(或正在发送/判断中)时才出现在语音右侧 */}
+                {/* 发送/停止:有文字 / 附件 / 待发送录屏(或正在发送/判断中)时才出现在语音右侧 */}
                 {(busy || input.trim() || attachments.length > 0 || pendingRecording) && (
                   <Button
                     type="button"
                     size="icon"
-                    className="size-9 shrink-0 cursor-pointer rounded-xl"
-                    disabled={busy}
-                    onClick={handleSend}
+                    className={`size-9 shrink-0 cursor-pointer rounded-xl ${
+                      sending ? "bg-destructive hover:bg-destructive/90" : ""
+                    }`}
+                    onClick={sending ? () => void handleStopSending() : handleSend}
                   >
-                    {busy ? <Loader2 className="animate-spin" /> : <Send />}
+                    {sending ? <Square className="size-4" /> : <Send />}
                   </Button>
                 )}
               </div>
@@ -1771,6 +2240,38 @@ export function ChatPage() {
           </DialogContent>
         </Dialog>
 
+        {/* 危险操作确认:编排器委派的子智能体命中高危工具(删文件/杀进程/跑命令等)时暂停等用户放行 */}
+        <AlertDialog
+          open={confirmReq !== null}
+          onOpenChange={(open) => {
+            if (!open) void resolveConfirm(false);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>确认危险操作</AlertDialogTitle>
+              <AlertDialogDescription>
+                子智能体请求执行高危工具
+                <span className="mx-1 rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">
+                  {confirmReq?.tool}
+                </span>
+                ,允许后将真正在本机执行,可能不可逆。
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel onClick={() => void resolveConfirm(false)}>
+                拒绝
+              </AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-destructive text-white hover:bg-destructive/90"
+                onClick={() => void resolveConfirm(true)}
+              >
+                允许执行
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
         {/* 删除会话:二次确认(与全局删除弹窗统一用 AlertDialog) */}
         <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
           <AlertDialogContent>
@@ -1829,36 +2330,20 @@ export function ChatPage() {
           </DialogContent>
         </Dialog>
       </div>
+      {/* 右侧富面板:编排器最近委派 coding→预览/文件,rpa→内嵌浏览器(可拖拽分隔) */}
+      {workPanel && (
+        <>
+          <div
+            onMouseDown={() => startSplitDrag()}
+            className="w-1 shrink-0 cursor-col-resize bg-border transition-colors hover:bg-primary/40"
+          />
+          {workPanel}
+        </>
+      )}
+    </div>
   );
 }
 
-// 操作栏小图标按钮
-function IconBtn({
-  title,
-  active,
-  onClick,
-  children,
-}: {
-  title: string;
-  active?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <SimpleTooltip content={title}>
-      <button
-        type="button"
-        aria-label={title}
-        onClick={onClick}
-        className={`rounded p-1 transition-colors hover:bg-accent hover:text-foreground ${
-          active ? "text-primary" : ""
-        }`}
-      >
-        {children}
-      </button>
-    </SimpleTooltip>
-  );
-}
 
 // 单条消息:用户右侧气泡(纯文本),助手左侧全宽(Markdown);各带时间 + 操作栏。
 // memo + 稳定回调:流式时已完成消息不重渲染(性能)。
@@ -1872,6 +2357,7 @@ function messageAttachmentSrc(a: MessageAttachment): string {
 const MessageBubble = memo(function MessageBubble({
   message,
   feedback,
+  thinkingMode,
   onCopy,
   onRegenerate,
   onToggleFeedback,
@@ -1879,6 +2365,7 @@ const MessageBubble = memo(function MessageBubble({
 }: {
   message: ChatMessageView;
   feedback?: "like" | "dislike";
+  thinkingMode?: boolean;
   onCopy: (text: string, okMsg?: string) => void;
   onRegenerate: (content: string) => void;
   onToggleFeedback: (id: number, v: "like" | "dislike") => void;
@@ -1965,8 +2452,9 @@ const MessageBubble = memo(function MessageBubble({
     <div className="group flex flex-col items-start gap-1">
       {/* 助手回复:宽度与输入框一致(占满 max-w-3xl 容器),不显示时间 */}
       <div className="w-full">
-        {message.reasoning?.trim() && (
-          <ReasoningBlock reasoning={message.reasoning} />
+        {/* 思考过程仅在「思考模式」开启时显示(默认展开);关闭则隐藏,原文仍保留,开启即可回看 */}
+        {thinkingMode && message.reasoning?.trim() && (
+          <ReasoningBlock reasoning={message.reasoning} defaultOpen />
         )}
         <MarkdownMessage content={message.content} />
       </div>

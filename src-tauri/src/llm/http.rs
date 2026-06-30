@@ -89,10 +89,14 @@ pub async fn send_with_retry(
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(CrawlerError::Config(format!(
-                    "{label} 返回错误状态 {code}: {}",
-                    truncate(&body, 300)
-                )));
+                let msg = match code {
+                    401 => format!("{label} 鉴权失败:API Key 无效或已过期"),
+                    402 => format!("{label} 账户余额不足,请充值后重试"),
+                    403 => format!("{label} 访问被拒绝:可能无权使用该模型或 IP 被封禁"),
+                    429 => format!("{label} 请求过于频繁,请稍后再试"),
+                    _ => format!("{label} 返回错误状态 {code}: {}", truncate(&body, 300)),
+                };
+                return Err(CrawlerError::Config(msg));
             }
             Err(e) => {
                 // 连接 / 超时 / 请求层网络错误可重试

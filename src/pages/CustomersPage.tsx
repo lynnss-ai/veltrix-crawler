@@ -9,11 +9,11 @@ import { type ColumnDef, type FilterFn } from "@tanstack/react-table";
 import { MoreVertical, SquarePen, Plus, Search, Trash2, X } from "lucide-react";
 import {
   api,
-  formatTimestamp,
   type CustomerInput,
   type CustomerView,
   type IndustryView,
 } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
@@ -23,7 +23,6 @@ import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
 import { FieldError } from "@/components/FieldError";
 import { CodeField, generateCode } from "@/components/CodeField";
-import { RefreshButton } from "@/components/RefreshButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -297,8 +296,8 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
               />
             </div>
             <div className="flex items-center gap-2">
-              <RefreshButton onClick={loadCustomers} />
               <Button
+                className="h-10"
                 onClick={() => {
                   setEditing(null);
                   setIsFormOpen(true);

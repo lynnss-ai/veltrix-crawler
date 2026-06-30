@@ -251,7 +251,8 @@ pub async fn summarize_conversation(
         retry_server_errors: false,
     })
     .await
-    .ok()?;
+    .ok()?
+    .content;
     let cleaned = reply.trim();
     if cleaned.is_empty() {
         return None;

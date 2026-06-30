@@ -1,16 +1,8 @@
 // 作者库:采集到的作者档案(authors 表)。画像 + 已采内容聚合 + 监控开关。
 // 筛选:左侧行业栏(作者跨行业按其内容所属任务聚合)+ 平台 chip + 仅看监控 + 关键字。
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import {
-  ChevronLeft,
-  Eye,
-  Filter,
-  RefreshCw,
-  Search,
-  UserRound,
-  X,
-} from "lucide-react";
+import { Eye, RefreshCw, Search, UserRound, X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
@@ -22,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
+import { FilterSidebar, IndustryFilterToggle } from "@/components/library-filters";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import {
   api,
@@ -35,8 +28,9 @@ import {
   platformClass,
 } from "@/lib/platforms";
 
-// 支持画像补采的平台(搜索响应缺画像、需打开主页拦截补全);其余平台搜索已含完整画像
-const ENRICH_SUPPORTED = new Set(["xhs", "kuaishou", "bilibili", "youtube"]);
+// 支持画像补采的平台(搜索响应缺画像、需打开主页拦截补全);其余平台搜索已含完整画像。
+// 抖音搜索不含粉丝/关注/获赞/属地,同样需打开主页补采
+const ENRICH_SUPPORTED = new Set(["douyin", "xhs", "kuaishou", "bilibili", "youtube"]);
 
 // 互动数:过万折算成「万」
 function formatCount(n?: number | null): string {
@@ -73,8 +67,8 @@ export function AuthorLibraryPage() {
       .listAuthors()
       .then(setAuthors)
       .catch((e) => toast.error(`加载作者失败: ${e}`));
-    api.listPlatforms().then(setPlatforms).catch(() => {});
-    api.listIndustries().then(setIndustries).catch(() => {});
+    api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
+    api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
   }, []);
 
   const platformOptions = useMemo(() => platforms.map((p) => p.id), [platforms]);
@@ -162,7 +156,7 @@ export function AuthorLibraryPage() {
     if (enriching) return;
     const eligible = filtered.filter((a) => ENRICH_SUPPORTED.has(a.platform));
     if (eligible.length === 0) {
-      toast.info("当前筛选下没有可补采的作者(支持:小红书 / 快手 / B站 / YouTube)");
+      toast.info("当前筛选下没有可补采的作者(支持:抖音 / 小红书 / 快手 / B站 / YouTube)");
       return;
     }
     setEnriching(true);
@@ -351,16 +345,7 @@ export function AuthorLibraryPage() {
         {/* 第一行:行业按钮(收起态)+ 关键字搜索 + 重置 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {sidebarCollapsed && (
-            <SimpleTooltip content="展开行业筛选">
-              <Button
-                variant="outline"
-                className="cursor-pointer"
-                onClick={() => setSidebarCollapsed(false)}
-              >
-                <Filter />
-                行业
-              </Button>
-            </SimpleTooltip>
+            <IndustryFilterToggle onExpand={() => setSidebarCollapsed(false)} />
           )}
           <div className="relative w-full sm:w-72 lg:w-80">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -406,7 +391,7 @@ export function AuthorLibraryPage() {
             仅看监控中
           </label>
           {/* 画像补采:对当前筛选下支持的作者打开主页拦截画像接口刷新档案 */}
-          <SimpleTooltip content="对当前筛选下「小红书 / 快手 / B站 / YouTube」的作者打开主页,补全粉丝 / 签名等画像(逐个开窗,较慢)">
+          <SimpleTooltip content="对当前筛选下「抖音 / 小红书 / 快手 / B站 / YouTube」的作者打开主页,补全粉丝 / 签名等画像(逐个开窗,较慢)">
             <Button
               variant="outline"
               size="sm"
@@ -438,87 +423,10 @@ export function AuthorLibraryPage() {
   );
 }
 
-// 左侧筛选侧栏:行业筛选(带数量角标),与全量库/评论库同款
-function FilterSidebar({
-  industries,
-  industryCounts,
-  industryFilter,
-  onIndustry,
-  onCollapse,
-}: {
-  industries: IndustryView[];
-  industryCounts: Record<string, number>;
-  industryFilter: string;
-  onIndustry: (v: string) => void;
-  onCollapse: () => void;
-}) {
-  return (
-    <div className="flex w-48 shrink-0 flex-col overflow-hidden rounded-xl border bg-card">
-      <div className="flex h-10 items-center justify-between border-b px-3">
-        <div className="flex items-center gap-1.5 text-sm font-medium">
-          <Filter className="size-3.5 text-muted-foreground" />
-          行业筛选
-        </div>
-        <SimpleTooltip content="收起">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            className="cursor-pointer"
-            onClick={onCollapse}
-          >
-            <ChevronLeft />
-          </Button>
-        </SimpleTooltip>
-      </div>
-      <div className="flex-1 space-y-0.5 overflow-auto p-2">
-        <IndustryFilterItem
-          label="全部行业"
-          count={industryCounts.__all ?? 0}
-          active={industryFilter === "__all"}
-          onClick={() => onIndustry("__all")}
-        />
-        {industries.map((ind) => (
-          <IndustryFilterItem
-            key={ind.id}
-            label={ind.name}
-            count={industryCounts[ind.name] ?? 0}
-            active={industryFilter === ind.name}
-            onClick={() => onIndustry(ind.name)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
 
-function IndustryFilterItem({
-  label,
-  count,
-  active,
-  onClick,
-}: {
-  label: string;
-  count: number;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      onClick={onClick}
-      className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors ${
-        active
-          ? "bg-accent font-medium text-accent-foreground"
-          : "hover:bg-accent/50"
-      }`}
-    >
-      <span className="flex-1 truncate">{label}</span>
-      <span className="text-xs text-muted-foreground">{count}</span>
-    </div>
-  );
-}
 
 // 作者单元格:头像(点击跳主页)+ 昵称 + 平台号/UID + 简介(截断)
-function AuthorCell({ a }: { a: AuthorView }) {
+const AuthorCell = memo(function AuthorCell({ a }: { a: AuthorView }) {
   const homeUrl = authorProfileUrl(a.platform, a.uid, a.platformId);
   return (
     <div className="flex w-[26rem] max-w-full items-center gap-3 py-1">
@@ -574,4 +482,4 @@ function AuthorCell({ a }: { a: AuthorView }) {
       )}
     </div>
   );
-}
+});

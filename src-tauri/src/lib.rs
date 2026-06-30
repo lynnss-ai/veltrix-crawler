@@ -180,12 +180,31 @@ fn reveal_path(app: tauri::AppHandle, path: String) -> std::result::Result<(), S
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    // 日志:同时输出到 stdout 与「滚动文件」,便于离线排查(尤其滑块/采集等只在终端一闪而过的日志)。
+    // 文件落 %LOCALAPPDATA%\veltrix-crawler\logs\veltrix.log.<日期>(按天滚动;取不到环境变量则退回临时目录)。
+    use tracing_subscriber::prelude::*;
+    let log_dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("veltrix-crawler")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "veltrix.log");
+    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
+    // _log_guard 必须存活到程序退出:它持有后台写线程,提前 drop 会丢失文件日志。
+    // 绑定在 run() 局部、跨越下方阻塞的 .run() 调用,随进程结束才释放。
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(log_filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false) // 文件不写 ANSI 颜色码
+                .with_writer(file_writer),
         )
         .init();
+    tracing::info!("日志文件目录: {}", log_dir.display());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -424,11 +443,12 @@ pub fn run() {
                 dev_server: Arc::new(std::sync::Mutex::new(
                     agent::coding::commands::DevServer::default(),
                 )),
-                sandbox_ready: std::sync::Mutex::new(
+                sandbox_ready: std::sync::Arc::new(std::sync::Mutex::new(
                     agent::coding::commands::SandboxReady::default(),
-                ),
+                )),
                 app_handle: app.handle().clone(),
                 agent_cancel: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                chat_cancel_flags: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 agent_confirm: Arc::new(agent::core::shared::AgentConfirmChannel::new()),
                 recording: {
                     let rec = agent::computer::recorder::RecordingState::new();
@@ -574,6 +594,13 @@ pub fn run() {
             commands::admin::create_keywords,
             commands::admin::upsert_keyword,
             commands::admin::remove_keyword,
+            // 内容创作:提示词管理(分类目录 / 分镜镜头提示词)
+            commands::creation::list_prompt_categories,
+            commands::creation::upsert_prompt_category,
+            commands::creation::remove_prompt_category,
+            commands::creation::list_shot_prompts,
+            commands::creation::upsert_shot_prompt,
+            commands::creation::remove_shot_prompt,
             commands::list_platforms,
             commands::upsert_platform,
             commands::remove_platform,
@@ -603,6 +630,7 @@ pub fn run() {
             commands::task::list_task_runs,
             commands::task::list_run_logs,
             commands::dashboard::dashboard_overview,
+            commands::billing::billing_overview,
             commands::task::remove_content,
             commands::task::remove_contents,
             commands::task::get_content_detail,
@@ -631,6 +659,7 @@ pub fn run() {
             agent::chat::commands::send_chat_message_stream,
             agent::chat::commands::attach_recording_message,
             agent::chat::commands::transcribe_chat_audio,
+            agent::chat::commands::transcribe_audio_chunk,
             agent::chat::commands::build_content_attachments,
             // AI 对话:长期记忆
             agent::chat::memory::list_chat_memories,
@@ -643,6 +672,9 @@ pub fn run() {
             agent::chat::memory::set_chat_memory_pinned,
             agent::chat::memory::get_embedding_config,
             agent::chat::memory::set_embedding_config,
+            // 对话 Agent
+            agent::chat::commands::stop_chat_agent,
+            agent::chat::commands::update_message_feedback,
             // 编程 Agent
             agent::coding::commands::send_coding_message,
             agent::coding::commands::stop_coding_agent,
@@ -657,6 +689,7 @@ pub fn run() {
             agent::coding::commands::read_workspace_file,
             agent::coding::commands::write_workspace_file,
             agent::coding::commands::classify_agent_type,
+            agent::coding::commands::list_agent_route_logs,
             agent::coding::commands::start_dev_server,
             agent::coding::commands::stop_dev_server,
             agent::coding::commands::get_dev_server_status,
@@ -675,9 +708,13 @@ pub fn run() {
             agent::rpa::commands::get_agent_network,
             // 「电脑操作」工具基础设施(桌面 GUI + 跨平台终端;独立模块,列出供前端 / 编排挑选)
             agent::list_agent_tools,
-            // 电脑操作 Agent:聚合全部工具的 ReAct 智能体
+            // 电脑操作 Agent(GUI:desktop/ocr/uia)的 ReAct 智能体
             agent::computer::commands::send_computer_message,
             agent::computer::commands::resolve_agent_confirm,
+            // 本机助手 Agent(fs/system/shell)的 ReAct 智能体(危险确认回执复用上面的 resolve_agent_confirm)
+            agent::local::commands::send_local_message,
+            // 统一编排器(默认对话):把 coding/rpa/computer/local 当工具委派
+            agent::orchestrator::commands::send_orchestrator_message,
             // 屏幕录制:打开悬浮条 / 取消 / 开始(最小化主窗口 + ffmpeg 录全屏)/ 停止 / 查状态
             agent::computer::recorder::open_recording_overlay,
             agent::computer::recorder::cancel_recording_overlay,

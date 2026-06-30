@@ -141,7 +141,7 @@ function GlobalMemorySection() {
   }
 
   useEffect(() => {
-    api.getChatMemoryEnabled().then(setEnabled).catch(() => {});
+    api.getChatMemoryEnabled().then(setEnabled).catch((e) => console.warn("获取记忆开关状态失败:", e));
     api
       .getEmbeddingConfig()
       .then((cfg) => {
@@ -149,7 +149,7 @@ function GlobalMemorySection() {
         if (cfg.apiUrl) setEmbedUrl(cfg.apiUrl);
         if (cfg.model) setEmbedModel(cfg.model);
       })
-      .catch(() => {});
+      .catch((e) => console.warn("获取 Embedding 配置失败:", e));
     reload();
   }, []);
 
@@ -425,7 +425,7 @@ function GlobalMemorySection() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="搜索记忆内容"
-            className="pl-8"
+            className="h-10 pl-8"
           />
         </div>
         <Select
@@ -899,7 +899,7 @@ function ConversationMemorySection() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="搜索会话"
-              className="h-8 pl-8 text-sm"
+              className="h-10 pl-8 text-sm"
             />
           </div>
         </div>

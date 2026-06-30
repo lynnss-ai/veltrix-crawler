@@ -118,6 +118,8 @@ function FallbackImage({
       src={current}
       alt=""
       loading="lazy"
+      // 异步解码:大图(瀑布全图 / 大图浏览)在后台线程解码,不阻塞翻图与切换的主线程
+      decoding="async"
       draggable={draggable}
       className={className}
       onClick={onClick}

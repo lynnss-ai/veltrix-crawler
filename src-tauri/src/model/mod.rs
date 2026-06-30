@@ -15,18 +15,15 @@ pub type PlatformId = String;
 /// 内容形态。`Unknown` 兜底,避免新平台出现未知类型时反序列化失败。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ContentKind {
     Video,
     Image,
     Article,
+    #[default]
     Unknown,
 }
 
-impl Default for ContentKind {
-    fn default() -> Self {
-        ContentKind::Unknown
-    }
-}
 
 /// 作者 / 博主。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

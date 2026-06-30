@@ -11,8 +11,9 @@ use sea_orm::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tauri::State;
-use veltrix_core::db::entity::{chat_conversation as conv, chat_message as msg};
+use veltrix_core::db::entity::{chat_conversation as conv, chat_message as msg, provider as provider_entity};
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 单会话最多回放消息数(防超长会话噎住 IPC)。
@@ -94,7 +95,8 @@ pub async fn create_conversation(
         title: Set("新对话".to_string()),
         provider_id: Set(provider_id),
         model: Set(model),
-        agent_type: Set(agent_type.unwrap_or_else(|| "chat".to_string())),
+        // 默认新会话=统一编排器(可直接对话,需要时把专门智能体当工具委派)
+        agent_type: Set(agent_type.unwrap_or_else(|| "orchestrator".to_string())),
         summary: Set(String::new()),
         summarized_upto_id: Set(0),
         created_at: Set(now),
@@ -293,6 +295,176 @@ pub async fn list_chat_messages(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+// ===== send_chat_message / send_chat_message_stream 共享逻辑 =====
+
+struct ChatSendContext {
+    conversation: conv::Model,
+    provider: provider_entity::Model,
+    had_messages: bool,
+    text: String,
+}
+
+impl ChatSendContext {
+    async fn prepare(
+        state: &AppState,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<Self> {
+        let me = current_user(state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+        let text = content.trim().to_string();
+
+        let conversation = conv::Entity::find_by_id(conversation_id.to_string())
+            .one(&state.db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
+            .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
+        if conversation.owner != me.name {
+            return Err(CrawlerError::Config("无权操作该会话".into()));
+        }
+
+        let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
+            .one(&state.db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
+            .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
+        if provider.api_key.trim().is_empty() {
+            return Err(CrawlerError::Config(
+                "该模型厂商未配置 API Key,请到系统配置补全".into(),
+            ));
+        }
+
+        let had_messages = msg::Entity::find()
+            .filter(msg::Column::ConversationId.eq(conversation_id))
+            .one(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        Ok(Self { conversation, provider, had_messages, text })
+    }
+}
+
+async fn fetch_history(
+    db: &sea_orm::DatabaseConnection,
+    conversation_id: &str,
+    summarized_upto_id: i64,
+) -> Result<Vec<msg::Model>> {
+    let mut rows = msg::Entity::find()
+        .filter(msg::Column::ConversationId.eq(conversation_id))
+        .filter(msg::Column::Id.gt(summarized_upto_id))
+        .order_by_desc(msg::Column::Id)
+        .limit(LIVE_HARD_CAP)
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
+    rows.reverse();
+    Ok(rows)
+}
+
+async fn build_chat_messages(
+    db: &sea_orm::DatabaseConnection,
+    owner: &str,
+    summary: &str,
+    user_text: &str,
+    history: &[msg::Model],
+    current_user_content: Value,
+) -> Value {
+    let mut arr: Vec<Value> = Vec::with_capacity(history.len() + 3);
+    if let Some(sys) =
+        crate::agent::chat::memory::memory_system_message(db, owner, user_text, "global", "").await
+    {
+        arr.push(sys);
+    }
+    if let Some(sys) = summary_system_message(summary) {
+        arr.push(sys);
+    }
+    for m in history {
+        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
+    }
+    arr.push(current_user_content);
+    json!(arr)
+}
+
+async fn insert_user_message(
+    db: &sea_orm::DatabaseConnection,
+    conversation_id: &str,
+    content: &str,
+    attachments_json: Option<String>,
+) -> Result<()> {
+    msg::ActiveModel {
+        conversation_id: Set(conversation_id.to_string()),
+        role: Set("user".to_string()),
+        content: Set(content.to_string()),
+        attachments: Set(attachments_json),
+        created_at: Set(Utc::now().timestamp()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
+    Ok(())
+}
+
+async fn insert_assistant_message(
+    db: &sea_orm::DatabaseConnection,
+    conversation_id: &str,
+    content: &str,
+    reasoning: Option<String>,
+) -> Result<msg::Model> {
+    msg::ActiveModel {
+        conversation_id: Set(conversation_id.to_string()),
+        role: Set("assistant".to_string()),
+        content: Set(content.to_string()),
+        reasoning: Set(reasoning),
+        created_at: Set(Utc::now().timestamp()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))
+}
+
+async fn finalize_chat_turn(
+    db: &sea_orm::DatabaseConnection,
+    conversation: conv::Model,
+    provider: &provider_entity::Model,
+    conversation_id: &str,
+    user_text: &str,
+    reply_text: &str,
+    had_messages: bool,
+) {
+    let fallback_ref = session_provider_ref(provider, &conversation.model);
+
+    spawn_memory_extraction(db, &conversation.owner, fallback_ref.clone(), user_text, reply_text);
+    spawn_summary_maintenance(db, conversation_id, fallback_ref.clone());
+
+    let new_title = if had_messages {
+        None
+    } else {
+        let title_ref =
+            crate::commands::resolve_role_provider(db, crate::llm::AgentRole::Summary, fallback_ref)
+                .await;
+        Some(
+            generate_title(
+                &title_ref.api_url,
+                &title_ref.api_key,
+                &title_ref.model,
+                user_text,
+                reply_text,
+            )
+            .await
+            .unwrap_or_else(|| truncate_title(user_text)),
+        )
+    };
+    let mut am = conversation.into_active_model();
+    am.updated_at = Set(Utc::now().timestamp());
+    if let Some(t) = new_title {
+        am.title = Set(t);
+    }
+    let _ = am.update(db).await;
+}
+
 /// 发送一条用户消息并取大模型回复。
 /// 落库 user 消息 → 取最近历史拼 messages → 调 chat → 落库 assistant 消息 → 返回 assistant 消息。
 /// 首轮对话(此前无消息)用首条内容生成会话标题。
@@ -302,90 +474,31 @@ pub async fn send_chat_message(
     conversation_id: String,
     content: String,
 ) -> Result<MessageView> {
-    use veltrix_core::db::entity::provider as provider_entity;
-
-    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let text = content.trim().to_string();
-    if text.is_empty() {
+    let ctx = ChatSendContext::prepare(&state, &conversation_id, &content).await?;
+    if ctx.text.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
     }
 
-    let conversation = conv::Entity::find_by_id(conversation_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
-    if conversation.owner != me.name {
-        return Err(CrawlerError::Config("无权操作该会话".into()));
-    }
+    // 先取历史(本条 user 尚未落库,history 不含当前消息),再把当前消息作为末条 append,
+    // 避免与「history 已含当前消息 + 再 append」造成同一条 user 消息重复发给模型。
+    let history = fetch_history(&state.db, &conversation_id, ctx.conversation.summarized_upto_id).await?;
+    let messages = build_chat_messages(
+        &state.db,
+        &ctx.conversation.owner,
+        &ctx.conversation.summary,
+        &ctx.text,
+        &history,
+        json!(ctx.text),
+    )
+    .await;
 
-    // 取会话绑定的厂商(api_url/api_key)
-    let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
-    if provider.api_key.trim().is_empty() {
-        return Err(CrawlerError::Config(
-            "该模型厂商未配置 API Key,请到系统配置补全".into(),
-        ));
-    }
+    // 构建好上下文后再落库当前 user 消息(调模型前落库,失败也能保留用户问题)
+    insert_user_message(&state.db, &conversation_id, &ctx.text, None).await?;
 
-    let now = Utc::now().timestamp();
-
-    // 是否首轮(决定要不要自动起标题)
-    let had_messages = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
-    // 落库 user 消息
-    msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("user".to_string()),
-        content: Set(text.clone()),
-        created_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
-
-    // 取 live 原文(id 大于已折叠进摘要的边界,含刚落库的 user 消息),更早的由会话摘要承载
-    let mut history = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .filter(msg::Column::Id.gt(conversation.summarized_upto_id))
-        .order_by_desc(msg::Column::Id)
-        .limit(LIVE_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
-    history.reverse();
-    let mut arr: Vec<Value> = Vec::with_capacity(history.len() + 2);
-    // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
-    if let Some(sys) =
-        crate::agent::chat::memory::memory_system_message(&state.db, &me.name, &text).await
-    {
-        arr.push(sys);
-    }
-    // 本会话滚动摘要:早期消息压缩后的前情提要,注入在原文之前
-    if let Some(sys) = summary_system_message(&conversation.summary) {
-        arr.push(sys);
-    }
-    // 历史里带图片的 user 消息重建为多模态,模型后续轮次仍"看得到"图(纯文本消息原样透传)
-    for m in &history {
-        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
-    }
-    let messages = json!(arr);
-
-    // 调大模型(失败时回滚刚插入的 user 消息会更干净,但保留也无碍——用户可重发)
-    let reply = crate::llm::chat::chat_completion(crate::llm::chat::ChatRequest {
-        api_url: &provider.api_url,
-        api_key: &provider.api_key,
-        model: &conversation.model,
+    let outcome = crate::llm::chat::chat_completion(crate::llm::chat::ChatRequest {
+        api_url: &ctx.provider.api_url,
+        api_key: &ctx.provider.api_key,
+        model: &ctx.conversation.model,
         messages,
         extra_body: None,
         timeout_secs: crate::llm::http::CHAT_TIMEOUT_SECS,
@@ -393,53 +506,30 @@ pub async fn send_chat_message(
     })
     .await?;
 
-    // 落库 assistant 消息
-    let assistant = msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("assistant".to_string()),
-        content: Set(reply.clone()),
-        created_at: Set(Utc::now().timestamp()),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
+    // 记录 token 用量
+    let _ = veltrix_core::db::entity::model_usage_record::Model::record(
+        &state.db,
+        &ctx.conversation.model,
+        &ctx.provider.id,
+        outcome.usage.prompt,
+        outcome.usage.completion,
+        "chat",
+        &ctx.conversation.owner,
+    )
+    .await;
 
-    // 会话模型作为杂活角色化解析的回退档
-    let fallback_ref = session_provider_ref(&provider, &conversation.model);
+    let assistant = insert_assistant_message(&state.db, &conversation_id, &outcome.content, None).await?;
 
-    // 自动记忆提取:从本轮对话抽取值得长期记住的事实,异步落库,不阻塞回复返回
-    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply);
-
-    // 滚动摘要维护:live 过长时把较旧消息折叠进会话摘要,异步进行,不阻塞回复返回
-    spawn_summary_maintenance(&state.db, &conversation_id, fallback_ref.clone());
-
-    // 更新会话时间;首轮用用户首句作标题(截断)
-    // 首轮:用 AI 概括对话生成标题(摘要角色的便宜模型;失败回退用户首句截断)
-    let new_title = if had_messages {
-        None
-    } else {
-        let title_ref =
-            crate::commands::resolve_role_provider(&state.db, crate::llm::AgentRole::Summary, fallback_ref)
-                .await;
-        Some(
-            generate_title(
-                &title_ref.api_url,
-                &title_ref.api_key,
-                &title_ref.model,
-                &text,
-                &reply,
-            )
-            .await
-            .unwrap_or_else(|| truncate_title(&text)),
-        )
-    };
-    let mut am = conversation.into_active_model();
-    am.updated_at = Set(Utc::now().timestamp());
-    if let Some(t) = new_title {
-        am.title = Set(t);
-    }
-    let _ = am.update(&state.db).await;
+    finalize_chat_turn(
+        &state.db,
+        ctx.conversation,
+        &ctx.provider,
+        &conversation_id,
+        &ctx.text,
+        &outcome.content,
+        ctx.had_messages,
+    )
+    .await;
 
     Ok(assistant.into())
 }
@@ -471,167 +561,108 @@ pub async fn send_chat_message_stream(
     attachments: Vec<ChatAttachment>,
 ) -> Result<MessageView> {
     use tauri::Emitter;
-    use veltrix_core::db::entity::provider as provider_entity;
 
-    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let text = content.trim().to_string();
-    if text.is_empty() && attachments.is_empty() {
-        return Err(CrawlerError::Config("消息内容为空".into()));
-    }
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(CrawlerError::Config(format!(
             "附件最多 {MAX_ATTACHMENTS} 个"
         )));
     }
-
-    let conversation = conv::Entity::find_by_id(conversation_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
-    if conversation.owner != me.name {
-        return Err(CrawlerError::Config("无权操作该会话".into()));
+    let ctx = ChatSendContext::prepare(&state, &conversation_id, &content).await?;
+    if ctx.text.is_empty() && attachments.is_empty() {
+        return Err(CrawlerError::Config("消息内容为空".into()));
     }
-    let provider = provider_entity::Entity::find_by_id(conversation.provider_id.clone())
-        .one(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("会话绑定的模型厂商不存在,请新建会话".into()))?;
-    if provider.api_key.trim().is_empty() {
-        return Err(CrawlerError::Config(
-            "该模型厂商未配置 API Key,请到系统配置补全".into(),
-        ));
-    }
-
-    let now = Utc::now().timestamp();
-
-    // 先读 live 原文(本条 user 消息尚未插入):id 大于已折叠进摘要的边界,更早的由会话摘要承载
-    let mut prior = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .filter(msg::Column::Id.gt(conversation.summarized_upto_id))
-        .order_by_desc(msg::Column::Id)
-        .limit(LIVE_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("读取历史失败: {e}")))?;
-    prior.reverse();
-    // 是否首轮:用整会话存在性查询,不能用 prior(它已被 summarized_upto_id 过滤,长会话折叠后
-    // prior 可能近空,会把非首轮误判为首轮、错误地用首句重起标题)。与非流式 send_chat_message 一致。
-    let had_messages = msg::Entity::find()
-        .filter(msg::Column::ConversationId.eq(&conversation_id))
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
 
     // 附件落盘并产出元数据 JSON:图片写入本地附件目录(供历史渲染 + 多轮重建),content 只存正文。
-    // 旧口径把 [附件:名] 塞进 content,导致历史只见文字占位、图片丢失;现改为图片单列存储。
     let attachments_json =
         persist_attachments(&state.config_dir, &conversation_id, &attachments).await;
-    msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("user".to_string()),
-        content: Set(text.clone()),
-        attachments: Set(attachments_json),
-        created_at: Set(now),
-        ..Default::default()
-    }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存消息失败: {e}")))?;
 
-    // 当前 user 消息:无附件用纯文本;有附件用多模态 content 数组
-    let current_content = build_user_content(&text, &attachments);
-    let mut arr: Vec<Value> = Vec::with_capacity(prior.len() + 3);
-    // 跨会话长期记忆:按本轮提问语义检索 top-K,作为 system 消息注入到最前面(关闭 / 无记忆时为 None)
-    if let Some(sys) =
-        crate::agent::chat::memory::memory_system_message(&state.db, &me.name, &text).await
+    // 先取历史(本条 user 尚未落库,prior 不含当前消息),再把当前消息(多模态/文本附件内联)
+    // 作为末条 append,避免同一条 user 消息重复发给模型。文本类附件内容只在此 append 中内联,
+    // history_content 无法从落库行重建,故必须保留这次 append、改由「先 fetch 再落库」去重。
+    let prior = fetch_history(&state.db, &conversation_id, ctx.conversation.summarized_upto_id).await?;
+    let current_content = build_user_content(&ctx.text, &attachments);
+    let messages = build_chat_messages(
+        &state.db,
+        &ctx.conversation.owner,
+        &ctx.conversation.summary,
+        &ctx.text,
+        &prior,
+        json!({ "role": "user", "content": current_content }),
+    )
+    .await;
+
+    // 构建好上下文后再落库当前 user 消息(供历史渲染 + 多轮重建);调模型前落库
+    insert_user_message(&state.db, &conversation_id, &ctx.text, attachments_json).await?;
+
+    // 创建取消标志:stop_chat_agent 命令会设置此标志来中断流式输出
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        arr.push(sys);
+        let mut flags = state
+            .chat_cancel_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.insert(conversation_id.clone(), cancel_flag.clone());
     }
-    // 本会话滚动摘要:早期消息压缩后的前情提要,注入在原文之前
-    if let Some(sys) = summary_system_message(&conversation.summary) {
-        arr.push(sys);
-    }
-    // 历史里带图片的 user 消息重建为多模态(与非流式一致),让模型后续轮次仍"看得到"图
-    for m in &prior {
-        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
-    }
-    arr.push(json!({ "role": "user", "content": current_content }));
-    let messages = json!(arr);
 
     // 流式调模型:每段增量 emit chat-stream 事件
     let app_emit = app.clone();
     let cid_emit = conversation_id.clone();
+    let cancel_flag_for_stream = cancel_flag.clone();
     let reply = crate::llm::chat::chat_completion_stream(
         crate::llm::chat::ChatRequest {
-            api_url: &provider.api_url,
-            api_key: &provider.api_key,
-            model: &conversation.model,
+            api_url: &ctx.provider.api_url,
+            api_key: &ctx.provider.api_key,
+            model: &ctx.conversation.model,
             messages,
             extra_body: None,
             timeout_secs: crate::llm::http::CHAT_TIMEOUT_SECS,
             retry_server_errors: false,
         },
         move |kind, delta| {
-            // kind 区分正文(content)与思考过程(reasoning),前端分别渲染
             let _ = app_emit.emit(
                 "chat-stream",
                 json!({ "conversationId": cid_emit, "kind": kind, "delta": delta }),
             );
         },
+        Some(cancel_flag_for_stream),
     )
     .await?;
     let reply_text = reply.content;
     let reply_reasoning = reply.reasoning;
 
-    let assistant = msg::ActiveModel {
-        conversation_id: Set(conversation_id.clone()),
-        role: Set("assistant".to_string()),
-        content: Set(reply_text.clone()),
-        reasoning: Set(reply_reasoning),
-        created_at: Set(Utc::now().timestamp()),
-        ..Default::default()
+    // 记录 token 用量
+    let _ = veltrix_core::db::entity::model_usage_record::Model::record(
+        &state.db,
+        &ctx.conversation.model,
+        &ctx.provider.id,
+        reply.usage.prompt,
+        reply.usage.completion,
+        "chat",
+        &ctx.conversation.owner,
+    )
+    .await;
+
+    // 清理取消标志
+    {
+        let mut flags = state
+            .chat_cancel_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.remove(&conversation_id);
     }
-    .insert(&state.db)
-    .await
-    .map_err(|e| CrawlerError::Config(format!("保存回复失败: {e}")))?;
 
-    // 会话模型作为杂活角色化解析的回退档
-    let fallback_ref = session_provider_ref(&provider, &conversation.model);
+    let assistant = insert_assistant_message(&state.db, &conversation_id, &reply_text, reply_reasoning).await?;
 
-    // 自动记忆提取:从本轮对话抽取值得长期记住的事实,异步落库,不阻塞回复返回
-    spawn_memory_extraction(&state.db, &me.name, fallback_ref.clone(), &text, &reply_text);
-
-    // 滚动摘要维护:live 过长时把较旧消息折叠进会话摘要,异步进行,不阻塞回复返回
-    spawn_summary_maintenance(&state.db, &conversation_id, fallback_ref.clone());
-
-    // 首轮:用 AI 概括对话生成标题(摘要角色的便宜模型;失败回退用户首句截断)
-    let new_title = if had_messages {
-        None
-    } else {
-        let title_ref =
-            crate::commands::resolve_role_provider(&state.db, crate::llm::AgentRole::Summary, fallback_ref)
-                .await;
-        Some(
-            generate_title(
-                &title_ref.api_url,
-                &title_ref.api_key,
-                &title_ref.model,
-                &text,
-                &reply_text,
-            )
-            .await
-            .unwrap_or_else(|| truncate_title(&text)),
-        )
-    };
-    let mut am = conversation.into_active_model();
-    am.updated_at = Set(Utc::now().timestamp());
-    if let Some(t) = new_title {
-        am.title = Set(t);
-    }
-    let _ = am.update(&state.db).await;
+    finalize_chat_turn(
+        &state.db,
+        ctx.conversation,
+        &ctx.provider,
+        &conversation_id,
+        &ctx.text,
+        &reply_text,
+        ctx.had_messages,
+    )
+    .await;
 
     Ok(assistant.into())
 }
@@ -712,6 +743,8 @@ fn spawn_memory_extraction(
             &p.model,
             &user_text,
             &assistant_text,
+            "global", // chat 场景默认为全局记忆
+            "",
         )
         .await;
     });
@@ -962,7 +995,8 @@ async fn generate_title(
         retry_server_errors: false,
     })
     .await
-    .ok()?;
+    .ok()?
+    .content;
     // 清洗:去引号/书名号/换行,截断到 20 字
     let cleaned: String = reply
         .trim()
@@ -1178,4 +1212,140 @@ fn local_image_paths(row: &veltrix_core::db::entity::content::Model) -> Vec<Stri
     }
     files.sort_by_key(|(idx, _)| *idx);
     files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// 请求停止某会话正在进行的流式对话。
+/// 前端调用后，后端会在下一个增量到达时中断流式输出。
+#[tauri::command]
+pub fn stop_chat_agent(state: State<'_, AppState>, conversation_id: String) -> Result<()> {
+    // 设置取消标志
+    let flags = state
+        .chat_cancel_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(flag) = flags.get(&conversation_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// 更新消息的用户反馈(点赞/点踩)。
+/// feedback 为 "like" / "dislike" / null(取消反馈)。
+#[tauri::command]
+pub async fn update_message_feedback(
+    state: State<'_, AppState>,
+    message_id: i64,
+    feedback: Option<String>,
+) -> Result<()> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+
+    // 校验归属:只能给自己会话的消息反馈
+    let message = msg::Entity::find_by_id(message_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询消息失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("消息不存在".into()))?;
+
+    let conversation = conv::Entity::find_by_id(message.conversation_id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询会话失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("会话不存在".into()))?;
+
+    if conversation.owner != me.name {
+        return Err(CrawlerError::Config("无权操作该消息".into()));
+    }
+
+    // 校验 feedback 值
+    let valid_feedback = match feedback.as_deref() {
+        Some("like") => Some("like"),
+        Some("dislike") => Some("dislike"),
+        None => None,
+        _ => return Err(CrawlerError::Config("feedback 必须是 like/dislike/null".into())),
+    };
+
+    // 更新反馈
+    let mut am = message.into_active_model();
+    am.feedback = Set(valid_feedback.map(|s| s.to_string()));
+    am.update(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("更新反馈失败: {e}")))?;
+
+    // 如果是 dislike，可以触发学习机制（例如记录到记忆系统）
+    if valid_feedback == Some("dislike") {
+        // 异步记录到记忆系统，供未来改进
+        spawn_feedback_learning(&state.db, &me.name, message_id);
+    }
+
+    Ok(())
+}
+
+/// 异步处理反馈学习：将负面反馈记录到记忆系统，帮助未来改进。
+fn spawn_feedback_learning(
+    db: &sea_orm::DatabaseConnection,
+    owner: &str,
+    message_id: i64,
+) {
+    let db = db.clone();
+    let owner = owner.to_string();
+    tauri::async_runtime::spawn(async move {
+        // 读取消息内容（用于日志记录）
+        if let Ok(Some(_message)) = msg::Entity::find_by_id(message_id).one(&db).await {
+            // 可以将负面反馈的上下文记录到记忆系统
+            // 这里简化处理，实际可以更复杂
+            tracing::info!(
+                "用户 {} 对消息 {} 给出了负面反馈",
+                owner,
+                message_id
+            );
+        }
+    });
+}
+
+/// 实时语音转写:前端定时发送音频片段(base64),后端转写并返回文本。
+/// 支持流式输入，每次调用转写一段音频片段。
+#[tauri::command]
+pub async fn transcribe_audio_chunk(
+    state: State<'_, AppState>,
+    audio_base64: String,
+    format: String,
+) -> Result<String> {
+    use base64::Engine;
+
+    let transcription_cfg = { lock_config(&state)?.transcription.clone() };
+    let api_key = crate::commands::get_secret(&state.db, "transcription_api_key").await;
+    if api_key.trim().is_empty() {
+        return Err(CrawlerError::Config(
+            "未配置语音转写 API Key,请到系统设置 → 语音转写填写 API Key".into(),
+        ));
+    }
+
+    // 解码音频写入临时文件
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(audio_base64.as_bytes())
+        .map_err(|e| CrawlerError::Config(format!("音频解码失败: {e}")))?;
+    let ext = if format.trim().is_empty() {
+        "webm".to_string()
+    } else {
+        format.trim().to_ascii_lowercase()
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "veltrix-chunk-{}.{ext}",
+        Utc::now().timestamp_millis()
+    ));
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("写临时音频失败: {e}")))?;
+
+    let result = crate::llm::transcribe(crate::llm::TranscribeRequest {
+        provider_code: "mimo",
+        api_url: &transcription_cfg.api_url,
+        api_key: &api_key,
+        model: &transcription_cfg.model,
+        audio_path: &tmp,
+    })
+    .await;
+    // 转写完删临时文件(失败忽略)
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result
 }

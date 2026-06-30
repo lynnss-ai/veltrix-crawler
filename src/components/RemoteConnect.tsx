@@ -1,7 +1,7 @@
 // 远程控制全局入口:顶部栏按钮 + 配对弹窗。
 // 按钮颜色按 RemoteStatus 反映远程会话健康度,弹窗内驱动 cloud_pair_init 拿真实连接码。
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   Copy,
   Info,
@@ -82,6 +82,20 @@ function RemoteConnectDialog({
   const [pairLoading, setPairLoading] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
 
+  const fetchPair = useCallback(async () => {
+    setPairLoading(true);
+    setPairError(null);
+    try {
+      const view = await api.cloudPairInit();
+      setPairData(view);
+      setQrSeed((s) => s + 1);
+    } catch (e: unknown) {
+      setPairError(String(e));
+    } finally {
+      setPairLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!open || isConnected) return;
     let cancelled = false;
@@ -101,22 +115,7 @@ function RemoteConnectDialog({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, isConnected]);
-
-  const fetchPair = async () => {
-    setPairLoading(true);
-    setPairError(null);
-    try {
-      const view = await api.cloudPairInit();
-      setPairData(view);
-      setQrSeed((s) => s + 1);
-    } catch (e: unknown) {
-      setPairError(String(e));
-    } finally {
-      setPairLoading(false);
-    }
-  };
+  }, [open, isConnected, fetchPair]);
 
   const realCode = pairData?.code ?? "";
   const pairCodeFormatted = realCode

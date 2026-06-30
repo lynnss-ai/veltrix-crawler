@@ -1,12 +1,19 @@
 // 任务新建/编辑表单抽屉:从 CollectPage 抽出的独立 Sheet 组件(props 自洽,无闭包捕获)。
 import { useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { api } from "@/lib/api";
 import type { IndustryView, TaskInput } from "@/lib/api";
-import { filterMetaFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY } from "./collect-meta";
+import { filterMetaFor, extraFiltersFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY } from "./collect-meta";
 import type { TaskTrigger, SortMode, TimeRange, TaskItem, CommentTimeRange, PlatformOption } from "./collect-meta";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { CircleSlash2 } from "lucide-react";
+import {
+  ArrowDownUp,
+  CalendarClock,
+  CircleSlash2,
+  Clock,
+  type LucideIcon,
+} from "lucide-react";
+import { Separator } from "@/components/ui/separator";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,6 +22,16 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+
+// 表单分区小标题:图标 + 文案,统一各组视觉,降低「一长条字段堆叠」的杂乱感
+function SectionLabel({ icon: Icon, children }: { icon: LucideIcon; children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+      <Icon className="size-3.5" />
+      {children}
+    </div>
+  );
+}
 
 export function TaskFormSheet({
   open,
@@ -48,7 +65,7 @@ export function TaskFormSheet({
     api
       .listKeywords(ind.id)
       .then((rows) => setKeywordsRaw(rows.map((r) => r.word).join("\n")))
-      .catch(() => {});
+      .catch((e) => console.warn("加载关键词列表失败:", e));
     // 这里有意只跟 industry 变化,不依赖 keywordsRaw,避免循环
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [industry, industries]);
@@ -81,16 +98,28 @@ export function TaskFormSheet({
   const [autoSyncObsidian, setAutoSyncObsidian] = useState(
     initial?.autoSyncObsidian ?? DEFAULT_STRATEGY.autoSyncObsidian,
   );
-  // 切换平台时:若当前排序/时间不在该平台支持项内,回退到该平台首项(综合/不限)
+  // 平台专属额外筛选(抖音:视频时长/搜索范围/内容形式),{维度id: 选中文案},"any"/缺省=不限
+  const [extraFilters, setExtraFilters] = useState<Record<string, string>>(
+    initial?.extraFilters ?? {},
+  );
+  // 切换平台时:若当前排序/时间不在该平台支持项内,回退到该平台首项(综合/不限);
+  // 额外筛选只保留新平台声明的维度键(切平台即重置,编辑态首进因键合法故保留)
   useEffect(() => {
     const meta = filterMetaFor(platform);
-    if (!meta.sort.some((o) => o.value === sortMode)) {
+    // 平台无排序/时间筛选项(如快手)时数组为空,不纠正(保留默认 synthetic/any,后端不点击)
+    if (meta.sort.length > 0 && !meta.sort.some((o) => o.value === sortMode)) {
       setSortMode(meta.sort[0].value);
     }
-    if (!meta.time.some((o) => o.value === timeRange)) {
+    if (meta.time.length > 0 && !meta.time.some((o) => o.value === timeRange)) {
       setTimeRange(meta.time[0].value);
     }
-    // 仅在平台变化时纠正,不依赖 sortMode/timeRange
+    const dimIds = new Set(extraFiltersFor(platform).map((d) => d.id));
+    setExtraFilters((prev) => {
+      const next: Record<string, string> = {};
+      for (const k of Object.keys(prev)) if (dimIds.has(k)) next[k] = prev[k];
+      return next;
+    });
+    // 仅在平台变化时纠正,不依赖 sortMode/timeRange/extraFilters
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform]);
   // ffmpeg 安装检测:null=检测中,true/false=结果;已装则隐藏「点此下载」引导
@@ -179,13 +208,54 @@ export function TaskFormSheet({
       commentTimeRange,
       commentLimit: collectComments ? Math.max(0, Number(commentLimit) || 0) : 0,
       analyzeCommentIntent: collectComments && analyzeCommentIntent,
+      // 只提交真实选中的额外筛选(剔除「不限」/any),落库即一组待点击文案
+      extraFilters: Object.fromEntries(
+        Object.entries(extraFilters).filter(([, v]) => v && v !== "any"),
+      ),
     };
     onSubmit(input);
   }
 
+  // 该平台提供哪些采集筛选(快手无任何筛选 → 整块隐藏);排序/时间为空数组的平台不渲染对应选择器
+  const platformSort = filterMetaFor(platform).sort;
+  const platformTime = filterMetaFor(platform).time;
+  const platformDims = extraFiltersFor(platform);
+  const hasFilters =
+    platformSort.length > 0 ||
+    platformTime.length > 0 ||
+    platformDims.length > 0;
+  // 表单是否已填值(名称 / 关键词 / 平台 / 行业 任一非空):有内容时点表单外不自动关闭,防误触丢失
+  const isDirty =
+    name.trim() !== "" ||
+    keywordsRaw.trim() !== "" ||
+    platform !== "" ||
+    industry !== "";
+
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="flex w-full flex-col gap-0 sm:max-w-[600px]">
+      <SheetContent
+        className="flex w-full flex-col gap-0 sm:max-w-[820px]"
+        onEscapeKeyDown={(e) => {
+          // 有内容时按 Esc 也不关闭(防误触丢内容),仅右上角 × 显式关闭
+          if (isDirty) {
+            e.preventDefault();
+            toast.info("表单有内容,如需关闭请点右上角 ×");
+          }
+        }}
+        onInteractOutside={(e) => {
+          // 点击自定义窗口标题栏(最小化 / 最大化 / 关闭 / 拖拽)不视为关闭表单:放行窗口操作,不弹提示、不关闭
+          const target = e.detail.originalEvent.target as HTMLElement | null;
+          if (target?.closest("[data-app-titlebar]")) {
+            e.preventDefault();
+            return;
+          }
+          // 已填内容时,点击遮罩 / 表单外不自动关闭(防误触丢内容);用右上角 × 显式关闭
+          if (isDirty) {
+            e.preventDefault();
+            toast.info("表单有内容,如需关闭请点右上角 ×");
+          }
+        }}
+      >
         <SheetHeader>
           <SheetTitle>{initial ? "编辑采集任务" : "创建采集任务"}</SheetTitle>
           <SheetDescription>
@@ -209,8 +279,10 @@ export function TaskFormSheet({
               placeholder="例:小红书 · 母婴关键词监控"
             />
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="task-industry">
+          {/* 行业 + 平台 并排,省竖向空间 */}
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="task-industry">
               所属行业 <span className="text-destructive">*</span>
             </Label>
             <Select value={industry} onValueChange={setIndustry}>
@@ -262,6 +334,96 @@ export function TaskFormSheet({
               </SelectContent>
             </Select>
           </div>
+          </div>
+          {/* 采集筛选:紧跟平台下方,不加标题/分割线/外框。该平台无任何筛选项(如快手)时整块隐藏 */}
+          {hasFilters && (
+              <div className="space-y-3">
+                {/* 排序 / 发布时间 + 平台专属维度同排平铺,flex-wrap 窄屏才换行;
+                    每项 flex-1 等分、min-w 保证 Select 不被压扁 */}
+                <div className="flex flex-wrap gap-3">
+                  {platformSort.length > 0 && (
+                    <div className="min-w-[140px] flex-1 space-y-1.5">
+                      <Label
+                        htmlFor="task-sort"
+                        className="flex items-center gap-1.5 text-sky-600 dark:text-sky-400"
+                      >
+                        <ArrowDownUp className="size-3.5" />
+                        排序方式
+                      </Label>
+                      <Select
+                        value={sortMode}
+                        onValueChange={(v) => setSortMode(v as SortMode)}
+                      >
+                        <SelectTrigger id="task-sort" className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {platformSort.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                  {platformTime.length > 0 && (
+                    <div className="min-w-[140px] flex-1 space-y-1.5">
+                      <Label
+                        htmlFor="task-time"
+                        className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400"
+                      >
+                        <CalendarClock className="size-3.5" />
+                        发布时间
+                      </Label>
+                      <Select
+                        value={timeRange}
+                        onValueChange={(v) => setTimeRange(v as TimeRange)}
+                      >
+                        <SelectTrigger id="task-time" className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {platformTime.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                  {platformDims.map((dim) => (
+                    <div key={dim.id} className="min-w-[140px] flex-1 space-y-1.5">
+                      <Label
+                        htmlFor={`task-ef-${dim.id}`}
+                        className={`flex items-center gap-1.5 ${dim.color}`}
+                      >
+                        <dim.icon className="size-3.5" />
+                        {dim.label}
+                      </Label>
+                      <Select
+                        value={extraFilters[dim.id] ?? "any"}
+                        onValueChange={(v) =>
+                          setExtraFilters((prev) => ({ ...prev, [dim.id]: v }))
+                        }
+                      >
+                        <SelectTrigger id={`task-ef-${dim.id}`} className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {dim.options.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+          )}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
               <Label htmlFor="task-keywords">
@@ -273,51 +435,13 @@ export function TaskFormSheet({
             </div>
             <Textarea
               id="task-keywords"
-              rows={10}
+              rows={6}
               value={keywordsRaw}
               onChange={(e) => setKeywordsRaw(e.target.value)}
-              placeholder={"婴儿辅食\n宝宝湿疹\n孕妇维生素"}
-              className="min-h-48 font-mono text-sm"
+              placeholder="请输入搜索关键词，每行一个"
+              // 固定 6 排高度,超出走滚动条:field-sizing-fixed 覆盖基类的 field-sizing-content(否则随内容自增高)
+              className="h-36 resize-none overflow-y-auto field-sizing-fixed font-mono text-sm"
             />
-          </div>
-          {/* 采集策略 */}
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="task-sort">排序方式</Label>
-              <Select
-                value={sortMode}
-                onValueChange={(v) => setSortMode(v as SortMode)}
-              >
-                <SelectTrigger id="task-sort" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {filterMetaFor(platform).sort.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="task-time">发布时间</Label>
-              <Select
-                value={timeRange}
-                onValueChange={(v) => setTimeRange(v as TimeRange)}
-              >
-                <SelectTrigger id="task-time" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {filterMetaFor(platform).time.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
@@ -349,40 +473,143 @@ export function TaskFormSheet({
           </div>
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
-              <Label htmlFor="task-ai-extract" className="cursor-pointer">
-                AI 文案提取
-              </Label>
+              <div className="flex flex-wrap items-center gap-1">
+                <Label htmlFor="task-ai-extract" className="cursor-pointer">
+                  AI 文案提取
+                </Label>
+                {/* ffmpeg 依赖与检测状态:用 [] 紧跟标题后,整段统一灰色(不再用绿色区分) */}
+                <span className="text-xs">
+                  {ffmpegAvailable === false ? (
+                    // 未安装:整段红色,下载链接同色加下划线
+                    <span className="text-red-600 dark:text-red-400">
+                      [依赖 ffmpeg · 未安装,
+                      <button
+                        type="button"
+                        className="cursor-pointer underline underline-offset-2 hover:text-red-700 dark:hover:text-red-300"
+                        onClick={() =>
+                          openUrl("https://ffmpeg.org/download.html").catch((e) =>
+                            toast.error(`打开下载页失败: ${e}`),
+                          )
+                        }
+                      >
+                        点此下载
+                      </button>
+                      ]
+                    </span>
+                  ) : ffmpegAvailable === true ? (
+                    // 已安装:绿色表示就绪
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      [依赖 ffmpeg · 已安装]
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">[依赖 ffmpeg]</span>
+                  )}
+                </span>
+              </div>
               <p className="text-xs text-muted-foreground">
-                对采集到的视频自动提取文案(转音频后做语音转写);依赖 ffmpeg
-                {ffmpegAvailable === true && (
-                  <span className="ml-1 text-emerald-600 dark:text-emerald-400">
-                    · 已检测到,可正常转写
-                  </span>
-                )}
-                {ffmpegAvailable === false && (
-                  <>
-                    ,未安装可
-                    <button
-                      type="button"
-                      className="ml-1 cursor-pointer text-primary underline underline-offset-2 hover:text-primary/80"
-                      onClick={() =>
-                        openUrl("https://ffmpeg.org/download.html").catch((e) =>
-                          toast.error(`打开下载页失败: ${e}`),
-                        )
-                      }
-                    >
-                      点此下载
-                    </button>
-                  </>
-                )}
+                对采集到的视频自动提取文案(转音频后做语音转写)
               </p>
             </div>
             <Switch
               id="task-ai-extract"
               checked={aiExtract}
               onCheckedChange={setAiExtract}
+              className="scale-125"
             />
           </div>
+          <div className="rounded-md border">
+            <div className="flex items-center justify-between px-3 py-2.5">
+              <div className="space-y-0.5">
+                <Label
+                  htmlFor="task-collect-comments"
+                  className="cursor-pointer"
+                >
+                  开启评论采集
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  抓取内容下的评论,用于后续意向客户分析
+                </p>
+              </div>
+              <Switch
+                id="task-collect-comments"
+                className="scale-125"
+                checked={collectComments}
+                onCheckedChange={(v) => {
+                  setCollectComments(v);
+                  // 意图分析依赖评论采集,关闭评论采集时同步关闭意图分析
+                  if (!v) setAnalyzeCommentIntent(false);
+                }}
+              />
+            </div>
+
+            {/* 参数常驻(不折叠);未开启评论采集时整体禁用 + 置灰。三项均为下拉,一行平铺 */}
+            <div
+              className={`grid grid-cols-3 gap-3 border-t px-3 py-3 ${
+                collectComments ? "" : "pointer-events-none opacity-50"
+              }`}
+            >
+              <div className="space-y-1.5">
+                <Label htmlFor="task-comment-time">评论时间</Label>
+                <Select
+                  value={commentTimeRange}
+                  onValueChange={(v) => setCommentTimeRange(v as CommentTimeRange)}
+                  disabled={!collectComments}
+                >
+                  <SelectTrigger id="task-comment-time" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(Object.keys(COMMENT_TIME_RANGE_META) as CommentTimeRange[]).map(
+                      (k) => (
+                        <SelectItem key={k} value={k}>
+                          {COMMENT_TIME_RANGE_META[k].label}
+                        </SelectItem>
+                      ),
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="task-comment-limit">单视频上限</Label>
+                <Select
+                  value={commentLimit}
+                  onValueChange={setCommentLimit}
+                  disabled={!collectComments}
+                >
+                  <SelectTrigger id="task-comment-limit" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {COMMENT_LIMIT_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {/* 评论意图分析:是 / 否 下拉(布尔映射 1/0),依赖评论采集开启 */}
+              <div className="space-y-1.5">
+                <Label htmlFor="task-comment-intent">评论意图分析</Label>
+                <Select
+                  value={analyzeCommentIntent ? "1" : "0"}
+                  onValueChange={(v) => setAnalyzeCommentIntent(v === "1")}
+                  disabled={!collectComments}
+                >
+                  <SelectTrigger id="task-comment-intent" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="0">否</SelectItem>
+                    <SelectItem value="1">是</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          {/* Obsidian 同步:置于触发方式上方 */}
+          <Separator />
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
               <Label htmlFor="task-auto-sync" className="cursor-pointer">
@@ -396,105 +623,14 @@ export function TaskFormSheet({
             </div>
             <Switch
               id="task-auto-sync"
+              className="scale-125"
               checked={obsidianConfigured && autoSyncObsidian}
               onCheckedChange={setAutoSyncObsidian}
               disabled={!obsidianConfigured}
             />
           </div>
-
-          {/* 评论采集:开启后展开评论抓取规则 + 意图分析 */}
-          <div className="rounded-md border">
-            <div className="flex items-center justify-between px-3 py-2.5">
-              <div className="space-y-0.5">
-                <Label
-                  htmlFor="task-collect-comments"
-                  className="cursor-pointer"
-                >
-                  评论采集
-                </Label>
-                <p className="text-xs text-muted-foreground">
-                  抓取内容下的评论,用于后续意向客户分析
-                </p>
-              </div>
-              <Switch
-                id="task-collect-comments"
-                checked={collectComments}
-                onCheckedChange={(v) => {
-                  setCollectComments(v);
-                  // 意图分析依赖评论采集,关闭评论采集时同步关闭意图分析
-                  if (!v) setAnalyzeCommentIntent(false);
-                }}
-              />
-            </div>
-
-            {collectComments && (
-              <div className="space-y-3 border-t px-3 py-3">
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="task-comment-time">评论时间范围</Label>
-                    <Select
-                      value={commentTimeRange}
-                      onValueChange={(v) =>
-                        setCommentTimeRange(v as CommentTimeRange)
-                      }
-                    >
-                      <SelectTrigger id="task-comment-time" className="w-full">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {(
-                          Object.keys(
-                            COMMENT_TIME_RANGE_META,
-                          ) as CommentTimeRange[]
-                        ).map((k) => (
-                          <SelectItem key={k} value={k}>
-                            {COMMENT_TIME_RANGE_META[k].label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="task-comment-limit">单视频上限</Label>
-                    <Select value={commentLimit} onValueChange={setCommentLimit}>
-                      <SelectTrigger id="task-comment-limit" className="w-full">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {COMMENT_LIMIT_OPTIONS.map((o) => (
-                          <SelectItem key={o.value} value={o.value}>
-                            {o.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
-                  <div className="space-y-0.5">
-                    <Label
-                      htmlFor="task-comment-intent"
-                      className="cursor-pointer"
-                    >
-                      评论意图分析
-                    </Label>
-                    <p className="text-xs text-muted-foreground">
-                      采集完成后用 AI 分析评论,提取有意向的客户
-                    </p>
-                  </div>
-                  <Switch
-                    id="task-comment-intent"
-                    checked={analyzeCommentIntent}
-                    onCheckedChange={setAnalyzeCommentIntent}
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-
+          <SectionLabel icon={Clock}>触发方式</SectionLabel>
           <div className="space-y-1.5">
-            <Label>触发方式</Label>
             <div className="grid grid-cols-3 gap-2">
               {(Object.keys(TRIGGER_META) as TaskTrigger[]).map((k) => {
                 const m = TRIGGER_META[k];
@@ -600,9 +736,19 @@ export function TaskFormSheet({
           )}
         </form>
 
-        <SheetFooter>
-          <Button type="submit" form="task-form" className="cursor-pointer">
-            {initial ? "保存修改" : "创建采集任务"}
+        {/* 取消 + 创建:并排右对齐;取消是用户主动关闭,直接关(不触发"有内容"拦截) */}
+        <SheetFooter className="flex-row justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 cursor-pointer"
+            onClick={() => onOpenChange(false)}
+          >
+            取消
+          </Button>
+          {/* 高度对齐筛选下拉(h-10);Button 默认 h-8,这里显式拉高 */}
+          <Button type="submit" form="task-form" className="h-10 cursor-pointer">
+            {initial ? "保存修改" : "创建任务"}
           </Button>
         </SheetFooter>
       </SheetContent>

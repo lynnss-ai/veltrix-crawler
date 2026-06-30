@@ -1,6 +1,7 @@
 //! AI 对话长期记忆实体。跨会话、按用户(owner)归属的记忆条目。
 //! 来源:`auto`(LLM 每轮自动从对话中提取)/ `manual`(用户在设置页手动维护)。
 //! 发消息前把启用的记忆拼成 system 消息注入上下文,让 AI 跨会话记住用户。
+//! 支持记忆层级化:global(全局)/project(项目)/conversation(会话)。
 
 use sea_orm::entity::prelude::*;
 
@@ -12,6 +13,10 @@ pub struct Model {
     pub id: i64,
     /// 数据归属:用户名
     pub owner: String,
+    /// 记忆作用域:global(全局)/project(项目)/conversation(会话)
+    pub scope: String,
+    /// 作用域 ID:project 时为项目 ID,conversation 时为会话 ID,global 时为空
+    pub scope_id: String,
     /// 记忆内容(一条自包含的事实 / 偏好)
     #[sea_orm(column_type = "Text")]
     pub content: String,

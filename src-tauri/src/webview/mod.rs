@@ -16,10 +16,12 @@
 // 拦截响应部分字段待解析链路接入,暂保留
 #![allow(dead_code)]
 
+pub mod cookies;
 pub mod native_intercept;
 pub mod pool;
 pub mod screenshot;
 pub mod script_eval;
+pub mod slider;
 
 use veltrix_core::config::RpaStep;
 use veltrix_core::error::{CrawlerError, Result};
@@ -157,12 +159,15 @@ impl RpaChannel {
 // 注:浏览器 Agent 早期的「动作 + 回读」请求-响应通道(AgentActionChannel / AgentActionOutcome)
 // 已废弃——回读改走 WebView2 ExecuteScript(见 webview::script_eval),不再依赖页面 invoke 回传。
 
-/// 采集中断控制:HUD「结束」按钮经 `stop_collect` 命令登记 session_id,
-/// 采集循环每轮检查到即**优雅停止**(保留已采内容、作为正常完成),而非报错中断。
+/// 采集中断控制:HUD「结束」按钮经 `stop_collect` 命令登记 session_id 与 task_id,
+/// 采集循环每轮 / 关键词切换时检查到即**优雅停止**(保留已采内容、作为正常完成),而非报错中断。
 #[derive(Default)]
 pub struct CollectControl {
-    /// 被请求停止的 session_id 集合。
+    /// 被请求停止的 session_id 集合(无 task 的联调单采用此兜底)。
     stopping: Mutex<std::collections::HashSet<u64>>,
+    /// 被请求停止的 task_id 集合。会话(session_id)按关键词刷新,在「两个关键词之间」点结束
+    /// 会落到上一个已结束的会话上而漏判;按任务登记则跨关键词稳定,关键词循环切下个词前据此终止。
+    stopping_tasks: Mutex<std::collections::HashSet<String>>,
     /// 当前检测到安全验证弹窗的 session_id 集合(采集窗口自检脚本经 `report_collect_verify` 写入)。
     /// 采集循环每轮检查到即暂停滚动,等弹窗消失(用户手动完成)再恢复。
     verifying: Mutex<std::collections::HashSet<u64>>,
@@ -186,6 +191,28 @@ impl CollectControl {
             .lock()
             .map(|set| set.contains(&session_id))
             .unwrap_or(false)
+    }
+
+    /// 请求停止某任务(HUD「结束」按钮按 task_id 登记)。
+    pub fn request_stop_task(&self, task_id: &str) {
+        if let Ok(mut set) = self.stopping_tasks.lock() {
+            set.insert(task_id.to_string());
+        }
+    }
+
+    /// 该任务是否被请求停止。
+    pub fn is_task_stopping(&self, task_id: &str) -> bool {
+        self.stopping_tasks
+            .lock()
+            .map(|set| set.contains(task_id))
+            .unwrap_or(false)
+    }
+
+    /// 清除某任务的停止标记。任务开始前重置,避免上一次运行的「结束」点击影响重跑。
+    pub fn clear_task(&self, task_id: &str) {
+        if let Ok(mut set) = self.stopping_tasks.lock() {
+            set.remove(task_id);
+        }
     }
 
     /// 设置某会话的「安全验证弹窗」状态:present=true 标记弹出,false 清除(弹窗已消失)。
@@ -251,8 +278,20 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
       window.__veltrixPushOk++;
     }} catch (e) {{ window.__veltrixPushErr++; console.error('[veltrix] intercept bridge unavailable', e); }}
   }}
+  var __veltrixApiSeen = {{}};
   function report(url, body) {{
     if (window.__veltrixSeen.length < 300) window.__veltrixSeen.push(url);
+    // 诊断:页面实际调用的每个 /api/ 接口「路径」首次出现时打到 HUD,便于核对页面真实接口
+    // (如小红书改版排查搜索/评论接口是否真的发出、路径是否变化)。按路径去重,不刷屏。
+    try {{
+      var p = (url || '').split('?')[0];
+      if (p.indexOf('/api/') !== -1 && !__veltrixApiSeen[p]) {{
+        __veltrixApiSeen[p] = 1;
+        if (window.__veltrixHud && window.__veltrixHud.log) {{
+          window.__veltrixHud.log({{ level: 'info', message: '🔎 接口 ' + p }});
+        }}
+      }}
+    }} catch (e) {{}}
     if (matched(url)) emit(url, body);
   }}
 
@@ -394,11 +433,19 @@ pub fn build_verify_check_eval(
   var TXT = __TXT__;
   var URLP = __URL__;
   var last = null;
+  // 本脚本经 window.eval 注入,只在顶层帧跑。验证码常渲染在跨域 iframe 里、顶层帧 querySelector
+  // 抓不到 —— 故除本帧 DOM/文案/URL 外,再读 HUD 注入脚本(在所有帧运行)写入的子帧心跳时间戳兜底:
+  // 子帧在 iframe 内看到验证码会 postMessage 到顶层,HUD 顶层监听把时间戳写到 window.__veltrixChildVerifyTs。
+  var CHILD_TTL = 4000; // 与 HUD 跨帧心跳一致(ms):超时即认为子帧验证码已消失
 
   function visible(el) {
-    if (!el || el.offsetParent === null) return false;
+    if (!el) return false;
+    // offsetParent 对 position:fixed 元素返回 null,不能据此判不可见
+    // 改用 getBoundingClientRect + 计算样式判断
     var r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
+    if (r.width === 0 || r.height === 0) return false;
+    var st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
   }
   // 命中任一验证弹窗选择器(可见)
   function bySelector() {
@@ -431,7 +478,12 @@ pub fn build_verify_check_eval(
     }
     return false;
   }
-  function present() { return bySelector() || byText() || byLocation(); }
+  // 顶层判定 = 本帧可见 或 跨域子帧近 CHILD_TTL 内报过验证码心跳(HUD 跨帧桥写入)
+  function present() {
+    if (bySelector() || byText() || byLocation()) return true;
+    try { if ((Date.now() - (window.__veltrixChildVerifyTs || 0)) < CHILD_TTL) return true; } catch (e) {}
+    return false;
+  }
 
   function tick() {
     var p = present();
@@ -643,11 +695,14 @@ pub fn build_select_eval(labels: &[String]) -> String {
     try {
       el.scrollIntoView({ block: 'center' });
       var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-      // 先派发 hover/move:抖音/小红书「筛选」等下拉靠 hover(React/Vue 的 mouseenter←mouseover)展开,只点不 hover 展不开
+      // 先派发 hover/move:抖音/小红书「筛选」等下拉靠 hover(React/Vue 的 mouseenter←mouseover)展开,只点不 hover 展不开。
+      // pointer 全套(down/up)必须带:抖音筛选项的点击处理挂在 pointer 事件上,只发 mouse 合成事件点不中(浮层开着但选项不生效)。
       try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
       el.dispatchEvent(new MouseEvent('mouseover', o));
       el.dispatchEvent(new MouseEvent('mousemove', o));
+      try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
       el.dispatchEvent(new MouseEvent('mousedown', o));
+      try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
       el.dispatchEvent(new MouseEvent('mouseup', o));
       el.dispatchEvent(new MouseEvent('click', o));
     } catch (e) {}
@@ -802,6 +857,9 @@ pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> 
     const TEMPLATE: &str = r#"(function () {
   var STEPS = __STEPS__;
   var KW = __KW__;
+  // 手动结束中断标志:HUD「结束」按钮会置 window.__veltrixAbort=true(同窗口共享),
+  // 本脚本的步骤循环与滚动循环每轮检查它即时退出。开跑先复位,避免窗口复用/SPA 下残留上次的 true。
+  try { window.__veltrixAbort = false; } catch (e) {}
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -845,10 +903,16 @@ pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> 
     el.scrollIntoView({ block: 'center' });
     await sleep(rand(150, 400));
     var r = el.getBoundingClientRect();
-    var o = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    var o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    // 派发 pointer + mouse 全套:小红书等 Vue 组件的点击处理常挂在 pointer 事件上,
+    // 只发 mouse 合成事件触发不了搜索(表现为「关键词输入完没点击/点了没反应」)。
+    try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
     el.dispatchEvent(new MouseEvent('mouseover', o));
+    el.dispatchEvent(new MouseEvent('mousemove', o));
     await sleep(rand(120, 350)); // hover 后短暂停顿再按下
+    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
     el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
     el.dispatchEvent(new MouseEvent('mouseup', o));
     el.dispatchEvent(new MouseEvent('click', o));
   }
@@ -882,6 +946,7 @@ pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> 
     var scroller = findMainScroller();
     var lastHeight = 0, stagnant = 0;
     for (var i = 0; i < maxRounds; i++) {
+      if (window.__veltrixAbort) break; // 手动结束:立即停止滚动翻页
       scroller.scrollBy({ top: rand(600, 1100) });
       var kids = scroller.children;
       if (kids && kids.length) {
@@ -918,6 +983,7 @@ pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> 
 
   (async function run() {
     for (var i = 0; i < STEPS.length; i++) {
+      if (window.__veltrixAbort) return done(false, i, '已手动结束'); // 手动结束:中止后续步骤
       var s = STEPS[i];
       try {
         if (s.action === 'waitFor') {
@@ -1027,7 +1093,7 @@ pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: im
 pub fn hud_log(app: &AppHandle, platform: &str, account_id: &str, level: &str, message: &str) {
     use tauri::Manager;
     if let Some(win) = app.get_webview_window(&pool::window_label(platform, account_id)) {
-        let _ = win.eval(&build_hud_log_eval(level, message));
+        let _ = win.eval(build_hud_log_eval(level, message));
     }
 }
 
@@ -1056,10 +1122,20 @@ pub fn build_hud_log_eval(level: &str, message: &str) -> String {
     format!("window.__veltrixHud&&window.__veltrixHud.log({payload});")
 }
 
-/// 构造「更新 HUD 状态条」的 eval 脚本。running 控制状态点颜色/呼吸。
+/// 构造「更新 HUD 状态条」的 eval 脚本。running 控制状态点颜色/呼吸;
+/// 收起态视觉由 JS 按 running 推断(true=运行中绿 / false=已停止灰)。
 pub fn build_hud_status_eval(text: &str, running: bool) -> String {
     let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!("window.__veltrixHud&&window.__veltrixHud.status({text_json},{running});")
+}
+
+/// 同 build_hud_status_eval,但显式指定收起态视觉状态(覆盖按 running 的推断):
+/// `state` ∈ "running"(运行中·绿)/ "error"(异常或需处理·红)/ "stopped"(已停止·灰)。
+/// 用于「异常结束」「等待安全验证」等需要在最小化图标上明确区分的场景。
+pub fn build_hud_status_eval_state(text: &str, running: bool, state: &str) -> String {
+    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    let state_json = serde_json::to_string(state).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__veltrixHud&&window.__veltrixHud.status({text_json},{running},{state_json});")
 }
 
 /// 构造「切到关键字 tab」的 eval 脚本。每轮采集前调用,使后续日志按关键字分组到独立 tab。
@@ -1071,6 +1147,13 @@ pub fn build_hud_keyword_eval(keyword: &str) -> String {
 /// 构造「绑定当前采集会话 id」的 eval 脚本,供 HUD「结束」按钮回传以停止本次采集。
 pub fn build_hud_session_eval(session_id: u64) -> String {
     format!("window.__veltrixHud&&window.__veltrixHud.bindSession({session_id});")
+}
+
+/// 构造「绑定当前任务 id」的 eval 脚本。task_id 跨关键词稳定,「结束」按钮按它停止整任务,
+/// 避免会话(session_id)随关键词刷新时,在关键词空档点结束落到旧会话上而漏判。
+pub fn build_hud_task_eval(task_id: &str) -> String {
+    let tid_json = serde_json::to_string(task_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__veltrixHud&&window.__veltrixHud.bindTask({tid_json});")
 }
 
 /// 构造注入采集窗口的 HUD 浮层脚本(作为 `initialization_script`)。
@@ -1088,10 +1171,21 @@ pub fn build_hud_init_script() -> String {
   var CUR_KEY = '__veltrix_hud_cur';
   var TAB_KEY = '__veltrix_hud_tab';
   var RUN_KEY = '__veltrix_hud_running';
+  var STATE_KEY = '__veltrix_hud_state';
   var DEFAULT_KW = '日志';
   var SID_KEY = '__veltrix_hud_sid';
-  // 状态色:绿=正常采集 / 红=遇到问题(风控、错误)/ 灰=空闲
+  var TID_KEY = '__veltrix_hud_tid';
+  // 状态色:绿=正常运行中 / 红=异常或需处理 / 灰=已停止
   var COLOR_OK = '#22c55e', COLOR_ERR = '#ef4444', COLOR_IDLE = '#9ca3af';
+  // 收起态三态视觉(颜色 + 图标 + 悬浮文案):最小化后一眼区分「运行中 / 异常 / 已停止」
+  var STATE_META = {
+    running: { color: COLOR_OK, glow: true, label: '正在采集',
+      svg: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg>' },
+    error: { color: COLOR_ERR, glow: true, label: '采集异常 / 需处理',
+      svg: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>' },
+    stopped: { color: COLOR_IDLE, glow: false, label: '已停止 / 空闲',
+      svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="white" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>' }
+  };
   // 记住最近一次状态色,收起时据此画发光环
   var lastColor = COLOR_IDLE, lastGlow = false;
 
@@ -1121,7 +1215,7 @@ pub fn build_hud_init_script() -> String {
     if (root) return root;
     root = document.createElement('div');
     root.id = 'veltrix-hud';
-    root.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;height:33vh;background:rgba(17,24,39,.95);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border-top:1px solid rgba(255,255,255,.14);box-shadow:0 -8px 24px rgba(0,0,0,.45);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
+    root.style.cssText = 'position:fixed;right:12px;bottom:12px;width:50vw;z-index:2147483647;height:33vh;background:rgba(17,24,39,.95);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border:1px solid rgba(255,255,255,.14);border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
     var head = document.createElement('div');
     head.id = 'veltrix-hud-head';
     head.style.cssText = 'padding:8px 11px;font-weight:600;background:rgba(255,255,255,.06);display:flex;align-items:center;gap:7px;flex:0 0 auto;cursor:default;user-select:none;';
@@ -1171,11 +1265,18 @@ pub fn build_hud_init_script() -> String {
     stopBtn.style.cssText = 'display:none;cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(239,68,68,.5);border-radius:5px;color:#fca5a5;flex:0 0 auto;';
     stopBtn.addEventListener('click', function (e) {
       e.stopPropagation();
-      var sid = null;
+      // 立即中断页面内 RPA 滚动(同窗口共享标志),不等 Rust 往返;Rust 停止信号另经 stop_collect 下发
+      try { window.__veltrixAbort = true; } catch (err) {}
+      var sid = null, tid = null;
       try { sid = sessionStorage.getItem(SID_KEY); } catch (err) {}
-      if (sid === null || sid === '') return;
+      try { tid = sessionStorage.getItem(TID_KEY); } catch (err) {}
+      // 会话或任务任一可用即可停止;任务采集走 task_id(跨关键词稳定),联调单采无 task 走 session
+      if ((sid === null || sid === '') && (tid === null || tid === '')) return;
       try {
-        window.__TAURI_INTERNALS__.invoke('stop_collect', { sessionId: Number(sid) });
+        var payload = {};
+        if (sid !== null && sid !== '') payload.sessionId = Number(sid);
+        if (tid !== null && tid !== '') payload.taskId = tid;
+        window.__TAURI_INTERNALS__.invoke('stop_collect', payload);
       } catch (err) { console.error('[veltrix] stop_collect 调用失败', err); }
       stopBtn.textContent = '结束中…';
       stopBtn.style.pointerEvents = 'none';
@@ -1202,7 +1303,7 @@ pub fn build_hud_init_script() -> String {
     root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
     document.body.appendChild(root);
 
-    // HUD 固定为底部栏(占满宽度、底部 1/3 高),不再恢复拖动位置
+    // HUD 为右下角浮动面板(宽度 1/2、高 1/3),默认收起为图标,不恢复拖动位置
 
     // 拖动:按住标题栏或收起图标移动浮层(按钮除外),松手把位置存入 sessionStorage。
     // dragMoved 供图标的 click 判断:刚拖动过的那次点击不应触发展开。
@@ -1251,13 +1352,15 @@ pub fn build_hud_init_script() -> String {
     renderTabs();
     renderBody();
     applyCollapsed(isCollapsed());
-    setStateColor(isRunning() ? COLOR_OK : COLOR_IDLE, isRunning());
+    setHudState(currentState());
     updateStopBtn();
+    applyCaptchaAvoid(); // 验证中心整页重注入时,若验证码已渲染则立刻避让,避免一帧闪现
     return root;
   }
 
   function isCollapsed() {
-    try { return sessionStorage.getItem(COLLAPSE_KEY) === '1'; } catch (e) { return false; }
+    // 默认隐藏(收起为右下角图标);用户手动展开后(置 '0')本会话保持展开
+    try { return sessionStorage.getItem(COLLAPSE_KEY) !== '0'; } catch (e) { return true; }
   }
   function applyCollapsed(collapsed) {
     var root = document.getElementById('veltrix-hud');
@@ -1286,22 +1389,22 @@ pub fn build_hud_init_script() -> String {
       root.style.border = 'none'; // 收起态不要边框线,整块纯色更干净
       root.style.boxShadow = (lastGlow ? '0 0 14px ' + lastColor + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
     } else {
-      // 展开:恢复成完整面板(尺寸与初始 cssText 保持一致)
       if (head) head.style.display = 'flex';
       if (icon) icon.style.display = 'none';
       if (body) body.style.display = '';
       if (tabs) tabs.style.display = keywordsOf(getLogs()).length < 2 ? 'none' : 'flex';
-      // 展开:恢复成底部固定栏(占满宽度、底部 1/3 高)
-      root.style.left = '0';
-      root.style.right = '0';
+      // 展开:右下角浮动面板,宽度为窗口的一半、高 1/3,带圆角与四边边框
+      root.style.left = 'auto';
+      root.style.right = '12px';
       root.style.top = 'auto';
-      root.style.bottom = '0';
-      root.style.width = 'auto';
+      root.style.bottom = '12px';
+      root.style.width = '50vw';
       root.style.height = '33vh';
       root.style.maxHeight = '';
-      root.style.border = 'none';
+      root.style.border = '1px solid rgba(255,255,255,.14)';
       root.style.borderTop = '1px solid rgba(255,255,255,.14)';
-      root.style.boxShadow = '0 -8px 24px rgba(0,0,0,.45)';
+      root.style.borderRadius = '10px';
+      root.style.boxShadow = '0 8px 28px rgba(0,0,0,.5)';
     }
   }
   function setCollapsed(collapsed) {
@@ -1346,7 +1449,7 @@ pub fn build_hud_init_script() -> String {
     if (!body) return;
     var line = document.createElement('div');
     var color = item.level === 'error' ? '#f87171' : (item.level === 'warn' ? '#fbbf24' : '#9ca3af');
-    line.style.cssText = 'white-space:pre-wrap;word-break:break-all;color:' + color + ';';
+    line.style.cssText = 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:' + color + ';';
     line.textContent = (item.time || '') + '  ' + (item.message || '');
     body.appendChild(line);
     body.scrollTop = body.scrollHeight;
@@ -1361,22 +1464,111 @@ pub fn build_hud_init_script() -> String {
     var b = document.getElementById('veltrix-hud-stop');
     if (b) b.style.display = isRunning() ? 'inline-block' : 'none';
   }
-  // 统一设置状态色:同时作用于标题栏状态点与收起图标;glow 控制辉光
-  function setStateColor(c, glow) {
-    lastColor = c; lastGlow = glow;
+  // 读取当前持久化的三态(默认 stopped);非法值回落 stopped
+  function currentState() {
+    var v = null;
+    try { v = sessionStorage.getItem(STATE_KEY); } catch (e) {}
+    return STATE_META[v] ? v : 'stopped';
+  }
+  // 统一设置三态(running/error/stopped):标题栏状态点 + 收起图标(颜色 + 图标 + 悬浮文案)+ 发光环
+  function setHudState(state) {
+    if (!STATE_META[state]) state = 'stopped';
+    try { sessionStorage.setItem(STATE_KEY, state); } catch (e) {}
+    var m = STATE_META[state];
+    lastColor = m.color; lastGlow = m.glow;
     var d = document.getElementById('veltrix-hud-dot');
     if (d) {
-      d.style.background = c;
-      d.style.boxShadow = glow ? '0 0 6px ' + c : 'none';
+      d.style.background = m.color;
+      d.style.boxShadow = m.glow ? '0 0 6px ' + m.color : 'none';
     }
-    // 收起态整块填充状态色(白色波形不变),一眼可辨绿/红/灰
+    // 收起态:整块填色 + 对应图标(波形=运行 / 警告三角=异常 / 方块=停止)+ 悬浮文案
     var icon = document.getElementById('veltrix-hud-icon');
-    if (icon) icon.style.background = c;
+    if (icon) {
+      icon.style.background = m.color;
+      icon.innerHTML = m.svg;
+      icon.title = m.label + '(点击展开 HUD 日志)';
+    }
     // 收起时整块外发光,远比细图标醒目
     var root = document.getElementById('veltrix-hud');
     if (root && isCollapsed()) {
-      root.style.boxShadow = (glow ? '0 0 14px ' + c + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
+      root.style.boxShadow = (m.glow ? '0 0 14px ' + m.color + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
     }
+  }
+
+  // ── 风控验证码自动避让 ───────────────────────────────────────────
+  // 抖音/字节 secsdk 验证码(滑块/盾牌/点选)弹出时,底部 HUD 栏会盖住验证弹窗下半部分,
+  // 妨碍手动验证。后端的 wait_verify_cleared 也会隐藏 HUD,但它依赖响应/DOM 自检命中后才触发,
+  // 弹窗刚渲染的空窗期盖不住(见用户实测:第 1 次翻页等待中弹窗已出 HUD 仍在)。这里在页面侧直接
+  // 按验证码 DOM 是否在屏可见来避让,弹窗一出即隐藏、消失即恢复,不依赖后端时序。
+  // 选择器取各平台 verify_selectors 的并集(抖音/TikTok/小红书/快手),确保是后端检测的超集,
+  // 整页「验证中心」与页内 overlay 两种形态都能识别。
+  var CAPTCHA_SELECTORS = [
+    '#captcha_container', '#vc_captcha_box', '.vc-captcha-verify',
+    '.captcha_verify_container', '#captcha-verify-image', '.captcha-verify-container',
+    '.captcha-container', '.red-captcha',          // 小红书
+    '.captcha-dialog', '.slide-verify'             // 快手
+  ];
+  // 本脚本经 initialization_script 注入,在「所有帧」运行(含跨域验证码 iframe)。
+  // 验证码常在跨域 iframe 里:该帧能看到弹窗 DOM 却无法 invoke,顶层帧又跨域抓不到 iframe DOM。
+  // 故由本脚本做跨帧桥:子帧看到验证码 → postMessage 给顶层;顶层把时间戳写到 window.__veltrixChildVerifyTs,
+  // 供「HUD 避让」与「verify 自检(report_collect_verify)」共用,从而正确暂停采集 + 隐藏全宽 HUD。
+  var CAPTCHA_MSG = 'veltrix-verify';
+  var CAPTCHA_TTL = 4000; // 子帧心跳超时(ms)
+  var hudIsTop = false;
+  try { hudIsTop = (window.top === window.self); } catch (e) { hudIsTop = false; }
+  if (hudIsTop) {
+    try {
+      window.addEventListener('message', function (ev) {
+        var d = ev && ev.data;
+        if (d && d.__veltrix === CAPTCHA_MSG) {
+          try { window.__veltrixChildVerifyTs = Date.now(); } catch (e) {}
+        }
+      }, false);
+    } catch (e) {}
+  }
+  // 本帧选择器命中(不含跨帧兜底)
+  function localCaptchaHit() {
+    for (var i = 0; i < CAPTCHA_SELECTORS.length; i++) {
+      var el;
+      try { el = document.querySelector(CAPTCHA_SELECTORS[i]); } catch (e) { continue; }
+      if (!el) continue;
+      // 0 尺寸 = display:none / 尚未渲染 / 已解除后残留,均视为不在屏
+      var r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return true;
+    }
+    return false;
+  }
+  function isCaptchaVisible() {
+    if (localCaptchaHit()) return true;
+    // 跨域子帧的验证码本帧抓不到 → 顶层靠子帧心跳兜底
+    try { if (hudIsTop && (Date.now() - (window.__veltrixChildVerifyTs || 0)) < CAPTCHA_TTL) return true; } catch (e) {}
+    return false;
+  }
+  // 仅托管「由本逻辑隐藏」的 HUD:验证码在屏→隐藏并记账;离屏后只恢复自己藏的那次。
+  // 这样后端因 verify_texts/url 命中(本侧选择器可能漏)而隐藏的 HUD 不会被错误抢回显示。
+  // 恢复用 flex(与初始 cssText 的 display:flex 一致),避免空串回落成 block 丢失弹性布局。
+  var hudHiddenByCaptcha = false;
+  function applyCaptchaAvoid() {
+    // 子帧:本帧看到验证码就向顶层发心跳(顶层据此暂停采集 + 隐藏全宽 HUD)
+    if (!hudIsTop && localCaptchaHit()) {
+      try { window.top.postMessage({ __veltrix: CAPTCHA_MSG, present: true }, '*'); } catch (e) {}
+    }
+    var root = document.getElementById('veltrix-hud');
+    if (!root) return;
+    if (isCaptchaVisible()) {
+      if (root.style.display !== 'none') { root.style.display = 'none'; hudHiddenByCaptcha = true; }
+    } else if (hudHiddenByCaptcha) {
+      hudHiddenByCaptcha = false;
+      if (root.style.display === 'none') root.style.display = 'flex';
+    }
+  }
+  function startCaptchaAvoid() {
+    if (window.__veltrixCaptchaAvoid) return;
+    window.__veltrixCaptchaAvoid = true;
+    // 轮询而非 MutationObserver:抖音滚动期 DOM 高频变更,逐次 getBoundingClientRect 触发的
+    // 强制重排代价高;400ms 定时检测开销可忽略,验证码显隐延迟也在可接受范围。
+    setInterval(applyCaptchaAvoid, 400);
+    applyCaptchaAvoid();
   }
 
   window.__veltrixHud = {
@@ -1406,19 +1598,16 @@ pub fn build_hud_init_script() -> String {
       } catch (e) {}
       if (!hadTab) renderTabs();
       if (item.keyword === activeTab) appendLine(item);
-      // warn/error 视为「遇到问题」置红;info 恢复正常态(采集中绿 / 空闲灰)
-      if (item.level === 'error' || item.level === 'warn') {
-        setStateColor(COLOR_ERR, true);
-      } else {
-        setStateColor(isRunning() ? COLOR_OK : COLOR_IDLE, isRunning());
-      }
+      // 收起态三态(运行/异常/停止)由后端 status() 显式驱动,单条日志不再改写状态色,
+      // 避免一条 warn 把「正常运行中」误闪成异常、又被下一条 info 抹掉,导致状态不可信。
     },
-    status: function (text, running) {
+    status: function (text, running, state) {
       ensureRoot();
       var s = document.getElementById('veltrix-hud-status');
       if (s && text) s.textContent = text;
       try { sessionStorage.setItem(RUN_KEY, running ? '1' : '0'); } catch (e) {}
-      setStateColor(running ? COLOR_OK : COLOR_IDLE, running);
+      // state 未显式传入时按 running 推断:运行中=running / 已结束=stopped;异常由后端显式传 'error'
+      setHudState(state || (running ? 'running' : 'stopped'));
       updateStopBtn();
     },
     // 绑定当前采集会话 id(供「结束」按钮回传);整页导航会丢 window 变量,故存 sessionStorage
@@ -1428,6 +1617,10 @@ pub fn build_hud_init_script() -> String {
       var b = document.getElementById('veltrix-hud-stop');
       if (b) { b.textContent = '结束'; b.style.pointerEvents = ''; }
       updateStopBtn();
+    },
+    // 绑定当前任务 id(供「结束」按钮按任务停止);跨关键词稳定,整页导航后从 sessionStorage 恢复
+    bindTask: function (tid) {
+      try { sessionStorage.setItem(TID_KEY, String(tid)); } catch (e) {}
     }
   };
 
@@ -1436,6 +1629,7 @@ pub fn build_hud_init_script() -> String {
   } else {
     ensureRoot();
   }
+  startCaptchaAvoid();
 })();"#
         .to_string()
 }

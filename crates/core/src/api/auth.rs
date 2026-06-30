@@ -6,7 +6,7 @@
 //! - UserClaims  — 桌面端/Web 登录后拿到,可调 /pair/init 等管理接口
 //! - PcClaims    — 配对成功后云端给 PC 签发,用于上报设备状态(/devices/status)
 //! - MobileClaims — 手机扫码绑定后签发,带 pair_id;每次请求由提取器查 Redis 比对当前绑定,
-//!                  实现「新手机绑定踢旧手机」语义
+//!   实现「新手机绑定踢旧手机」语义
 
 use axum::{extract::FromRequestParts, http::request::Parts};
 use bb8_redis::redis::AsyncCommands;

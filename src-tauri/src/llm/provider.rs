@@ -100,7 +100,7 @@ pub struct ModelSpec {
 /// 解析 `providers.models` 列。
 /// - 新格式:`[{"name":"gpt-4o","capabilities":["text","vision"]}]` JSON 数组;
 /// - 旧格式(兼容旧库):多行文本(每行一个模型名),整体降级为「仅对话(text)」能力。
-/// 解析顺带清洗:去空名、丢弃未知能力 code、按 MODEL_CAPABILITIES 顺序去重、能力为空兜底 text。
+///   解析顺带清洗:去空名、丢弃未知能力 code、按 MODEL_CAPABILITIES 顺序去重、能力为空兜底 text。
 pub fn parse_models(raw: &str) -> Vec<ModelSpec> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

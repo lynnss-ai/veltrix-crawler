@@ -29,6 +29,8 @@ pub struct Model {
     /// 仅推理型模型非空;供前端「思考过程」折叠块展示,历史里也能看到完整推理。
     #[sea_orm(column_type = "Text", nullable)]
     pub reasoning: Option<String>,
+    /// 用户反馈:like / dislike / null(未反馈)。用于学习与适应功能。
+    pub feedback: Option<String>,
     pub created_at: i64,
 }
 

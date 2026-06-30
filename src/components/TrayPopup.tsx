@@ -13,13 +13,13 @@ export function TrayPopup() {
   useEffect(() => {
     currentVersion()
       .then(setVersion)
-      .catch(() => {});
+      .catch((e) => console.debug("获取版本号失败:", e));
   }, []);
 
   function hideSelf() {
     getCurrentWindow()
       .hide()
-      .catch(() => {});
+      .catch((e) => console.debug("隐藏托盘窗口失败:", e));
   }
 
   return (
@@ -44,7 +44,7 @@ export function TrayPopup() {
         <button
           type="button"
           onClick={() => {
-            invoke("show_main_from_tray").catch(() => {});
+            invoke("show_main_from_tray").catch((e) => console.debug("显示主窗口失败:", e));
           }}
           className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-foreground transition-colors hover:bg-accent"
         >
@@ -69,7 +69,7 @@ export function TrayPopup() {
         <button
           type="button"
           onClick={() => {
-            invoke("quit_app").catch(() => {});
+            invoke("quit_app").catch((e) => console.debug("退出应用失败:", e));
           }}
           className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/10"
         >

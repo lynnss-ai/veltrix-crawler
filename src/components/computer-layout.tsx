@@ -1,5 +1,6 @@
-// 电脑操作 Agent 页面(左对话 + 右桌面截图预览双栏)。
-// 工具集聚合桌面/文件/进程/OCR/UIA/HTTP/终端;右栏不是内嵌 webview,而是定时拉桌面截图(capture_desktop_screenshot)显示。
+// 电脑操作 Agent 页面(GUI 自动化,单栏对话)。
+// 工具集:桌面(desktop:鼠标键盘/窗口/剪贴板/启程序)+ OCR 读屏 + UIA 控件 + 看屏(capture_screen)。
+// 文件 / 进程 / 终端已拆到「本机助手(local)」,直发 HTTP 在「rpa」。
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -57,12 +58,8 @@ function parseToolCalls(json: string | null | undefined): ToolCallJson[] {
   }
 }
 
-// 危险工具(与后端 computer::tools::DANGEROUS_TOOLS 对应),消息里标红提示
+// 危险工具(与后端 computer::tools::DANGEROUS_TOOLS 对应,GUI 三项),消息里标红提示
 const DANGEROUS = new Set([
-  "delete_path",
-  "kill_process",
-  "write_file",
-  "move_path",
   "control_window",
   "launch_program",
   "click_control",
@@ -515,13 +512,15 @@ export function ComputerLayout() {
 
         <div
           ref={scrollRef}
-          className="veltrix-thin-scrollbar mx-auto min-h-0 w-full max-w-3xl flex-1 space-y-2.5 overflow-y-auto px-5 py-3"
+          className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto"
         >
+          {/* 滚动条贴面板右缘;正文居中收窄交给内层 max-w-3xl,而非把滚动条挤进对话里 */}
+          <div className="mx-auto w-full max-w-3xl space-y-2.5 px-5 py-3">
           {messages.length === 0 && !sending ? (
             <EmptyState
               icon={Monitor}
               title="电脑操作 Agent"
-              description="描述要在这台电脑上做的事(截图看屏幕、点按钮、敲命令、查/改文件、管进程…)。我会在这台电脑上亲自操作。"
+              description="描述要在这台电脑上做的 GUI 操作(截图看屏幕、点按钮/控件、操作窗口、启动程序…)。文件 / 进程 / 终端类请用「本机助手」,网页自动化用「rpa」。"
             />
           ) : (
             <>
@@ -559,6 +558,7 @@ export function ComputerLayout() {
               </div>
             </div>
           )}
+          </div>
         </div>
 
         <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-3">

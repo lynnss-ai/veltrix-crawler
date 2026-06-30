@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, PromptCategoryView, PromptCategoryInput, ShotPromptView, ShotPromptInput, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -160,12 +160,24 @@ export const api = {
   // 编程 Agent:请求停止该会话正在自主续航的循环(下一步检查点优雅收尾)
   stopCodingAgent: (conversationId: string) =>
     invoke<void>("stop_coding_agent", { conversationId }),
+  // 对话 Agent:请求停止该会话正在进行的流式输出
+  stopChatAgent: (conversationId: string) =>
+    invoke<void>("stop_chat_agent", { conversationId }),
+  // 更新消息反馈(点赞/点踩)
+  updateMessageFeedback: (messageId: number, feedback: string | null) =>
+    invoke<void>("update_message_feedback", { messageId, feedback }),
   // 浏览器 / RPA Agent:驱动 navigate/click/type/read_page/wait_for/get_network 的 ReAct 循环(动作可回读结果)
   sendBrowserMessage: (conversationId: string, content: string) =>
     invoke<ChatMessageView>("send_browser_message", { conversationId, content }),
-  // 电脑操作 Agent:聚合桌面/文件/进程/OCR/UIA/HTTP/终端工具的 ReAct 循环
+  // 电脑操作 Agent(GUI:desktop/ocr/uia 看屏 + 鼠标键盘 + 控件)的 ReAct 循环
   sendComputerMessage: (conversationId: string, content: string) =>
     invoke<ChatMessageView>("send_computer_message", { conversationId, content }),
+  // 本机助手 Agent(fs/system/shell:文件 / 进程 / 终端)的 ReAct 循环;危险确认复用 resolveAgentConfirm
+  sendLocalMessage: (conversationId: string, content: string) =>
+    invoke<ChatMessageView>("send_local_message", { conversationId, content }),
+  // 统一编排器(默认对话):需要时把 coding/rpa/computer/local 当工具委派,子智能体结果回灌本会话
+  sendOrchestratorMessage: (conversationId: string, content: string) =>
+    invoke<ChatMessageView>("send_orchestrator_message", { conversationId, content }),
   // 危险操作确认回执:approved=true 放行后端执行,false 拒绝(后端把「已拒绝」回灌模型)
   resolveAgentConfirm: (confirmId: number, approved: boolean) =>
     invoke<void>("resolve_agent_confirm", { confirmId, approved }),
@@ -249,14 +261,29 @@ export const api = {
   sandboxStop: () => invoke<void>("sandbox_stop"),
   // 强制重建容器(删旧 + 正确挂载新建),用于旧容器挂载错误导致「文件不在沙盒」时一键修复。
   sandboxRecreate: () => invoke<string>("sandbox_recreate"),
-  // 意图分类:首条消息判断该用哪个 Agent("chat" / "coding"),用于发送时自动切布局。
-  // 传入当前选中的厂商/模型,供 LLM 分类使用(关键词明显时后端不调 LLM)。
+  // 意图分类:首条消息判断该用哪个 Agent(chat/coding/rpa/computer/local),用于发送时自动切布局。
+  // 混合策略:关键词命中直接返回(零延迟);仅关键词落到 chat 且像可执行任务时,后端才用所选模型做一次 LLM 兜底。
   classifyAgentType: (text: string, providerId?: string, model?: string) =>
     invoke<string>("classify_agent_type", {
       text,
       providerId: providerId ?? null,
       model: model ?? null,
     }),
+  // 意图路由遥测:最近的路由决策(关键词命中 / 是否走 LLM 兜底 / 最终路由),供分析误路由
+  listAgentRouteLogs: (limit?: number) =>
+    invoke<
+      {
+        id: number;
+        text: string;
+        keywordRoute: string;
+        llmUsed: boolean;
+        llmRoute: string;
+        finalRoute: string;
+        model: string;
+        owner: string;
+        createdAt: number;
+      }[]
+    >("list_agent_route_logs", { limit: limit ?? null }),
   listChatMessages: (conversationId: string) =>
     invoke<ChatMessageView[]>("list_chat_messages", { conversationId }),
   sendChatMessage: (conversationId: string, content: string) =>
@@ -275,6 +302,9 @@ export const api = {
     }),
   transcribeChatAudio: (audioBase64: string, format: string) =>
     invoke<string>("transcribe_chat_audio", { audioBase64, format }),
+  // 实时语音转写:定时发送音频片段
+  transcribeAudioChunk: (audioBase64: string, format: string) =>
+    invoke<string>("transcribe_audio_chunk", { audioBase64, format }),
 
   // AI 对话:长期记忆(跨会话,设置页「AI 记忆」管理)
   listChatMemories: () => invoke<ChatMemoryView[]>("list_chat_memories"),
@@ -358,6 +388,21 @@ export const api = {
     invoke<void>("upsert_keyword", { keyword }),
   removeKeyword: (id: string) => invoke<void>("remove_keyword", { id }),
 
+  // 内容创作:提示词分类目录
+  listPromptCategories: () =>
+    invoke<PromptCategoryView[]>("list_prompt_categories"),
+  upsertPromptCategory: (category: PromptCategoryInput) =>
+    invoke<void>("upsert_prompt_category", { category }),
+  removePromptCategory: (id: string) =>
+    invoke<void>("remove_prompt_category", { id }),
+
+  // 内容创作:分镜镜头提示词
+  listShotPrompts: (categoryId: string) =>
+    invoke<ShotPromptView[]>("list_shot_prompts", { categoryId }),
+  upsertShotPrompt: (prompt: ShotPromptInput) =>
+    invoke<void>("upsert_shot_prompt", { prompt }),
+  removeShotPrompt: (id: string) => invoke<void>("remove_shot_prompt", { id }),
+
   // 采集任务
   listTasks: () => invoke<TaskView[]>("list_tasks"),
   upsertTask: (input: TaskInput) => invoke<void>("upsert_task", { input }),
@@ -431,10 +476,12 @@ export const api = {
     invoke<void>("cloud_login", { username, password }),
   cloudPairInit: () => invoke<CloudPairView>("cloud_pair_init"),
   cloudDisconnect: () => invoke<void>("cloud_disconnect"),
+
+  // 账单计费
+  billingOverview: (start?: number, end?: number) =>
+    invoke<BillingOverview>("billing_overview", {
+      start: start ?? null,
+      end: end ?? null,
+    }),
 };
 
-// Unix 秒 -> 本地时间字符串;0 视为「未使用过」
-export function formatTimestamp(ts: number): string {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
-}

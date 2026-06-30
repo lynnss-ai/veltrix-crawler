@@ -6,12 +6,14 @@ import { Brain, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 export const ReasoningBlock = memo(function ReasoningBlock({
   reasoning,
   streaming,
+  defaultOpen,
 }: {
   reasoning: string;
   streaming?: boolean;
+  defaultOpen?: boolean;
 }) {
-  // 流式生成中默认展开(让用户看到思考实时发生),历史消息默认折叠不抢占正文
-  const [open, setOpen] = useState(!!streaming);
+  // 流式生成中默认展开(让用户看到思考实时发生);开启思考模式时历史也展开;否则折叠
+  const [open, setOpen] = useState(!!streaming || !!defaultOpen);
   const text = reasoning.trim();
   if (!text) return null;
 

@@ -1,11 +1,9 @@
 import {
-  Fragment,
+  memo,
   useEffect,
   useRef,
   useState,
   type ComponentType,
-  type MouseEvent as ReactMouseEvent,
-  type ReactNode,
 } from "react";
 import {
   Activity,
@@ -28,10 +26,9 @@ import {
   api,
   type DashboardOverview,
   type PlatformCount,
-  type PlatformSeries,
 } from "@/lib/api";
 import { ErrorBanner } from "@/components/ErrorBanner";
-import { AnimatedNumber, useCountUp } from "@/components/animated-number";
+import { AnimatedNumber } from "@/components/animated-number";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import {
@@ -39,6 +36,9 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { DonutChart } from "@/components/charts/DonutChart";
+import { AutoScrollList } from "@/components/charts/AutoScrollList";
+import { MultiTrendChart } from "@/components/charts/MultiTrendChart";
 
 // 实时刷新节流间隔:采集中 task-progress / collect-log 事件触发很频繁,
 // 而概览是多表聚合查询较重,最快每 3s 拉一次,事件风暴不会压垮后端
@@ -116,7 +116,7 @@ export function DashboardPage() {
   };
 
   useEffect(() => {
-    api.listPlatforms().then(setPlatforms).catch(() => {});
+    api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
     load();
 
     // 实时刷新:订阅采集进度与采集日志事件,数据一落库概览随之更新,无需手动刷新;
@@ -409,6 +409,7 @@ export function DashboardPage() {
           series={data?.trendSeries ?? []}
           platformName={platformName}
           metric="contents"
+          renderEmpty={(props) => <EmptyLine {...props} />}
         />
       </div>
 
@@ -497,7 +498,7 @@ export function DashboardPage() {
 }
 
 // 概览卡片:彩色图标块 + 大数字 + 平台细分 chips
-function OverviewCard({
+const OverviewCard = memo(function OverviewCard({
   icon: Icon,
   label,
   hint,
@@ -562,10 +563,10 @@ function OverviewCard({
       </div>
     </div>
   );
-}
+});
 
 // 形态 / 平台共用键值项:标签左、数字右对齐,使两行数字成列对齐
-function KV({ label, value }: { label: string; value: number }) {
+const KV = memo(function KV({ label, value }: { label: string; value: number }) {
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="truncate text-muted-foreground">{label}</span>
@@ -574,10 +575,10 @@ function KV({ label, value }: { label: string; value: number }) {
       </span>
     </div>
   );
-}
+});
 
 // 今日采集指标:图标块 + 大数字 + 标签 + 环比
-function TodayMetric({
+const TodayMetric = memo(function TodayMetric({
   icon: Icon,
   label,
   value,
@@ -610,10 +611,10 @@ function TodayMetric({
       </div>
     </div>
   );
-}
+});
 
 // 任务状态格子:状态色图标 + 数字 + 标签
-function StatusTile({
+const StatusTile = memo(function StatusTile({
   icon: Icon,
   label,
   value,
@@ -639,10 +640,10 @@ function StatusTile({
       <div className="text-[11px] text-muted-foreground">{label}</div>
     </div>
   );
-}
+});
 
 // 环比徽章(较昨日)
-function DeltaBadge({ delta }: { delta: number | undefined }) {
+const DeltaBadge = memo(function DeltaBadge({ delta }: { delta: number | undefined }) {
   if (delta === undefined) return null;
   if (delta === 0)
     return <span className="text-muted-foreground">较昨日持平</span>;
@@ -658,10 +659,10 @@ function DeltaBadge({ delta }: { delta: number | undefined }) {
       {up ? "↑" : "↓"} {Math.abs(delta).toLocaleString()} 较昨日
     </span>
   );
-}
+});
 
 // 环形图卡片(标题 + 甜甜圈 + 图例)
-function DonutCard({
+const DonutCard = memo(function DonutCard({
   title,
   data,
 }: {
@@ -702,87 +703,9 @@ function DonutCard({
       </div>
     </div>
   );
-}
+});
 
-// 甜甜圈图(纯 SVG):各分段按占比绘制圆环弧
-function DonutChart({
-  data,
-  size = 128,
-}: {
-  data: { label: string; value: number; color: string }[];
-  size?: number;
-}) {
-  const total = data.reduce((s, d) => s + d.value, 0);
-  const animatedTotal = useCountUp(total) ?? total;
-  const r = size / 2 - 12;
-  const c = 2 * Math.PI * r;
-  let acc = 0;
-  return (
-    <svg
-      viewBox={`0 0 ${size} ${size}`}
-      className="shrink-0 text-muted-foreground"
-      style={{ width: size, height: size }}
-    >
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke="currentColor"
-        strokeOpacity={0.45}
-        strokeWidth={12}
-      />
-      {total > 0 && (
-        <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
-          {data.map((d, i) => {
-            if (d.value === 0) return null;
-            const frac = d.value / total;
-            const seg = (
-              <circle
-                key={i}
-                cx={size / 2}
-                cy={size / 2}
-                r={r}
-                fill="none"
-                stroke={d.color}
-                strokeWidth={12}
-                strokeDasharray={`${(frac * c).toFixed(2)} ${c.toFixed(2)}`}
-                strokeDashoffset={(-acc * c).toFixed(2)}
-                style={{
-                  transition:
-                    "stroke-dasharray 0.6s ease-out, stroke-dashoffset 0.6s ease-out",
-                }}
-              />
-            );
-            acc += frac;
-            return seg;
-          })}
-        </g>
-      )}
-      <text
-        x={size / 2}
-        y={size / 2 - 2}
-        textAnchor="middle"
-        className="fill-foreground"
-        fontSize={22}
-        fontWeight={600}
-      >
-        {animatedTotal.toLocaleString()}
-      </text>
-      <text
-        x={size / 2}
-        y={size / 2 + 15}
-        textAnchor="middle"
-        className="fill-muted-foreground"
-        fontSize={10}
-      >
-        合计
-      </text>
-    </svg>
-  );
-}
-
-function EmptyLine({ text, className }: { text: string; className?: string }) {
+const EmptyLine = memo(function EmptyLine({ text, className }: { text: string; className?: string }) {
   return (
     <div
       className={`flex flex-col items-center justify-center gap-2 text-muted-foreground ${className ?? "h-32"}`}
@@ -791,351 +714,4 @@ function EmptyLine({ text, className }: { text: string; className?: string }) {
       <span className="text-sm">{text}</span>
     </div>
   );
-}
-
-// 自动滚动列表:缓慢上滚,到底停顿后回到顶部循环(单份内容,不重复);鼠标悬停暂停。
-function AutoScrollList({
-  count,
-  children,
-}: {
-  count: number;
-  children: ReactNode;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  // 用 ref 存暂停态:onMouseEnter/Leave 改它,rAF 循环里读它,避免重建动画
-  const pausedRef = useRef(false);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    let raf = 0;
-    let bottomFrames = 0; // 到底后停留的帧数,停一会再回顶,避免突兀
-    const tick = () => {
-      if (el && !pausedRef.current && el.scrollHeight > el.clientHeight) {
-        if (el.scrollTop >= el.scrollHeight - el.clientHeight - 1) {
-          bottomFrames += 1;
-          if (bottomFrames > 90) {
-            el.scrollTop = 0; // 到底停约 1.5s 后回到顶部
-            bottomFrames = 0;
-          }
-        } else {
-          el.scrollTop += 0.4;
-        }
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [count]);
-  return (
-    <div
-      ref={ref}
-      onMouseEnter={() => {
-        pausedRef.current = true;
-      }}
-      onMouseLeave={() => {
-        pausedRef.current = false;
-      }}
-      className="veltrix-no-scrollbar h-80 overflow-y-auto"
-    >
-      {children}
-    </div>
-  );
-}
-
-// 多平台采集趋势(纯 SVG):以「内容」采集量为主的平滑折线 + 线下渐变面积,每平台一条品牌色曲线。
-// 评论量级与内容相差悬殊(常数十倍),不再叠进主图,改在悬停浮窗里看当天明细。
-// 平滑用控制点 y 钳在本段端点内的 Catmull-Rom:曲线必过数据点、孤立高点不过冲,不会鼓成误导性钟形。
-function MultiTrendChart({
-  dates,
-  series,
-  platformName,
-  metric = "contents",
-  compact = false,
-}: {
-  dates: string[];
-  series: PlatformSeries[];
-  platformName: (id: string) => string;
-  metric?: "contents" | "comments";
-  compact?: boolean;
-}) {
-  const [hover, setHover] = useState<number | null>(null);
-  // 区间完全没有日期才退回纯占位;有日期则照常画坐标轴,仅缺曲线
-  if (dates.length === 0) {
-    return <EmptyLine text="该区间暂无采集数据" className="h-52" />;
-  }
-
-  // 主绘制字段:内容图(默认)或评论图(独立小图)。两图同款平滑折线,仅数据源 + 轴名不同
-  const valuesOf = (s: PlatformSeries) =>
-    metric === "comments" ? s.comments : s.contents;
-  const axisLabel = metric === "comments" ? "评论" : "内容";
-
-  const W = 760;
-  const H = compact ? 176 : 240;
-  const padL = 36;
-  const padR = 16;
-  const padT = 26; // 顶部留白:给轴名腾位,与最高刻度数字拉开
-  const padB = 28;
-  const innerW = W - padL - padR;
-  const innerH = H - padT - padB;
-  const n = dates.length;
-
-  // 只画有数据的平台:全 0 平台会在底部叠成误导性的 0 基线。保留原始下标 si 用于配色,与图例一致
-  const active = series
-    .map((s, si) => ({ s, si }))
-    .filter(({ s }) => valuesOf(s).some((c) => c > 0));
-  const hasData = active.length > 0;
-
-  const maxV = Math.max(1, ...active.flatMap(({ s }) => valuesOf(s)));
-  const px = (i: number) =>
-    padL + (n === 1 ? innerW / 2 : (i * innerW) / (n - 1));
-  const py = (v: number) => padT + innerH * (1 - v / maxV);
-
-  // Catmull-Rom→三次贝塞尔,但把控制点 y 钳在本段两端点之间:平滑且不过冲、峰落在数据点上,
-  // 避免普通平滑把孤立高点鼓成偏移的钟形(评论那版钟形的根因)
-  const smooth = (pts: [number, number][]): string => {
-    if (pts.length === 0) return "";
-    if (pts.length === 1) {
-      return `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
-    }
-    const clampSeg = (y: number, a: number, b: number) =>
-      Math.max(Math.min(a, b), Math.min(Math.max(a, b), y));
-    let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[i - 1] ?? pts[i];
-      const p1 = pts[i];
-      const p2 = pts[i + 1];
-      const p3 = pts[i + 2] ?? p2;
-      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
-      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
-      const cp1y = clampSeg(p1[1] + (p2[1] - p0[1]) / 6, p1[1], p2[1]);
-      const cp2y = clampSeg(p2[1] - (p3[1] - p1[1]) / 6, p1[1], p2[1]);
-      d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
-    }
-    return d;
-  };
-  const linePath = (counts: number[]) =>
-    smooth(counts.map((v, i) => [px(i), py(v)] as [number, number]));
-  // 面积:折线下沿沿底边闭合
-  const areaPath = (counts: number[]) => {
-    const yb = py(0).toFixed(1);
-    return `${linePath(counts)} L${px(n - 1).toFixed(1)},${yb} L${px(0).toFixed(1)},${yb} Z`;
-  };
-
-  const fractions = [0, 0.25, 0.5, 0.75, 1];
-  const ticks = fractions.map((f) => Math.round(maxV * f));
-  const tickY = (f: number) => padT + innerH * (1 - f);
-  const step = Math.max(1, Math.ceil(n / 8));
-
-  // 鼠标移动 → 命中最近日期下标(viewBox 与渲染宽度按比例换算)
-  const onMove = (e: ReactMouseEvent<SVGSVGElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width === 0) return;
-    const vbX = ((e.clientX - rect.left) / rect.width) * W;
-    const idx = Math.round((vbX - padL) / (innerW / Math.max(1, n - 1)));
-    setHover(Math.max(0, Math.min(n - 1, idx)));
-  };
-
-  return (
-    <div className="relative">
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        className="h-auto w-full text-border"
-        preserveAspectRatio="xMidYMid meet"
-        onMouseMove={onMove}
-        onMouseLeave={() => setHover(null)}
-      >
-        <defs>
-          {active.map(({ s, si }) => (
-            <linearGradient
-              key={`grad-${si}`}
-              id={`trend-grad-${metric}-${s.platform}`}
-              x1="0"
-              y1="0"
-              x2="0"
-              y2="1"
-            >
-              <stop
-                offset="0%"
-                stopColor={platformColor(s.platform, si)}
-                stopOpacity={0.3}
-              />
-              <stop
-                offset="100%"
-                stopColor={platformColor(s.platform, si)}
-                stopOpacity={0}
-              />
-            </linearGradient>
-          ))}
-        </defs>
-
-        {/* 横向网格 + 内容刻度(单轴) */}
-        {fractions.map((f, i) => {
-          const yy = tickY(f);
-          return (
-            <g key={`g${i}`}>
-              <line
-                x1={padL}
-                y1={yy}
-                x2={W - padR}
-                y2={yy}
-                stroke="currentColor"
-                strokeOpacity={0.12}
-              />
-              <text
-                x={padL - 6}
-                y={yy + 3}
-                textAnchor="end"
-                className="fill-muted-foreground"
-                fontSize={8}
-              >
-                {ticks[i]}
-              </text>
-            </g>
-          );
-        })}
-
-        {/* 轴名:固定在顶部留白处,与最高刻度数字隔开 */}
-        <text
-          x={padL - 6}
-          y={10}
-          textAnchor="end"
-          className="fill-muted-foreground"
-          fontSize={8}
-        >
-          {axisLabel}
-        </text>
-
-        {dates.map((d, i) =>
-          i % step === 0 || i === n - 1 ? (
-            <text
-              key={`x${i}`}
-              x={px(i)}
-              y={H - 8}
-              textAnchor="middle"
-              className="fill-muted-foreground"
-              fontSize={8}
-            >
-              {d}
-            </text>
-          ) : null,
-        )}
-
-        {/* 内容面积(渐变填充,科技感) */}
-        {active.map(({ s, si }) => (
-          <path
-            key={`a${si}`}
-            d={areaPath(valuesOf(s))}
-            fill={`url(#trend-grad-${metric}-${s.platform})`}
-            stroke="none"
-            style={{ transition: "d 0.6s ease-out" }}
-          />
-        ))}
-
-        {/* 内容平滑折线(每平台品牌色) */}
-        {active.map(({ s, si }) => (
-          <path
-            key={`l${si}`}
-            d={linePath(valuesOf(s))}
-            fill="none"
-            stroke={platformColor(s.platform, si)}
-            strokeWidth={1}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            style={{ transition: "d 0.6s ease-out" }}
-          />
-        ))}
-
-        {/* 数据点标记(非零;悬停当天放大) */}
-        {active.map(({ s, si }) =>
-          valuesOf(s).map((v, i) =>
-            v > 0 ? (
-              <circle
-                key={`p${si}-${i}`}
-                cx={px(i)}
-                cy={py(v)}
-                r={hover === i ? 3.5 : 2}
-                fill={platformColor(s.platform, si)}
-                className="stroke-background"
-                strokeWidth={1.5}
-                style={{ transition: "r 0.15s" }}
-              />
-            ) : null,
-          ),
-        )}
-
-        {!hasData && (
-          <text
-            x={W / 2}
-            y={padT + innerH / 2}
-            textAnchor="middle"
-            className="fill-muted-foreground"
-            fontSize={8}
-          >
-            暂无采集数据
-          </text>
-        )}
-
-        {/* 悬停竖线 */}
-        {hover !== null && (
-          <line
-            x1={px(hover)}
-            y1={padT}
-            x2={px(hover)}
-            y2={padT + innerH}
-            stroke="currentColor"
-            strokeOpacity={0.35}
-            strokeDasharray="3 3"
-          />
-        )}
-      </svg>
-
-      {/* 悬停浮窗:当天各平台内容 + 评论明细(评论虽不画线,数据仍可见) */}
-      {hover !== null && hasData && (
-        <div
-          className="pointer-events-none absolute top-1 z-10 w-max max-w-[260px] whitespace-nowrap rounded-md border bg-popover px-2.5 py-1.5 text-xs shadow-md"
-          style={{
-            left: `${(px(hover) / W) * 100}%`,
-            // 靠左点左对齐、靠右点右对齐、中间居中,避免浮窗超出图表边缘被截断
-            transform: `translateX(${
-              px(hover) / W < 0.18
-                ? "0%"
-                : px(hover) / W > 0.82
-                  ? "-100%"
-                  : "-50%"
-            })`,
-          }}
-        >
-          <div className="mb-1 font-medium text-foreground">{dates[hover]}</div>
-          <div className="grid grid-cols-[1fr_auto_auto] items-center gap-x-4 gap-y-1">
-            {/* 「呈现所有」:浮窗列出全部平台当天数值(图只画有数据平台,浮窗补全 0 的) */}
-            {series.map((s, si) => (
-              <Fragment key={`t${si}`}>
-                <span className="flex items-center gap-1.5">
-                  <span
-                    className="size-2 shrink-0 rounded-full"
-                    style={{ background: platformColor(s.platform, si) }}
-                  />
-                  <span className="text-muted-foreground">
-                    {platformName(s.platform)}
-                  </span>
-                </span>
-                <span className="text-muted-foreground">
-                  内容{" "}
-                  <span className="font-mono text-foreground">
-                    {s.contents[hover] ?? 0}
-                  </span>
-                </span>
-                <span className="text-muted-foreground">
-                  评论{" "}
-                  <span className="font-mono text-foreground">
-                    {s.comments[hover] ?? 0}
-                  </span>
-                </span>
-              </Fragment>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+});

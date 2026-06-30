@@ -3,8 +3,10 @@
 //! 阶段0 提供平台管理;阶段1 追加账号管理与签名回调;后续追加用户/系统配置 CRUD(admin)。
 
 pub mod admin;
+pub mod billing;
 pub mod cloud;
 pub mod collect;
+pub mod creation;
 pub mod dashboard;
 pub mod task;
 // 再导出采集执行引擎的全部命令与类型,保持 commands::X 路径不变(lib.rs invoke_handler 依赖)。
@@ -65,11 +67,13 @@ pub struct AppState {
     /// 编程 Agent 的常驻开发服务器状态(预览-开发服务器模式)。
     pub dev_server: Arc<Mutex<crate::agent::coding::commands::DevServer>>,
     /// 沙盒容器「就绪结论」缓存:避免每个编程动作都重跑一串 docker 探测(慢且放大挂死面)。
-    pub sandbox_ready: Mutex<crate::agent::coding::commands::SandboxReady>,
+    pub sandbox_ready: Arc<Mutex<crate::agent::coding::commands::SandboxReady>>,
     /// 应用句柄:供后台 / 非命令上下文(如 resolve_exec 回退本机时)向前端推送事件(弹窗等)。
     pub app_handle: AppHandle,
     /// 自主续航编程 Agent 的「请求停止」会话集合(stop_coding_agent 写入,续航循环每步消费)。
     pub agent_cancel: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 对话 Agent 流式输出的取消标志(stop_chat_agent 写入,流式循环检查)。
+    pub chat_cancel_flags: Arc<Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Agent 危险操作「暂停 — 等用户确认」通道(ReAct 循环命中危险工具时等待,前端
     /// `resolve_agent_confirm` 回执)。
     pub agent_confirm: Arc<crate::agent::core::shared::AgentConfirmChannel>,
@@ -82,6 +86,7 @@ pub struct AppState {
 pub const MAX_CONCURRENT_COLLECT: usize = 3;
 
 /// 取某「平台-账号」的采集互斥锁(惰性创建)。外层 std Mutex 仅做表查找,绝不跨 await 持有。
+#[allow(clippy::type_complexity)]
 fn account_collect_lock(
     locks: &Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     key: &str,
@@ -491,6 +496,7 @@ pub fn save_binary_file(path: String, content_base64: String) -> Result<()> {
 ///    为 false 时只清库,已下载的素材文件原样保留。
 ///
 /// 平台 / 账号 / 用户 / 客户 / 行业 / 厂商 / 提示词等配置类数据一律保留。
+/// 采集去重台账(collect_records)也刻意不清:清空后重采时据它跳过曾采过的内容,避免重复入库。
 #[tauri::command]
 pub async fn clear_business_data(
     state: State<'_, AppState>,

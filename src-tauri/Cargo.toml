@@ -66,6 +66,8 @@ sea-orm = { version = "1", default-features = false, features = [
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 滚动文件日志:同时落盘便于离线排查(stdout 之外多一份)
+tracing-appender = "0.2"
 # 对外 HTTP API:版本化路由 + 统一响应;与现有 tokio / SeaORM 栈一致
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -113,6 +115,8 @@ windows = { version = "0.61", features = [
     "Storage_Streams",     # InMemoryRandomAccessStream / DataWriter
     # UI 控件读取(agent/uia):UI Automation 客户端 COM 接口
     "Win32_UI_Accessibility",
+    # 读「系统代理」(Internet Settings 注册表):ffmpeg 子进程拉海外 CDN 需复用同源代理
+    "Win32_System_Registry",
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"

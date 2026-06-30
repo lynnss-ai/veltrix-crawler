@@ -123,7 +123,7 @@ export function SettingsPage() {
     api
       .listProviderCapabilities()
       .then(setCaps)
-      .catch(() => {});
+      .catch((e) => console.warn("加载模型能力列表失败:", e));
   }, []);
 
   function submitProvider(provider: Provider) {
@@ -493,7 +493,7 @@ function RemoteControlSection() {
     void refresh();
     // 连接态可能因 WS 重连变化,轻量轮询;后续可换 Tauri Event 推
     const t = setInterval(() => {
-      api.cloudGetStatus().then(setState).catch(() => {});
+      api.cloudGetStatus().then(setState).catch((e) => console.warn("获取云端状态失败:", e));
     }, 5000);
     return () => clearInterval(t);
   }, []);
@@ -682,7 +682,7 @@ function GeneralSection({
         setStoragePath(p);
         setStorageBaseline(p);
       })
-      .catch(() => {});
+      .catch((e) => console.warn("获取存储路径失败:", e));
     // refreshKey 变化(清空数据后)重新拉取数据库大小,数字即时反映清空结果
   }, [refreshKey]);
   useEffect(() => {
@@ -940,7 +940,7 @@ function ObsidianSection() {
         setVault(v);
         setBaseline(v);
       })
-      .catch(() => {});
+      .catch((e) => console.warn("获取 Obsidian 仓库路径失败:", e));
   }, []);
   const dirty = vault.trim() !== baseline;
   return (
@@ -1358,7 +1358,7 @@ function RoleModelSection({ providers }: { providers: Provider[] }) {
         setCfg(r);
         setBase(r);
       })
-      .catch(() => {});
+      .catch((e) => console.warn("获取角色模型配置失败:", e));
   }, []);
 
   const dirty =

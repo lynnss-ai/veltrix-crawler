@@ -5,7 +5,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { FieldError } from "@/components/FieldError";
 import { toast } from "sonner";
-import { api, formatTimestamp, type UserView } from "@/lib/api";
+import { api, type UserView } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 
 // 个人中心分区:左导航切换,布局与系统设置一致(左导航 + 右内容)
 type Section = "profile" | "password";

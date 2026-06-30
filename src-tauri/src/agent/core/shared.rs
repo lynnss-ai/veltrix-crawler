@@ -13,17 +13,22 @@ use sea_orm::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 use veltrix_core::db::entity::{
     chat_conversation as conv, chat_message as msg, provider as provider_entity,
 };
 use veltrix_core::error::{CrawlerError, Result};
 
-use super::llm::{ChatMsg, LlmResponse, ToolCall};
+use super::llm::{ChatMsg, LlmResponse, ToolCall, ToolResult};
 use super::summary::LIVE_HARD_CAP;
 
 /// ReAct 最大步数(防失控循环)。chat / coding / rpa 命令共用,统一一处定义。
 pub const MAX_ITERS: usize = 25;
+
+/// 危险操作等待用户确认的超时(秒):超时按「拒绝」处理,避免 ReAct 永久挂起。
+/// computer / local 等带危险工具的 Agent 共用。
+pub const CONFIRM_TIMEOUT_SECS: u64 = 180;
 
 /// 危险操作「暂停 — 等用户确认」通道(场景无关)。
 ///
@@ -67,6 +72,49 @@ impl AgentConfirmChannel {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&id);
         }
+    }
+}
+
+/// 危险工具执行前的确认闸门(场景无关,computer / local 等共用):
+/// emit 带 confirmId 的 `agent-confirm` 事件让前端弹框,等回执再决定是否放行。
+/// 返回 `None`=用户放行(正常执行);`Some(err)`=拒绝 / 超时(把该 ToolResult 当工具结果回灌模型)。
+/// 同步 ReAct 钩子无法 await,故由各 Agent 的 `on_before_tool`(async)调用本函数。
+pub async fn confirm_dangerous_tool(
+    channel: &AgentConfirmChannel,
+    app: &AppHandle,
+    conversation_id: &str,
+    name: &str,
+    args: &Value,
+) -> Option<ToolResult> {
+    let (confirm_id, rx) = channel.open();
+    let _ = app.emit(
+        "agent-confirm",
+        json!({
+            "conversationId": conversation_id,
+            "confirmId": confirm_id,
+            "tool": name,
+            "args": args,
+        }),
+    );
+    let approved = match tokio::time::timeout(
+        std::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS),
+        rx,
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        // 超时 / 发送端被丢弃:清理条目并按「拒绝」处理,避免 ReAct 永久挂起
+        _ => {
+            channel.cancel(confirm_id);
+            false
+        }
+    };
+    if approved {
+        None
+    } else {
+        Some(ToolResult::err(format!(
+            "用户拒绝执行危险操作「{name}」(或确认超时)。已跳过该操作,请改用更安全的方式或先征询用户。"
+        )))
     }
 }
 
@@ -343,9 +391,9 @@ pub async fn finalize_conversation_meta(
     let _ = am.update(db).await;
 }
 
-/// 合法的 agent 规范种类(防路径穿越):coding / computer / rpa。
+/// 合法的 agent 规范种类(防路径穿越):coding / computer / rpa / local / orchestrator。
 pub fn is_valid_guidelines_kind(kind: &str) -> bool {
-    matches!(kind, "coding" | "computer" | "rpa")
+    matches!(kind, "coding" | "computer" | "rpa" | "local" | "orchestrator")
 }
 
 /// 某 agent 规范文件路径:<config_dir>/agent-guidelines/<kind>.md。

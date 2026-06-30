@@ -24,11 +24,11 @@ import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import {
   api,
-  formatTimestamp,
   type AccountInput,
   type AccountView,
   type PlatformConfig,
 } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
 import { FieldError } from "@/components/FieldError";
@@ -37,7 +37,6 @@ import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
-import { RefreshButton } from "@/components/RefreshButton";
 import { PlatformManagerSheet } from "@/components/platform-manager-sheet";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -365,7 +364,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
         {/* 左侧:平台(可收起,窄屏自动收起) */}
         {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
-          <div className="flex h-8 items-center justify-between border-b px-4">
+          <div className="flex h-10 items-center justify-between border-b px-4">
             <span className="text-sm font-semibold">平台</span>
             <SimpleTooltip content="收起">
               <Button
@@ -417,7 +416,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
               <SimpleTooltip content="展开平台筛选">
                 <Button
                   variant="outline"
-                  className="cursor-pointer"
+                  className="h-10 cursor-pointer"
                   onClick={() => setSbCollapsed(false)}
                 >
                   <Filter />
@@ -453,7 +452,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                     <SimpleTooltip content="展开平台筛选">
                       <Button
                         variant="outline"
-                        className="cursor-pointer"
+                        className="h-10 cursor-pointer"
                         onClick={() => setSbCollapsed(false)}
                       >
                         <Filter />
@@ -477,14 +476,16 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                   />
                 </div>
                 <div className="flex items-center gap-2">
-                  <RefreshButton
-                    onClick={() => loadAccounts(selectedPlatform)}
-                  />
-                  <Button variant="outline" onClick={() => setManagerOpen(true)}>
+                  <Button
+                    variant="outline"
+                    className="h-10"
+                    onClick={() => setManagerOpen(true)}
+                  >
                     <Network />
                     管理平台
                   </Button>
                   <Button
+                    className="h-10"
                     onClick={() => {
                       setEditing(null);
                       setIsFormOpen(true);
@@ -581,7 +582,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
           api
             .listPlatforms()
             .then(setPlatforms)
-            .catch(() => {});
+            .catch((e) => console.warn("刷新平台列表失败:", e));
         }}
       />
     </div>
@@ -653,7 +654,7 @@ function AccountFormSheet({
               </Label>
               <Input
                 id="account-label"
-                placeholder="如:抖音主号 / 小红书测试号"
+                placeholder="平台账号"
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
                 aria-invalid={submitted && !label.trim()}

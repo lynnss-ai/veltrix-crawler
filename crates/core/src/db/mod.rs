@@ -130,11 +130,15 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::customer::Entity, "customers").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
+    create_table(db, &schema, entity::prompt_category::Entity, "prompt_categories").await?;
+    create_table(db, &schema, entity::shot_prompt::Entity, "shot_prompts").await?;
     create_table(db, &schema, entity::app_secret::Entity, "app_secrets").await?;
     create_table(db, &schema, entity::task::Entity, "tasks").await?;
     create_table(db, &schema, entity::content::Entity, "contents").await?;
     create_table(db, &schema, entity::comment::Entity, "comments").await?;
     create_table(db, &schema, entity::collect_log::Entity, "collect_logs").await?;
+    // 采集去重台账:独立于业务数据,「清空业务数据」不清它(见 clear_business_data)
+    create_table(db, &schema, entity::collect_record::Entity, "collect_records").await?;
     create_table(db, &schema, entity::task_run::Entity, "task_runs").await?;
     create_table(
         db,
@@ -153,6 +157,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     .await?;
     create_table(db, &schema, entity::chat_message::Entity, "chat_messages").await?;
     create_table(db, &schema, entity::chat_memory::Entity, "chat_memories").await?;
+    create_table(db, &schema, entity::model_usage_record::Entity, "model_usage_records").await?;
+    create_table(db, &schema, entity::agent_route_log::Entity, "agent_route_logs").await?;
 
     // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
@@ -275,6 +281,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("comment_video_done", "ALTER TABLE tasks ADD COLUMN comment_video_done INTEGER NOT NULL DEFAULT 0"),
         ("archived", "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"),
         ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT 0"),
+        // 平台专属额外筛选(抖音视频时长/搜索范围/内容形式等),JSON 对象,旧行回填 '{}'(全不限)
+        ("extra_filters", "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -341,6 +349,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("tool_name", "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT"),
         ("attachments", "ALTER TABLE chat_messages ADD COLUMN attachments TEXT"),
         ("reasoning", "ALTER TABLE chat_messages ADD COLUMN reasoning TEXT"),
+        // 用户反馈:like / dislike / null(未反馈),用于学习与适应功能
+        ("feedback", "ALTER TABLE chat_messages ADD COLUMN feedback TEXT"),
     ] {
         if !column_exists(db, "chat_messages", col).await {
             if let Err(e) = db
@@ -364,6 +374,9 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("confidence", "ALTER TABLE chat_memories ADD COLUMN confidence INTEGER NOT NULL DEFAULT 3"),
         ("hit_count", "ALTER TABLE chat_memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0"),
         ("last_hit_at", "ALTER TABLE chat_memories ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0"),
+        // 记忆层级化:scope(作用域) + scope_id(作用域 ID)
+        ("scope", "ALTER TABLE chat_memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'"),
+        ("scope_id", "ALTER TABLE chat_memories ADD COLUMN scope_id TEXT NOT NULL DEFAULT ''"),
     ] {
         if !column_exists(db, "chat_memories", col).await {
             if let Err(e) = db
@@ -397,6 +410,9 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
         "CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(owner)",
         "CREATE INDEX IF NOT EXISTS idx_keywords_industry ON keywords(industry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_prompt_categories_owner ON prompt_categories(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_shot_prompts_owner ON shot_prompts(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_shot_prompts_category ON shot_prompts(category_id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)",
         "CREATE INDEX IF NOT EXISTS idx_contents_task ON contents(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id)",
@@ -420,6 +436,13 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_chat_conversations_owner ON chat_conversations(owner, updated_at)",
         "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_chat_memories_owner ON chat_memories(owner, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_created ON model_usage_records(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_owner ON model_usage_records(owner, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_model ON model_usage_records(model, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_route_created ON agent_route_logs(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_route_owner ON agent_route_logs(owner, created_at)",
+        // 采集去重台账:按平台取 content_id 列表(计数判重),复合索引覆盖该查询
+        "CREATE INDEX IF NOT EXISTS idx_collect_records_platform ON collect_records(platform, content_id)",
     ] {
         if let Err(e) = db
             .execute(Statement::from_string(backend, ddl.to_owned()))

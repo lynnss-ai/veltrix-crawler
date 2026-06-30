@@ -179,35 +179,51 @@ pub(super) async fn sync_task_to_obsidian(db: &DatabaseConnection, task_id: &str
         Ok(r) => r,
         Err(_) => return,
     };
-    for content in &rows {
-        let comments = comment_entity::Entity::find()
-            .filter(comment_entity::Column::TaskId.eq(task_id))
-            .filter(comment_entity::Column::ContentId.eq(&content.content_id))
-            .all(db)
-            .await
-            .unwrap_or_default();
-        if crate::obsidian::sync_one(&vault_path, content, &comments, &industry)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        let am = csu_entity::ActiveModel {
-            content_id: Set(content.id.clone()),
-            synced_user: Set(owner.to_string()),
-            synced_at: Set(now),
-            vault_path: Set(vault.clone()),
-        };
-        let _ = csu_entity::Entity::insert(am)
-            .on_conflict(
-                OnConflict::columns([
-                    csu_entity::Column::ContentId,
-                    csu_entity::Column::SyncedUser,
-                ])
-                .update_columns([csu_entity::Column::SyncedAt, csu_entity::Column::VaultPath])
-                .to_owned(),
-            )
-            .exec(db)
-            .await;
-    }
+    use futures_util::StreamExt;
+    let db_clone = db.clone();
+    futures_util::stream::iter(rows)
+        .map(|content| {
+            let db = db_clone.clone();
+            let vault_path = vault_path.clone();
+            let vault = vault.clone();
+            let industry = industry.clone();
+            let owner = owner.to_string();
+            async move {
+                let comments = comment_entity::Entity::find()
+                    .filter(comment_entity::Column::TaskId.eq(task_id))
+                    .filter(comment_entity::Column::ContentId.eq(&content.content_id))
+                    .all(&db)
+                    .await
+                    .unwrap_or_default();
+                if crate::obsidian::sync_one(&vault_path, &content, &comments, &industry)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let am = csu_entity::ActiveModel {
+                    content_id: Set(content.id.clone()),
+                    synced_user: Set(owner),
+                    synced_at: Set(now),
+                    vault_path: Set(vault),
+                };
+                let _ = csu_entity::Entity::insert(am)
+                    .on_conflict(
+                        OnConflict::columns([
+                            csu_entity::Column::ContentId,
+                            csu_entity::Column::SyncedUser,
+                        ])
+                        .update_columns([
+                            csu_entity::Column::SyncedAt,
+                            csu_entity::Column::VaultPath,
+                        ])
+                        .to_owned(),
+                    )
+                    .exec(&db)
+                    .await;
+            }
+        })
+        .buffer_unordered(8)
+        .count()
+        .await;
 }

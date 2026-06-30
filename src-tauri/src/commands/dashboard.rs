@@ -847,7 +847,7 @@ async fn top_topics(
         }
     }
     let mut list: Vec<(String, i64)> = counter.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.sort_by_key(|item| std::cmp::Reverse(item.1));
     list.truncate(50);
     Ok(list
         .into_iter()

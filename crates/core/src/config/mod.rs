@@ -239,12 +239,17 @@ pub enum RpaStep {
 /// 打开真实页面用 DevTools 校准后修正;校准前可能 `waitFor` 超时。未列平台返回空 = 走旧逻辑。
 fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
     match platform_id {
-        // 小红书:信息流搜索框逐字输入 → 点搜索图标提交 → 等结果频道栏 → 分段滚动翻页。
-        // 改版后搜索框是 textarea(name=aiSearchTextarea,容器 #search-input-in-feeds,旁有「问点点」AI 入口);
-        // textarea 回车不一定提交,故改为点搜索图标(.submit-button)。选择器用逗号候选,兼容新旧结构。
+        // 小红书:纯 RPA(search_url_template 留空,窗口停在首页 login_url)——在首页搜索框逐字
+        // 输入关键词 → 点搜索图标提交,让页面自己跳到笔记搜索结果页(触发 /search/notes)→ 分段滚动翻页。
+        // 不走 search_result_ai URL 直达(那是 AI 问答页,不出笔记列表)。
+        // 搜索框是 textarea(name=aiSearchTextarea / #search-input / #search-input-in-feeds);提交按钮是
+        // .submit-button-wrapper(内含 svg.submit-button)。选择器用逗号候选,兼容首页/结果页与新旧结构。
         "xhs" => {
-            let box_sel = "textarea[name='aiSearchTextarea'], #search-input-in-feeds textarea, .search-input textarea, #search-input, input#search-input";
-            let submit_sel = "#search-input-in-feeds .submit-button-wrapper, .search-input .submit-button-wrapper, .submit-button-wrapper, .submit-button";
+            let box_sel = "#search-input-in-feeds, textarea[name='aiSearchTextarea'], .search-input textarea, #search-input";
+            // 点最内层的搜索图标 svg(class 含 submit-button):合成 click 会从 svg 冒泡到真正挂 @click 的
+            // 祖先,比点外层 .submit-button-wrapper 更稳——若处理函数挂在 svg 上,点 wrapper(父)不会触发子。
+            // 不再把 .submit-button-wrapper 放进来:querySelector 按文档顺序会先返回外层 div(父在前)。
+            let submit_sel = "svg.submit-button, .submit-button";
             vec![
                 RpaStep::WaitFor {
                     selector: box_sel.into(),
@@ -265,11 +270,8 @@ fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
                 RpaStep::Click {
                     selector: submit_sel.into(),
                 },
-                RpaStep::WaitFor {
-                    // 搜索结果页特有的频道栏(全部/图文/视频/用户),首页没有,可靠判断「已进入结果页」
-                    selector: "#channel-container".into(),
-                    timeout_ms: 12_000,
-                },
+                // 不再在页面内等结果页 DOM:结果页就绪改由 Rust 侧轮询「拦截到 /search/notes 响应」判断
+                // (见 run_human_rpa 的 wait_intercepted),更准更快;命中后再点筛选 + 滚动。
                 // 作为最大滚动轮数上限;实际滚到底(内容不再增长)自动停
                 RpaStep::Scroll { segments: 40 },
             ]
@@ -296,9 +298,16 @@ fn builtin_search_query(
         ),
         // B站搜索 URL:order totalrank综合/click最多播放/pubdate最新发布;
         // 时间筛选走 pubtime_begin_s/end_s 绝对时间戳,静态映射表达不了,留空不支持
+        // order: totalrank综合/click最多播放/pubdate最新发布/dm最大弹幕/stow最多收藏
         "bilibili" => (
             "order".into(),
-            pair(&[("synthetic", "totalrank"), ("hottest", "click"), ("latest", "pubdate")]),
+            pair(&[
+                ("synthetic", "totalrank"),
+                ("hottest", "click"),
+                ("latest", "pubdate"),
+                ("most_danmaku", "dm"),
+                ("most_collect", "stow"),
+            ]),
             String::new(),
             BTreeMap::new(),
         ),
@@ -320,15 +329,18 @@ fn builtin_next_page_texts(id: &str) -> Vec<String> {
 /// 真实值需本机 `bun run tauri dev` 触发风控后核对调整(代码与 search_url 等同属抓包依赖项)。
 fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     match id {
-        // 抖音 / TikTok:secsdk 验证码容器(滑块 / 点选)+ captcha 接口
+        // 抖音 / TikTok:secsdk 验证码容器(滑块 / 点选 / 盾牌拼图)+ captcha 接口
         "douyin" | "tiktok" => (
             vec![
+                "#captcha_container".into(),
+                "#vc_captcha_box".into(),
+                ".vc-captcha-verify".into(),
                 ".captcha_verify_container".into(),
                 "#captcha-verify-image".into(),
                 ".captcha-verify-container".into(),
             ],
-            vec!["完成安全验证".into(), "拖动下方滑块".into(), "向右滑动".into()],
-            vec!["/captcha/".into(), "verifycenter".into(), "secsdk".into()],
+            vec!["请完成下列验证后继续".into(), "完成安全验证".into(), "拖动下方滑块".into(), "按住左边按钮拖动完成上方拼图".into(), "向右滑动".into()],
+            vec!["/captcha/".into(), "verifycenter".into(), "secsdk".into(), "vc_captcha".into()],
         ),
         // 小红书:滑块验证容器 + captcha 接口
         "xhs" => (
@@ -348,9 +360,12 @@ fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 }
 
 /// 各平台作者主页 URL 模板(画像补采导航用),`{id}`=作者 uid,`{token}`=鉴权 token。
-/// 仅「搜索响应缺画像」的平台需要:抖音/TikTok 搜索已含完整画像,返回空表示不支持补采。
+/// 「搜索响应缺画像」的平台需要打开主页补采(抖音搜索其实不含粉丝/关注/获赞/属地,也需补采);
+/// 返回空表示该平台不支持补采(如 TikTok 搜索已含画像)。
 fn builtin_profile_url(id: &str) -> &'static str {
     match id {
+        // 抖音主页用 sec_uid,无需 token;搜索响应不含粉丝/关注/获赞/属地,需打开主页补采
+        "douyin" => "https://www.douyin.com/user/{id}",
         // 小红书主页需 xsec_token(由最近一条该作者内容的 author_xsec_token 提供)
         "xhs" => "https://www.xiaohongshu.com/user/profile/{id}?xsec_token={token}&xsec_source=pc_search",
         "kuaishou" => "https://www.kuaishou.com/profile/{id}",
@@ -364,6 +379,8 @@ fn builtin_profile_url(id: &str) -> &'static str {
 /// 主页自己请求的用户信息接口,命中后由适配器 parse_profile 解析为画像。
 fn builtin_profile_patterns(id: &str) -> Vec<&'static str> {
     match id {
+        // 抖音:主页加载时请求用户画像(粉丝/关注/获赞总数/属地在 user)。真实路径需本机抓包核对
+        "douyin" => vec!["/aweme/v1/web/user/profile/other/"],
         // 小红书:主页加载时请求用户基础信息(粉丝/关注/获赞在 interactions)
         "xhs" => vec!["/api/sns/web/v1/user/otherinfo"],
         // 快手:主页画像走 GraphQL(visionProfile);/graphql 已在搜索特征里,无需重复
@@ -642,6 +659,9 @@ impl AppConfig {
             // rpa_steps 由我们随平台改版维护、无用户编辑入口:始终用最新内置值刷新(而非仅补空),
             // 确保选择器更新(如小红书改版搜索框/筛选)对老配置也即时生效,无需删档重建。
             p.collect.rpa_steps = bp.collect.rpa_steps.clone();
+            // search_url_template 同理(平台改版维护、无 UI 编辑入口):始终刷新为最新内置值,
+            // 否则老配置仍保留旧搜索 URL(如小红书旧 search_result),改版后采集会落错页。
+            p.collect.search_url_template = bp.collect.search_url_template.clone();
         }
     }
 
@@ -670,11 +690,17 @@ impl AppConfig {
                 "xhs",
                 "小红书",
                 "https://www.xiaohongshu.com/",
-                "https://www.xiaohongshu.com/search_result?keyword={keyword}",
+                // 搜索不走 URL 直达:search_result_ai 是 AI 问答页(问点点),不出笔记列表、不发
+                // /search/notes,导致完全采不到。改为纯 RPA——窗口开在首页(login_url),由 rpa_steps
+                // 在首页搜索框输入关键词 + 点搜索图标,让页面自己跳到笔记搜索结果页触发 /search/notes。
+                // 故 search_url_template 留空(run_human_rpa 为空时不导航、直接在 login_url 上执行步骤)。
+                "",
                 // 笔记详情页:{id}=note_id,{token}=xsec_token(详情页鉴权必需);真实格式需抓包核对
                 "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_search",
                 vec![
-                    "/api/sns/web/v1/search/notes",
+                    // 笔记搜索:改版后从 v1(edith)迁到 v2(so.xiaohongshu.com)/api/sns/web/v2/search/notes,
+                    // 用版本无关子串兼容 v1/v2 与不同子域。
+                    "/search/notes",
                     // 一级评论接口;真实路径需抓包核对
                     "/api/sns/web/v2/comment/page",
                     // 笔记详情(feed)接口:详情卡含 video.media.stream,补取视频直链用;真实路径需抓包核对

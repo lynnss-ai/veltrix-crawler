@@ -69,7 +69,7 @@ impl YoutubeAdapter {
     /// 解析本地化计数文本:"1,234,567 views" / "1.2万次观看" / "3.4K"。
     /// 取前导数字(含千分位与小数点),按 万/亿/K/M/B 乘倍;无数字返回 None。
     fn parse_count_text(text: &str) -> Option<i64> {
-        let cleaned = text.replace(',', "").replace(' ', "");
+        let cleaned = text.replace([',', ' '], "");
         let numeric: String = cleaned
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '.')

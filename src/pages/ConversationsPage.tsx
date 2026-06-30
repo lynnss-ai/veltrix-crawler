@@ -15,6 +15,7 @@ import {
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
 import { api, type ConversationView } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 import type { PageKey } from "@/components/app-sidebar";
 import { useChat } from "@/hooks/use-chat";
 import { Button } from "@/components/ui/button";
@@ -51,12 +52,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Pagination } from "@/components/Pagination";
-
-function formatTime(ts: number): string {
-  const d = new Date(ts * 1000);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
 
 function fmtMd(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -305,7 +300,7 @@ export function ConversationsPage({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索对话标题"
-            className="pl-8"
+            className="h-10 pl-8"
           />
         </div>
         <div className="ml-auto flex items-center gap-2">
@@ -392,7 +387,7 @@ export function ConversationsPage({
                     </span>
                   </button>
                   <span className="w-32 shrink-0 text-left font-mono text-xs text-muted-foreground">
-                    {formatTime(c.updatedAt)}
+                    {formatTimestamp(c.updatedAt)}
                   </span>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>

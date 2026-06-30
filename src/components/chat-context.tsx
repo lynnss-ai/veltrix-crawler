@@ -7,7 +7,8 @@ import { ChatContext } from "@/hooks/use-chat";
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [conversations, setConversations] = useState<ConversationView[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [pendingAgentType, setPendingAgentType] = useState<string>("chat");
+  // 默认新会话=统一编排器(可直接对话,需要时把专门智能体当工具委派)
+  const [pendingAgentType, setPendingAgentType] = useState<string>("orchestrator");
   const [pendingFirstMessage, setPendingFirstMessage] = useState<string | null>(
     null,
   );
@@ -24,7 +25,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void reload();
     // 模型厂商列表加载一次(全局共享);失败忽略,配置后重进对话工作区会重载
-    api.listProviders().then(setProviders).catch(() => {});
+    api.listProviders().then(setProviders).catch((e) => console.warn("加载模型厂商列表失败:", e));
   }, [reload]);
 
   return (

@@ -6,6 +6,7 @@
 //! chat / coding / rpa 三个智能体只依赖本 core,彼此之间不直接耦合。
 
 pub mod llm;
+pub mod react;
 pub mod shared;
 pub mod summary;
 

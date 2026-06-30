@@ -212,7 +212,7 @@ export function CodingLayout() {
         setDockerOk(c.dockerAvailable);
         setSandboxRunning(c.containerRunning);
       })
-      .catch(() => {});
+      .catch((e) => console.debug("获取沙箱配置失败:", e));
   }, [sandboxOpen]);
   const scrollRef = useRef<HTMLDivElement>(null);
   // 发送重入锁:state 更新异步,挡住极快连点/交接与手动发送撞车造成的重复发送(仅护建会话窗口)
@@ -237,7 +237,7 @@ export function CodingLayout() {
     api
       .getCodingWorkspace(activeId ?? undefined)
       .then(setWorkspace)
-      .catch(() => {});
+      .catch((e) => console.debug("获取工作区路径失败:", e));
   }, [activeId]);
 
   // 切换会话时加载消息;若有待交接的首条消息(此刻 DB 尚空),跳过加载,交给发送流程
@@ -387,7 +387,7 @@ export function CodingLayout() {
       .then((fs) => {
         if (alive) setWsFiles(fs);
       })
-      .catch(() => {});
+      .catch((e) => console.debug("加载工作区文件列表失败:", e));
     return () => {
       alive = false;
     };

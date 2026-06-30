@@ -26,10 +26,10 @@ import {
 } from "lucide-react";
 import {
   api,
-  formatTimestamp,
   type UserInput,
   type UserView,
 } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { FieldError } from "@/components/FieldError";
 import { generatePassword } from "@/lib/password";
@@ -40,7 +40,6 @@ import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { DataTableFacetedFilter } from "@/components/DataTableFacetedFilter";
 import { StatusBadge, type StatusTone } from "@/components/StatusBadge";
-import { RefreshButton } from "@/components/RefreshButton";
 import { Button } from "@/components/ui/button";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { Input } from "@/components/ui/input";
@@ -353,8 +352,7 @@ export function UsersPage() {
               )}
             </div>
             <div className="flex items-center gap-2">
-              <RefreshButton onClick={reload} />
-              <Button onClick={openCreate}>
+              <Button className="h-10" onClick={openCreate}>
                 <Plus />
                 新增用户
               </Button>

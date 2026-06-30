@@ -1,8 +1,8 @@
 // 评论库:展示采集落库的评论(comments 表)+ AI 意向标记。
 // 筛选:左侧栏(行业 + 角标)+ 顶部(意向 / 平台 chip + 评论日期 + 关键字)。
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { Download, Filter, Heart, MessageCircle, Search, X } from "lucide-react";
+import { Download, Heart, MessageCircle, Search, X } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
 
@@ -14,6 +14,7 @@ import {
   DateRangeFilter,
   FilterChip,
   FilterSidebar,
+  IndustryFilterToggle,
   inDateRange,
 } from "@/components/library-filters";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ import {
   type IndustryView,
   type PlatformConfig,
 } from "@/lib/api";
+import { formatTimestamp } from "@/lib/utils";
 import {
   platformClass,
   platformChipClass,
@@ -83,11 +85,6 @@ function formatCount(n?: number | null): string {
   return String(n);
 }
 
-function formatTime(ts?: number | null): string {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
-}
-
 export function CommentLibraryPage() {
   const [comments, setComments] = useState<CommentView[]>([]);
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
@@ -105,12 +102,12 @@ export function CommentLibraryPage() {
       .listComments()
       .then(setComments)
       .catch((e) => toast.error(`加载评论失败: ${e}`));
-    api.listPlatforms().then(setPlatforms).catch(() => {});
-    api.listIndustries().then(setIndustries).catch(() => {});
+    api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
+    api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
   }, []);
 
-  const platformName = (id: string) =>
-    platforms.find((p) => p.id === id)?.name ?? id;
+  const platformName = useCallback((id: string) =>
+    platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
 
   // 各行业评论数(侧栏角标)
   const industryCounts = useMemo(() => {
@@ -390,7 +387,7 @@ export function CommentLibraryPage() {
         ),
         cell: ({ row }) => (
           <span className="text-xs text-muted-foreground">
-            {formatTime(row.original.createdAt)}
+            {formatTimestamp(row.original.createdAt)}
           </span>
         ),
       },
@@ -402,14 +399,12 @@ export function CommentLibraryPage() {
         ),
         cell: ({ row }) => (
           <span className="text-xs text-muted-foreground">
-            {formatTime(row.original.collectedAt)}
+            {formatTimestamp(row.original.collectedAt)}
           </span>
         ),
       },
     ],
-    // platformName 依赖 platforms,平台加载后重建列以正确显示名称
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [platforms],
+    [platforms, platformName],
   );
 
   // 导出当前筛选 + 排序后的评论为 Excel(.xlsx);路径经系统保存对话框选定
@@ -432,8 +427,8 @@ export function CommentLibraryPage() {
         采集关键词: c.keyword ?? "",
         所属内容标题: c.contentTitle ?? "",
         内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
-        评论时间: formatTime(c.createdAt),
-        创建时间: formatTime(c.collectedAt),
+        评论时间: formatTimestamp(c.createdAt),
+        创建时间: formatTimestamp(c.collectedAt),
       }));
       const ws = XLSX.utils.json_to_sheet(rows);
       // 表头样式:居中 + 靛蓝背景 + 加粗白字
@@ -515,16 +510,7 @@ export function CommentLibraryPage() {
         {/* 行业按钮(收起态) + 评论日期 + 关键字搜索 + 重置 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {sidebarCollapsed && (
-            <SimpleTooltip content="展开行业筛选">
-              <Button
-                variant="outline"
-                className="cursor-pointer"
-                onClick={() => setSidebarCollapsed(false)}
-              >
-                <Filter />
-                行业
-              </Button>
-            </SimpleTooltip>
+            <IndustryFilterToggle onExpand={() => setSidebarCollapsed(false)} />
           )}
           <DateRangeFilter
             title="评论日期"
@@ -548,7 +534,7 @@ export function CommentLibraryPage() {
           </div>
           <Button
             variant="outline"
-            className="cursor-pointer px-2 lg:px-3"
+            className="h-10 cursor-pointer px-2 lg:px-3"
             onClick={handleExport}
           >
             <Download className="size-4" />

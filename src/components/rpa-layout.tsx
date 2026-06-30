@@ -533,7 +533,7 @@ function AgentWebviewHost({
     const el = hostRef.current;
     if (!id || !el) return;
     const r = el.getBoundingClientRect();
-    void api.setAgentWebviewBounds(id, r.left, r.top, r.width, r.height).catch(() => {});
+    void api.setAgentWebviewBounds(id, r.left, r.top, r.width, r.height).catch((e) => console.debug("设置 webview 边界失败:", e));
   }, []);
 
   // rAF 节流,避免拖动 / 连续 resize 时频繁 IPC 抖动
@@ -549,14 +549,14 @@ function AgentWebviewHost({
   // 清理时藏掉(切走的会话或离开页面),避免原生层盖住别处。
   useLayoutEffect(() => {
     scheduleSync();
-    if (activeId) void api.showAgentWebview(activeId).catch(() => {});
+    if (activeId) void api.showAgentWebview(activeId).catch((e) => console.debug("显示 webview 失败:", e));
     const ro = new ResizeObserver(() => scheduleSync());
     if (hostRef.current) ro.observe(hostRef.current);
     window.addEventListener("resize", scheduleSync);
     return () => {
       ro.disconnect();
       window.removeEventListener("resize", scheduleSync);
-      if (activeId) void api.hideAgentWebview(activeId).catch(() => {});
+      if (activeId) void api.hideAgentWebview(activeId).catch((e) => console.debug("隐藏 webview 失败:", e));
     };
   }, [activeId, scheduleSync]);
 
@@ -564,7 +564,7 @@ function AgentWebviewHost({
   useEffect(() => {
     if (!sending) {
       scheduleSync();
-      if (activeRef.current) void api.showAgentWebview(activeRef.current).catch(() => {});
+      if (activeRef.current) void api.showAgentWebview(activeRef.current).catch((e) => console.debug("显示 webview 失败:", e));
     }
   }, [sending, scheduleSync]);
 
@@ -575,7 +575,7 @@ function AgentWebviewHost({
     listen<{ conversationId: string }>("agent-webview-ready", (e) => {
       if (e.payload.conversationId !== activeRef.current) return;
       scheduleSync();
-      void api.showAgentWebview(e.payload.conversationId).catch(() => {});
+      void api.showAgentWebview(e.payload.conversationId).catch((e) => console.debug("显示新 webview 失败:", e));
     }).then(
       (fn) => {
         if (disposed) fn();
@@ -592,7 +592,7 @@ function AgentWebviewHost({
   // 离开 RPA 工作区(组件卸载):藏掉全部内嵌 webview,防原生层盖住其它页面
   useEffect(() => {
     return () => {
-      void api.hideAllAgentWebviews().catch(() => {});
+      void api.hideAllAgentWebviews().catch((e) => console.debug("隐藏全部 webview 失败:", e));
     };
   }, []);
 
@@ -641,7 +641,7 @@ function NetworkPanel({ activeId }: { activeId: string | null }) {
     api
       .getAgentNetwork(activeId)
       .then((list) => setRows(toRows(list)))
-      .catch(() => {});
+      .catch((e) => console.debug("加载网络拦截记录失败:", e));
   }, [activeId, toRows]);
 
   // 实时增量:监听 agent-network(仅当前会话),保留最近 200 条

@@ -1,6 +1,15 @@
 // CollectPage 的纯元数据与辅助:状态/触发/筛选的标签映射、任务判定谓词、格式化函数。
 // 从 CollectPage.tsx 拆出——皆为无 React 状态的纯逻辑 / 常量,缩减主组件文件体量。
-import { CalendarClock, Infinity as InfinityIcon, Zap } from "lucide-react";
+import {
+  CalendarClock,
+  Infinity as InfinityIcon,
+  LayoutGrid,
+  MapPin,
+  Target,
+  Timer,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 import type { PlatformConfig, TaskView } from "@/lib/api";
 
 export type TaskStatus = TaskView["status"];
@@ -13,6 +22,9 @@ export const SORT_MODE_META: Record<SortMode, { label: string }> = {
   synthetic: { label: "综合" },
   hottest: { label: "最热" },
   latest: { label: "最新" },
+  most_comment: { label: "最多评论" },
+  most_collect: { label: "最多收藏" },
+  most_danmaku: { label: "最大弹幕" },
 };
 
 export const TIME_RANGE_META: Record<TimeRange, { label: string }> = {
@@ -60,30 +72,31 @@ export const PLATFORM_FILTER_META: Record<
       { value: "synthetic", label: "综合" },
       { value: "latest", label: "最新" },
       { value: "hottest", label: "最多点赞" },
+      { value: "most_comment", label: "最多评论" },
+      { value: "most_collect", label: "最多收藏" },
     ],
     time: ALL_TIME,
   },
+  // 快手:无条件筛选(搜索结果页不提供排序 / 时间等筛选),任务表单不展示「采集筛选」区
   kuaishou: {
-    sort: [
-      { value: "synthetic", label: "综合" },
-      { value: "latest", label: "最新" },
-    ],
-    time: ALL_TIME,
+    sort: [],
+    time: [],
   },
   bilibili: {
     sort: [
-      { value: "synthetic", label: "综合" },
+      { value: "synthetic", label: "综合排序" },
       { value: "hottest", label: "最多播放" },
       { value: "latest", label: "最新发布" },
+      { value: "most_danmaku", label: "最大弹幕" },
+      { value: "most_collect", label: "最多收藏" },
     ],
     time: ALL_TIME,
   },
+  // TikTok:搜索结果靠顶部 tab 切「内容形式」(综合/视频/照片),无排序 / 时间筛选;
+  // 内容形式见 PLATFORM_EXTRA_FILTERS.tiktok
   tiktok: {
-    sort: [
-      { value: "synthetic", label: "综合" },
-      { value: "latest", label: "最新" },
-    ],
-    time: ALL_TIME,
+    sort: [],
+    time: [],
   },
   youtube: {
     sort: [
@@ -97,6 +110,127 @@ export const PLATFORM_FILTER_META: Record<
 
 export function filterMetaFor(platform: string) {
   return PLATFORM_FILTER_META[platform] ?? DEFAULT_FILTER_META;
+}
+
+// 平台专属额外筛选维度(排序 / 发布时间见上方 PLATFORM_FILTER_META):每个平台单独声明自己
+// 「筛选」面板里的维度,只在该平台的任务表单显示与生效。非「不限」选项的 value 即结果页浮层中
+// 要点击的文案;"any" = 不限(默认、不点)。新增平台维度 = 在此声明 + 后端无需改(值即点击文案)。
+export type FilterDimension = {
+  id: string;
+  label: string;
+  icon: LucideIcon;
+  /// 标签文字 + 图标的颜色(Tailwind 类,图标继承 currentColor 一并着色)
+  color: string;
+  options: FilterOpt<string>[];
+};
+export const PLATFORM_EXTRA_FILTERS: Record<string, FilterDimension[]> = {
+  douyin: [
+    {
+      id: "videoDuration",
+      label: "视频时长",
+      icon: Timer,
+      color: "text-emerald-600 dark:text-emerald-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "1分钟以下", label: "1分钟以下" },
+        { value: "1-5分钟", label: "1-5分钟" },
+        { value: "5分钟以上", label: "5分钟以上" },
+      ],
+    },
+    {
+      id: "searchScope",
+      label: "搜索范围",
+      icon: Target,
+      color: "text-violet-600 dark:text-violet-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "关注的人", label: "关注的人" },
+        { value: "最近看过", label: "最近看过" },
+        { value: "还未看过", label: "还未看过" },
+      ],
+    },
+    {
+      id: "contentForm",
+      label: "内容形式",
+      icon: LayoutGrid,
+      color: "text-rose-600 dark:text-rose-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "视频", label: "视频" },
+        { value: "图文", label: "图文" },
+      ],
+    },
+  ],
+  xhs: [
+    {
+      id: "noteType",
+      label: "笔记类型",
+      icon: LayoutGrid,
+      color: "text-rose-600 dark:text-rose-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "视频", label: "视频" },
+        { value: "图文", label: "图文" },
+      ],
+    },
+    {
+      id: "searchScope",
+      label: "搜索范围",
+      icon: Target,
+      color: "text-violet-600 dark:text-violet-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "已看过", label: "已看过" },
+        { value: "未看过", label: "未看过" },
+        { value: "已关注", label: "已关注" },
+      ],
+    },
+    {
+      id: "locationDistance",
+      label: "位置距离",
+      icon: MapPin,
+      color: "text-cyan-600 dark:text-cyan-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "同城", label: "同城" },
+        { value: "附近", label: "附近" },
+      ],
+    },
+  ],
+  // TikTok:内容形式是顶部 tab(#search-tabs 内 综合/用户/视频/直播/照片),非「筛选」浮层;
+  // 故 filter_panel_labels 不含 tiktok(不展开面板),直接点 tab 文案「视频」/「照片」即可。
+  // 内容只有视频与照片(无图文),"any"=综合 tab(默认不点)。
+  tiktok: [
+    {
+      id: "contentForm",
+      label: "内容形式",
+      icon: LayoutGrid,
+      color: "text-rose-600 dark:text-rose-400",
+      options: [
+        { value: "any", label: "不限" },
+        { value: "视频", label: "视频" },
+        { value: "照片", label: "照片" },
+      ],
+    },
+  ],
+  // B站:形式(综合/视频/专栏)是搜索结果页顶部 tab,非「筛选」浮层 → 直接点 tab 文案。
+  // 基础搜索 URL 为 /video(视频),故「视频」=默认(any,不点);综合 / 专栏 点对应 tab 切换。
+  bilibili: [
+    {
+      id: "contentForm",
+      label: "形式",
+      icon: LayoutGrid,
+      color: "text-pink-600 dark:text-pink-400",
+      options: [
+        { value: "综合", label: "综合" },
+        { value: "any", label: "视频" },
+        { value: "专栏", label: "专栏" },
+      ],
+    },
+  ],
+};
+export function extraFiltersFor(platform: string): FilterDimension[] {
+  return PLATFORM_EXTRA_FILTERS[platform] ?? [];
 }
 // 列表/详情展示用:取平台标签,回退通用标签
 export function sortLabelOf(platform: string, value: SortMode) {
@@ -113,22 +247,51 @@ export function timeLabelOf(platform: string, value: TimeRange) {
     value
   );
 }
+// 列表/详情展示用:把任务选中的平台专属额外筛选(noteType/searchScope/locationDistance 等)
+// 转成 {维度标签, 选项标签} 列表,跳过"不限/空"。维度与选项标签按平台配置取,跨平台共用。
+export function extraFilterChipsOf(
+  platform: string,
+  extraFilters: Record<string, string> | undefined,
+): { label: string; value: string }[] {
+  if (!extraFilters) return [];
+  const chips: { label: string; value: string }[] = [];
+  for (const dim of extraFiltersFor(platform)) {
+    const v = extraFilters[dim.id];
+    if (!v || v === "any") continue;
+    const opt = dim.options.find((o) => o.value === v);
+    chips.push({ label: dim.label, value: opt?.label ?? v });
+  }
+  return chips;
+}
+
+// 数据穿透上下文:从任务列表/详情跳到全量库时携带,按任务过滤内容;
+// 含 runStart/runEnd(Unix 秒)时进一步按 collectedAt 落在该次运行时间范围内过滤(单次任务穿透);
+// 含 keyword 时再按该关键词过滤(采集明细里单关键词穿透)。
+export type TaskContentFilter = {
+  taskId: string;
+  taskName?: string;
+  keyword?: string;
+  runStart?: number;
+  runEnd?: number;
+};
 
 export type CommentTimeRange = NonNullable<TaskView["commentTimeRange"]>;
 
+// 不限排首位:下拉默认/首选项,Select 按 Object.keys 插入顺序渲染
 export const COMMENT_TIME_RANGE_META: Record<CommentTimeRange, { label: string }> = {
+  any: { label: "不限" },
   "3d": { label: "3 天内" },
   "7d": { label: "7 天内" },
   "14d": { label: "14 天内" },
-  any: { label: "不限" },
 };
 
-// 单视频评论抓取上限选项,value 为字符串(Select 需要),0 表示不限
+// 单视频评论抓取上限选项,value 为字符串(Select 需要),0 表示不限(排首位)
 export const COMMENT_LIMIT_OPTIONS: { value: string; label: string }[] = [
+  { value: "0", label: "不限" },
   { value: "100", label: "100 条" },
   { value: "500", label: "500 条" },
   { value: "1000", label: "1000 条" },
-  { value: "0", label: "不限" },
+  { value: "2000", label: "2000 条" },
 ];
 
 // 活跃 = 未归档;归档由用户手动操作(终止 / 失败都不自动归档,留在列表里)
@@ -354,17 +517,16 @@ export const DEFAULT_STRATEGY = {
   aiExtract: false,
   collectComments: false,
   commentTimeRange: "any" as CommentTimeRange,
-  commentLimit: 500,
+  commentLimit: 100,
   analyzeCommentIntent: false,
   autoSyncObsidian: false,
+  // 平台专属额外筛选(默认全不限);实际维度由 PLATFORM_EXTRA_FILTERS 按平台决定
+  extraFilters: {} as Record<string, string>,
 };
 
 // 平台颜色 / 名称统一从 @/lib/platforms 取(PlatformId 枚举);本文件内仅引用
 
-export function formatTime(ts?: number | null): string {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
-}
+export { formatTimestamp as formatTime } from "@/lib/utils";
 
 // ---- 页面主体 ----
 

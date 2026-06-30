@@ -32,7 +32,7 @@ export function RecordingOverlay() {
           setStartedAtMs(s.startedAt ? s.startedAt * 1000 : Date.now());
         }
       })
-      .catch(() => {});
+      .catch((e) => console.debug("获取录制状态失败:", e));
   }, []);
 
   // 录制中每秒刷新计时(以后端开始时间为基准)
@@ -71,7 +71,7 @@ export function RecordingOverlay() {
 
   function cancel() {
     // 未开始时取消:后端关悬浮窗 + 还原主窗口,不产出文件
-    api.cancelRecordingOverlay().catch(() => {});
+    api.cancelRecordingOverlay().catch((e) => console.debug("取消录制失败:", e));
   }
 
   // 录制中:红点 + 计时 + 停止(居中)。外层透明只负责居中,内层自适应宽度 + 圆弧角

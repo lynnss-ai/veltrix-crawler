@@ -126,6 +126,23 @@ mod win {
                 request.Uri(&mut uri)?;
                 let url = pwstr_take(uri);
 
+                // 诊断:记录疑似风控/验证相关请求(WebResourceResponseReceived 帧无关,
+                // 跨域验证码 iframe 的请求也能看到)。用于定位「被拦截」到底是弹验证码还是静默不返回。
+                // 仅命中关键词才打,避免刷屏;这是定位风控形态的关键信号。
+                {
+                    let lu = url.to_ascii_lowercase();
+                    // redcaptcha/v2/getconfig 是小红书每次都预加载的验证码 SDK 配置(良性,非真验证),
+                    // 排除掉,避免误报"疑似风控"刷屏。真正的验证挑战会走其它 redcaptcha 接口。
+                    let is_benign_preload = lu.contains("redcaptcha/v2/getconfig");
+                    if !is_benign_preload
+                        && ["captcha", "secsdk", "verifycenter", "vc_captcha", "shark"]
+                            .iter()
+                            .any(|k| lu.contains(k))
+                    {
+                        tracing::info!("拦截诊断:疑似风控请求 {url}");
+                    }
+                }
+
                 let response = args.Response()?;
                 // 放行判定:patterns 非空(采集)→ URL 命中特征;patterns 空(Agent 全量)→ 仅 content-type 含 json
                 let pass = if patterns.is_empty() {

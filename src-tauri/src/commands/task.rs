@@ -68,6 +68,8 @@ pub struct TaskView {
     pub archived: bool,
     /// 采集完成后自动同步内容到发起者 Obsidian vault
     pub auto_sync_obsidian: bool,
+    /// 平台专属额外筛选(抖音:视频时长 / 搜索范围 / 内容形式),对象 {维度id: 选中文案};{} = 全不限
+    pub extra_filters: serde_json::Value,
     pub owner: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -113,6 +115,8 @@ impl From<task::Model> for TaskView {
             error_message: m.error_message,
             archived: m.archived,
             auto_sync_obsidian: m.auto_sync_obsidian,
+            extra_filters: serde_json::from_str(&m.extra_filters)
+                .unwrap_or_else(|_| serde_json::json!({})),
             owner: m.owner,
             created_at: m.created_at,
             updated_at: m.updated_at,
@@ -154,6 +158,9 @@ pub struct TaskInput {
     /// 采集完成后自动同步内容到发起者(owner)的 Obsidian vault
     #[serde(default)]
     pub auto_sync_obsidian: bool,
+    /// 平台专属额外筛选(对象 {维度id: 选中文案});缺省 / 非对象归一化为空 {}
+    #[serde(default)]
+    pub extra_filters: serde_json::Value,
 }
 
 fn owner_of(state: &AppState) -> Result<String> {
@@ -320,6 +327,12 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
         .one(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?;
+    // 额外筛选:仅接受对象,其余(Null / 数组等)归一化为空 {} 落库
+    let extra_filters_json = if input.extra_filters.is_object() {
+        input.extra_filters.to_string()
+    } else {
+        "{}".to_string()
+    };
     match existing {
         Some(model) => {
             let mut am = model.into_active_model();
@@ -340,6 +353,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.comment_limit = Set(input.comment_limit);
             am.analyze_comment_intent = Set(input.analyze_comment_intent);
             am.auto_sync_obsidian = Set(input.auto_sync_obsidian);
+            am.extra_filters = Set(extra_filters_json);
             am.updated_at = Set(now);
             am.update(db)
                 .await
@@ -365,6 +379,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 comment_limit: Set(input.comment_limit),
                 analyze_comment_intent: Set(input.analyze_comment_intent),
                 auto_sync_obsidian: Set(input.auto_sync_obsidian),
+                extra_filters: Set(extra_filters_json),
                 archived: Set(false),
                 status: Set("pending".into()),
                 progress: Set(0),

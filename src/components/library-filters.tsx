@@ -114,7 +114,24 @@ export function FilterSidebar({
   );
 }
 
-function IndustryFilterItem({
+// 行业筛选「收起态」的展开按钮:采集页 / 各资产库统一收口。
+// 高度固定 h-10,与同排搜索框 / 日期筛选 / Tabs 对齐。
+export function IndustryFilterToggle({ onExpand }: { onExpand: () => void }) {
+  return (
+    <SimpleTooltip content="展开行业筛选">
+      <Button
+        variant="outline"
+        className="h-10 cursor-pointer"
+        onClick={onExpand}
+      >
+        <Filter />
+        行业
+      </Button>
+    </SimpleTooltip>
+  );
+}
+
+export function IndustryFilterItem({
   label,
   count,
   active,

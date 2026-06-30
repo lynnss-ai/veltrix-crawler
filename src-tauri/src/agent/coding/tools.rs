@@ -133,12 +133,7 @@ pub fn detect_placeholder(s: &str) -> Option<&'static str> {
         "omitted for brevity",
         "code omitted here",
     ];
-    for p in EN {
-        if lower.contains(p) {
-            return Some(p);
-        }
-    }
-    None
+    EN.iter().find(|&p| lower.contains(p)).map(|v| v as _)
 }
 
 /// 占位拒收的统一提示(返回给模型,触发它重写完整内容)。
@@ -163,6 +158,7 @@ pub fn is_code_file(path: &str) -> bool {
 }
 
 /// 收尾前强制验证的引导词:改了代码却没跑验证就想 finish 时注入,逼它先验证。
+#[allow(dead_code)]
 pub fn verify_before_finish_prompt() -> String {
     "你改动了代码但还没运行验证就想收尾。请先用 run_command 实际验证——能构建就构建、有测试就跑测试、\
 有类型检查/lint 就跑(如 tsc、cargo check、go build、pytest 等),确认通过后再调用 finish;\
@@ -200,6 +196,7 @@ impl AgentMode {
 /// 构造编程 Agent 的工具注册表(文件工具绑定宿主工作区;run_command 按 exec 路由 host/Docker)。
 /// 按 mode 从源头裁剪可用工具:Plan 只注册只读工具(read_file/list_dir/search_files),
 /// 从根上不挂 write_file/replace_in_file/run_command,杜绝 Plan 模式越权改动或执行。
+/// 跨场景任务由「统一编排器」按 agent 即 tool 委派,编程 Agent 自身不再持委派工具(递归护栏)。
 pub fn build_registry(workspace: PathBuf, exec: ExecConfig, mode: AgentMode) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadFileTool { workspace: workspace.clone() }));
@@ -787,8 +784,9 @@ fn checkpoint_message(label: &str) -> String {
     let folded = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed: String = folded.chars().take(50).collect();
     if trimmed.trim().is_empty() {
-        "veltrix checkpoint".to_string()
+        "agent checkpoint".to_string()
     } else {
         trimmed
     }
 }
+

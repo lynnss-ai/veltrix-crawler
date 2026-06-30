@@ -340,6 +340,42 @@ export interface KeywordDto {
   word: string;
 }
 
+// 内容创作 - 提示词分类目录
+export interface PromptCategoryView {
+  id: string;
+  owner: string;
+  name: string;
+  remark: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PromptCategoryInput {
+  id: string;
+  name: string;
+  remark: string;
+}
+
+// 内容创作 - 分镜镜头提示词
+export interface ShotPromptView {
+  id: string;
+  owner: string;
+  categoryId: string;
+  name: string;
+  content: string;
+  remark: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ShotPromptInput {
+  id: string;
+  categoryId: string;
+  name: string;
+  content: string;
+  remark: string;
+}
+
 // 采集任务
 export interface KeywordStat {
   keyword: string;
@@ -356,7 +392,7 @@ export interface TaskView {
   trigger: "once-now" | "daily" | "watching";
   scheduledAt: string | null;
   watchIntervalMin: number | null;
-  sortMode: "synthetic" | "hottest" | "latest";
+  sortMode: "synthetic" | "hottest" | "latest" | "most_comment" | "most_collect" | "most_danmaku";
   timeRange: "any" | "1d" | "1w" | "6m";
   perKeywordLimit: number;
   minLikes: number;
@@ -395,6 +431,8 @@ export interface TaskView {
   archived: boolean;
   // 采集完成后自动同步内容到发起者 Obsidian vault
   autoSyncObsidian: boolean;
+  // 平台专属额外筛选(抖音:视频时长/搜索范围/内容形式),{维度id: 选中文案};{} = 全不限
+  extraFilters: Record<string, string>;
   owner: string;
   createdAt: number;
   updatedAt: number;
@@ -414,7 +452,7 @@ export interface TaskInput {
   trigger: "once-now" | "daily" | "watching";
   scheduledAt?: string | null;
   watchIntervalMin?: number | null;
-  sortMode: "synthetic" | "hottest" | "latest";
+  sortMode: "synthetic" | "hottest" | "latest" | "most_comment" | "most_collect" | "most_danmaku";
   timeRange: "any" | "1d" | "1w" | "6m";
   perKeywordLimit: number;
   minLikes: number;
@@ -426,6 +464,8 @@ export interface TaskInput {
   analyzeCommentIntent?: boolean;
   // 采集完成后自动同步内容到发起者(owner)的 Obsidian vault
   autoSyncObsidian?: boolean;
+  // 平台专属额外筛选(抖音:视频时长/搜索范围/内容形式),{维度id: 选中文案};省略 = 全不限
+  extraFilters?: Record<string, string>;
 }
 
 export interface TaskStatusPatch {
@@ -728,4 +768,37 @@ export interface RecordingStatus {
   startedAt: number | null;
   // 输出 MP4 路径;未录制为 null
   outputPath: string | null;
+}
+
+// ===================== 账单计费 =====================
+
+export interface BillingOverview {
+  totalTokens: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalRequests: number;
+  byModel: ModelUsage[];
+  requestByModel: ModelRequestCount[];
+  tokenTrendDates: string[];
+  tokenTrendSeries: ModelTrendSeries[];
+  requestTrendDates: string[];
+  requestTrendSeries: ModelTrendSeries[];
+}
+
+export interface ModelUsage {
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  lastRequestedAt: number;
+}
+
+export interface ModelRequestCount {
+  model: string;
+  count: number;
+}
+
+export interface ModelTrendSeries {
+  model: string;
+  values: number[];
 }

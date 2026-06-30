@@ -21,6 +21,9 @@ const SEARCH_PATH: &str = "/aweme/v1/web/general/search/";
 const COMMENT_PATH: &str = "/aweme/v1/web/comment/list/";
 /// 内容详情接口 URL 特征(补取/刷新视频直链用),与平台配置 intercept_patterns 对应。
 const DETAIL_PATH: &str = "/aweme/v1/web/aweme/detail/";
+/// 作者主页画像接口 URL 特征(画像补采用),与平台配置 builtin_profile_patterns 对应。
+/// 抖音主页加载时请求该接口返回 `user`(含粉丝/关注/获赞总数/属地)。真实路径需本机抓包核对。
+const PROFILE_PATH: &str = "/aweme/v1/web/user/profile/other/";
 
 #[derive(Default)]
 pub struct DouyinAdapter;
@@ -313,6 +316,62 @@ impl DouyinAdapter {
         }
     }
 
+    /// 解析作者主页画像(authors 仅一条;contents/comments 恒空)。
+    /// 主页请求 `/aweme/v1/web/user/profile/other/`:画像在响应 `user` 对象
+    /// (nickname/signature/avatar_larger 头像/unique_id 抖音号/ip_location 属地,
+    /// follower_count 粉丝/following_count 关注/total_favorited 获赞总数)。
+    /// uid 用导航时的 sec_uid(ctx.keyword)。
+    fn parse_profile(ctx: &FetchContext) -> FetchOutput {
+        let uid = ctx.keyword.clone();
+        let mut authors = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(PROFILE_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let Some(user) = root.get("user") else {
+                continue;
+            };
+            // 头像:大图优先,逐级回退
+            let avatar = ["avatar_larger", "avatar_300x300", "avatar_thumb"]
+                .iter()
+                .find_map(|key| {
+                    user.get(*key)
+                        .and_then(|av| av.get("url_list"))
+                        .and_then(Value::as_array)
+                        .and_then(|l| l.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            authors.push(Author {
+                platform: PLATFORM_ID.to_string(),
+                uid: uid.clone(),
+                nickname: user
+                    .get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                avatar,
+                signature: user.get("signature").and_then(Value::as_str).map(str::to_string),
+                follower_count: user.get("follower_count").and_then(Value::as_i64),
+                following_count: user.get("following_count").and_then(Value::as_i64),
+                extra: serde_json::json!({
+                    "unique_id": user.get("unique_id").and_then(Value::as_str),
+                    "ip_location": user.get("ip_location").and_then(Value::as_str),
+                    "total_favorited": user.get("total_favorited").and_then(Value::as_i64),
+                }),
+            });
+            break; // 一个主页只取一条画像
+        }
+        FetchOutput {
+            contents: Vec::new(),
+            comments: Vec::new(),
+            authors,
+        }
+    }
+
     /// 解析一级评论接口响应为评论列表(contents 恒空)。
     /// 只取一级评论接口,排除 URL 含 `reply` 的二级回复接口(本期只采一级)。
     fn parse_comments(ctx: &FetchContext) -> FetchOutput {
@@ -381,15 +440,19 @@ impl PlatformAdapter for DouyinAdapter {
     fn supports(&self, kind: &TaskKind) -> bool {
         matches!(
             kind,
-            TaskKind::Search | TaskKind::Comments | TaskKind::ContentDetail
+            TaskKind::Search
+                | TaskKind::Comments
+                | TaskKind::ContentDetail
+                | TaskKind::UserProfile
         )
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
-        // 按任务类型分流:评论任务解析一级评论,详情补取解析单条直链,其余按搜索内容解析
+        // 按任务类型分流:评论解析一级评论,详情补取解析单条直链,画像补采解析主页 user,其余按搜索内容解析
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::ContentDetail => Self::parse_detail(ctx),
+            TaskKind::UserProfile => Self::parse_profile(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)

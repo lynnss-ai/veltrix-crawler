@@ -5,21 +5,24 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
-  Clapperboard,
   Contact,
   Database,
   FileStack,
   FolderKanban,
   Grip,
-  Image,
   Images,
+  Library,
+  Lightbulb,
   MessageSquare,
   LayoutDashboard,
   LogOut,
   MoreVertical,
+  Palette,
   Radar,
+  Receipt,
   Rocket,
   Settings,
+  Sparkles,
   SquarePen,
   Tags,
   Trash2,
@@ -86,6 +89,7 @@ export type PageKey =
   | "industry"
   | "customers"
   | "users"
+  | "billing"
   | "system-config"
   | "user-center"
   | "chat-sessions"
@@ -93,7 +97,10 @@ export type PageKey =
   | "chat-history"
   | "memory-center"
   | "cowork-space"
-  | "cowork-team";
+  | "cowork-team"
+  | "creation-home"
+  | "creation-prompts"
+  | "creation-works";
 
 interface SubItem {
   key: PageKey;
@@ -139,22 +146,39 @@ const MENU_GROUPS: MenuGroup[] = [
     title: "系统管理",
     items: [
       { key: "users", label: "用户管理", icon: UserCog },
-      // 「系统配置」已从侧栏移除,统一从个人中心 → 系统设置进入(见用户下拉菜单)
+      // 「账单计费」移至用户下拉(系统设置上方);「系统配置」同样从侧栏移除,统一从用户下拉进入
     ],
   },
 ];
 
-// 产品平台矩阵:同一账号体系下的多个 AI 产品,Logo 旁切换;当前产品为采集,其余占位
-const PRODUCT_PLATFORMS: {
-  key: string;
+// 顶层产品:同一账号体系下的多个 AI 产品,Logo 旁 Grip 切换。
+// crawler=协作平台(采集) content=内容创作(出图/出视频工作台) publish=发布服务(占位)。
+export type ProductKey = "crawler" | "content" | "publish";
+
+interface ProductMeta {
+  key: ProductKey;
   name: string;
   icon: LucideIcon;
-  current?: boolean;
-}[] = [
-  { key: "crawler", name: "协作平台", icon: Radar, current: true },
-  { key: "video", name: "视频创作", icon: Clapperboard },
-  { key: "image", name: "图片创作", icon: Image },
-  { key: "publish", name: "发布服务", icon: Rocket },
+  // 占位产品:点击仅提示「即将上线」,不切换上下文
+  placeholder?: boolean;
+}
+
+const PRODUCTS: ProductMeta[] = [
+  { key: "crawler", name: "协作平台", icon: Radar },
+  { key: "content", name: "内容创作", icon: Palette },
+  { key: "publish", name: "发布服务", icon: Rocket, placeholder: true },
+];
+
+// 内容创作产品的侧栏菜单(扁平一组,无子工作区);本期仅「提示词管理」已实现,其余为占位页。
+const CONTENT_MENU_GROUPS: MenuGroup[] = [
+  {
+    title: "",
+    items: [
+      { key: "creation-home", label: "创作工作台", icon: Sparkles },
+      { key: "creation-works", label: "作品库", icon: Library },
+      { key: "creation-prompts", label: "创作脚本", icon: Lightbulb },
+    ],
+  },
 ];
 
 // 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(协作);后两者暂为占位
@@ -162,7 +186,7 @@ export type Workspace = "management" | "chat" | "cowork";
 
 // 工作区元数据(标签固定);展示顺序由 useWorkspaceOrder 控制,可在系统配置调整。
 export const WORKSPACES: { key: Workspace; label: string }[] = [
-  { key: "management", label: "营销" },
+  { key: "management", label: "运营" },
   { key: "chat", label: "对话" },
   { key: "cowork", label: "协作" },
 ];
@@ -199,12 +223,19 @@ export function getWorkspaceDefaultPage(workspace: Workspace): PageKey {
   return WORKSPACE_MENUS[workspace][0].items[0].key;
 }
 
+// 某产品的默认落地页,切换产品时跳转到此
+export function getProductDefaultPage(product: ProductKey): PageKey {
+  if (product === "content") return CONTENT_MENU_GROUPS[0].items[0].key;
+  return "dashboard";
+}
+
 // 不在侧栏导航中、但可由个人中心等入口进入的页面,补面包屑(标题栏 H1 取 page)
 const OFF_NAV_PAGES: Partial<
   Record<PageKey, { group: string; page: string }>
 > = {
   "system-config": { group: "个人中心", page: "系统设置" },
   "user-center": { group: "个人中心", page: "个人中心" },
+  billing: { group: "个人中心", page: "账单计费" },
   "chat-history": { group: "对话", page: "对话记录" },
 };
 
@@ -214,7 +245,7 @@ export function getPageBreadcrumb(key: PageKey): {
   group: string;
   page: string;
 } {
-  for (const groups of Object.values(WORKSPACE_MENUS)) {
+  for (const groups of [...Object.values(WORKSPACE_MENUS), CONTENT_MENU_GROUPS]) {
     for (const group of groups) {
       const item = group.items.find((i) => i.key === key);
       if (item) return { group: group.title, page: item.label };
@@ -358,7 +389,7 @@ function ChatConversationList({
         {/* 新对话:统一入口;进入新会话后在窗口内选择智能体类型(对话 / 编程…),页面随之变形 */}
         <button
           type="button"
-          onClick={() => startNew("chat")}
+          onClick={() => startNew("orchestrator")}
           className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
         >
           <SquarePen className="size-4" />
@@ -489,6 +520,8 @@ function ChatConversationList({
 }
 
 interface AppSidebarProps {
+  product: ProductKey;
+  onProductChange: (product: ProductKey) => void;
   workspace: Workspace;
   onWorkspaceChange: (workspace: Workspace) => void;
   active: PageKey;
@@ -498,6 +531,8 @@ interface AppSidebarProps {
 }
 
 export function AppSidebar({
+  product,
+  onProductChange,
   workspace,
   onWorkspaceChange,
   active,
@@ -511,12 +546,47 @@ export function AppSidebar({
     .map((key) => WORKSPACES.find((w) => w.key === key))
     .filter((w): w is (typeof WORKSPACES)[number] => Boolean(w));
 
+  // 当前产品(用于 Logo 副标题与产品切换高亮)
+  const currentProduct = PRODUCTS.find((p) => p.key === product) ?? PRODUCTS[0];
+
+  // 渲染一组菜单分组(运营各工作区 / 内容创作产品共用同一套样式)
+  const renderMenuGroups = (groups: MenuGroup[]) =>
+    groups.map((group) => (
+      <SidebarGroup key={group.title || group.items[0]?.key}>
+        {/* 标题为空的分组(如内容创作)不渲染一级分组标题,菜单项直接平铺 */}
+        {group.title && <SidebarGroupLabel>{group.title}</SidebarGroupLabel>}
+        <SidebarGroupContent>
+          <SidebarMenu>
+            {group.items.map((item) => {
+              const Icon = item.icon;
+              return (
+                <SidebarMenuItem key={item.key}>
+                  <SidebarMenuButton
+                    isActive={active === item.key}
+                    onClick={() => onChange(item.key)}
+                    tooltip={item.label}
+                    // 选中态用主题色高亮(左侧色条 + 主色文字/图标),与未选中明显区分
+                    className="data-active:bg-primary/10 data-active:font-semibold data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:hover:bg-primary/15 data-active:hover:text-primary data-active:[&_svg]:text-primary"
+                  >
+                    <Icon />
+                    <span>{item.label}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              );
+            })}
+          </SidebarMenu>
+        </SidebarGroupContent>
+      </SidebarGroup>
+    ));
+
   return (
     // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
     // 这里按标题栏高度 --titlebar-h 下移并缩高,使其从标题栏下方开始
     <Sidebar
-      // 对话 / 协作工作区:收起即完全隐藏(offcanvas);营销保持收成图标条(icon)
-      collapsible={workspace === "management" ? "icon" : "offcanvas"}
+      // 对话 / 协作工作区:收起即完全隐藏(offcanvas);运营 / 内容创作保持收成图标条(icon)
+      collapsible={
+        product === "content" || workspace === "management" ? "icon" : "offcanvas"
+      }
       className="top-(--titlebar-h)! h-[calc(100svh-var(--titlebar-h))]!"
     >
       <SidebarHeader>
@@ -529,7 +599,7 @@ export function AppSidebar({
               <div className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-semibold">VeltrixLoop</span>
                 <span className="truncate text-xs text-muted-foreground">
-                  协作平台
+                  {currentProduct.name}
                 </span>
               </div>
             </SidebarMenuButton>
@@ -554,12 +624,12 @@ export function AppSidebar({
               >
                 <DropdownMenuLabel>切换平台</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                {PRODUCT_PLATFORMS.map((product) => {
-                  const Icon = product.icon;
-                  const isCurrent = !!product.current;
+                {PRODUCTS.map((item) => {
+                  const Icon = item.icon;
+                  const isCurrent = item.key === product;
                   return (
                     <DropdownMenuItem
-                      key={product.key}
+                      key={item.key}
                       disabled={isCurrent}
                       // disabled 默认会半透明,这里强制保留全不透明,让颜色高亮更明显
                       className={
@@ -568,13 +638,17 @@ export function AppSidebar({
                           : ""
                       }
                       onClick={() => {
-                        if (!isCurrent) {
-                          toast.info(`${product.name} 即将上线`);
+                        if (isCurrent) return;
+                        // 占位产品仅提示;真实产品切换上下文
+                        if (item.placeholder) {
+                          toast.info(`${item.name} 即将上线`);
+                        } else {
+                          onProductChange(item.key);
                         }
                       }}
                     >
                       <Icon className={isCurrent ? "text-primary" : ""} />
-                      <span className="flex-1">{product.name}</span>
+                      <span className="flex-1">{item.name}</span>
                       {isCurrent && (
                         <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                           当前
@@ -588,57 +662,36 @@ export function AppSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
 
-        {/* 工作区分类切换:营销 / 对话 / 协作(顺序可在系统配置调整,折叠态隐藏) */}
-        <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
-          {orderedWorkspaces.map((ws) => (
-            <button
-              key={ws.key}
-              type="button"
-              onClick={() => onWorkspaceChange(ws.key)}
-              className={cn(
-                "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
-                workspace === ws.key
-                  ? "bg-background text-primary shadow-sm"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {ws.label}
-            </button>
-          ))}
-        </div>
+        {/* 工作区分类切换:运营 / 对话 / 协作(仅协作平台产品有子工作区;内容创作为扁平菜单,不展示) */}
+        {product === "crawler" && (
+          <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
+            {orderedWorkspaces.map((ws) => (
+              <button
+                key={ws.key}
+                type="button"
+                onClick={() => onWorkspaceChange(ws.key)}
+                className={cn(
+                  "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
+                  workspace === ws.key
+                    ? "bg-background text-primary shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {ws.label}
+              </button>
+            ))}
+          </div>
+        )}
       </SidebarHeader>
 
       <SidebarContent className="group-data-[collapsible=icon]:overflow-y-auto">
-        {/* 对话工作区:侧栏渲染会话列表(新对话 + 历史),取代静态菜单 */}
-        {workspace === "chat" ? (
+        {/* 内容创作产品:扁平创作菜单;协作平台:对话工作区渲染会话列表,其余渲染静态菜单 */}
+        {product === "content" ? (
+          renderMenuGroups(CONTENT_MENU_GROUPS)
+        ) : workspace === "chat" ? (
           <ChatConversationList active={active} onChange={onChange} />
         ) : (
-          WORKSPACE_MENUS[workspace].map((group) => (
-          <SidebarGroup key={group.title}>
-            <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {group.items.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <SidebarMenuItem key={item.key}>
-                      <SidebarMenuButton
-                        isActive={active === item.key}
-                        onClick={() => onChange(item.key)}
-                        tooltip={item.label}
-                        // 选中态用主题色高亮(左侧色条 + 主色文字/图标),与未选中明显区分
-                        className="data-active:bg-primary/10 data-active:font-semibold data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:hover:bg-primary/15 data-active:hover:text-primary data-active:[&_svg]:text-primary"
-                      >
-                        <Icon />
-                        <span>{item.label}</span>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  );
-                })}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-          ))
+          renderMenuGroups(WORKSPACE_MENUS[workspace])
         )}
       </SidebarContent>
 
@@ -683,6 +736,13 @@ export function AppSidebar({
                   </div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator className="my-1.5" />
+                <DropdownMenuItem
+                  className="gap-2.5 py-2 cursor-pointer"
+                  onClick={() => onChange("billing")}
+                >
+                  <Receipt />
+                  账单计费
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   className="gap-2.5 py-2 cursor-pointer"
                   onClick={() => onChange("user-center")}

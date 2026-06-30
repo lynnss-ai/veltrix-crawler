@@ -79,6 +79,10 @@ pub struct MemoryView {
     pub enabled: bool,
     /// 置顶:恒注入,不参与相似度淘汰。
     pub pinned: bool,
+    /// 作用域:global(全局)/project(项目)/conversation(会话)
+    pub scope: String,
+    /// 作用域 ID:project 时为项目 ID,conversation 时为会话 ID,global 时为空
+    pub scope_id: String,
     /// 分类:identity/preference/project/relationship/habit/other。
     pub mem_type: String,
     /// 重要度 1-5。
@@ -99,6 +103,8 @@ impl From<mem::Model> for MemoryView {
             source: m.source,
             enabled: m.enabled,
             pinned: m.pinned,
+            scope: m.scope,
+            scope_id: m.scope_id,
             mem_type: m.mem_type,
             importance: m.importance,
             confidence: m.confidence,
@@ -112,11 +118,26 @@ impl From<mem::Model> for MemoryView {
 // ===================== 命令:记忆 CRUD =====================
 
 /// 列出当前用户的记忆,按最近更新倒序。
+/// 可选按 scope 和 scope_id 过滤。
 #[tauri::command]
-pub async fn list_chat_memories(state: State<'_, AppState>) -> Result<Vec<MemoryView>> {
+pub async fn list_chat_memories(
+    state: State<'_, AppState>,
+    scope: Option<String>,
+    scope_id: Option<String>,
+) -> Result<Vec<MemoryView>> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let rows = mem::Entity::find()
-        .filter(mem::Column::Owner.eq(me.name))
+    let mut query = mem::Entity::find()
+        .filter(mem::Column::Owner.eq(me.name));
+
+    // 按 scope 过滤
+    if let Some(s) = scope {
+        query = query.filter(mem::Column::Scope.eq(s));
+    }
+    if let Some(sid) = scope_id {
+        query = query.filter(mem::Column::ScopeId.eq(sid));
+    }
+
+    let rows = query
         .order_by_desc(mem::Column::UpdatedAt)
         .limit(MEMORY_HARD_CAP as u64)
         .all(&state.db)
@@ -126,12 +147,15 @@ pub async fn list_chat_memories(state: State<'_, AppState>) -> Result<Vec<Memory
 }
 
 /// 手动新增一条记忆(source=manual,默认启用、高置信)。mem_type/importance 可选(缺省 other / 3)。
+/// scope 默认为 global,scope_id 默认为空。
 #[tauri::command]
 pub async fn add_chat_memory(
     state: State<'_, AppState>,
     content: String,
     mem_type: Option<String>,
     importance: Option<i32>,
+    scope: Option<String>,
+    scope_id: Option<String>,
 ) -> Result<MemoryView> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let text: String = content.trim().chars().take(MAX_MEMORY_ITEM_CHARS).collect();
@@ -141,6 +165,8 @@ pub async fn add_chat_memory(
     let now = Utc::now().timestamp();
     let saved = mem::ActiveModel {
         owner: Set(me.name),
+        scope: Set(scope.unwrap_or_else(|| "global".to_string())),
+        scope_id: Set(scope_id.unwrap_or_default()),
         content: Set(text),
         source: Set("manual".to_string()),
         enabled: Set(true),
@@ -308,6 +334,7 @@ async fn embedding_config(db: &DatabaseConnection) -> Option<(String, String, St
 
 /// 取当前用户的启用记忆,**按当前问题语义检索 top-K** 拼成一条 system 消息(JSON)。
 /// 无记忆 / 关闭时返回 None。`query` 为本轮用户提问,用于语义匹配。
+/// scope 和 scope_id 用于过滤特定作用域的记忆,同时包含全局记忆。
 ///
 /// 检索策略:置顶记忆恒注入;其余按与 `query` 的余弦相似度取 top-K。
 /// 未配置 embedding / 查询为空 / 查询向量化失败时,回退到「最近更新优先」(旧行为,零破坏)。
@@ -315,14 +342,21 @@ pub async fn memory_system_message(
     db: &DatabaseConnection,
     owner: &str,
     query: &str,
+    scope: &str,
+    scope_id: &str,
 ) -> Option<Value> {
     if !memory_enabled(db).await {
         return None;
     }
     // 一次性载入该用户全部启用记忆(≤ MEMORY_HARD_CAP=200,内存暴力 cosine 足够快)
+    // 同时包含全局记忆和特定作用域的记忆
     let rows = mem::Entity::find()
         .filter(mem::Column::Owner.eq(owner))
         .filter(mem::Column::Enabled.eq(true))
+        .filter(
+            mem::Column::Scope.eq("global")
+                .or(mem::Column::Scope.eq(scope).and(mem::Column::ScopeId.eq(scope_id)))
+        )
         .order_by_desc(mem::Column::UpdatedAt)
         .limit(MEMORY_HARD_CAP as u64)
         .all(db)
@@ -578,6 +612,8 @@ async fn backfill_embeddings(db: &DatabaseConnection, ids: &[i64]) {
 
 /// 智能维护:从本轮对话提取信息,对照「相关已有记忆」判断新增 / 更新 / 跳过,带分类与打分落库。
 /// 根治「只增不治」导致的碎片化与矛盾。失败仅告警,设计为在 spawn 中调用,不阻塞回复。
+/// scope 和 scope_id 用于记忆层级化,默认为 global。
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_and_store_memories(
     db: &DatabaseConnection,
     owner: &str,
@@ -586,6 +622,8 @@ pub async fn extract_and_store_memories(
     model: &str,
     user_text: &str,
     assistant_text: &str,
+    scope: &str,
+    scope_id: &str,
 ) {
     if !memory_enabled(db).await {
         return;
@@ -706,6 +744,8 @@ pub async fn extract_and_store_memories(
         };
         to_insert.push(mem::ActiveModel {
             owner: Set(owner.to_string()),
+            scope: Set(scope.to_string()),
+            scope_id: Set(scope_id.to_string()),
             content: Set(op.content),
             source: Set("auto".to_string()),
             enabled: Set(true),
@@ -820,7 +860,7 @@ async fn retrieve_relevant<'a>(
         scored.into_iter().take(MAINTAIN_CONTEXT_N).map(|(_, m)| m).collect()
     } else {
         let mut sorted: Vec<&mem::Model> = existing.iter().collect();
-        sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sorted.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
         sorted.into_iter().take(MAINTAIN_CONTEXT_N).collect()
     }
 }
@@ -886,7 +926,8 @@ async fn call_maintainer(
         retry_server_errors: false,
     })
     .await
-    .ok()?;
+    .ok()?
+    .content;
     parse_operations(&reply)
 }
 

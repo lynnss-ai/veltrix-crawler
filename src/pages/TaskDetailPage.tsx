@@ -4,15 +4,18 @@
 // - 子任务 SubTask:一个关键词对应一个子任务,继承父任务的策略
 // - 执行历史 Execution:子任务每次跑生成一条;watching/daily 类任务会有很多条
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   CalendarClock,
+  Eye,
   Infinity as InfinityIcon,
   Zap,
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, type TaskContentFilter } from "./collect-meta";
+import type { PageKey } from "@/components/app-sidebar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -37,6 +40,7 @@ import {
   type TaskView,
 } from "@/lib/api";
 import { platformClass } from "@/lib/platforms";
+import { formatTimestamp } from "@/lib/utils";
 
 // 采集日志条目类型见 @/lib/api 的 CollectLogEntry(含富条目 entry:头像/昵称/标题/序号)
 
@@ -149,11 +153,6 @@ function deriveSubTasks(task: TaskView): SubTask[] {
 
 // ---- 工具 ----
 
-function formatTime(ts?: number | null): string {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
-}
-
 function formatDuration(start: number, end: number | null): string {
   if (!end) return "进行中";
   const sec = Math.max(0, end - start);
@@ -169,10 +168,13 @@ export function TaskDetailPage({
   task,
   platformName,
   onBack,
+  onNavigate,
 }: {
   task: TaskView;
   platformName: (id: string) => string;
   onBack: () => void;
+  // 数据穿透:跳全量库查看本任务 / 单次运行采集的内容
+  onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
 }) {
   const [tab, setTab] = useState<"sub" | "history">("sub");
   const [runs, setRuns] = useState<TaskRunView[]>([]);
@@ -190,7 +192,7 @@ export function TaskDetailPage({
         .then((rows) => {
           if (!cancelled) setRuns(rows);
         })
-        .catch(() => {});
+        .catch((e) => console.warn("加载运行记录失败:", e));
     };
     load();
     const inProgress =
@@ -207,14 +209,14 @@ export function TaskDetailPage({
   }, [task.id, task.status]);
 
   // 打开某次运行的采集日志(后端按该运行的时间范围从 collect_logs 切分)
-  const openRunLogs = (run: TaskRunView) => {
+  const openRunLogs = useCallback((run: TaskRunView) => {
     setViewRun(run);
     setRunLogs([]);
     api
       .listRunLogs(run.id)
       .then(setRunLogs)
-      .catch(() => {});
-  };
+      .catch((e) => console.warn("加载运行日志失败:", e));
+  }, []);
 
   const subTasks = useMemo(() => deriveSubTasks(task), [task]);
 
@@ -229,11 +231,32 @@ export function TaskDetailPage({
         header: ({ column }) => (
           <DataTableColumnHeader column={column} title="关键词" />
         ),
-        cell: ({ row }) => (
-          <span className="font-medium text-foreground">
-            {row.original.keyword}
-          </span>
-        ),
+        cell: ({ row }) => {
+          const t = row.original;
+          // 数据穿透:该关键词采到内容且能导航时,点关键词跳全量库按任务+关键词过滤
+          const canDrill = !!onNavigate && t.contentCount > 0;
+          if (!canDrill) {
+            return (
+              <span className="font-medium text-foreground">{t.keyword}</span>
+            );
+          }
+          return (
+            <button
+              type="button"
+              onClick={() =>
+                onNavigate!("assets-all", {
+                  taskId: task.id,
+                  taskName: task.name,
+                  keyword: t.keyword,
+                })
+              }
+              title={`穿透查看「${t.keyword}」采集的内容`}
+              className="cursor-pointer font-medium text-foreground underline-offset-2 hover:text-primary hover:underline"
+            >
+              {t.keyword}
+            </button>
+          );
+        },
       },
       {
         id: "status",
@@ -285,7 +308,7 @@ export function TaskDetailPage({
         ),
         cell: ({ row }) => (
           <span className="text-xs text-muted-foreground">
-            {formatTime(row.original.lastRunAt)}
+            {formatTimestamp(row.original.lastRunAt)}
           </span>
         ),
       },
@@ -307,7 +330,7 @@ export function TaskDetailPage({
         ),
       },
     ],
-    [],
+    [onNavigate, task.id, task.name],
   );
 
   const historyColumns = useMemo<ColumnDef<TaskRunView>[]>(
@@ -319,7 +342,7 @@ export function TaskDetailPage({
           <DataTableColumnHeader column={column} title="开始时间" />
         ),
         cell: ({ row }) => (
-          <span className="text-xs">{formatTime(row.original.startedAt)}</span>
+          <span className="text-xs">{formatTimestamp(row.original.startedAt)}</span>
         ),
       },
       {
@@ -391,7 +414,27 @@ export function TaskDetailPage({
         header: () => <div className="text-right">操作</div>,
         enableSorting: false,
         cell: ({ row }) => (
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-1">
+            {/* 单次任务穿透:跳全量库,按本任务 + 该次运行时间范围(collectedAt)过滤,看本次新增内容 */}
+            {onNavigate && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 cursor-pointer px-2"
+                onClick={() =>
+                  onNavigate("assets-all", {
+                    taskId: task.id,
+                    taskName: task.name,
+                    runStart: row.original.startedAt,
+                    runEnd:
+                      row.original.finishedAt ??
+                      Math.floor(Date.now() / 1000),
+                  })
+                }
+              >
+                查看内容
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -404,14 +447,12 @@ export function TaskDetailPage({
         ),
       },
     ],
-    // openRunLogs 仅用稳定的 setState/api,闭包捕获首次定义即可
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [openRunLogs, onNavigate, task.id, task.name],
   );
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
-      {/* 返回 + 标题 */}
+      {/* 返回 + 标题 + 数据穿透:查看本任务全部内容 */}
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -423,6 +464,22 @@ export function TaskDetailPage({
           返回
         </Button>
         <h1 className="ml-1 text-xl font-semibold tracking-tight">任务详情</h1>
+        {onNavigate && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="ml-auto cursor-pointer"
+            onClick={() =>
+              onNavigate("assets-all", {
+                taskId: task.id,
+                taskName: task.name,
+              })
+            }
+          >
+            <Eye />
+            查看本任务全部内容
+          </Button>
+        )}
       </div>
 
       {/* 顶部任务信息卡 */}
@@ -464,8 +521,8 @@ export function TaskDetailPage({
                   </span>
                 )}
               </span>
-              <span>创建于 {formatTime(task.createdAt)}</span>
-              {task.startedAt && <span>开始于 {formatTime(task.startedAt)}</span>}
+              <span>创建于 {formatTimestamp(task.createdAt)}</span>
+              {task.startedAt && <span>开始于 {formatTimestamp(task.startedAt)}</span>}
             </div>
           </div>
           {/* 右侧数据卡 */}
@@ -536,21 +593,15 @@ export function TaskDetailPage({
 
         {/* 策略参数 */}
         <div className="mt-3 flex flex-wrap gap-1 border-t pt-3 text-[11px] text-muted-foreground">
-          <ParamChip label="排序" value={task.sortMode === "synthetic" ? "综合" : task.sortMode === "hottest" ? "最热" : "最新"} />
-          <ParamChip
-            label="发布"
-            value={
-              task.timeRange === "any"
-                ? "不限"
-                : task.timeRange === "1d"
-                  ? "一天内"
-                  : task.timeRange === "1w"
-                    ? "一周内"
-                    : "半年内"
-            }
-          />
+          {/* 排序/发布按平台取标签(各平台选项不同,如小红书 hottest=最多点赞) */}
+          <ParamChip label="排序" value={sortLabelOf(task.platform, task.sortMode)} />
+          <ParamChip label="发布" value={timeLabelOf(task.platform, task.timeRange)} />
           <ParamChip label="每组" value={`≤ ${task.perKeywordLimit}`} />
           <ParamChip label="点赞" value={`≥ ${task.minLikes}`} />
+          {/* 平台专属额外筛选(小红书 笔记类型/搜索范围/位置距离;抖音 视频时长 等) */}
+          {extraFilterChipsOf(task.platform, task.extraFilters).map((c) => (
+            <ParamChip key={c.label} label={c.label} value={c.value} />
+          ))}
           {task.aiExtract && (
             <span className="rounded bg-primary/10 px-1.5 py-0.5 text-primary">
               AI 文案提取
@@ -647,7 +698,7 @@ export function TaskDetailPage({
               采集日志
               {viewRun && (
                 <span className="text-xs font-normal text-muted-foreground">
-                  {formatTime(viewRun.startedAt)} · 新增内容 {viewRun.contentDelta} / 评论{" "}
+                  {formatTimestamp(viewRun.startedAt)} · 新增内容 {viewRun.contentDelta} / 评论{" "}
                   {viewRun.commentDelta}
                 </span>
               )}
@@ -689,7 +740,7 @@ export function TaskDetailPage({
 }
 
 // 富日志条目行:序号 + 类型徽章 + 头像 + 昵称 + 标题/评论内容(已由后端截断)
-function CollectEntryLine({
+const CollectEntryLine = memo(function CollectEntryLine({
   entry,
 }: {
   entry: NonNullable<CollectLogEntry["entry"]>;
@@ -732,13 +783,13 @@ function CollectEntryLine({
       </span>
     </span>
   );
-}
+});
 
-function ParamChip({ label, value }: { label: string; value: string }) {
+const ParamChip = memo(function ParamChip({ label, value }: { label: string; value: string }) {
   return (
     <span className="rounded bg-muted px-1.5 py-0.5">
       <span className="text-muted-foreground">{label}</span>
       <span className="ml-1 text-foreground">{value}</span>
     </span>
   );
-}
+});

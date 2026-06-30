@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import {
   AppSidebar,
   getPageBreadcrumb,
+  getProductDefaultPage,
   getWorkspaceDefaultPage,
   isOffNavPage,
   type PageKey,
+  type ProductKey,
   type Workspace,
 } from "@/components/app-sidebar";
 import { UserCenterPage } from "@/pages/UserCenterPage";
@@ -19,9 +21,11 @@ import { toast } from "sonner";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { CollectPage } from "@/pages/CollectPage";
+import type { TaskContentFilter } from "@/pages/collect-meta";
 import { AccountsPage } from "@/pages/AccountsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
+import { PromptStudioPage } from "@/pages/PromptStudioPage";
 import { CustomersPage } from "@/pages/CustomersPage";
 import { AuthorLibraryPage } from "@/pages/AuthorLibraryPage";
 import { MemoryCenterPage } from "@/pages/MemoryCenterPage";
@@ -31,10 +35,11 @@ import { ConversationShell } from "@/components/conversation-shell";
 import { ContentLibraryPage } from "@/pages/ContentLibraryPage";
 import { CommentLibraryPage } from "@/pages/CommentLibraryPage";
 import { UsersPage } from "@/pages/UsersPage";
+import { BillingPage } from "@/pages/BillingPage";
 import { PlaceholderPage } from "@/pages/PlaceholderPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { SetupWizard } from "@/pages/SetupWizard";
-import { checkForUpdate, currentVersion } from "@/lib/updater";
+import { checkForUpdate } from "@/lib/updater";
 
 // 登录态持久化键:桌面端走 IPC、不发 token,登录用户存 localStorage,刷新 / 重开免登录
 const AUTH_STORAGE_KEY = "veltrix.auth.user";
@@ -54,11 +59,19 @@ function loadStoredUser(): UserView | null {
 // 当前工作区 / 页面持久化键:刷新按钮是整页 reload,靠它在重载后停留原页而非回到数据概览
 const NAV_STORAGE_KEY = "veltrix.nav.page";
 
-function loadStoredNav(): { workspace: Workspace; active: PageKey } | null {
+function loadStoredNav(): {
+  product: ProductKey;
+  workspace: Workspace;
+  active: PageKey;
+} | null {
   try {
     const raw = sessionStorage.getItem(NAV_STORAGE_KEY);
     return raw
-      ? (JSON.parse(raw) as { workspace: Workspace; active: PageKey })
+      ? (JSON.parse(raw) as {
+          product: ProductKey;
+          workspace: Workspace;
+          active: PageKey;
+        })
       : null;
   } catch {
     return null;
@@ -69,13 +82,15 @@ function renderPage(
   active: PageKey,
   loggedUser: UserView,
   onProfileUpdated: (user: UserView) => void,
-  onNavigate: (key: PageKey) => void,
+  onNavigate: (key: PageKey, ctx?: TaskContentFilter) => void,
+  navCtx: TaskContentFilter | null,
+  drillSource: PageKey | null,
 ): ReactNode {
   switch (active) {
     case "dashboard":
       return <DashboardPage />;
     case "collect-tasks":
-      return <CollectPage />;
+      return <CollectPage onNavigate={onNavigate} />;
     case "accounts":
       return <AccountsPage currentUser={loggedUser.username} />;
     case "system-config":
@@ -89,6 +104,8 @@ function renderPage(
       );
     case "users":
       return <UsersPage />;
+    case "billing":
+      return <BillingPage />;
     case "industry":
       return <IndustryPage />;
     case "customers":
@@ -116,7 +133,22 @@ function renderPage(
     // 三个库共用组件,必须用 key 强制各自独立挂载:
     // 否则路由切换时 React 复用实例,上一个库的筛选/视图状态会带到下一个库
     case "assets-all":
-      return <ContentLibraryPage key="assets-all" title="全量库" />;
+      return (
+        <ContentLibraryPage
+          // 带任务穿透时按「任务+关键词+单次运行起点」入 key,强制重挂载并应用过滤;
+          // 不同穿透目标 key 各异,避免上一次「清除筛选」的残留态带到下一次穿透
+          key={
+            navCtx
+              ? `assets-all-${navCtx.taskId}-${navCtx.keyword ?? ""}-${navCtx.runStart ?? ""}`
+              : "assets-all"
+          }
+          title="全量库"
+          taskFilter={navCtx ?? undefined}
+          onBack={
+            navCtx && drillSource ? () => onNavigate(drillSource) : undefined
+          }
+        />
+      );
     case "assets-content":
       return (
         <ContentLibraryPage
@@ -137,6 +169,23 @@ function renderPage(
       return <CommentLibraryPage />;
     case "assets-author":
       return <AuthorLibraryPage />;
+    // 内容创作产品:仅「创作脚本」已实现,其余为占位页
+    case "creation-home":
+      return (
+        <PlaceholderPage
+          title="创作工作台"
+          description="内容创作工作台建设中,即将上线。"
+        />
+      );
+    case "creation-prompts":
+      return <PromptStudioPage />;
+    case "creation-works":
+      return (
+        <PlaceholderPage
+          title="作品库"
+          description="生成图片 / 视频的统一管理与导出,即将上线。"
+        />
+      );
     default:
       return null;
   }
@@ -145,8 +194,11 @@ function renderPage(
 function App() {
   // 初始值从 localStorage 恢复:刷新页面不丢登录态
   const [loggedUser, setLoggedUser] = useState<UserView | null>(loadStoredUser);
-  // 初始工作区 / 页面从 sessionStorage 恢复:刷新后停留原页(无记录时回默认)
+  // 初始产品 / 工作区 / 页面从 sessionStorage 恢复:刷新后停留原页(无记录时回默认)
   const storedNav = loadStoredNav();
+  const [product, setProduct] = useState<ProductKey>(
+    storedNav?.product ?? "crawler",
+  );
   const [workspace, setWorkspace] = useState<Workspace>(
     storedNav?.workspace ?? "management",
   );
@@ -161,9 +213,9 @@ function App() {
   useEffect(() => {
     sessionStorage.setItem(
       NAV_STORAGE_KEY,
-      JSON.stringify({ workspace, active }),
+      JSON.stringify({ product, workspace, active }),
     );
-  }, [workspace, active]);
+  }, [product, workspace, active]);
 
   // 登录 / 初始化成功:先同步后端当前用户,再持久化登录态。
   // remember=true 存 localStorage(关掉重开仍免登录);false 存 sessionStorage(仅本次会话,关闭后需重新登录)
@@ -194,7 +246,7 @@ function App() {
   // 退出登录:清除后端会话与两处登录态
   function handleLogout() {
     // 后端清理失败不阻塞退出
-    api.clearCurrentUser().catch(() => {});
+    api.clearCurrentUser().catch((e) => console.warn("清除后端会话失败:", e));
     localStorage.removeItem(AUTH_STORAGE_KEY);
     sessionStorage.removeItem(AUTH_STORAGE_KEY);
     setLoggedUser(null);
@@ -208,11 +260,24 @@ function App() {
     setActive(getWorkspaceDefaultPage(next));
   }
 
+  // 切换产品时整体跳到该产品默认落地页(本期不记忆各产品上次停留页)
+  function handleProductChange(next: ProductKey) {
+    setProduct(next);
+    setActive(getProductDefaultPage(next));
+  }
+
+  // 数据穿透:从任务列表/详情跳全量库时携带的过滤上下文(按任务 / 单次运行);跳别处自动清空
+  const [navCtx, setNavCtx] = useState<TaskContentFilter | null>(null);
+  // 数据穿透来源页:带 ctx 跳转视为穿透,记下出发页,供穿透目标页「返回」回到原处
+  const [drillSource, setDrillSource] = useState<PageKey | null>(null);
   // 进入「系统设置 / 个人中心」等脱离侧栏的页面前记住来源页,关闭时返回该页
-  function handleNavigate(next: PageKey) {
+  function handleNavigate(next: PageKey, ctx?: TaskContentFilter) {
     if (isOffNavPage(next) && !isOffNavPage(active)) {
       prevPageRef.current = active;
     }
+    // 带穿透上下文 = 数据穿透,记下出发页;否则清空(普通跳转不保留返回)
+    setDrillSource(ctx ? active : null);
+    setNavCtx(ctx ?? null);
     setActive(next);
   }
   function closeOffNavPage() {
@@ -220,7 +285,6 @@ function App() {
   }
   // 远程上报连接状态;后端 RemoteConfig 上报模块就绪前先占位为未连接
   const [remoteStatus] = useState<RemoteStatus>("disconnected");
-  const [appVersion, setAppVersion] = useState("");
 
   // 侧栏按窗口宽度自动展开/收起:窄屏(<1024px) 收起腾出表格空间;用户可手动覆盖
   const [sidebarOpen, setSidebarOpen] = useState(
@@ -276,9 +340,6 @@ function App() {
 
   // 启动后台静默检查软件更新(延迟 5s 避免与启动请求争抢);有新版弹原生确认框
   useEffect(() => {
-    currentVersion()
-      .then(setAppVersion)
-      .catch(() => {});
     const timer = setTimeout(() => {
       void checkForUpdate(true);
     }, 5000);
@@ -289,7 +350,7 @@ function App() {
   useEffect(() => {
     getCurrentWindow()
       .show()
-      .catch(() => {});
+      .catch((e) => console.warn("显示主窗口失败:", e));
   }, []);
 
   // 启动恢复登录态:先向后端校验该用户在数据库中仍存在且启用(清库 / 删用户 / 禁用后
@@ -353,6 +414,8 @@ function App() {
         style={{ "--sidebar-width": "14rem" } as CSSProperties}
       >
         <AppSidebar
+          product={product}
+          onProductChange={handleProductChange}
           workspace={workspace}
           onWorkspaceChange={handleWorkspaceChange}
           active={active}
@@ -365,7 +428,7 @@ function App() {
           {/* 对话页整页即会话,不套标题与内边距外层;其余页保留标题 + 留白 */}
           {active === "chat-sessions" ? (
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate)}
+              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
             </div>
           ) : (
             <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
@@ -388,16 +451,8 @@ function App() {
                     {breadcrumb.page}
                   </h1>
                 </div>
-                {active === "dashboard" && (
-                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    当前版本
-                    <span className="font-mono font-medium text-foreground">
-                      v{appVersion || "—"}
-                    </span>
-                  </span>
-                )}
               </div>
-              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate)}
+              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
             </div>
           )}
         </SidebarInset>

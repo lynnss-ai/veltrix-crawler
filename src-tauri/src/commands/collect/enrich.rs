@@ -113,7 +113,7 @@ async fn apply_profile_to_author(
 }
 
 /// 作者画像补采:对指定作者逐个打开主页、拦截画像接口、刷新 authors 表画像字段。
-/// 仅 `supports(UserProfile)` 的平台(小红书 / 快手 / B站 / YouTube)有效,其余跳过。
+/// 仅 `supports(UserProfile)` 的平台(抖音 / 小红书 / 快手 / B站 / YouTube)有效,其余跳过。
 /// 串行限速逐个处理(复用账号采集互斥锁,不抢占正在跑的采集),返回汇总供前端提示。
 /// self scope 仅能补采自己 owner 的作者。
 #[tauri::command]

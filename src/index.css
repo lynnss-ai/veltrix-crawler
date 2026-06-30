@@ -271,3 +271,26 @@ body {
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
 }
+
+/* AI 流式输出波浪下划线动画 */
+@keyframes wave {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(200%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+/* AI 生成中加载:流光进度条。一道渐变高光从左扫到右,首尾都在条外(不可见)→ 循环无缝、无闪烁。 */
+@keyframes veltrix-shimmer {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(320%);
+  }
+}

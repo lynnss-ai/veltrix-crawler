@@ -1,6 +1,6 @@
 //! 小红书平台适配器。
 //!
-//! 解析网页搜索接口 `/api/sns/web/v1/search/notes` 的响应(明文 JSON):
+//! 解析网页搜索接口 `/search/notes` 的响应(改版后为 `/api/sns/web/v2/search/notes`,明文 JSON):
 //! `data.items[]` 每项 `model_type=note` 含 `note_card`(笔记详情),抽取为统一 Content。
 //! `model_type=hot_query`(大家都在搜)等非笔记项跳过。
 //!
@@ -19,7 +19,9 @@ use veltrix_core::error::Result;
 
 const PLATFORM_ID: &str = "xhs";
 /// 搜索接口 URL 特征,与平台配置 intercept_patterns 对应。
-const SEARCH_PATH: &str = "/api/sns/web/v1/search/notes";
+/// 用版本无关子串 `/search/notes`:小红书改版后笔记搜索从 v1(edith)迁到 v2(so.xiaohongshu.com),
+/// 路径 `/api/sns/web/v2/search/notes`;子串匹配同时兼容 v1/v2 与不同子域。
+const SEARCH_PATH: &str = "/search/notes";
 /// 一级评论接口 URL 特征;真实路径需本机抓包核对。子评论接口路径不同(comment/sub/page)不会命中。
 const COMMENT_PATH: &str = "/api/sns/web/v2/comment/page";
 /// 作者主页用户信息接口 URL 特征(画像补采);真实路径需本机抓包核对。

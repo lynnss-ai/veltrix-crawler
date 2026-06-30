@@ -13,7 +13,6 @@ import {
   Check,
   ChevronLeft,
   Copy,
-  Filter,
   MoreVertical,
   SquarePen,
   Plus,
@@ -23,6 +22,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { IndustryFilterToggle } from "@/components/library-filters";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import {
   api,
@@ -35,7 +35,6 @@ import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
-import { RefreshButton } from "@/components/RefreshButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -293,7 +292,7 @@ export function IndustryPage() {
           {/* 左侧:行业类别(可收起) */}
         {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
-          <div className="flex h-8 items-center justify-between border-b px-4">
+          <div className="flex h-10 items-center justify-between border-b px-4">
             <span className="text-sm font-semibold">行业类别</span>
             <div className="flex items-center gap-1">
               <Button size="icon-sm" variant="ghost" onClick={openCreateIndustry}>
@@ -381,16 +380,7 @@ export function IndustryPage() {
           {/* 占位态下没有 DataTable toolbar,这里也放一个展开按钮 */}
           {sbCollapsed && !selectedIndustry && (
             <div>
-              <SimpleTooltip content="展开行业筛选">
-                <Button
-                  variant="outline"
-                  className="cursor-pointer"
-                  onClick={() => setSbCollapsed(false)}
-                >
-                  <Filter />
-                  行业
-                </Button>
-              </SimpleTooltip>
+              <IndustryFilterToggle onExpand={() => setSbCollapsed(false)} />
             </div>
           )}
         {selectedIndustry ? (
@@ -410,16 +400,9 @@ export function IndustryPage() {
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2">
                   {sbCollapsed && (
-                    <SimpleTooltip content="展开行业筛选">
-                      <Button
-                        variant="outline"
-                        className="cursor-pointer"
-                        onClick={() => setSbCollapsed(false)}
-                      >
-                        <Filter />
-                        行业
-                      </Button>
-                    </SimpleTooltip>
+                    <IndustryFilterToggle
+                      onExpand={() => setSbCollapsed(false)}
+                    />
                   )}
                   <div className="relative w-full sm:w-80 lg:w-96">
                     <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -432,8 +415,8 @@ export function IndustryPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <RefreshButton onClick={() => loadKeywords(selectedId)} />
                   <Button
+                    className="h-10"
                     onClick={() => {
                       setKeywordForm(null);
                       setIsKeywordFormOpen(true);

@@ -143,7 +143,7 @@ impl Tool for ListProcessesTool {
             if by_cpu {
                 rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
             } else {
-                rows.sort_by(|a, b| b.mem.cmp(&a.mem));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.mem));
             }
             rows.truncate(limit);
             rows

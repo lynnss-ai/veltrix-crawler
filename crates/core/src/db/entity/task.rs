@@ -69,6 +69,10 @@ pub struct Model {
     pub archived: bool,
     /// 采集完成后是否自动同步内容到发起者(owner)的 Obsidian vault
     pub auto_sync_obsidian: bool,
+    /// 平台专属额外筛选维度(如抖音:视频时长 / 搜索范围 / 内容形式),
+    /// JSON 对象 `{维度id: 选中文案}`,空对象 `{}` = 全「不限」。
+    /// 采集时在结果页「筛选」浮层按选中文案点击应用;不同平台维度由前端 PLATFORM_EXTRA_FILTERS 声明。
+    pub extra_filters: String,
     pub created_at: i64,
     pub updated_at: i64,
 }

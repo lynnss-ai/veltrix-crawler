@@ -87,4 +87,5 @@ async fn mimo_transcribe(req: &TranscribeRequest<'_>) -> Result<String> {
         retry_server_errors: false,
     })
     .await
+    .map(|o| o.content)
 }
