@@ -34,7 +34,9 @@ pub async fn connect(config_dir: &Path, cfg: &DatabaseConfig) -> Result<Database
                 // 连默认本地库都失败,无从回退
                 return Err(e);
             }
-            tracing::warn!("连接数据库失败({e}),已回退默认本地 SQLite: {fallback}");
+            // ⚠️ 数据完整性风险:PG 连接失败时静默回退本地 SQLite,数据落点与配置预期不符。
+            // Cloud 多实例部署下会导致数据分裂(各实例独立 sqlite 文件),应为 error 级别便于监控发现。
+            tracing::error!("连接数据库失败({e}),已回退默认本地 SQLite: {fallback}。请检查数据库连接配置。");
             try_connect(&fallback, cfg.max_connections).await?
         }
     };
@@ -177,6 +179,18 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 冷却机制已下线:历史遗留的 cooldown 账号启动时一次性归并为可用(幂等,可随每次启动执行)
+    if let Err(e) = db
+        .execute(Statement::from_string(
+            backend,
+            "UPDATE accounts SET status = 'active', cooldown_until = 0 WHERE status = 'cooldown'"
+                .to_owned(),
+        ))
+        .await
+    {
+        tracing::warn!("归并历史 cooldown 账号失败(忽略): {e}");
+    }
+
     // 兼容已建的 contents 表:补 keyword 列(全量库按采集关键词筛选)
     if !column_exists(db, "contents", "keyword").await {
         if let Err(e) = db
@@ -259,6 +273,10 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     for (col, ddl) in [
         ("media_total", "ALTER TABLE tasks ADD COLUMN media_total INTEGER NOT NULL DEFAULT 0"),
         ("media_done", "ALTER TABLE tasks ADD COLUMN media_done INTEGER NOT NULL DEFAULT 0"),
+        // 失败自动重试:上限 0=关闭;重试计数与下次重试时间(见 write_task_failed / 调度器)
+        ("max_retries", "ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0"),
+        ("retry_count", "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"),
+        ("next_retry_at", "ALTER TABLE tasks ADD COLUMN next_retry_at BIGINT"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -283,6 +301,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT 0"),
         // 平台专属额外筛选(抖音视频时长/搜索范围/内容形式等),JSON 对象,旧行回填 '{}'(全不限)
         ("extra_filters", "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'"),
+        // 定向采集目标链接(JSON 数组,视频链接/主页链接);旧行回填 '[]'(非定向任务)
+        ("target_urls", "ALTER TABLE tasks ADD COLUMN target_urls TEXT NOT NULL DEFAULT '[]'"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -291,6 +311,42 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
             {
                 tracing::warn!("ALTER tasks.{col} 失败(忽略): {e}");
             }
+        }
+    }
+
+    // 兼容已建的 tasks 表:补「音频提取」开关(与 AI 文案提取拆分:只要音频不要文案的场景)。
+    // 旧行回填规则:ai_extract=1 的任务历史上隐含音频提取,列添加后立刻按 ai_extract 回填,
+    // 避免老任务升级后丢音频;新增列以外的启动不再执行 UPDATE(尊重用户后续单独关音频)。
+    if !column_exists(db, "tasks", "audio_extract").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE tasks ADD COLUMN audio_extract BOOLEAN NOT NULL DEFAULT 0".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER tasks.audio_extract 失败(忽略): {e}");
+        } else if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "UPDATE tasks SET audio_extract = 1 WHERE ai_extract = 1".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("回填 tasks.audio_extract 失败(忽略): {e}");
+        }
+    }
+
+    // 兼容已建的 task_runs 表:补运行指标列(拦截数 / 解析失败 / 阶段耗时 JSON,可空)。
+    if !column_exists(db, "task_runs", "metrics_json").await {
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                backend,
+                "ALTER TABLE task_runs ADD COLUMN metrics_json TEXT".to_owned(),
+            ))
+            .await
+        {
+            tracing::warn!("ALTER task_runs.metrics_json 失败(忽略): {e}");
         }
     }
 

@@ -17,11 +17,10 @@
 #![allow(dead_code)]
 
 pub mod cookies;
+pub mod filter_locate;
 pub mod native_intercept;
 pub mod pool;
-pub mod screenshot;
 pub mod script_eval;
-pub mod slider;
 
 use veltrix_core::config::RpaStep;
 use veltrix_core::error::{CrawlerError, Result};
@@ -30,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
 /// 一条被拦截的接口响应。`body` 为响应文本(通常是 JSON),由适配器解析。
@@ -89,6 +88,51 @@ impl InterceptChannel {
             .ok()
             .and_then(|sessions| sessions.get(&session_id).cloned())
             .unwrap_or_default()
+    }
+
+    /// 非破坏性查看会话当前已拦截的响应条数(不加锁,无 clone),供进度轮询用。
+    /// 替代 `peek_session(session_id).len()` 的整份克隆热点(每轮 O(n²) 内存搬运)。
+    /// 锁异常时返回 0。
+    pub fn session_len(&self, session_id: u64) -> usize {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&session_id).map(|v| v.len()))
+            .unwrap_or(0)
+    }
+
+    /// 非破坏性倒查会话内首个 URL 命中 `url_pattern` 的响应体(锁内按引用查找,
+    /// 只克隆命中那一条)。供「看最新一条接口的字段」场景,避免 peek_session 整份克隆
+    /// (每条是整页 JSON,滚动循环每轮调用会成 O(轮数×总字节) 热点)。
+    pub fn find_session_body_rev(&self, session_id: u64, url_pattern: &str) -> Option<String> {
+        self.sessions.lock().ok().and_then(|sessions| {
+            sessions.get(&session_id).and_then(|buf| {
+                buf.iter()
+                    .rev()
+                    .find(|r| r.url.contains(url_pattern))
+                    .map(|r| r.body.clone())
+            })
+        })
+    }
+
+    /// 非破坏性查看会话自 `offset` 起的新增响应,返回 (新增响应, 当前总条数) 供调用方推进游标。
+    /// 滚动循环每轮调用:会话缓冲只追加,只克隆增量——此前整份 clone 随轮数增长成 O(n²) 热点
+    /// (响应体是整页 JSON)。锁异常时返回空增量且总数保持 offset,游标原地不动、下轮重试。
+    pub fn peek_session_from(
+        &self,
+        session_id: u64,
+        offset: usize,
+    ) -> (Vec<InterceptedResponse>, usize) {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions.get(&session_id).map(|buf| {
+                    let fresh = buf.get(offset..).map(<[_]>::to_vec).unwrap_or_default();
+                    (fresh, buf.len())
+                })
+            })
+            .unwrap_or((Vec::new(), offset))
     }
 
     /// 结束会话并取走全部已拦截响应。锁异常时返回空,由调度方按空结果处理。
@@ -604,6 +648,49 @@ pub fn build_scroll_eval() -> String {
     "window.scrollTo(0, document.body.scrollHeight);".to_string()
 }
 
+/// 评论区专用滚动脚本:整页 scrollTo 只能覆盖「评论在视频下方」的布局;
+/// 抖音等平台的详情页存在「评论在右侧面板」布局,评论列表是内部滚动容器,
+/// 整页滚动滚不动它。此脚本先按评论标记元素(data-e2e/class/id 含 comment)
+/// 向上找最近的可滚祖先并把它滚到底(附带派发 WheelEvent,兼容只认滚轮的懒加载),
+/// 再整页 scrollTo 兜底,两种布局都能触发评论分页。
+pub fn build_comment_scroll_eval() -> String {
+    r#"(function () {
+  function isScrollable(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    try {
+      var st = getComputedStyle(el);
+      return /(auto|scroll|overlay)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 60;
+    } catch (e) { return false; }
+  }
+  function findCommentScroller() {
+    var markers = document.querySelectorAll('[data-e2e*="comment"], [class*="comment" i], [id*="comment" i]');
+    for (var i = 0; i < markers.length; i++) {
+      var cur = markers[i], depth = 0;
+      while (cur && depth < 12) {
+        if (isScrollable(cur)) return cur;
+        cur = cur.parentElement; depth++;
+      }
+    }
+    return null;
+  }
+  try {
+    var sc = findCommentScroller();
+    if (sc) {
+      var r = sc.getBoundingClientRect();
+      var opt = {
+        bubbles: true, cancelable: true, deltaY: 800, deltaMode: 0,
+        clientX: r.left + r.width / 2, clientY: r.top + Math.min(r.height / 2, 300)
+      };
+      sc.dispatchEvent(new WheelEvent('wheel', opt));
+      sc.scrollTop = sc.scrollHeight;
+      sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+  } catch (e) {}
+  window.scrollTo(0, document.body.scrollHeight);
+})();"#
+        .to_string()
+}
+
 /// 非 Windows(主要是 macOS)的「真实滚轮」对等实现:向**内容最高的可滚容器**派发
 /// 一个 `WheelEvent` 并直接抬高 scrollTop,触发只认滚轮事件的页面(快手 / 小红书等)的
 /// 懒加载。Windows 走窗口消息级 `WM_MOUSEWHEEL`;mac 无需辅助功能权限、后台窗口也能滚,
@@ -666,11 +753,60 @@ pub fn build_detail_eval(template: &str, id: &str, token: &str) -> String {
     let tpl = template.replace('\\', "\\\\").replace('\'', "\\'");
     let id_esc = id.replace('\\', "\\\\").replace('\'', "\\'");
     let token_esc = token.replace('\\', "\\\\").replace('\'', "\\'");
+    // split/join 做全局替换:抖音「主页模态」详情模板里 {id} 出现两次(modal_id={id}&vid={id}),
+    // String.replace 只换首个会漏掉第二个,导致 URL 残留 vid={id} 而打不开。
     format!(
         "(function () {{ var id = encodeURIComponent('{id_esc}'); \
          var token = encodeURIComponent('{token_esc}'); \
-         window.location.assign('{tpl}'.replace('{{id}}', id).replace('{{token}}', token)); }})();"
+         window.location.assign('{tpl}'.split('{{id}}').join(id).split('{{token}}').join(token)); }})();"
     )
+}
+
+/// 激活右侧详情面板的「评论」tab。抖音「主页模态」详情(/user/{sec_uid}?modal_id=)默认可能停在
+/// 「详情」tab,评论列表与 comment/list 请求要切到「评论」tab 才加载。找文本以「评论」开头的短元素
+/// (tab 文案如「评论」/「评论 16」,排除评论正文的长文本)派发全套 pointer+mouse 点击。
+/// 兜底:无「评论」文案 tab 的布局(沉浸式播放器 modal,评论入口是动作栏图标按钮,
+/// data-e2e="feed-comment-icon",真机实测 2026-08)直接点图标开面板——面板开出后「评论」tab 默认已激活。
+/// best-effort:找不到 / 已在评论 tab 均无害(文案 tab 优先,图标仅作兜底,避免面板已开时误点图标反而关掉)。
+pub fn build_comment_tab_eval() -> String {
+    r#"(function () {
+  // 评论面板已开(「全部评论」标志在)直接 no-op:图标点击是开关语义,重复点会把面板关掉
+  if (document.body.innerText.indexOf('全部评论') !== -1) return true;
+  function fireClick(el) {
+    var r = el.getBoundingClientRect();
+    var o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mouseover', o));
+    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+  }
+  var nodes = document.querySelectorAll('[role="tab"],[class*="tab" i],span,div,li');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var t = (el.textContent || '').trim();
+    // tab 文案:以「评论」开头且整体很短(后面最多跟数量);长文本是评论正文/容器,排除
+    if (t.length > 8 || !/^评论(\s|\(|（|\d|$)/.test(t)) continue;
+    if (el.closest && el.closest('[aria-hidden="true"]')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    fireClick(el);
+    return true;
+  }
+  // 兜底:沉浸式播放器布局没有「评论」文案 tab,点动作栏评论图标开面板
+  var icon = document.querySelector('[data-e2e="feed-comment-icon"]');
+  if (icon) {
+    var ir = icon.getBoundingClientRect();
+    if (ir.width > 0 && ir.height > 0) {
+      fireClick(icon);
+      return true;
+    }
+  }
+  return false;
+})()"#
+        .to_string()
 }
 
 /// 构造「按文案点击元素」的脚本(排序 / 时间筛选用)。在可点击元素里找 textContent
@@ -1061,17 +1197,19 @@ pub struct CollectLog {
 }
 
 /// 采集日志落库通道。lib.rs setup 初始化后,emit 时把日志副本发到此处由后台 writer 落库。
-static LOG_SINK: OnceLock<UnboundedSender<CollectLog>> = OnceLock::new();
+static LOG_SINK: OnceLock<Sender<CollectLog>> = OnceLock::new();
 
-/// 初始化日志落库通道(进程启动时调用一次)。
-pub fn init_log_sink(sender: UnboundedSender<CollectLog>) {
+/// 初始化日志落库通道(进程启动时调用一次)。改用有界通道,
+/// 采集高峰期发送阻塞提供背压,防止无界通道内存无限增长。
+pub fn init_log_sink(sender: Sender<CollectLog>) {
     let _ = LOG_SINK.set(sender);
 }
 
-/// 把日志副本送入落库通道;通道未初始化 / 已关闭时静默忽略,不影响采集。
+/// 把日志副本送入落库通道;通道未初始化 / 已满 / 已关闭时静默忽略,不影响采集。
 fn persist_log(log: &CollectLog) {
     if let Some(sink) = LOG_SINK.get() {
-        let _ = sink.send(log.clone());
+        // try_send 非阻塞:通道满时丢弃日志(优先保障采集吞吐,不因日志 IO 阻塞采集)
+        let _ = sink.try_send(log.clone());
     }
 }
 

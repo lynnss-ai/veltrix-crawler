@@ -1024,8 +1024,31 @@ fn truncate_title(text: &str) -> String {
     }
 }
 
+/// 记录一次语音转写的 ASR 用量到账单(model_usage_records):每次 API 请求一条记录
+/// (GLM 无 usage 字段则 token 记 0、仅计请求次数)。写库失败仅忽略,不影响转写结果。
+async fn record_transcription_usage(
+    db: &sea_orm::DatabaseConnection,
+    model: &str,
+    provider: &str,
+    usages: &[crate::llm::chat::TokenUsage],
+    owner: &str,
+) {
+    for u in usages {
+        let _ = veltrix_core::db::entity::model_usage_record::Model::record(
+            db,
+            model,
+            provider,
+            u.prompt,
+            u.completion,
+            "transcription",
+            owner,
+        )
+        .await;
+    }
+}
+
 /// 语音输入:把前端录制的音频(base64)转写为文字回填输入框。
-/// 复用系统设置的「语音转写」厂商配置(目前 MiMo ASR)。
+/// 复用系统设置的「语音转写」厂商配置(MiMo / GLM ASR)。
 #[tauri::command]
 pub async fn transcribe_chat_audio(
     state: State<'_, AppState>,
@@ -1061,16 +1084,30 @@ pub async fn transcribe_chat_audio(
         .map_err(|e| CrawlerError::Config(format!("写临时音频失败: {e}")))?;
 
     let result = crate::llm::transcribe(crate::llm::TranscribeRequest {
-        provider_code: "mimo",
+        provider_code: &transcription_cfg.provider,
         api_url: &transcription_cfg.api_url,
         api_key: &api_key,
         model: &transcription_cfg.model,
         audio_path: &tmp,
+        // 语音消息体积小,不切片;万一超大回退系统 PATH 的 ffmpeg
+        ffmpeg_path: None,
     })
     .await;
     // 转写完删临时文件(失败忽略)
     let _ = tokio::fs::remove_file(&tmp).await;
-    result
+    let outcome = result?;
+    // 账单:记录 ASR 用量(未登录拿不到归属则跳过,不影响转写结果)
+    if let Some(me) = current_user(&state) {
+        record_transcription_usage(
+            &state.db,
+            &transcription_cfg.model,
+            &transcription_cfg.provider,
+            &outcome.usages,
+            &me.name,
+        )
+        .await;
+    }
+    Ok(outcome.text)
 }
 
 /// 单条资产引入的图片附件上限(与单条消息附件上限一致)。
@@ -1338,14 +1375,28 @@ pub async fn transcribe_audio_chunk(
         .map_err(|e| CrawlerError::Config(format!("写临时音频失败: {e}")))?;
 
     let result = crate::llm::transcribe(crate::llm::TranscribeRequest {
-        provider_code: "mimo",
+        provider_code: &transcription_cfg.provider,
         api_url: &transcription_cfg.api_url,
         api_key: &api_key,
         model: &transcription_cfg.model,
         audio_path: &tmp,
+        // 语音消息体积小,不切片;万一超大回退系统 PATH 的 ffmpeg
+        ffmpeg_path: None,
     })
     .await;
     // 转写完删临时文件(失败忽略)
     let _ = tokio::fs::remove_file(&tmp).await;
-    result
+    let outcome = result?;
+    // 账单:记录 ASR 用量(未登录拿不到归属则跳过,不影响转写结果)
+    if let Some(me) = current_user(&state) {
+        record_transcription_usage(
+            &state.db,
+            &transcription_cfg.model,
+            &transcription_cfg.provider,
+            &outcome.usages,
+            &me.name,
+        )
+        .await;
+    }
+    Ok(outcome.text)
 }

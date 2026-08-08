@@ -17,7 +17,6 @@ export interface AccountView {
   cookie: string;
   status: string;
   risk_count: number;
-  cooldown_until: number;
   last_used_at: number;
   created_at: number;
   // 编码 / 备注 / 归属用户:后端账号表补字段后返回,当前可能为空
@@ -43,6 +42,8 @@ export interface MediaConfig {
   ffmpeg_path: string | null;
   audio_format: string;
   output_dir: string;
+  // 海外平台音频拉流代理:空=自动探测本机代理、"off"=关闭直连、其余为代理 URL
+  proxy: string;
 }
 
 export interface AppConfig {
@@ -59,8 +60,12 @@ export interface AppConfig {
   };
   // 语音转写配置(后端 snake_case,与 intent 一致)
   transcription: {
+    // ASR 厂商 code(mimo / glm,与后端 provider 预设对应)
+    provider: string;
     api_url: string;
     model: string;
+    // 转写并发数(同时在飞的 ASR 请求数)
+    concurrency: number;
   };
 }
 
@@ -389,6 +394,8 @@ export interface TaskView {
   industry: string;
   platform: string;
   keywords: string[];
+  // 定向采集目标链接(视频链接 / 作者主页链接);空数组 = 关键词搜索任务,定向任务 keywords 恒空
+  targetUrls: string[];
   trigger: "once-now" | "daily" | "watching";
   scheduledAt: string | null;
   watchIntervalMin: number | null;
@@ -397,6 +404,8 @@ export interface TaskView {
   perKeywordLimit: number;
   minLikes: number;
   aiExtract: boolean;
+  // 音频提取:视频下载并转 mp3 留存;AI 文案提取开启时隐含开启
+  audioExtract: boolean;
   // 评论采集:开启后按下列规则抓评论;关闭时其余字段无意义
   collectComments?: boolean;
   // 评论发布时间范围:3d / 7d / 14d / any(不限)
@@ -433,6 +442,12 @@ export interface TaskView {
   autoSyncObsidian: boolean;
   // 平台专属额外筛选(抖音:视频时长/搜索范围/内容形式),{维度id: 选中文案};{} = 全不限
   extraFilters: Record<string, string>;
+  // 失败自动重试次数上限(0=不自动重试);失败后按 1/5/15 分钟指数退避重跑
+  maxRetries: number;
+  // 当前失败序列已自动重试次数(成功或手动重跑新序列后归零)
+  retryCount: number;
+  // 下次自动重试时间(unix 秒);null=未排期(未开重试/已耗尽/运行中)
+  nextRetryAt: number | null;
   owner: string;
   createdAt: number;
   updatedAt: number;
@@ -449,6 +464,8 @@ export interface TaskInput {
   industry: string;
   platform: string;
   keywords: string[];
+  // 定向采集目标链接(视频链接 / 主页链接);省略/空 = 关键词搜索任务
+  targetUrls?: string[];
   trigger: "once-now" | "daily" | "watching";
   scheduledAt?: string | null;
   watchIntervalMin?: number | null;
@@ -457,6 +474,8 @@ export interface TaskInput {
   perKeywordLimit: number;
   minLikes: number;
   aiExtract: boolean;
+  // 音频提取:视频下载并转 mp3 留存;AI 文案提取开启时隐含开启
+  audioExtract: boolean;
   // 评论采集相关(见 TaskView 同名字段说明)
   collectComments?: boolean;
   commentTimeRange?: "3d" | "7d" | "14d" | "any";
@@ -466,6 +485,8 @@ export interface TaskInput {
   autoSyncObsidian?: boolean;
   // 平台专属额外筛选(抖音:视频时长/搜索范围/内容形式),{维度id: 选中文案};省略 = 全不限
   extraFilters?: Record<string, string>;
+  // 失败自动重试次数上限(0=不自动重试;缺省视为 0)
+  maxRetries?: number;
 }
 
 export interface TaskStatusPatch {
@@ -598,6 +619,9 @@ export interface MediaStatusView {
   mediaStatus: "pending" | "success" | "failed" | null;
   audioExtracted: boolean | null;
   mediaError: string | null;
+  // 最新转写文本 / 失败原因(音频重试成功会顺带补转写,转写重试会更新两者)
+  transcript: string | null;
+  transcriptError: string | null;
 }
 
 // 评论库:采集落库的评论(对应后端 CommentView / comments 表)

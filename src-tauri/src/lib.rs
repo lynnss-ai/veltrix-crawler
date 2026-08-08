@@ -246,6 +246,30 @@ pub fn run() {
                 }
             }
 
+            // 同步收尾残留的「进行中」执行历史(task_run):finalize_task_run 只在线上路径跑,
+            // 重启后这些行会永远停在 running、finished_at=NULL,执行历史里像「永远跑不完」
+            {
+                use sea_orm::sea_query::Expr;
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+                use veltrix_core::db::entity::task_run;
+                let reset_db = db.clone();
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = tauri::async_runtime::block_on(async {
+                    task_run::Entity::update_many()
+                        .col_expr(task_run::Column::Status, Expr::value("failed"))
+                        .col_expr(task_run::Column::FinishedAt, Expr::value(now))
+                        .col_expr(
+                            task_run::Column::ErrorMessage,
+                            Expr::value("应用重启,采集已中断"),
+                        )
+                        .filter(task_run::Column::Status.eq("running"))
+                        .exec(&reset_db)
+                        .await
+                }) {
+                    tracing::warn!("重置残留进行中执行历史失败: {e}");
+                }
+            }
+
             // 作者表存量回填:authors 为空时,从 content 历史数据回填一次(幂等)
             {
                 let migrate_db = db.clone();
@@ -355,28 +379,91 @@ pub fn run() {
                 config_dir.display()
             );
 
-            // 采集日志落库:全局通道 + 后台 writer,把 emit 的日志异步持久化到 collect_logs。
-            // 异步落库不阻塞采集;通道未初始化时 emit 静默跳过落库(仅推前端事件)。
+            // 采集日志落库:有界通道 + 后台 writer,攒批插入减轻 SQLite 写锁竞争。
+            // 通道满时限流丢弃(emit 走 try_send),优先保障采集吞吐。
             let (log_tx, mut log_rx) =
-                tokio::sync::mpsc::unbounded_channel::<webview::CollectLog>();
+                tokio::sync::mpsc::channel::<webview::CollectLog>(1024);
             webview::init_log_sink(log_tx);
             let log_db = db.clone();
             tauri::async_runtime::spawn(async move {
-                use sea_orm::{ActiveModelTrait, Set};
+                use sea_orm::{EntityTrait, Set};
                 use veltrix_core::db::entity::collect_log;
-                while let Some(log) = log_rx.recv().await {
-                    let entry_json =
-                        log.entry.as_ref().and_then(|e| serde_json::to_string(e).ok());
-                    let am = collect_log::ActiveModel {
-                        task_id: Set(log.task_id),
-                        ts: Set(log.ts),
-                        level: Set(log.level),
-                        message: Set(log.message),
-                        entry_json: Set(entry_json),
-                        ..Default::default()
-                    };
-                    if let Err(e) = am.insert(&log_db).await {
-                        tracing::warn!("采集日志落库失败: {e}");
+                // 攒批缓冲区:每 100 条或 200ms 超时 flush 一批
+                const FLUSH_SIZE: usize = 100;
+                const FLUSH_MS: u64 = 200;
+                let mut batch: Vec<collect_log::ActiveModel> = Vec::with_capacity(FLUSH_SIZE);
+                loop {
+                    let deadline = tokio::time::Duration::from_millis(FLUSH_MS);
+                    let first = tokio::time::timeout(deadline, log_rx.recv()).await;
+                    match first {
+                        Ok(Some(log)) => {
+                            // 收到第一条,先入批
+                            let entry_json =
+                                log.entry.as_ref().and_then(|e| serde_json::to_string(e).ok());
+                            batch.push(collect_log::ActiveModel {
+                                task_id: Set(log.task_id),
+                                ts: Set(log.ts),
+                                level: Set(log.level),
+                                message: Set(log.message),
+                                entry_json: Set(entry_json),
+                                ..Default::default()
+                            });
+                            // 尽可能再 drain 通道中剩余,凑满 FLUSH_SIZE 即 flush
+                            while batch.len() < FLUSH_SIZE {
+                                match log_rx.try_recv() {
+                                    Ok(log) => {
+                                        let entry_json = log
+                                            .entry
+                                            .as_ref()
+                                            .and_then(|e| serde_json::to_string(e).ok());
+                                        batch.push(collect_log::ActiveModel {
+                                            task_id: Set(log.task_id),
+                                            ts: Set(log.ts),
+                                            level: Set(log.level),
+                                            message: Set(log.message),
+                                            entry_json: Set(entry_json),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                        break;
+                                    }
+                                }
+                            }
+                            // flush
+                            if !batch.is_empty() {
+                                let models = std::mem::take(&mut batch);
+                                if let Err(e) =
+                                    collect_log::Entity::insert_many(models).exec(&log_db).await
+                                {
+                                    tracing::warn!("采集日志批量落库失败: {e}");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // 通道已关闭,flush 残留后结束
+                            if !batch.is_empty() {
+                                let models = std::mem::take(&mut batch);
+                                if let Err(e) =
+                                    collect_log::Entity::insert_many(models).exec(&log_db).await
+                                {
+                                    tracing::warn!("采集日志批量落库失败: {e}");
+                                }
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            // 超时:flush 当前批
+                            if !batch.is_empty() {
+                                let models = std::mem::take(&mut batch);
+                                if let Err(e) =
+                                    collect_log::Entity::insert_many(models).exec(&log_db).await
+                                {
+                                    tracing::warn!("采集日志批量落库失败: {e}");
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -555,6 +642,7 @@ pub fn run() {
             commands::set_agent_guidelines,
             commands::set_intent_config,
             commands::set_transcription_config,
+            commands::set_media_proxy,
             commands::get_role_models,
             commands::set_role_models,
             commands::list_provider_capabilities,
@@ -640,6 +728,8 @@ pub fn run() {
             commands::task::set_author_blacklisted_by_id,
             commands::enrich_authors,
             commands::retry_content_media,
+            commands::retry_content_transcript,
+            commands::retry_failed_transcripts,
             commands::compensate_task,
             commands::check_ffmpeg,
             commands::set_obsidian_vault,

@@ -19,6 +19,7 @@ import {
   getSortedRowModel,
   useReactTable,
 } from "@tanstack/react-table";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { GripVertical, RotateCcw, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
@@ -80,6 +81,8 @@ interface DataTableProps<TData, TValue> {
   emptyState?: ReactNode;
   /// 每页默认条数(不传默认 50)
   defaultPageSize?: number;
+  /// 每页条数可选档位(不传用 Pagination 的全站默认档位)
+  pageSizeOptions?: number[];
   // 列自定义(显隐 / 列序 / 列宽)+ localStorage 持久化:传入唯一 key 才启用,仅个别列表用。
   // 启用后表头右上出现「列设置」,并支持拖拽表头边缘调宽(软调:auto 布局下作宽度提示)。
   customizeKey?: string;
@@ -94,6 +97,7 @@ export function DataTable<TData, TValue>({
   renderToolbar,
   emptyState,
   defaultPageSize = 50,
+  pageSizeOptions,
   customizeKey,
 }: DataTableProps<TData, TValue>) {
   const customizable = !!customizeKey;
@@ -168,6 +172,33 @@ export function DataTable<TData, TValue>({
   // 一旦用户设过任一列宽,才切到 table-fixed 让设定的宽度权威生效。
   const useFixed = customizable && Object.keys(columnSizing).length > 0;
 
+  // 行虚拟化:一页几百条时只挂载可视区行(每行含 Tooltip/DropdownMenu/图片等重组件,
+  // 整页一次同步挂载会堵死主线程,连标题栏/侧边栏都无法绘制)。
+  // 用「上下占位行」而非绝对定位,保持语义 table 布局与 sticky 表头/末列不变。
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const rows = table.getRowModel().rows;
+  const rowVirtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollEl,
+    // 估算行高:ContentCard 行 ~200px、普通文本行 ~40px,取中间值,实测后自动校正
+    estimateSize: () => 96,
+    overscan: 8,
+    getItemKey: (index) => rows[index]?.id ?? index,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const totalSize = rowVirtualizer.getTotalSize();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? totalSize - virtualRows[virtualRows.length - 1].end
+      : 0;
+
+  // 翻页后回到顶部:虚拟滚动保留旧偏移会落在页中间某行,观感像数据丢了
+  const pageIndex = table.getState().pagination.pageIndex;
+  useEffect(() => {
+    scrollEl?.scrollTo({ top: 0 });
+  }, [pageIndex, scrollEl]);
+
   return (
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col gap-4">
       {customizable ? (
@@ -185,6 +216,7 @@ export function DataTable<TData, TValue>({
           {/* 默认 min-w-max 让表宽随列内容扩展;列自定义时改 table-fixed + 显式表宽,
               让拖拽列宽权威生效(content 不再反向撑列),table-container 的 overflow-auto 提供横向滚动 */}
           <Table
+            containerRef={setScrollEl}
             className={useFixed ? "table-fixed" : "min-w-max"}
             style={useFixed ? { width: table.getTotalSize() } : undefined}
           >
@@ -235,7 +267,7 @@ export function DataTable<TData, TValue>({
               ))}
             </TableHeader>
             <TableBody>
-              {table.getRowModel().rows.length === 0 ? (
+              {rows.length === 0 ? (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={columns.length}>
                     {emptyState ?? (
@@ -246,45 +278,75 @@ export function DataTable<TData, TValue>({
                   </TableCell>
                 </TableRow>
               ) : (
-                table.getRowModel().rows.map((row) => (
-                  <TableRow
-                    key={row.id}
-                    data-state={row.getIsSelected() ? "selected" : undefined}
-                    // 行分割线:虚线;主题 --border 偏淡,用 foreground/15 让虚线更清晰
-                    className="border-b border-dashed border-foreground/15"
-                  >
-                    {row.getVisibleCells().map((cell, idx, arr) => {
-                      const isLast = idx === arr.length - 1;
-                      return (
-                        <TableCell
-                          key={cell.id}
-                          style={
-                            useFixed
-                              ? { width: cell.column.getSize() }
-                              : undefined
-                          }
-                          className={cn(
-                            isLast
-                              ? "sticky right-0 z-10 bg-card pr-6 shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.06)]"
-                              : "",
-                            cell.column.columnDef.meta?.cellClassName,
-                          )}
-                        >
-                          {flexRender(
-                            cell.column.columnDef.cell,
-                            cell.getContext(),
-                          )}
-                        </TableCell>
-                      );
-                    })}
-                  </TableRow>
-                ))
+                <>
+                  {/* 顶部占位行:撑起未渲染区域的高度,保持滚动条位置正确 */}
+                  {paddingTop > 0 && (
+                    <tr aria-hidden="true">
+                      <td
+                        colSpan={table.getVisibleLeafColumns().length}
+                        style={{ height: paddingTop, padding: 0, border: 0 }}
+                      />
+                    </tr>
+                  )}
+                  {virtualRows.map((virtualRow) => {
+                    const row = rows[virtualRow.index];
+                    return (
+                      <TableRow
+                        key={row.id}
+                        // data-index + measureElement:动态实测行高(行高随内容变化)
+                        data-index={virtualRow.index}
+                        ref={rowVirtualizer.measureElement}
+                        data-state={row.getIsSelected() ? "selected" : undefined}
+                        // 行分割线:虚线;主题 --border 偏淡,用 foreground/15 让虚线更清晰
+                        className="border-b border-dashed border-foreground/15"
+                      >
+                        {row.getVisibleCells().map((cell, idx, arr) => {
+                          const isLast = idx === arr.length - 1;
+                          return (
+                            <TableCell
+                              key={cell.id}
+                              style={
+                                useFixed
+                                  ? { width: cell.column.getSize() }
+                                  : undefined
+                              }
+                              className={cn(
+                                isLast
+                                  ? "sticky right-0 z-10 bg-card pr-6 shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.06)]"
+                                  : "",
+                                cell.column.columnDef.meta?.cellClassName,
+                              )}
+                            >
+                              {flexRender(
+                                cell.column.columnDef.cell,
+                                cell.getContext(),
+                              )}
+                            </TableCell>
+                          );
+                        })}
+                      </TableRow>
+                    );
+                  })}
+                  {/* 底部占位行 */}
+                  {paddingBottom > 0 && (
+                    <tr aria-hidden="true">
+                      <td
+                        colSpan={table.getVisibleLeafColumns().length}
+                        style={{ height: paddingBottom, padding: 0, border: 0 }}
+                      />
+                    </tr>
+                  )}
+                </>
               )}
             </TableBody>
           </Table>
         </CardContent>
         <CardFooter className="border-t py-3">
-          <DataTablePagination table={table} itemLabel={itemLabel} />
+          <DataTablePagination
+            table={table}
+            itemLabel={itemLabel}
+            pageSizeOptions={pageSizeOptions}
+          />
         </CardFooter>
       </Card>
     </div>

@@ -1,10 +1,12 @@
 //! 多账号 Cookie 池(SeaORM 版)。
 //!
-//! 职责:持久化每个平台的多个账号 Cookie,按「最久未用优先」轮换以分摊风控压力,
-//! 并对调度层反馈的风控信号做冷却 / 失效降级。
+//! 职责:持久化每个平台的多个账号 Cookie,按「最久未用优先」轮换以分摊风控压力。
 //!
 //! 存储经 SeaORM 落到全局数据库连接(运行时二选一 SQLite / PostgreSQL),
 //! 账号操作非热路径,直接走连接池即可。
+//!
+//! ⚠️ 安全注意:Cookie 明文存储在 DB 中(SQLite 文件无加密),任何人拿到 veltrix.db
+//! 即可获取所有已登录账号的会话凭据。若有安全需求,建议后续加 OS keychain 加密。
 
 // 账号轮换/风控降级方法待调度引擎接入,暂保留
 #![allow(dead_code)]
@@ -14,23 +16,16 @@ use veltrix_core::error::{CrawlerError, Result};
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
-/// 风控后冷却时长(秒)。期间该账号不被轮换选中,到期自动恢复。
-const RISK_COOLDOWN_SECS: i64 = 1800;
-/// 连续风控累计达到此次数,判定账号已被平台重点标记,降级为失效需人工介入。
-const MAX_RISK_BEFORE_INVALID: i64 = 5;
-
-/// 账号状态。冷却是「自动可恢复」,失效 / 停用需人工处理。
+/// 账号状态。失效 / 停用需人工处理;历史版本曾有「冷却」状态,启动时已统一归并为 active。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountStatus {
     /// 可用。
     Active,
-    /// 风控冷却中,到 `cooldown_until` 自动恢复。
-    Cooldown,
-    /// 登录态失效(Cookie 过期 / 频繁风控),需重新登录。
+    /// 登录态失效(Cookie 过期),需重新登录。
     Invalid,
     /// 人工停用,保留记录但不参与轮换。
     Disabled,
@@ -40,7 +35,6 @@ impl AccountStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             AccountStatus::Active => "active",
-            AccountStatus::Cooldown => "cooldown",
             AccountStatus::Invalid => "invalid",
             AccountStatus::Disabled => "disabled",
         }
@@ -48,9 +42,9 @@ impl AccountStatus {
 
     fn from_str(s: &str) -> Self {
         match s {
-            "cooldown" => AccountStatus::Cooldown,
             "invalid" => AccountStatus::Invalid,
             "disabled" => AccountStatus::Disabled,
+            // 含历史遗留的 "cooldown":一律按可用处理(冷却机制已下线)
             _ => AccountStatus::Active,
         }
     }
@@ -65,10 +59,8 @@ pub struct Account {
     pub label: String,
     pub cookie: String,
     pub status: AccountStatus,
-    /// 累计风控次数,达到阈值降级失效。
+    /// 累计风控次数(只读展示;风控冷却机制已下线,不再据此变更状态)。
     pub risk_count: i64,
-    /// 冷却截止 Unix 秒;为 0 表示无冷却。
-    pub cooldown_until: i64,
     /// 最后一次被取用的 Unix 秒,轮换据此选「最久未用」。
     pub last_used_at: i64,
     pub created_at: i64,
@@ -89,7 +81,6 @@ impl From<account::Model> for Account {
             cookie: m.cookie,
             status: AccountStatus::from_str(&m.status),
             risk_count: m.risk_count,
-            cooldown_until: m.cooldown_until,
             last_used_at: m.last_used_at,
             created_at: m.created_at,
             code: m.code,
@@ -119,7 +110,8 @@ impl CookiePool {
             cookie: Set(account.cookie.clone()),
             status: Set(account.status.as_str().to_string()),
             risk_count: Set(account.risk_count),
-            cooldown_until: Set(account.cooldown_until),
+            // 列保留(历史 schema),冷却机制下线后恒写 0
+            cooldown_until: Set(0),
             last_used_at: Set(account.last_used_at),
             created_at: Set(account.created_at),
             // 新建时写入 code/remark/owner;采集登录回写走 on_conflict,不更新这三列(见下)
@@ -151,8 +143,7 @@ impl CookiePool {
 
     /// 取一个可用账号并占用(更新 last_used_at,实现轮换公平性)。
     ///
-    /// 选取规则:平台匹配 + (状态 active,或冷却已到期)→ 取 last_used_at 最小者。
-    /// 冷却到期的账号在此顺带恢复为 active。
+    /// 选取规则:平台匹配 + 状态 active → 取 last_used_at 最小者。
     ///
     /// 并发安全:候选选出后用 `last_used_at = old_last_used_at` 做乐观 CAS,
     /// 更新影响 0 行表示其他线程已抢走,重试到 MAX_RETRIES 上限。
@@ -162,15 +153,7 @@ impl CookiePool {
         for _ in 0..MAX_RETRIES {
             let model = AccountEntity::find()
                 .filter(account::Column::Platform.eq(platform))
-                .filter(
-                    Condition::any()
-                        .add(account::Column::Status.eq(AccountStatus::Active.as_str()))
-                        .add(
-                            Condition::all()
-                                .add(account::Column::Status.eq(AccountStatus::Cooldown.as_str()))
-                                .add(account::Column::CooldownUntil.lte(now)),
-                        ),
-                )
+                .filter(account::Column::Status.eq(AccountStatus::Active.as_str()))
                 .order_by_asc(account::Column::LastUsedAt)
                 .one(&self.db)
                 .await
@@ -182,11 +165,6 @@ impl CookiePool {
 
             // 乐观 CAS:只在 last_used_at 仍是候选时刻的值时更新
             let res = AccountEntity::update_many()
-                .col_expr(
-                    account::Column::Status,
-                    sea_orm::sea_query::Expr::value(AccountStatus::Active.as_str()),
-                )
-                .col_expr(account::Column::CooldownUntil, sea_orm::sea_query::Expr::value(0i64))
                 .col_expr(account::Column::LastUsedAt, sea_orm::sea_query::Expr::value(now))
                 .filter(account::Column::Id.eq(model.id.clone()))
                 .filter(account::Column::LastUsedAt.eq(snapshot_last_used))
@@ -201,30 +179,6 @@ impl CookiePool {
         Err(CrawlerError::Account(
             "并发争用激烈,获取账号失败,请稍后重试".into(),
         ))
-    }
-
-    /// 反馈该账号触发风控:累加计数,达阈值判失效,否则进入冷却。
-    pub async fn mark_risk(&self, account_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
-        let model = AccountEntity::find_by_id(account_id)
-            .one(&self.db)
-            .await
-            .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
-            .ok_or_else(|| CrawlerError::Account(format!("账号不存在: {account_id}")))?;
-
-        let next_count = model.risk_count + 1;
-        let mut am: account::ActiveModel = model.into();
-        am.risk_count = Set(next_count);
-        if next_count >= MAX_RISK_BEFORE_INVALID {
-            am.status = Set(AccountStatus::Invalid.as_str().to_string());
-        } else {
-            am.status = Set(AccountStatus::Cooldown.as_str().to_string());
-            am.cooldown_until = Set(now + RISK_COOLDOWN_SECS);
-        }
-        am.update(&self.db)
-            .await
-            .map_err(|e| CrawlerError::Account(format!("更新风控状态失败: {e}")))?;
-        Ok(())
     }
 
     /// 标记账号登录态失效(Cookie 过期),需重新登录。账号不存在时静默。
@@ -243,7 +197,7 @@ impl CookiePool {
         Ok(())
     }
 
-    /// 标记账号已登录可用:扫码登录完成后置 active,清零风控计数与冷却,
+    /// 标记账号已登录可用:扫码登录完成后置 active,清零风控计数,
     /// 并把 last_used_at 更新为当前时间(「最近使用」以登录成功为准,而非仅采集占用)。
     pub async fn mark_active(&self, account_id: &str) -> Result<()> {
         if let Some(model) = AccountEntity::find_by_id(account_id)
@@ -271,7 +225,7 @@ impl CookiePool {
             .await
             .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
         {
-            // 仅对 active 账号重置,避免覆盖冷却 / 失效状态
+            // 仅对 active 账号重置,避免覆盖失效 / 停用状态
             if model.status == AccountStatus::Active.as_str() {
                 let mut am: account::ActiveModel = model.into();
                 am.risk_count = Set(0);

@@ -5,11 +5,21 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import { toast } from "sonner";
 
+// 更新源开关:tauri.conf.json 的 updater endpoint 还是占位地址(OWNER/REPO)时保持 false,
+// 跳过一切检查——否则每次检查都对占位地址发请求,后端刷
+// 「update endpoint did not respond with a successful status code」错误日志。
+// 将来发布正式更新渠道时:配好 tauri.conf.json 的 endpoints + pubkey,再把这里置 true。
+const UPDATE_ENABLED = false;
+
 /**
  * 检查并(经用户确认后)下载安装更新。
  * @param silent true=启动后台静默检查(无更新/失败都不打扰);false=手动检查(始终给反馈)
  */
 export async function checkForUpdate(silent: boolean): Promise<void> {
+  if (!UPDATE_ENABLED) {
+    if (!silent) toast.info("当前版本未配置自动更新");
+    return;
+  }
   let update;
   try {
     update = await check();

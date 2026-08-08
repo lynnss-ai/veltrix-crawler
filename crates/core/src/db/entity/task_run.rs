@@ -27,6 +27,9 @@ pub struct Model {
     pub comment_delta: i64,
     /// 失败原因;None 表示无
     pub error_message: Option<String>,
+    /// 本次运行的采集指标 JSON(拦截响应数 / 解析失败数 / 入库数 / 各阶段耗时等),
+    /// 供事后排查与横向对比;老数据为 None。
+    pub metrics_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

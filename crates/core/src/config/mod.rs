@@ -14,13 +14,13 @@ const CONFIG_FILE_NAME: &str = "veltrix-config.json";
 
 /// 默认每平台并发请求数,偏保守以降低风控概率。
 const DEFAULT_CONCURRENCY: u32 = 2;
-/// 默认请求最小间隔(毫秒)。
+/// 【已弃用】`RateLimitConfig` 全仓库无引用,保留仅兼容旧配置文件反序列化。
 const DEFAULT_MIN_INTERVAL_MS: u64 = 1200;
-/// 默认失败重试次数。
+/// 【已弃用】同上。
 const DEFAULT_MAX_RETRIES: u32 = 3;
 /// 默认滚动加载轮数:模拟下滑触发分页接口。
 const DEFAULT_SCROLL_ROUNDS: u32 = 5;
-/// 默认每轮滚动后的等待(毫秒),给接口返回与页面渲染留出时间。
+/// 【已弃用】实际滚动停顿由 `random_scroll_pause`(pool.rs,2-4s 随机)决定,此字段从未被读取。
 const DEFAULT_SCROLL_INTERVAL_MS: u64 = 1500;
 /// 默认等待节点出现的超时(毫秒);超时即判定该 RPA 步骤失败。
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 8000;
@@ -29,7 +29,7 @@ const DEFAULT_SCROLL_SEGMENTS: u32 = 4;
 /// 默认数据库连接池上限。
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 8;
 
-/// 单平台限速与退避策略。各平台风控强度不同,逐平台可调。
+/// 【已弃用】单平台限速与退避策略,全仓库无引用,保留仅兼容旧配置文件反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     /// 同时在途请求数上限。
@@ -451,6 +451,11 @@ pub struct MediaConfig {
     pub audio_format: String,
     /// 媒体与中间文件输出目录。
     pub output_dir: String,
+    /// 海外平台音频拉流的代理(仅作用于 tiktok/youtube 等海外 CDN,国内平台恒直连):
+    /// 空 = 自动探测本机代理(代理环境变量 / Windows 系统代理);`"off"` = 关闭(直连);
+    /// 其余按代理 URL 使用(如 `http://127.0.0.1:7897`)。旧配置无此字段时按空(自动)。
+    #[serde(default)]
+    pub proxy: String,
 }
 
 impl Default for MediaConfig {
@@ -461,6 +466,8 @@ impl Default for MediaConfig {
             ffmpeg_path: None,
             audio_format: "mp3".to_string(),
             output_dir: "media".to_string(),
+            // 默认空 = 自动探测本机代理(与加此字段前的行为一致)
+            proxy: String::new(),
         }
     }
 }
@@ -484,8 +491,15 @@ pub struct CommentIntentConfig {
 }
 
 /// 语音转写默认接入(MiMo ASR):开箱即用,用户仅需补 API Key。
+pub const DEFAULT_ASR_PROVIDER: &str = "mimo";
 pub const DEFAULT_ASR_API_URL: &str = "https://api.xiaomimimo.com/v1";
 pub const DEFAULT_ASR_MODEL: &str = "mimo-v2.5-asr";
+/// 语音转写默认并发数:同时在飞的 ASR 请求数,偏保守以降低厂商限流概率。
+pub const DEFAULT_ASR_CONCURRENCY: u32 = 3;
+
+fn default_asr_provider() -> String {
+    DEFAULT_ASR_PROVIDER.to_string()
+}
 
 fn default_asr_api_url() -> String {
     DEFAULT_ASR_API_URL.to_string()
@@ -495,23 +509,36 @@ fn default_asr_model() -> String {
     DEFAULT_ASR_MODEL.to_string()
 }
 
-/// 语音转写配置(系统设置「语音转写」)。api_url / model 默认 MiMo ASR(开箱即用);
-/// api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。目前仅支持 ASR 的厂商(小米 MiMo)。
+fn default_asr_concurrency() -> u32 {
+    DEFAULT_ASR_CONCURRENCY
+}
+
+/// 语音转写配置(系统设置「语音转写」)。provider / api_url / model 默认 MiMo ASR(开箱即用);
+/// api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。provider 决定走哪家 ASR 实现
+/// (目前支持小米 MiMo、智谱 GLM,见 provider.rs 预设与 speech.rs 分发)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
+    /// ASR 厂商 code(默认 mimo;旧配置无此字段时由 serde default / load_or_default 回退)。
+    #[serde(default = "default_asr_provider")]
+    pub provider: String,
     /// API 地址(默认 MiMo;旧配置存空时由 load_or_default 回退默认)。
     #[serde(default = "default_asr_api_url")]
     pub api_url: String,
     /// 所选 ASR 模型(默认 mimo-v2.5-asr)。
     #[serde(default = "default_asr_model")]
     pub model: String,
+    /// 转写并发数(同时在飞的 ASR 请求数);0 视为未设置,调用方回退默认值。
+    #[serde(default = "default_asr_concurrency")]
+    pub concurrency: u32,
 }
 
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
+            provider: default_asr_provider(),
             api_url: default_asr_api_url(),
             model: default_asr_model(),
+            concurrency: DEFAULT_ASR_CONCURRENCY,
         }
     }
 }
@@ -567,12 +594,24 @@ impl AppConfig {
             return Ok(Self::builtin_default());
         }
         let text = std::fs::read_to_string(&path)?;
-        let mut cfg: AppConfig = serde_json::from_str(&text)
-            .map_err(|e| CrawlerError::Config(format!("解析 {CONFIG_FILE_NAME} 失败: {e}")))?;
+        let mut cfg: AppConfig = match serde_json::from_str(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                // 配置文件损坏/格式错误时回退内置默认,避免应用无法启动。
+                // 解析失败远比「丢失用户改动」严重:一次写盘中断/手动编辑错误就锁死应用。
+                tracing::error!(
+                    "解析 {CONFIG_FILE_NAME} 失败,回退内置默认配置: {e}。请检查配置文件内容。"
+                );
+                return Ok(Self::builtin_default());
+            }
+        };
         // 兼容旧配置文件:补全内置平台后续新增的关键字段(detail_url_template / 内置拦截特征)。
         // 「文件已存在则只读文件」会让老用户拿不到新增的内置配置(如评论采集所需),这里启动时补齐。
         cfg.merge_builtin_platform_defaults();
         // 兼容旧配置:transcription 历史上常存成空字符串,启动时回退 MiMo 默认(开箱即用,仅 api_key 需用户补)
+        if cfg.transcription.provider.trim().is_empty() {
+            cfg.transcription.provider = default_asr_provider();
+        }
         if cfg.transcription.api_url.trim().is_empty() {
             cfg.transcription.api_url = default_asr_api_url();
         }
@@ -583,11 +622,16 @@ impl AppConfig {
     }
 
     /// 持久化配置,供前端「平台管理」保存改动后调用。
+    /// 写盘使用临时文件 + rename 原子操作:防止写盘中断(崩溃/断电)导致配置文件截断,
+    /// 进而启动时 JSON 解析失败。
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(config_dir)?;
         let path = config_dir.join(CONFIG_FILE_NAME);
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
+        // 临时文件在同目录,确保 rename 是原子操作(同文件系统)
+        let tmp = config_dir.join(format!(".{CONFIG_FILE_NAME}.tmp"));
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -629,9 +673,6 @@ impl AppConfig {
             if p.login_url.is_empty() {
                 p.login_url = bp.login_url.clone();
             }
-            if p.collect.detail_url_template.is_empty() {
-                p.collect.detail_url_template = bp.collect.detail_url_template.clone();
-            }
             if p.collect.profile_url_template.is_empty() {
                 p.collect.profile_url_template = bp.collect.profile_url_template.clone();
             }
@@ -656,12 +697,13 @@ impl AppConfig {
             if p.collect.next_page_texts.is_empty() {
                 p.collect.next_page_texts = bp.collect.next_page_texts.clone();
             }
-            // rpa_steps 由我们随平台改版维护、无用户编辑入口:始终用最新内置值刷新(而非仅补空),
-            // 确保选择器更新(如小红书改版搜索框/筛选)对老配置也即时生效,无需删档重建。
+            // rpa_steps/search_url_template/detail_url_template 由我们随平台改版维护,
+            // 无 UI 编辑入口:始终用最新内置值刷新。若需自定义,请通过各平台的 `extra` 字段传递,
+            // adapter 在解析时读取 platform_config.extra 里的自定义值(内置三项不会被覆盖)。
+            // 注意:直接编辑 veltrix.json 改这三项的值会在下次启动时被还原。
             p.collect.rpa_steps = bp.collect.rpa_steps.clone();
-            // search_url_template 同理(平台改版维护、无 UI 编辑入口):始终刷新为最新内置值,
-            // 否则老配置仍保留旧搜索 URL(如小红书旧 search_result),改版后采集会落错页。
             p.collect.search_url_template = bp.collect.search_url_template.clone();
+            p.collect.detail_url_template = bp.collect.detail_url_template.clone();
         }
     }
 
@@ -675,8 +717,10 @@ impl AppConfig {
                 "抖音",
                 "https://www.douyin.com/",
                 "https://www.douyin.com/search/{keyword}",
-                // 详情页 URL 模板,{id}=aweme_id,评论采集导航用;真实路径需本机抓包核对
-                "https://www.douyin.com/video/{id}",
+                // 详情页 URL 模板:走「作者主页 + modal_id」模态,{id}=aweme_id、{token}=作者 sec_uid。
+                // 评论稳定显示在右侧「评论」tab,图文 / 视频同一套布局;而旧的 /video/{id} 对图文内容
+                // 布局不对、评论区出不来(采不到右侧评论)。评论采集导航用,{id} 出现两处(modal_id/vid)。
+                "https://www.douyin.com/user/{token}?modal_id={id}&vid={id}",
                 vec![
                     "/aweme/v1/web/general/search/",
                     "/aweme/v1/web/search/item/",
@@ -684,6 +728,8 @@ impl AppConfig {
                     "/aweme/v1/web/comment/list/",
                     // 内容详情接口:补取/刷新视频直链用;真实路径需本机抓包核对
                     "/aweme/v1/web/aweme/detail/",
+                    // 作者主页视频列表接口:定向采集「主页链接」抓该作者作品用
+                    "/aweme/v1/web/aweme/post/",
                 ],
             ),
             (

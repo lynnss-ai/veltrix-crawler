@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 
-import { sortLabelOf, timeLabelOf, extraFilterChipsOf, type TaskContentFilter } from "./collect-meta";
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, nextRunTs, formatCountdown, isInProgress, type TaskContentFilter } from "./collect-meta";
 import type { PageKey } from "@/components/app-sidebar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -124,6 +124,43 @@ const STATUS_META: Record<
     dot: "bg-slate-400",
   },
 };
+
+// 下次运行倒计时(定时/监听):口径与任务列表 CountdownCell 一致——
+// 运行中不显示(状态徽章已示);监听已停止不显示(不再自动追新);监听从未跑过提示待首次运行
+function NextRunCountdown({ task }: { task: TaskView }) {
+  const next = nextRunTs(task);
+  const showCountdown =
+    !isInProgress(task) &&
+    !(task.trigger === "watching" && task.status === "cancelled") &&
+    next != null;
+  // 仅用于驱动每秒重渲染,值本身不消费
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!showCountdown) return;
+    const id = setInterval(() => setTick((x) => x + 1), 1000);
+    return () => clearInterval(id);
+  }, [showCountdown]);
+
+  if (isInProgress(task)) return null;
+  if (task.trigger === "watching" && task.status === "cancelled") return null;
+  if (next == null) {
+    return task.trigger === "watching" ? (
+      <span className="ml-1">· 待首次运行</span>
+    ) : null;
+  }
+  const remain = next - Math.floor(Date.now() / 1000);
+  return (
+    <span
+      className={`ml-1 font-mono ${
+        remain <= 0
+          ? "text-emerald-600 dark:text-emerald-400"
+          : "text-sky-600 dark:text-sky-400"
+      }`}
+    >
+      · {formatCountdown(remain)}
+    </span>
+  );
+}
 
 // ---- 子任务 / 执行历史 数据模型 ----
 
@@ -520,6 +557,8 @@ export function TaskDetailPage({
                     每 {task.watchIntervalMin} 分钟
                   </span>
                 )}
+                {/* 定时/监听:下次运行倒计时(与任务列表一致) */}
+                {task.trigger !== "once-now" && <NextRunCountdown task={task} />}
               </span>
               <span>创建于 {formatTimestamp(task.createdAt)}</span>
               {task.startedAt && <span>开始于 {formatTimestamp(task.startedAt)}</span>}
@@ -607,6 +646,12 @@ export function TaskDetailPage({
               AI 文案提取
             </span>
           )}
+          {/* 只开音频提取(未开 AI 文案)时单独标注;开 AI 文案已隐含音频,不重复显示 */}
+          {task.audioExtract && !task.aiExtract && (
+            <span className="rounded bg-teal-500/10 px-1.5 py-0.5 text-teal-600 dark:text-teal-400">
+              音频提取
+            </span>
+          )}
           {task.collectComments && (
             <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-600 dark:text-violet-400">
               评论采集
@@ -692,7 +737,7 @@ export function TaskDetailPage({
           if (!open) setViewRun(null);
         }}
       >
-        <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-2xl">
+        <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-[min(64rem,94vw)]">
           <SheetHeader className="border-b">
             <SheetTitle className="flex flex-wrap items-baseline gap-x-2">
               采集日志

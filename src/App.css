@@ -9,7 +9,6 @@
   --color-primary: #2563eb;
   --color-danger: #dc2626;
   --color-active: #10b981;
-  --color-cooldown: #f59e0b;
   --color-invalid: #ef4444;
   --color-disabled: #9ca3af;
 }
@@ -149,9 +148,6 @@ td.actions {
 
 .status-active {
   background: var(--color-active);
-}
-.status-cooldown {
-  background: var(--color-cooldown);
 }
 .status-invalid {
   background: var(--color-invalid);

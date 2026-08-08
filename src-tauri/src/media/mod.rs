@@ -8,7 +8,9 @@
 
 use crate::model::{Content, ContentKind};
 use chrono::Local;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use veltrix_core::config::MediaConfig;
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -29,7 +31,7 @@ pub struct MediaOutcome {
     pub avatar_path: Option<String>,
     /// 视频转出的音频(mp3)本地绝对路径,供后续语音转写读取;None=非视频/转码失败
     pub audio_path: Option<String>,
-    /// 视频文件是否下载成功(仅 video + ai_extract);None=非视频/未尝试
+    /// 视频文件是否下载成功(仅 video + 音频提取);None=非视频/未尝试
     pub video_downloaded: Option<bool>,
     /// 图文图片总数 / 已成功下载数(仅 image)
     pub image_total: Option<i32>,
@@ -66,6 +68,14 @@ const MAX_FILENAME_PREFIX_CHARS: usize = 120;
 const MAX_EXTRACT_ATTEMPTS: usize = 2;
 /// 拉流转音频两次尝试之间的退避(毫秒),给 CDN 短暂喘息后重试。
 const EXTRACT_RETRY_DELAY_MS: u64 = 500;
+/// 单次拉流转音频的整体超时:长视频正常提取也就几分钟,10 分钟未完视为挂起,杀进程记失败。
+const FFMPEG_EXTRACT_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+/// ffmpeg 子进程并发上限:素材下载已按 10 路并发,但视频转音频每个都起一个 ffmpeg;
+/// 全开会打满 CPU / 出口带宽并放大 CDN 并发限制,故对 ffmpeg 单独限流,与 HTTP 下载解耦。
+const MAX_FFMPEG_CONCURRENCY: usize = 3;
+static FFMPEG_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(MAX_FFMPEG_CONCURRENCY))
+});
 
 // ffmpeg(libavformat)拉流失败时进程退出码即 AVERROR 负值。HTTP 错误形如
 // `-MKTAG(0xF8,'4','0','3')`,直接看是「魔法负数」。这里登记常见几种,把退出码翻译成
@@ -118,6 +128,22 @@ fn detect_proxy() -> Option<String> {
         return Some(normalize_proxy_url(&proxy));
     }
     None
+}
+
+/// 代理配置为该值(忽略大小写)时表示「关闭代理」——即便本机有系统代理也强制直连。
+const PROXY_DISABLED: &str = "off";
+
+/// 按用户配置解析实际代理(仅在命中海外 CDN 时才会被调用):
+/// 空 → 自动探测本机代理(`detect_proxy`);`"off"` → None(直连);其余 → 按该 URL(补 scheme)。
+fn resolve_proxy(setting: &str) -> Option<String> {
+    let setting = setting.trim();
+    if setting.is_empty() {
+        detect_proxy()
+    } else if setting.eq_ignore_ascii_case(PROXY_DISABLED) {
+        None
+    } else {
+        Some(normalize_proxy_url(setting))
+    }
 }
 
 /// 仅海外平台 CDN 需要走代理(域名子串命中)。国内 CDN(抖音/快手/小红书/B站)直连,
@@ -270,16 +296,28 @@ const REFERER_BY_PLATFORM: &[(&str, &str)] = &[
 /// 抖音 CDN 对「半成品 UA」会直接 close TCP 不返响应,故必须带完整 AppleWebKit...Safari 后缀。
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+/// 素材下载连接 / 整体超时(秒):避免个别 hang 住的 CDN 直链无限阻塞,拖垮整批素材下载。
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 15;
+const DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 120;
+
+/// 素材下载共享 HTTP 客户端:reqwest Client 内部自带连接池,全局唯一才吃得到 keep-alive;
+/// 此前每次下载都新建客户端,同一 CDN 的每张图都重做一次 TCP+TLS 握手。
+/// 构建失败(TLS 后端初始化异常等)时保留 Err,由 download_to_file 逐次报错,与旧行为一致。
+static DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
+        .build()
+});
+
 /// 下载 URL 到本地文件。reqwest 拉取字节后整体写入;失败返回错误供调用方告警。
 pub async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     if url.trim().is_empty() {
         return Err(CrawlerError::Parse("下载地址为空".into()));
     }
-    // 带超时:避免某条 hang 住的 CDN 直链无限阻塞,拖垮整批素材下载
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    let client = DOWNLOAD_CLIENT
+        .as_ref()
+        .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?;
     let mut req = client.get(url);
     if let Some((_, referer)) = REFERER_BY_CDN.iter().find(|(cdn, _)| url.contains(cdn)) {
         req = req
@@ -290,6 +328,20 @@ pub async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     let bytes = resp.bytes().await?;
     tokio::fs::write(path, &bytes).await?;
     Ok(())
+}
+
+/// 同作者头像下载互斥(键:平台-uid):并发批量处理内容时,同作者的多条内容会同时发现
+/// 头像「不新鲜」而各自重复下载、互相覆盖写同一文件;加锁让首个任务下载,其余等锁后经
+/// 新鲜检查命中、直接复用。锁表随进程累积(每作者一个空 Mutex 的 Arc),量级可忽略。
+static AVATAR_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 取(或建)某作者头像的下载锁。锁表中毒时接管内层数据继续(表内只是 Arc,无不变量可破坏)。
+fn avatar_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = AVATAR_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(key.to_string()).or_default().clone()
 }
 
 /// 文件存在且修改时间在 ttl 秒内为「新鲜」。读元数据 / 系统时间失败按不新鲜处理(触发重下)。
@@ -318,6 +370,7 @@ pub fn extract_audio_from_url(
     ffmpeg_path: Option<&str>,
     referer: Option<&str>,
     cookie: Option<&str>,
+    proxy_setting: &str,
 ) -> Result<()> {
     let program = ffmpeg_path
         .map(str::trim)
@@ -326,6 +379,8 @@ pub fn extract_audio_from_url(
     let mut cmd = std::process::Command::new(program);
     cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
     // CDN 偶发中途断流:让 ffmpeg 自行重连续传,避免一断就整条失败(须在 -i 之前作为输入选项)
+    // -rw_timeout(微秒):单次 I/O 停滞上限,CDN 建立连接后滴流/不返数据时 30s 无数据即报错退出,
+    // 否则 ffmpeg 会在这种连接上挂住数小时(整体兜底见下方等待循环)
     cmd.args([
         "-reconnect",
         "1",
@@ -333,11 +388,13 @@ pub fn extract_audio_from_url(
         "1",
         "-reconnect_delay_max",
         "2",
+        "-rw_timeout",
+        "30000000",
     ]);
     // 海外 CDN 地域限制:仅对海外平台直链补代理(国内 CDN 直连,避免全局节点把国内流量绕远/拒绝);
-    // ffmpeg 子进程不走系统代理,故显式补一条与浏览器同源的代理(-i 之前)
+    // ffmpeg 子进程不走系统代理,故按用户配置(空=自动探测)显式补一条代理(-i 之前)
     if url_needs_proxy(url) {
-        if let Some(proxy) = detect_proxy() {
+        if let Some(proxy) = resolve_proxy(proxy_setting) {
             cmd.arg("-http_proxy").arg(proxy);
         }
     }
@@ -378,9 +435,29 @@ pub fn extract_audio_from_url(
         ]);
     }
     cmd.arg(audio);
-    let status = cmd
-        .status()
+    // 整体超时兜底:-rw_timeout 管单次 I/O 停滞,这里管总时长(长视频正常提取也就几分钟)。
+    // 超时杀子进程记失败——挂起的 ffmpeg 会占死 spawn_blocking 线程,10 路并发全挂即拖垮整个下载阶段
+    let mut child = cmd
+        .spawn()
         .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    let deadline = std::time::Instant::now() + FFMPEG_EXTRACT_MAX;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CrawlerError::Parse(format!(
+                        "ffmpeg 拉流转音频超时(超过 {} 分钟),已终止",
+                        FFMPEG_EXTRACT_MAX.as_secs() / 60
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => return Err(CrawlerError::Parse(format!("等待 ffmpeg 退出失败: {e}"))),
+        }
+    };
     if !status.success() {
         return Err(CrawlerError::Parse(format!(
             "ffmpeg 拉流转音频失败:{}",
@@ -388,6 +465,62 @@ pub fn extract_audio_from_url(
         )));
     }
     Ok(())
+}
+
+/// 把本地音频按时长切片(语音转写用:单文件超过 ASR 体积上限时先切再逐段转写)。
+/// 用 ffmpeg 的 segment muxer、`-c copy` 不重编码(快且无损);切片命名为 chunk_0001.mp3 起,
+/// 输出目录由调用方创建/清理。返回按文件名排序的切片路径(顺序即时间顺序)。
+/// ffmpeg_path 为空用系统 PATH 的 `ffmpeg`,退出码非 0 或无产出切片视为失败。
+pub fn split_audio(
+    audio: &Path,
+    out_dir: &Path,
+    segment_seconds: u32,
+    ffmpeg_path: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg");
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| CrawlerError::Parse(format!("创建切片目录失败: {e}")))?;
+    let pattern = out_dir.join("chunk_%04d.mp3");
+    let status = std::process::Command::new(program)
+        .arg("-y") // 覆盖已存在切片,避免交互确认卡住
+        .arg("-i")
+        .arg(audio)
+        .arg("-f")
+        .arg("segment")
+        .arg("-segment_time")
+        .arg(segment_seconds.to_string())
+        .arg("-c")
+        .arg("copy") // 不重编码:按帧边界切,速度快、音质无损
+        .arg("-threads")
+        .arg("1")
+        .arg(&pattern)
+        .status()
+        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    if !status.success() {
+        return Err(CrawlerError::Parse(format!(
+            "ffmpeg 音频切片失败:{}",
+            describe_ffmpeg_exit(status.code())
+        )));
+    }
+    let mut chunks: Vec<PathBuf> = std::fs::read_dir(out_dir)
+        .map_err(|e| CrawlerError::Parse(format!("读取切片目录失败: {e}")))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mp3"))
+                .unwrap_or(false)
+        })
+        .collect();
+    // 文件名零填充序号,字典序即时间序
+    chunks.sort();
+    if chunks.is_empty() {
+        return Err(CrawlerError::Parse("ffmpeg 音频切片无产出".into()));
+    }
+    Ok(chunks)
 }
 
 /// 探测 ffmpeg 是否可用:用 `<program> -version` 起一次进程,退出码 0 视为可用,
@@ -401,8 +534,7 @@ pub fn probe_ffmpeg(ffmpeg_path: Option<&str>) -> Option<String> {
     let output = std::process::Command::new(program)
         .arg("-version")
         .output()
-        .ok()?;
-    if !output.status.success() {
+        .ok()?;    if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -436,7 +568,7 @@ pub async fn process_content(
     content: &Content,
     root: &Path,
     media: &MediaConfig,
-    ai_extract: bool,
+    audio_extract: bool,
     cookie: Option<&str>,
 ) -> MediaOutcome {
     let kind_dir = if content.kind == ContentKind::Video {
@@ -483,6 +615,9 @@ pub async fn process_content(
             match tokio::fs::create_dir_all(&avatar_dir).await {
                 Ok(()) => {
                     let path = avatar_dir.join(format!("{uid}.jpg"));
+                    // 同作者互斥:首个任务下载,其余等它完成后由下方新鲜检查命中、直接复用
+                    let lock = avatar_lock(&format!("{}-{uid}", content.platform));
+                    let _avatar_guard = lock.lock().await;
                     // 头像 7 天节流:未过期则复用;过期(或不存在)则删旧重下,避免头像长期陈旧
                     if is_file_fresh(&path, AVATAR_TTL_SECS).await {
                         avatar_path = Some(path.to_string_lossy().into_owned());
@@ -515,9 +650,9 @@ pub async fn process_content(
         image_done: None,
     };
 
-    // 视频:仅当任务开启「AI 文案提取」才下载并转音频(只留音频);
-    // 未开则视频不下载、不存储——不需要文案就不留视频/音频。
-    if content.kind == ContentKind::Video && ai_extract {
+    // 视频:仅当任务开启「音频提取」(AI 文案提取隐含开启)才下载并转音频(只留音频);
+    // 未开则视频不下载、不存储——不需要音频/文案就不留视频。
+    if content.kind == ContentKind::Video && audio_extract {
         match content.video_url.as_deref().filter(|s| !s.is_empty()) {
             Some(video_url) => {
                 // 音频单独存到 audio 目录(与封面/视频分开),便于检索与转写读取
@@ -611,11 +746,16 @@ async fn process_video(
     // 抖音等 CDN 偶发「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_EXTRACT_ATTEMPTS {
+        // ffmpeg 全局限流:同一时刻最多 MAX_FFMPEG_CONCURRENCY 个子进程在转码。
+        // 排队等待比并发打满更稳(CPU / 带宽 / CDN 并发限制),permit 随本次尝试结束释放。
+        // 信号量不会关闭,Err 仅理论路径;ok() 拿到 Option 持有 permit,随本次尝试结束释放
+        let _ffmpeg_permit = FFMPEG_SEMAPHORE.acquire().await.ok();
         let url_for_task = video_url.to_string();
         let audio_for_task = audio_path.clone();
         let ffmpeg_for_task = media.ffmpeg_path.clone();
-        // cookie 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
+        // cookie / proxy 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
         let cookie_for_task = cookie.map(str::to_string);
+        let proxy_for_task = media.proxy.clone();
         let result = tokio::task::spawn_blocking(move || {
             extract_audio_from_url(
                 &url_for_task,
@@ -623,6 +763,7 @@ async fn process_video(
                 ffmpeg_for_task.as_deref(),
                 referer,
                 cookie_for_task.as_deref(),
+                &proxy_for_task,
             )
         })
         .await;

@@ -15,9 +15,10 @@ pub struct Model {
     /// 完整 Cookie 串,可能较长,用 Text 列。
     #[sea_orm(column_type = "Text")]
     pub cookie: String,
-    /// 状态字符串:active / cooldown / invalid / disabled。
+    /// 状态字符串:active / invalid / disabled(历史 cooldown 启动时归并为 active)。
     pub status: String,
     pub risk_count: i64,
+    /// 历史冷却机制遗留列,已下线,恒为 0。
     pub cooldown_until: i64,
     pub last_used_at: i64,
     pub created_at: i64,

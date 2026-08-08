@@ -52,6 +52,20 @@ pub trait PlatformAdapter: Send + Sync {
     /// 是否支持某类采集任务。调度层据此提前拒绝不支持的任务。
     fn supports(&self, kind: &TaskKind) -> bool;
 
+    /// 详情接口的 URL 特征子串(如抖音 /aweme/v1/web/aweme/detail/):
+    /// 定向采集(链接直达详情页)据此等「详情接口已回」即收尾,命中即走不死等。
+    /// None 表示平台未声明(或不支持详情解析),定向采集退回固定等待。
+    fn detail_pattern(&self) -> Option<&str> {
+        None
+    }
+
+    /// 作者主页视频列表接口的 URL 特征子串(如抖音 /aweme/v1/web/aweme/post/):
+    /// 定向采集「主页链接」据此等列表接口已回、并在滚动加载时判定是否有新响应。
+    /// None 表示平台未声明(或不支持 UserPosts),主页采集不可用。
+    fn posts_pattern(&self) -> Option<&str> {
+        None
+    }
+
     /// 把本次采集拦截到的接口响应解析为统一模型。
     /// 保留 async:部分平台解析后可能需异步补取媒体直链。
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput>;

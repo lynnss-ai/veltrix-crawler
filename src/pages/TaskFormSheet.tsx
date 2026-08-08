@@ -6,6 +6,7 @@ import type { IndustryView, TaskInput } from "@/lib/api";
 import { filterMetaFor, extraFiltersFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY } from "./collect-meta";
 import type { TaskTrigger, SortMode, TimeRange, TaskItem, CommentTimeRange, PlatformOption } from "./collect-meta";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { contentDetailUrl } from "@/lib/platforms";
 import {
   ArrowDownUp,
   CalendarClock,
@@ -33,11 +34,46 @@ function SectionLabel({ icon: Icon, children }: { icon: LucideIcon; children: Re
   );
 }
 
+// ffmpeg 依赖与检测状态:用 [] 紧跟标题后;音频提取 / AI 文案提取两卡片共用。
+// null=检测中,false=未安装(给下载引导),true=已安装(绿色就绪)
+function FfmpegNote({ available }: { available: boolean | null }) {
+  return (
+    <span className="text-xs">
+      {available === false ? (
+        // 未安装:整段红色,下载链接同色加下划线
+        <span className="text-red-600 dark:text-red-400">
+          [依赖 ffmpeg · 未安装,
+          <button
+            type="button"
+            className="cursor-pointer underline underline-offset-2 hover:text-red-700 dark:hover:text-red-300"
+            onClick={() =>
+              openUrl("https://ffmpeg.org/download.html").catch((e) =>
+                toast.error(`打开下载页失败: ${e}`),
+              )
+            }
+          >
+            点此下载
+          </button>
+          ]
+        </span>
+      ) : available === true ? (
+        // 已安装:绿色表示就绪
+        <span className="text-emerald-600 dark:text-emerald-400">
+          [依赖 ffmpeg · 已安装]
+        </span>
+      ) : (
+        <span className="text-muted-foreground">[依赖 ffmpeg]</span>
+      )}
+    </span>
+  );
+}
+
 export function TaskFormSheet({
   open,
   initial,
   industries,
   platforms,
+  mode = "keyword",
   onOpenChange,
   onSubmit,
 }: {
@@ -45,19 +81,27 @@ export function TaskFormSheet({
   initial: TaskItem | null;
   industries: IndustryView[];
   platforms: PlatformOption[];
+  // keyword=关键词搜索采集(默认);targeted=定向采集(按账号主页/内容链接逐条抓取)
+  mode?: "keyword" | "targeted";
   onOpenChange: (v: boolean) => void;
   onSubmit: (input: TaskInput) => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [industry, setIndustry] = useState(initial?.industry ?? "");
   const [platform, setPlatform] = useState(initial?.platform ?? "");
-  const [keywordsRaw, setKeywordsRaw] = useState(
-    initial?.keywords.join("\n") ?? "",
-  );
+  const [keywordsRaw, setKeywordsRaw] = useState(() => {
+    if (!initial) return "";
+    // 定向任务关键词存占位词「定向采集」(仅展示用),目标链接存 targetUrls;老数据可能没有该字段
+    const lines =
+      mode === "targeted" ? (initial.targetUrls ?? []) : initial.keywords;
+    return lines.join("\n");
+  });
 
   // 行业变更时自动从该行业拉关键词填充(可编辑);编辑模式下首次保持原值不覆盖
   const initialIndustryName = initial?.industry ?? "";
   useEffect(() => {
+    // 定向模式按目标链接/账号采集,不做行业关键词预填
+    if (mode === "targeted") return;
     // 编辑态首次进入 = 用户没主动切换行业,不动 textarea
     if (industry === initialIndustryName && keywordsRaw) return;
     const ind = industries.find((i) => i.name === industry);
@@ -78,6 +122,9 @@ export function TaskFormSheet({
   const [watchIntervalMin, setWatchIntervalMin] = useState<string>(
     String(initial?.watchIntervalMin ?? 30),
   );
+  const [maxRetries, setMaxRetries] = useState<string>(
+    String(initial?.maxRetries ?? 0),
+  );
 
   // 采集策略字段
   const [sortMode, setSortMode] = useState<SortMode>(
@@ -91,6 +138,9 @@ export function TaskFormSheet({
   );
   const [minLikes, setMinLikes] = useState(
     String(initial?.minLikes ?? DEFAULT_STRATEGY.minLikes),
+  );
+  const [audioExtract, setAudioExtract] = useState(
+    initial?.audioExtract ?? DEFAULT_STRATEGY.audioExtract,
   );
   const [aiExtract, setAiExtract] = useState(
     initial?.aiExtract ?? DEFAULT_STRATEGY.aiExtract,
@@ -176,31 +226,55 @@ export function TaskFormSheet({
       toast.error("请选择所属平台");
       return;
     }
-    // 多行关键词:严格按行分隔,每行 trim 后取非空
-    const keywords = keywordsRaw
+    // 多行输入:严格按行分隔,每行 trim 后取非空
+    const rawLines = keywordsRaw
       .split(/\r?\n/)
       .map((k) => k.trim())
       .filter(Boolean);
-    if (keywords.length === 0) {
-      toast.error("请至少输入一个关键词");
+    if (rawLines.length === 0) {
+      toast.error(
+        mode === "targeted"
+          ? "请至少输入一个视频 ID 或链接"
+          : "请至少输入一个关键词",
+      );
       return;
     }
+    // 定向模式:每行是视频 ID、视频链接或作者主页链接;纯 ID 按平台拼详情链接(如抖音
+    // 7665294148962580899 → https://www.douyin.com/video/7665294148962580899),
+    // 平台不支持拼接时保留原值;已是链接(含主页链接)的原样保留。
+    // 定向任务关键词存占位词「定向采集」(仅展示用,后端不会拿它搜索),目标链接存 targetUrls;
+    // 搜索任务反之(targetUrls 空)。
+    const targetUrls =
+      mode === "targeted"
+        ? rawLines.map((line) =>
+            /^https?:\/\//i.test(line)
+              ? line
+              : (contentDetailUrl(platform, line) ?? line),
+          )
+        : [];
     const input: TaskInput = {
       id: initial?.id ?? crypto.randomUUID(),
       name: trimmedName,
       industry,
       platform,
-      keywords,
-      trigger,
-      scheduledAt: trigger === "daily" && scheduledAt ? scheduledAt : null,
+      keywords: mode === "targeted" ? ["定向采集"] : rawLines,
+      targetUrls,
+      // 定向采集是一次性任务:不走定时/监听,保存即按「立即一次」执行
+      trigger: mode === "targeted" ? "once-now" : trigger,
+      scheduledAt:
+        mode !== "targeted" && trigger === "daily" && scheduledAt
+          ? scheduledAt
+          : null,
       watchIntervalMin:
-        trigger === "watching"
+        mode !== "targeted" && trigger === "watching"
           ? Math.max(30, Number(watchIntervalMin) || 30)
           : null,
       sortMode,
       timeRange,
-      perKeywordLimit: Math.max(1, Number(perKeywordLimit) || 50),
+      perKeywordLimit: Math.min(100000, Math.max(1, Number(perKeywordLimit) || 50)),
       minLikes: Math.max(0, Number(minLikes) || 0),
+      // AI 文案提取依赖音频提取:开文案提取时强制带上音频提取(后端 upsert 同样兜底)
+      audioExtract: audioExtract || aiExtract,
       aiExtract,
       autoSyncObsidian,
       collectComments,
@@ -212,6 +286,8 @@ export function TaskFormSheet({
       extraFilters: Object.fromEntries(
         Object.entries(extraFilters).filter(([, v]) => v && v !== "any"),
       ),
+      // 失败自动重试次数上限(0=关闭),夹在 0~10(后端同样兜底)
+      maxRetries: Math.min(10, Math.max(0, Number(maxRetries) || 0)),
     };
     onSubmit(input);
   }
@@ -257,9 +333,17 @@ export function TaskFormSheet({
         }}
       >
         <SheetHeader>
-          <SheetTitle>{initial ? "编辑采集任务" : "创建采集任务"}</SheetTitle>
+          <SheetTitle>
+            {initial
+              ? "编辑采集任务"
+              : mode === "targeted"
+                ? "创建定向采集任务"
+                : "创建采集任务"}
+          </SheetTitle>
           <SheetDescription>
-            配置采集目标 + 触发方式;保存后任务进入「等待运行」,可手动启动。
+            {mode === "targeted"
+              ? "按视频 ID / 视频链接 / 作者主页链接定向抓取;保存后自动开始采集。"
+              : "配置采集目标 + 触发方式;保存后任务进入「等待运行」,可手动启动。"}
           </SheetDescription>
         </SheetHeader>
 
@@ -276,7 +360,11 @@ export function TaskFormSheet({
               id="task-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="例:小红书 · 母婴关键词监控"
+              placeholder={
+                mode === "targeted"
+                  ? "例:抖音 · 竞品账号定向采集"
+                  : "例:小红书 · 母婴关键词监控"
+              }
             />
           </div>
           {/* 行业 + 平台 并排,省竖向空间 */}
@@ -335,8 +423,9 @@ export function TaskFormSheet({
             </Select>
           </div>
           </div>
-          {/* 采集筛选:紧跟平台下方,不加标题/分割线/外框。该平台无任何筛选项(如快手)时整块隐藏 */}
-          {hasFilters && (
+          {/* 采集筛选:紧跟平台下方,不加标题/分割线/外框。该平台无任何筛选项(如快手)时整块隐藏;
+              定向采集按视频 ID 直取,不涉及搜索排序/时间筛选,同样隐藏 */}
+          {hasFilters && mode !== "targeted" && (
               <div className="space-y-3">
                 {/* 排序 / 发布时间 + 平台专属维度同排平铺,flex-wrap 窄屏才换行;
                     每项 flex-1 等分、min-w 保证 Select 不被压扁 */}
@@ -427,10 +516,13 @@ export function TaskFormSheet({
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
               <Label htmlFor="task-keywords">
-                关键词 <span className="text-destructive">*</span>
+                {mode === "targeted" ? "采集目标" : "关键词"}{" "}
+                <span className="text-destructive">*</span>
               </Label>
               <span className="text-xs text-muted-foreground">
-                多个关键词每行一个
+                {mode === "targeted"
+                  ? "视频 ID、视频链接或作者主页链接,每行一个"
+                  : "多个关键词每行一个"}
               </span>
             </div>
             <Textarea
@@ -438,11 +530,17 @@ export function TaskFormSheet({
               rows={6}
               value={keywordsRaw}
               onChange={(e) => setKeywordsRaw(e.target.value)}
-              placeholder="请输入搜索关键词，每行一个"
+              placeholder={
+                mode === "targeted"
+                  ? "例:7665294148962580899 或 https://www.douyin.com/user/MS4wLjAB..."
+                  : "请输入搜索关键词，每行一个"
+              }
               // 固定 6 排高度,超出走滚动条:field-sizing-fixed 覆盖基类的 field-sizing-content(否则随内容自增高)
               className="h-36 resize-none overflow-y-auto field-sizing-fixed font-mono text-sm"
             />
           </div>
+          {/* 返回数量/最低点赞:搜索采集的限量过滤;定向采集按 ID 逐条抓取,不涉及,隐藏 */}
+          {mode !== "targeted" && (
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="task-limit">每组返回数量</Label>
@@ -450,6 +548,7 @@ export function TaskFormSheet({
                 id="task-limit"
                 type="number"
                 min={1}
+                max={100000}
                 value={perKeywordLimit}
                 onChange={(e) => setPerKeywordLimit(e.target.value)}
               />
@@ -471,49 +570,51 @@ export function TaskFormSheet({
               </p>
             </div>
           </div>
+          )}
+          {/* 音频提取(只留 mp3 不转写);AI 文案提取依赖它,关音频会联动关文案提取 */}
+          <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+            <div className="space-y-0.5">
+              <div className="flex flex-wrap items-center gap-1">
+                <Label htmlFor="task-audio-extract" className="cursor-pointer">
+                  音频提取
+                </Label>
+                <FfmpegNote available={ffmpegAvailable} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                对采集到的视频提取音频(mp3)留存,不做文案转写
+              </p>
+            </div>
+            <Switch
+              id="task-audio-extract"
+              checked={audioExtract}
+              onCheckedChange={(v) => {
+                setAudioExtract(v);
+                // AI 文案提取依赖音频提取,关闭音频时同步关闭文案提取
+                if (!v) setAiExtract(false);
+              }}
+              className="scale-125"
+            />
+          </div>
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
               <div className="flex flex-wrap items-center gap-1">
                 <Label htmlFor="task-ai-extract" className="cursor-pointer">
                   AI 文案提取
                 </Label>
-                {/* ffmpeg 依赖与检测状态:用 [] 紧跟标题后,整段统一灰色(不再用绿色区分) */}
-                <span className="text-xs">
-                  {ffmpegAvailable === false ? (
-                    // 未安装:整段红色,下载链接同色加下划线
-                    <span className="text-red-600 dark:text-red-400">
-                      [依赖 ffmpeg · 未安装,
-                      <button
-                        type="button"
-                        className="cursor-pointer underline underline-offset-2 hover:text-red-700 dark:hover:text-red-300"
-                        onClick={() =>
-                          openUrl("https://ffmpeg.org/download.html").catch((e) =>
-                            toast.error(`打开下载页失败: ${e}`),
-                          )
-                        }
-                      >
-                        点此下载
-                      </button>
-                      ]
-                    </span>
-                  ) : ffmpegAvailable === true ? (
-                    // 已安装:绿色表示就绪
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      [依赖 ffmpeg · 已安装]
-                    </span>
-                  ) : (
-                    <span className="text-muted-foreground">[依赖 ffmpeg]</span>
-                  )}
-                </span>
+                <FfmpegNote available={ffmpegAvailable} />
               </div>
               <p className="text-xs text-muted-foreground">
-                对采集到的视频自动提取文案(转音频后做语音转写)
+                对采集到的视频自动提取文案(转音频后做语音转写,会自动开启音频提取)
               </p>
             </div>
             <Switch
               id="task-ai-extract"
               checked={aiExtract}
-              onCheckedChange={setAiExtract}
+              onCheckedChange={(v) => {
+                setAiExtract(v);
+                // AI 文案提取依赖音频提取,开启时自动带上音频提取
+                if (v) setAudioExtract(true);
+              }}
               className="scale-125"
             />
           </div>
@@ -542,7 +643,8 @@ export function TaskFormSheet({
               />
             </div>
 
-            {/* 参数常驻(不折叠);未开启评论采集时整体禁用 + 置灰。三项均为下拉,一行平铺 */}
+            {/* 参数常驻(不折叠);未开启评论采集时整体禁用 + 置灰。三项均为下拉,一行平铺;
+                定向采集与搜索采集一致,同样展示 */}
             <div
               className={`grid grid-cols-3 gap-3 border-t px-3 py-3 ${
                 collectComments ? "" : "pointer-events-none opacity-50"
@@ -629,6 +731,9 @@ export function TaskFormSheet({
               disabled={!obsidianConfigured}
             />
           </div>
+          {/* 触发方式:定时/监听只针对关键词搜索采集;定向采集是一次性任务,隐藏整段 */}
+          {mode !== "targeted" && (
+          <>
           <SectionLabel icon={Clock}>触发方式</SectionLabel>
           <div className="space-y-1.5">
             <div className="grid grid-cols-3 gap-2">
@@ -734,6 +839,35 @@ export function TaskFormSheet({
               </div>
             </>
           )}
+          </>
+          )}
+
+          {/* 失败自动重试:0=关闭;失败后按 1/5/15 分钟指数退避重跑,直到成功或次数耗尽 */}
+          <Separator />
+          <div className="space-y-1.5">
+            <Label htmlFor="task-max-retries">失败自动重试(次)</Label>
+            <Input
+              id="task-max-retries"
+              type="number"
+              min={0}
+              max={10}
+              value={maxRetries}
+              onChange={(e) => setMaxRetries(e.target.value)}
+              onBlur={() => {
+                const n = Number(maxRetries);
+                if (!Number.isFinite(n) || n < 0) {
+                  setMaxRetries("0");
+                } else if (n > 10) {
+                  setMaxRetries("10");
+                }
+              }}
+              className="w-40"
+            />
+            <p className="text-xs text-muted-foreground">
+              任务失败后按 1 / 5 / 15 分钟自动重跑,直到成功或次数耗尽(0 =
+              不自动重试)
+            </p>
+          </div>
         </form>
 
         {/* 取消 + 创建:并排右对齐;取消是用户主动关闭,直接关(不触发"有内容"拦截) */}

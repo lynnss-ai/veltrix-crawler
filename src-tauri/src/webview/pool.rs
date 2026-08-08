@@ -18,7 +18,8 @@ use crate::webview::{
     build_hud_log_eval, build_hud_session_eval, build_hud_status_eval, build_hud_status_eval_state,
     build_hud_task_eval,
     build_intercept_init_script,
-    build_scroll_eval, build_search_eval, build_select_eval, build_set_session_eval,
+    build_comment_scroll_eval, build_scroll_eval, build_search_eval, build_select_eval,
+    build_set_session_eval,
     emit_collect_log, CollectControl, InterceptChannel, InterceptedResponse, RpaChannel,
 };
 use std::collections::{HashMap, HashSet};
@@ -46,13 +47,10 @@ const STAGNANT_STOP: u32 = 3;
 const COMMENT_STAGNANT_STOP: u32 = 2;
 /// 「接口连响应都没有」(网络慢/请求未返回)连续 N 轮 → 兜底结束。与 STAGNANT_STOP 分开:
 /// 慢网络请求往返久,容忍更大轮数,避免网络抖动被误判成「没数据」而提前结束。
-const NO_RESPONSE_STOP: u32 = 8;
+/// 取 20:每轮连滚动带停顿约 3~6 秒,≈ 1~2 分钟等待上限,覆盖弱网首屏慢加载。
+const NO_RESPONSE_STOP: u32 = 20;
 /// 检测到安全验证弹窗后,等待用户手动完成的最长时长:超时仍未完成则结束本次采集(已采数据已保留)。
 const VERIFY_WAIT_MAX: Duration = Duration::from_secs(180);
-
-/// 自动滑块最多尝试次数:每次失败刷新换图再试,仍不过则回退手动。
-/// 别设太大——连续失败的拖拽反而更易加重风控。
-const AUTO_SLIDE_MAX_ATTEMPTS: u32 = 3;
 /// 验证弹窗等待期间的轮询间隔。
 const VERIFY_POLL: Duration = Duration::from_secs(2);
 /// 每次滚动后的拟人停顿区间(毫秒):2~4 秒随机,避免匀速快速滚动触发风控。
@@ -63,6 +61,17 @@ const SCROLL_PAUSE_SPAN_MS: u64 = 2000;
 /// 评论区滚动停顿区间:1~2 秒随机,比内容滚动(2~6s)更短(评论分页更轻、需更快翻完)。
 const COMMENT_PAUSE_MIN_MS: u64 = 1000;
 const COMMENT_PAUSE_SPAN_MS: u64 = 1000;
+/// 点「评论」tab 后等评论首屏加载的停顿(毫秒):切 tab 会触发一次 comment/list,等它返回再进滚动循环。
+const COMMENT_TAB_SETTLE_MS: u64 = 800;
+
+/// 「评论在右侧面板」布局的真实滚轮落点(相对窗口宽/高的比例)。
+/// 抖音详情页右侧评论面板宽约 350~480px,取 85% 宽度可稳定落入面板内;
+/// 55% 高度避开面板顶部的标签/输入区。评论在下方的布局中该落点落在页面主体上,
+/// 同样只是整页下滚,无副作用。
+#[cfg(windows)]
+const COMMENT_WHEEL_RIGHT_X_RATIO: f32 = 0.85;
+#[cfg(windows)]
+const COMMENT_WHEEL_RIGHT_Y_RATIO: f32 = 0.55;
 
 /// 生成 2~4 秒的随机滚动停顿。无 rand 依赖,用系统时间纳秒做廉价熵源,拟人足够。
 fn random_scroll_pause() -> Duration {
@@ -130,6 +139,107 @@ const FILTER_PANEL_OPEN_MS: u64 = 450;
 /// 每点一个筛选标签后的停顿(毫秒)。必须留足让本次筛选的「重新拉取 + 面板重渲染」落定后再点下一个,
 /// 否则多选时中间的筛选还没提交就被下一次点击/重渲染冲掉(实测压到 500ms 会丢中间项)。1500ms 兼顾稳与不太慢。
 const FILTER_APPLY_WAIT_MS: u64 = 1500;
+/// 浮层/入口就绪轮询的间隔(毫秒):每轮跑一次页面侧文案定位,太密会挤占页面主线程。
+const FILTER_PANEL_POLL_MS: u64 = 200;
+/// 展开「筛选」后等浮层标志文案出现的上限(毫秒):超时未确认也继续点选,交给标签重试兜底。
+const FILTER_PANEL_READY_TIMEOUT_MS: u64 = 3000;
+/// 点筛选前等「筛选」入口按钮出现的上限(毫秒):网络静默 ≠ 渲染/水合完成,入口没渲染出来
+/// 就点必然踩空;超时未出现也继续(可能文案不符),由后续告警暴露。
+const FILTER_ENTRY_READY_TIMEOUT_MS: u64 = 5000;
+/// 筛选标签定位失败时的重试轮数:每轮「重新展开浮层 → 等待 → 再定位」,
+/// 应对首次点「筛选」未生效(水合未完成/点了没反应)或点选后浮层被收起的情况。
+const FILTER_LABEL_RETRIES: u32 = 2;
+/// 每轮重试前的等待(毫秒):给页面水合/浮层动画留时间。
+const FILTER_RETRY_WAIT_MS: u64 = 700;
+
+/// 浮层「已真正渲染出来」的标志文案:展开「筛选」后轮询任一出现即视为就绪。
+/// 取浮层里必有的段标题/默认选项(抖音:发布时间/排序依据段 + 不限;小红书同浮层结构)。
+/// ⚠️ 与选项文案一样属待真机校准点,文案改版会退化为「等满超时再继续」,不阻断流程。
+fn filter_panel_ready_labels(platform_id: &str) -> Vec<String> {
+    match platform_id {
+        "douyin" => vec!["发布时间".into(), "排序依据".into(), "不限".into()],
+        "xhs" => vec!["排序依据".into(), "发布时间".into(), "不限".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// 展开「筛选」浮层并确认它真的渲染出来:点「筛选」→ 轮询浮层标志文案出现。
+/// 之前是点完固定等 450ms,页面水合慢时浮层还没出来就去点选项,表现为
+/// 「定位文案:页面未找到 [时间选项]」;改为出现标志才继续,超时兜底不阻断。
+/// 返回是否确认浮层已就绪。
+async fn open_filter_panel(window: &WebviewWindow, platform_id: &str, real: bool) -> bool {
+    let panel_lbls = filter_panel_labels(platform_id);
+    if panel_lbls.is_empty() {
+        return true;
+    }
+    let _ = window.eval(build_hud_log_eval(
+        "info",
+        if real {
+            "🎛️ 展开「筛选」浮层(真实鼠标)…"
+        } else {
+            "🎛️ 展开「筛选」浮层…"
+        },
+    ));
+    let _ = click_filter_labels(window, &panel_lbls, real).await;
+    let ready_lbls = filter_panel_ready_labels(platform_id);
+    if ready_lbls.is_empty() {
+        // 无标志文案的平台:退回固定等待
+        tokio::time::sleep(Duration::from_millis(FILTER_PANEL_OPEN_MS)).await;
+        return true;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if crate::webview::filter_locate::locate_by_labels_quiet(window, &ready_lbls)
+            .await
+            .is_some()
+        {
+            // 标志出现后再留一小段动画/布局稳定时间
+            tokio::time::sleep(Duration::from_millis(FILTER_PANEL_OPEN_MS)).await;
+            let _ = window.eval(build_hud_log_eval("info", "🎛️ 筛选浮层已就绪"));
+            return true;
+        }
+        if start.elapsed().as_millis() as u64 >= FILTER_PANEL_READY_TIMEOUT_MS {
+            let _ = window.eval(build_hud_log_eval(
+                "warn",
+                "⚠️ 未确认筛选浮层已展开(超时)· 继续尝试点选",
+            ));
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(FILTER_PANEL_POLL_MS)).await;
+    }
+}
+
+/// 点一个筛选标签,定位不到时自动「重新展开浮层 → 等待 → 重试」(仅面板型平台)。
+/// 静默预定位命中才走正式点击;重试耗尽后仍走一次原路径,由其告警 + 合成兜底。
+async fn click_filter_with_retry(
+    window: &WebviewWindow,
+    platform_id: &str,
+    labels: &[String],
+    real: bool,
+) -> bool {
+    let uses_panel = !filter_panel_labels(platform_id).is_empty();
+    let label0 = labels.first().map(String::as_str).unwrap_or("");
+    for attempt in 0..=FILTER_LABEL_RETRIES {
+        if attempt > 0 {
+            let _ = window.eval(build_hud_log_eval(
+                "info",
+                &format!("🔁 没找到「{label0}」· 重新展开浮层重试({attempt}/{FILTER_LABEL_RETRIES})"),
+            ));
+            if uses_panel {
+                open_filter_panel(window, platform_id, real).await;
+            }
+            tokio::time::sleep(Duration::from_millis(FILTER_RETRY_WAIT_MS)).await;
+        }
+        if crate::webview::filter_locate::locate_by_labels_quiet(window, labels)
+            .await
+            .is_some()
+        {
+            return click_filter_labels(window, labels, real).await;
+        }
+    }
+    // 重试仍找不到:走原路径(内部会再定位一次、告警并做合成兜底),行为与旧版一致
+    click_filter_labels(window, labels, real).await
+}
 
 /// 该平台的筛选点击是否需要真实 OS 鼠标:抖音 / TikTok 走 secsdk 体系,会校验事件 isTrusted,
 /// 合成 DOM 点击只触发视觉、不被采纳(表现为"点了又还原"),必须用真实鼠标点击。
@@ -143,7 +253,7 @@ fn needs_real_click(platform_id: &str) -> bool {
 async fn click_filter_labels(window: &WebviewWindow, labels: &[String], real: bool) -> bool {
     let label0 = labels.first().map(String::as_str).unwrap_or("");
     // 先回读定位:定位不到 = 浮层里没找到该文案(没展开到 / 文案不符 / 被同名元素抢先),HUD 告警
-    let located = crate::webview::slider::locate_by_labels(window, labels).await;
+    let located = crate::webview::filter_locate::locate_by_labels(window, labels).await;
     let Some((cx, cy)) = located else {
         let _ = window.eval(build_hud_log_eval(
             "warn",
@@ -203,31 +313,12 @@ async fn apply_sort_time(
     }
     // 抖音/TikTok(secsdk)用真实鼠标点击,合成点击会被 isTrusted 校验判伪("点了又还原")
     let real = needs_real_click(platform_id);
-    // 需展开的平台(抖音 / 小红书):先点「筛选」打开浮层并等渲染;浮层内同时含排序与时间两段,只需展开一次
-    let panel_lbls = filter_panel_labels(platform_id);
-    if !panel_lbls.is_empty() {
-        let _ = window.eval(build_hud_log_eval(
-            "info",
-            if real {
-                "🎛️ 展开「筛选」浮层(真实鼠标)…"
-            } else {
-                "🎛️ 展开「筛选」浮层…"
-            },
-        ));
-        let opened = click_filter_labels(window, &panel_lbls, real).await;
-        let _ = window.eval(build_hud_log_eval(
-            "info",
-            if opened {
-                "🎛️ 已点开筛选(真实鼠标)"
-            } else {
-                "🎛️ 已点开筛选(合成)"
-            },
-        ));
-        tokio::time::sleep(Duration::from_millis(FILTER_PANEL_OPEN_MS)).await;
-    }
+    // 需展开的平台(抖音 / 小红书):先点「筛选」打开浮层并轮询确认渲染就绪;
+    // 浮层内同时含排序与时间两段,只需展开一次。之后各标签定位失败会自动重新展开重试。
+    open_filter_panel(window, platform_id, real).await;
     let tag = |ok: bool| if ok { "真实点击" } else { "合成点击" };
     if !sort_lbls.is_empty() {
-        let ok = click_filter_labels(window, &sort_lbls, real).await;
+        let ok = click_filter_with_retry(window, platform_id, &sort_lbls, real).await;
         let _ = window.eval(build_hud_log_eval(
             "info",
             &format!("应用排序:{sort_mode} · {}", tag(ok)),
@@ -235,7 +326,7 @@ async fn apply_sort_time(
         tokio::time::sleep(Duration::from_millis(FILTER_APPLY_WAIT_MS)).await;
     }
     if !time_lbls.is_empty() {
-        let ok = click_filter_labels(window, &time_lbls, real).await;
+        let ok = click_filter_with_retry(window, platform_id, &time_lbls, real).await;
         let _ = window.eval(build_hud_log_eval(
             "info",
             &format!("应用时间筛选:{time_range} · {}", tag(ok)),
@@ -247,7 +338,7 @@ async fn apply_sort_time(
         if text.is_empty() {
             continue;
         }
-        let ok = click_filter_labels(window, std::slice::from_ref(text), real).await;
+        let ok = click_filter_with_retry(window, platform_id, std::slice::from_ref(text), real).await;
         let _ = window.eval(build_hud_log_eval("info", &format!("应用筛选:{text} · {}", tag(ok))));
         tokio::time::sleep(Duration::from_millis(FILTER_APPLY_WAIT_MS)).await;
     }
@@ -307,6 +398,42 @@ async fn wait_intercepted(
             }
         }
         if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 导航后等「页面已开始产出拦截响应」:快网秒回即继续,慢网在 `max_ms` 内不误判。
+/// pattern 为 Some 时等该特征命中,None 时等任意响应(sink 已按平台 intercept_patterns 过滤,
+/// 有响应即说明新页面上下文已运行、hook 已挂);sink 不可用时退回 `fallback_ms` 固定等待。
+/// 命中返回 true;窗口关闭 / 超时返回 false,调用方按旧行为继续,不阻断采集。
+async fn wait_nav_response(
+    window: &WebviewWindow,
+    sink: Option<&ResponseSink>,
+    pattern: Option<&str>,
+    max_ms: u64,
+    fallback_ms: u64,
+) -> bool {
+    let Some(sink) = sink else {
+        tokio::time::sleep(Duration::from_millis(fallback_ms)).await;
+        return false;
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if collect_window_gone(window) {
+            return false;
+        }
+        if let Ok(buf) = sink.lock() {
+            let hit = match pattern {
+                Some(p) => buf.iter().any(|r| r.url.contains(p)),
+                None => !buf.is_empty(),
+            };
+            if hit {
+                return true;
+            }
+        }
+        if start.elapsed().as_millis() as u64 >= max_ms {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -374,6 +501,9 @@ fn build_search_query(collect: &CollectConfig, sort_mode: &str, time_range: &str
 /// 导航到搜索页后、注入 session 前的等待(毫秒)。
 /// 给页面完成导航 + 挂载 hook 留时间;此前命中的首屏请求由页内缓冲兜底,不会漏抓。
 const NAV_SETTLE_MS: u64 = 2500;
+/// 导航后等「首个拦截响应」的上限(毫秒):健康页面通常几百毫秒内回包,
+/// 此上限主要兜底弱网 / 页面无响应场景,超时后按旧行为继续,不阻断采集。
+const NAV_RESPONSE_WAIT_MS: u64 = 8000;
 
 /// 拟人 RPA(仅"输入关键词 + 点搜索",滚动已独立由 Rust 真实滚轮跑)的最长等待(毫秒)。
 /// 不能太长:点搜索常触发页面跳转 → RPA 脚本上下文被销毁、done() 回不来,死等就会白卡到超时
@@ -387,6 +517,21 @@ const REPLAY_SETTLE_MS: u64 = 1500;
 /// 详情补取:导航详情页并注入 session 后,等详情/feed 接口响应到达的额外等待(毫秒)。
 /// 详情接口随首屏发出,NAV_SETTLE 后多等一会确保响应入会话缓冲再取走。
 const DETAIL_FETCH_WAIT_MS: u64 = 3500;
+
+/// 定向采集:导航内容链接后等详情接口响应的最长等待(毫秒)。
+/// 命中拦截特征即提前走(先到即走);超时兜底仍取走已拦截响应,交给解析层尽力解析。
+const DIRECT_DETAIL_WAIT_MS: u64 = 15_000;
+
+/// 定向主页采集:滚动加载作品分页的最大轮数(兜底上限,防作品极多的作者无限滚动)。
+/// 每轮约触发一页(抖音 ~18 条),还要预留接口在途时的空转轮;真正的收尾靠
+/// 「接口 has_more=0 / 长停滞」判定,此上限只防死循环,不能成为漏采来源。
+const PROFILE_POSTS_MAX_ROUNDS: u32 = 400;
+/// 定向主页采集:每轮滚动后的等待(毫秒),等分页接口返回再判增长。
+const PROFILE_POSTS_ROUND_MS: u64 = 2200;
+/// 定向主页采集:接口明确还有下一页(has_more=1)但响应停滞时的容忍轮数。
+/// 快速翻页下抖音常风控延迟/停发几秒,只按 STAGNANT_STOP(≈6.6s)收尾会误判到底、
+/// 漏掉后面所有页;给 ~18s 容忍,仍不增长才放弃。
+const PROFILE_POSTS_STALL_STOP: u32 = 8;
 
 /// WebView 窗口标签拼装规则。统一前缀便于在 Tauri 端区分管理类窗口。
 pub(crate) fn window_label(platform: &str, account_id: &str) -> String {
@@ -528,7 +673,16 @@ mod win_wheel {
     }
 
     /// 给 `parent`(Tauri 窗口)下的 WebView2 渲染子窗口投递一次滚轮。notches 负值下滚。
+    /// 落点取窗口中心(适配整页滚动 / 评论在下方的布局)。
     pub fn real_wheel(parent: HWND, notches: i32) -> Result<()> {
+        real_wheel_at(parent, notches, 0.5, 0.5)
+    }
+
+    /// 在窗口矩形的指定比例位置(fx/fy ∈ [0,1])投递一次滚轮。
+    /// Chromium 按 WM_MOUSEWHEEL 的 lParam 坐标做命中测试路由滚动目标:
+    /// 落点在哪个可滚容器上就滚哪个——评论采集用右侧落点驱动
+    /// 「评论在右侧面板」布局的内部滚动容器(整页滚动对其无效)。
+    pub fn real_wheel_at(parent: HWND, notches: i32, fx: f32, fy: f32) -> Result<()> {
         let mut target: Option<HWND> = None;
         unsafe {
             let _ = EnumChildWindows(
@@ -540,14 +694,14 @@ mod win_wheel {
         // 找不到渲染子窗口时退回父窗口
         let hwnd = target.unwrap_or(parent);
 
-        // WM_MOUSEWHEEL 的 lParam 用屏幕坐标的鼠标位置,取目标窗口中心
+        // WM_MOUSEWHEEL 的 lParam 用屏幕坐标的鼠标位置,按比例取窗口内落点
         let mut rect = RECT::default();
         unsafe {
             GetWindowRect(hwnd, &mut rect)
                 .map_err(|e| CrawlerError::Config(format!("GetWindowRect 失败: {e}")))?;
         }
-        let x = ((rect.left + rect.right) / 2) & 0xFFFF;
-        let y = (rect.top + rect.bottom) / 2;
+        let x = (rect.left + ((rect.right - rect.left) as f32 * fx) as i32) & 0xFFFF;
+        let y = rect.top + ((rect.bottom - rect.top) as f32 * fy) as i32;
         let lparam = LPARAM(((y << 16) | x) as isize);
 
         // wParam 高 16 位 = 有符号滚轮位移(负=下滚),低 16 位 = 按键状态(0)
@@ -642,8 +796,10 @@ impl WebviewPool {
         // 「采集窗口关了之后再采就打不开」。复用时弹到前台,避免藏在后台像没触发。
         if let Some(existing) = app.get_webview_window(&label) {
             self.remember(&label, existing.clone())?;
+            // 复用时刷新标题:标题只在创建时设置,不更新会一直显示上一任务名
+            let _ = existing.set_title(spec.title);
             bring_to_front(&existing);
-            self.ensure_intercept(&label, existing.as_ref(), spec.patterns, None);
+            self.ensure_intercept(&label, existing.as_ref(), spec.patterns, None, !spec.with_hud);
             return Ok(existing);
         }
         // 走到这:窗口从未创建,或上次采集后已被关闭。清掉可能残留的失效句柄与拦截缓冲,
@@ -706,7 +862,8 @@ impl WebviewPool {
             .map_err(|e| CrawlerError::Config(format!("创建 WebView 失败: {e}")))?;
 
         self.remember(&label, window.clone())?;
-        self.ensure_intercept(&label, window.as_ref(), spec.patterns, None);
+        // 采集窗口(with_hud)缓冲不限长;登录/访问平台窗口长期开着,限长防内存膨胀
+        self.ensure_intercept(&label, window.as_ref(), spec.patterns, None, !spec.with_hud);
         // 采集窗口挂关闭监听:用户手动关闭窗口 → 记下该 label,采集主循环据此终止任务,
         // 而非为后续关键词 / 评论重建新窗口继续采集。仅采集窗口(with_hud)需要。
         if spec.with_hud {
@@ -750,23 +907,30 @@ impl WebviewPool {
 
     /// 给 webview 确保装了原生响应拦截器(同 label 只装一次),返回其缓冲。
     /// `emit` 为 Some 时(浏览器 Agent)命中响应额外实时推前端;采集传 None。
+    /// `cap_entries` 为 true 时缓冲限长(非采集窗口:登录/访问平台长期开着,防内存线性膨胀);
+    /// 采集窗口传 false(滚动循环按游标增量消费,丢条目会漏解析)。
     fn ensure_intercept(
         &self,
         label: &str,
         webview: &Webview,
         patterns: &[String],
         emit: Option<native_intercept::EmitCtx>,
+        cap_entries: bool,
     ) -> ResponseSink {
-        if let Ok(map) = self.sinks.lock() {
+        // 先用单次持锁完成 check-then-insert,防止并发双装竞态(两次调用各拿到
+        // None → 各装一个拦截器 → 后装的 sink 覆盖先装的,先装那个成无人消费的孤儿)
+        if let Ok(mut map) = self.sinks.lock() {
             if let Some(sink) = map.get(label) {
                 return sink.clone();
             }
-        }
-        let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
-        native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit);
-        if let Ok(mut map) = self.sinks.lock() {
+            let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
+            native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries);
             map.insert(label.to_string(), sink.clone());
+            return sink;
         }
+        // 锁异常时降级:直接装但不记录(下次调用再试)
+        let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
+        native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries);
         sink
     }
 
@@ -923,7 +1087,7 @@ impl WebviewPool {
             if let Ok(mut m) = self.agent_webviews.lock() {
                 m.insert(label.clone(), existing.clone());
             }
-            self.ensure_intercept(&label, &existing, &[], Some(emit));
+            self.ensure_intercept(&label, &existing, &[], Some(emit), true);
             return Ok(existing);
         }
         // 走到这:从未建过或已被移除。清掉可能残留的失效拦截缓冲,确保下面重装拦截。
@@ -956,7 +1120,7 @@ impl WebviewPool {
             .map_err(|e| CrawlerError::Config(format!("内嵌浏览器 Agent webview 失败: {e}")))?;
         // 先藏起来,等前端定位后再显示(避免初始 (0,0) 盖住左栏对话)
         let _ = webview.hide();
-        self.ensure_intercept(&label, &webview, &[], Some(emit));
+        self.ensure_intercept(&label, &webview, &[], Some(emit), true);
         if let Ok(mut m) = self.agent_webviews.lock() {
             m.insert(label.clone(), webview.clone());
         }
@@ -1133,8 +1297,6 @@ pub struct CollectRequest<'a> {
     /// 黑名单作者 uid 集合(owner+platform 维度):命中的内容直接排除——不计目标数、不增量发出、不落库。
     /// None=不过滤。
     pub blacklisted_uids: Option<&'a std::collections::HashSet<String>>,
-    /// 视觉模型配置:用于自动完成滑块验证码。None=不尝试自动滑块。
-    pub vision_provider: Option<super::slider::VisionProvider>,
 }
 
 /// 一次「单视频评论采集」调用的参数。集中成结构体以遵守「参数 ≤ 4」。
@@ -1187,6 +1349,38 @@ pub struct ProfileCollectRequest<'a> {
     pub task_id: Option<&'a str>,
     /// 平台适配器:把主页拦截到的画像接口响应解析为 Author。
     pub adapter: Arc<dyn PlatformAdapter>,
+}
+
+/// 一次「定向采集」调用的参数:直接打开内容链接抓详情,不走关键词搜索。
+pub struct DirectCollectRequest<'a> {
+    pub account_id: &'a str,
+    /// 内容链接(如 https://www.douyin.com/video/{id}),采集窗口直接导航到它。
+    pub url: &'a str,
+    /// 任务名称:作为采集窗口标题(平台名称 - 任务名称)。
+    pub task_name: &'a str,
+    /// 平台配置:提供登录页(开窗落点)与拦截特征。
+    pub platform_cfg: &'a PlatformConfig,
+    /// 所属任务 id;Some 时采集日志经事件推给前端面板。
+    pub task_id: Option<&'a str>,
+    /// 详情接口 URL 特征(如抖音 /aweme/v1/web/aweme/detail/):拦截命中即视为详情已回,
+    /// 提前结束等待;None(平台未声明)时退回固定等待 DETAIL_FETCH_WAIT_MS。
+    pub detail_pattern: Option<&'a str>,
+}
+
+/// 一次「主页链接定向采集」调用的参数:打开作者主页,滚动抓取其全部作品。
+pub struct ProfilePostsCollectRequest<'a> {
+    pub account_id: &'a str,
+    /// 作者主页链接(如 https://www.douyin.com/user/{sec_uid}),采集窗口直接导航到它。
+    pub url: &'a str,
+    /// 任务名称:作为采集窗口标题(平台名称 - 任务名称)。
+    pub task_name: &'a str,
+    /// 平台配置:提供登录页(开窗落点)与拦截特征。
+    pub platform_cfg: &'a PlatformConfig,
+    /// 所属任务 id;Some 时采集日志经事件推给前端面板。
+    pub task_id: Option<&'a str>,
+    /// 作品列表接口 URL 特征(如抖音 /aweme/v1/web/aweme/post/):拦截命中即首屏已回,
+    /// 滚动加载时据响应数增长判到底;None 时退回固定等待。
+    pub posts_pattern: Option<&'a str>,
 }
 
 impl CollectBridge {
@@ -1299,6 +1493,40 @@ impl CollectBridge {
         responses
     }
 
+    /// 最新一条作品列表响应的 has_more:Some(true)=接口明确还有下一页,
+    /// Some(false)=接口明确到底,None=未拦到该接口 / 响应不可解析(调用方退回按停滞轮判定)。
+    /// 会话通道与原生拦截缓冲都查(两路拦截并存),取各自最后一条命中里较可信的即可——
+    /// 同一路翻页响应时序一致,任一路的最新值都能代表当前分页状态。
+    fn latest_posts_has_more(
+        &self,
+        sink: Option<&Arc<Mutex<Vec<InterceptedResponse>>>>,
+        session_id: u64,
+        posts_pattern: Option<&str>,
+    ) -> Option<bool> {
+        let pattern = posts_pattern?;
+        let parse = |body: &str| -> Option<bool> {
+            let root: serde_json::Value = serde_json::from_str(body).ok()?;
+            let v = root.get("has_more")?;
+            // 兼容 bool / 数字(1/0) 两种形态
+            v.as_bool().or_else(|| v.as_i64().map(|n| n != 0))
+        };
+        if let Some(b) = self
+            .channel
+            .find_session_body_rev(session_id, pattern)
+            .and_then(|body| parse(&body))
+        {
+            return Some(b);
+        }
+        sink.and_then(|s| {
+            s.lock().ok().and_then(|buf| {
+                buf.iter()
+                    .rev()
+                    .find(|r| r.url.contains(pattern))
+                    .and_then(|r| parse(&r.body))
+            })
+        })
+    }
+
     /// 用关键词在某账号的 WebView 内执行一次 RPA 采集,返回拦截到的接口响应集合。
     ///
     /// 流程:复用登录态窗口 → 导航到搜索结果页 → 注入会话 ID 并回放首屏缓冲 →
@@ -1348,7 +1576,6 @@ impl CollectBridge {
                 req.min_likes,
                 req.blacklisted_uids,
                 req.extra_filters,
-                req.vision_provider.as_ref(),
             )
             .await
         } else {
@@ -1425,6 +1652,297 @@ impl CollectBridge {
         }
     }
 
+    /// 定向采集:在某账号的 WebView 内直接导航到内容链接,等详情接口响应后取走拦截结果。
+    ///
+    /// 与 `collect`(关键词搜索)的区别:不拼搜索模板、不跑 RPA、不滚动——链接直达详情页,
+    /// 详情接口(如抖音 /aweme/v1/web/aweme/detail/)随首屏发出,拦到即收尾。
+    /// 返回 `CollectOutcome` 与 `collect` 同语义:失败/停止也带回已拦截响应,由调用方兜底解析落库。
+    pub async fn collect_direct(
+        &self,
+        app: &AppHandle,
+        req: DirectCollectRequest<'_>,
+    ) -> CollectOutcome {
+        let cfg = req.platform_cfg;
+        // 开窗/开会话失败:此时尚无任何响应,直接带空响应 + 错误返回
+        let (window, session_id, sink) = match self.setup_collect_session(
+            app,
+            cfg,
+            req.account_id,
+            req.task_name,
+            req.task_id,
+            req.url,
+        ) {
+            Ok(v) => v,
+            Err(e) => return CollectOutcome::failed(e),
+        };
+
+        let _ = window.eval(build_hud_status_eval(
+            &format!("定向采集中:{}", req.url),
+            true,
+        ));
+        self.log_step(
+            app,
+            &window,
+            req.task_id,
+            "info",
+            &format!("启动定向采集 · 平台 {} · 链接 {}", cfg.name, req.url),
+        );
+
+        // 导航 → 注 session 回放首屏 → 等详情接口;结果存住不早退(同 collect:无论成败都要
+        // 取走会话并清停止标志,否则关窗等异常路径会让会话缓冲与标志残留)。
+        let run_result: Result<()> = async {
+            window
+                .eval(crate::webview::build_navigate_eval(req.url))
+                .map_err(|e| CrawlerError::Config(format!("导航内容链接失败: {e}")))?;
+            // 等详情接口响应(sink 原生拦截不依赖会话,导航后即收):拦到即走,快网秒回;
+            // 未声明特征(或超时)退回固定等待兜底。随后注入会话回放页内缓冲。
+            let hit = match req.detail_pattern {
+                Some(pattern) => {
+                    wait_nav_response(
+                        &window,
+                        sink.as_ref(),
+                        Some(pattern),
+                        DIRECT_DETAIL_WAIT_MS,
+                        NAV_SETTLE_MS,
+                    )
+                    .await
+                }
+                None => {
+                    tokio::time::sleep(Duration::from_millis(DETAIL_FETCH_WAIT_MS)).await;
+                    false
+                }
+            };
+            let _ = window.eval(build_set_session_eval(session_id));
+            let _ = window.eval(build_hud_log_eval(
+                "info",
+                if hit {
+                    "✅ 已拦到详情接口 · 整理入库中"
+                } else {
+                    "⚠️ 未拦到详情接口(超时)· 仍尝试解析已拦截响应"
+                },
+            ));
+            Ok(())
+        }
+        .await;
+
+        let responses = self.take_collected_responses(session_id, sink.as_ref());
+        // 停止判定与 collect 一致:关窗(句柄消失 / Destroyed 标记)→ WindowClosed;
+        // HUD 结束 / 任务级停止 → UserEnded。必须在 clear 之前读 is_stopping。
+        let label = window_label(&cfg.id, req.account_id);
+        let task_stopping = req
+            .task_id
+            .map(|t| self.control.is_task_stopping(t))
+            .unwrap_or(false);
+        let stop = if app.get_webview_window(&label).is_none() || self.pool.is_user_closed(&label)
+        {
+            Some(CollectStop::WindowClosed)
+        } else if self.control.is_stopping(session_id) || task_stopping {
+            Some(CollectStop::UserEnded)
+        } else {
+            None
+        };
+        // 清理本会话的停止标志,避免 session_id 复用时误判(成败都要清)
+        self.control.clear(session_id);
+        if let Err(e) = run_result {
+            let _ = window.eval(build_hud_status_eval_state(
+                &format!("定向采集异常结束:{}", req.url),
+                false,
+                "error",
+            ));
+            return CollectOutcome {
+                responses,
+                error: Some(e),
+                stop,
+            };
+        }
+        let was_stopped = matches!(stop, Some(CollectStop::UserEnded));
+        let _ = window.eval(build_hud_status_eval(
+            &format!(
+                "{}:{}",
+                if was_stopped { "已手动结束" } else { "本轮完成" },
+                req.url
+            ),
+            false,
+        ));
+        CollectOutcome {
+            responses,
+            error: None,
+            stop,
+        }
+    }
+
+    /// 定向采集「主页链接」:在某账号的 WebView 内导航到作者主页,滚动加载作品分页,
+    /// 直到「连续多轮无新响应(到底)/ 手动停 / 关窗 / 达轮数上限」后取走全部拦截响应。
+    ///
+    /// 与 `collect_direct`(单条内容链接)的区别:主页作品靠滚动分页加载,需要滚动循环;
+    /// 列表接口(如抖音 /aweme/v1/web/aweme/post/)随首屏与每轮滚动发出。
+    /// 返回 `CollectOutcome` 语义同上:停止/异常也带回已拦截响应,由调用方解析落库。
+    pub async fn collect_profile_posts(
+        &self,
+        app: &AppHandle,
+        req: ProfilePostsCollectRequest<'_>,
+    ) -> CollectOutcome {
+        let cfg = req.platform_cfg;
+        let (window, session_id, sink) = match self.setup_collect_session(
+            app,
+            cfg,
+            req.account_id,
+            req.task_name,
+            req.task_id,
+            req.url,
+        ) {
+            Ok(v) => v,
+            Err(e) => return CollectOutcome::failed(e),
+        };
+
+        let _ = window.eval(build_hud_status_eval(
+            &format!("主页采集中:{}", req.url),
+            true,
+        ));
+        self.log_step(
+            app,
+            &window,
+            req.task_id,
+            "info",
+            &format!("启动主页采集 · 平台 {} · 链接 {}", cfg.name, req.url),
+        );
+
+        // 导航 → 注 session 回放首屏 → 等列表接口 → 滚动加载直到到底;结果存住不早退
+        // (同 collect:无论成败都要取走会话并清停止标志,防缓冲与标志残留)。
+        let run_result: Result<()> = async {
+            window
+                .eval(crate::webview::build_navigate_eval(req.url))
+                .map_err(|e| CrawlerError::Config(format!("导航作者主页失败: {e}")))?;
+            // 等作品列表接口响应(sink 原生拦截不依赖会话):拦到即开始滚动,快网秒回;
+            // 未声明特征(或超时)退回固定等待兜底。随后注入会话回放页内缓冲。
+            let hit = match req.posts_pattern {
+                Some(pattern) => {
+                    wait_nav_response(
+                        &window,
+                        sink.as_ref(),
+                        Some(pattern),
+                        DIRECT_DETAIL_WAIT_MS,
+                        NAV_SETTLE_MS,
+                    )
+                    .await
+                }
+                None => {
+                    tokio::time::sleep(Duration::from_millis(DETAIL_FETCH_WAIT_MS)).await;
+                    false
+                }
+            };
+            let _ = window.eval(build_set_session_eval(session_id));
+            if !hit {
+                let _ = window.eval(build_hud_log_eval(
+                    "info",
+                    "⚠️ 未拦到作品列表接口(超时)· 仍尝试滚动加载",
+                ));
+            }
+            // 滚动加载分页:按「拦截缓冲 + 会话通道的响应总数是否增长」判停滞;
+            // 结合最新一页作品接口的 has_more 区分「真到底」与「风控/慢响应停滞」——
+            // 接口明确 has_more=0 立即收尾;has_more=1 但响应停滞给更长容忍,防漏采。
+            let mut last_len = 0usize;
+            let mut stagnant = 0u32;
+            for _round in 0..PROFILE_POSTS_MAX_ROUNDS {
+                if self.control.is_stopping(session_id) || collect_window_gone(&window) {
+                    break;
+                }
+                let _ = window.eval(build_scroll_eval());
+                #[cfg(windows)]
+                if let Ok(parent) = window.hwnd() {
+                    let _ = win_wheel::real_wheel(parent, -2);
+                }
+                #[cfg(not(windows))]
+                let _ = window.eval(&crate::webview::build_wheel_eval());
+                tokio::time::sleep(Duration::from_millis(PROFILE_POSTS_ROUND_MS)).await;
+                let len = sink
+                    .as_ref()
+                    .and_then(|s| s.lock().ok().map(|b| b.len()))
+                    .unwrap_or(0)
+                    + self.channel.session_len(session_id);
+                if len > last_len {
+                    last_len = len;
+                    stagnant = 0;
+                    // 接口明确到底(has_more=0):不必再等停滞轮,直接收尾
+                    if self.latest_posts_has_more(sink.as_ref(), session_id, req.posts_pattern)
+                        == Some(false)
+                    {
+                        let _ = window.eval(build_hud_log_eval(
+                            "info",
+                            "✅ 作品接口返回已到底 · 结束滚动",
+                        ));
+                        break;
+                    }
+                } else {
+                    stagnant += 1;
+                    // has_more=1(或接口信息缺失)时按长停滞容忍收尾;明确无 has_more 信息
+                    // 的兜底场景退回原口径(STAGNANT_STOP 轮无增长即停)
+                    let limit = match self.latest_posts_has_more(
+                        sink.as_ref(),
+                        session_id,
+                        req.posts_pattern,
+                    ) {
+                        Some(true) => PROFILE_POSTS_STALL_STOP,
+                        Some(false) => STAGNANT_STOP,
+                        None => STAGNANT_STOP,
+                    };
+                    if stagnant >= limit {
+                        let _ = window.eval(build_hud_log_eval(
+                            "info",
+                            "✅ 连续多轮无新作品 · 已到底 · 结束滚动",
+                        ));
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let responses = self.take_collected_responses(session_id, sink.as_ref());
+        // 停止判定与 collect 一致(必须在 clear 之前读 is_stopping)
+        let label = window_label(&cfg.id, req.account_id);
+        let task_stopping = req
+            .task_id
+            .map(|t| self.control.is_task_stopping(t))
+            .unwrap_or(false);
+        let stop = if app.get_webview_window(&label).is_none() || self.pool.is_user_closed(&label)
+        {
+            Some(CollectStop::WindowClosed)
+        } else if self.control.is_stopping(session_id) || task_stopping {
+            Some(CollectStop::UserEnded)
+        } else {
+            None
+        };
+        self.control.clear(session_id);
+        if let Err(e) = run_result {
+            let _ = window.eval(build_hud_status_eval_state(
+                &format!("主页采集异常结束:{}", req.url),
+                false,
+                "error",
+            ));
+            return CollectOutcome {
+                responses,
+                error: Some(e),
+                stop,
+            };
+        }
+        let was_stopped = matches!(stop, Some(CollectStop::UserEnded));
+        let _ = window.eval(build_hud_status_eval(
+            &format!(
+                "{}:{}",
+                if was_stopped { "已手动结束" } else { "本轮完成" },
+                req.url
+            ),
+            false,
+        ));
+        CollectOutcome {
+            responses,
+            error: None,
+            stop,
+        }
+    }
+
     /// 记一条采集日志:更新窗口 HUD,并在有 task 上下文时推送前端事件(双端共用一条)。
     fn log_step(
         &self,
@@ -1454,63 +1972,10 @@ impl CollectBridge {
         verify_eval: &str,
         verify_url_patterns: &[String],
         platform_id: &str,
-        vision_provider: Option<&super::slider::VisionProvider>,
     ) -> bool {
         // 进入验证模式:隐藏 HUD 浮层,避免遮挡验证码弹窗
-        tracing::info!(
-            "进入验证等待 session={session_id} platform={platform_id} 有视觉模型={}",
-            vision_provider.is_some()
-        );
+        tracing::info!("进入验证等待 session={session_id} platform={platform_id}");
         let _ = window.eval("var h=document.getElementById('veltrix-hud');if(h)h.style.display='none';");
-
-        // 自动滑块:仅抖音/TikTok 平台尝试,失败无害(回退手动)。
-        // 截图 → 视觉模型算目标位置 → enigo 真实鼠标拖拽;最多 N 次,每次失败刷新换图再试。
-        if platform_id == "douyin" || platform_id == "tiktok" {
-            if let Some(vp) = vision_provider {
-                for attempt in 1..=AUTO_SLIDE_MAX_ATTEMPTS {
-                    let _ = window.eval(build_hud_log_eval(
-                        "info",
-                        &format!(
-                            "AI 自动识别滑块中…(第 {attempt}/{AUTO_SLIDE_MAX_ATTEMPTS} 次 · 模型 {})",
-                            vp.model
-                        ),
-                    ));
-                    if super::slider::try_auto_solve(window, vp).await {
-                        // 拖完等 3s,再重注自检脚本回传最新验证态
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        if !verify_eval.is_empty() {
-                            let _ = window.eval(verify_eval);
-                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                        }
-                        if !self.control.is_verifying(session_id) {
-                            let _ = window
-                                .eval(build_hud_log_eval("info", "自动滑块验证成功 · 恢复采集"));
-                            let _ = window.eval("var h=document.getElementById('veltrix-hud');if(h)h.style.display='flex';");
-                            let _ = window.eval(build_hud_status_eval("采集中(已恢复)", true));
-                            return true;
-                        }
-                    }
-                    // 本次未过:还有机会就刷新换一张验证图再试
-                    if attempt < AUTO_SLIDE_MAX_ATTEMPTS {
-                        let _ = window
-                            .eval(build_hud_log_eval("warn", "本次未通过 · 刷新验证码重试"));
-                        let _ = window.eval(super::slider::CAPTCHA_REFRESH_JS);
-                        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
-                    }
-                }
-                let _ = window.eval(build_hud_log_eval(
-                    "warn",
-                    "自动滑块多次未成功 · 切换为手动验证",
-                ));
-            } else {
-                // 没配视觉模型 → 自动滑块无从谈起,明确告知用户怎么开启(HUD 恢复后可见)
-                tracing::info!("自动滑块:providers 表无 vision 能力模型,跳过自动,等待手动");
-                let _ = window.eval(build_hud_log_eval(
-                    "warn",
-                    "未配置视觉模型 · 自动滑块未启用 · 请手动完成;到「系统设置→模型厂商」给支持图片的模型勾选「图片」能力即可开启自动",
-                ));
-            }
-        }
 
         let _ = window.eval(build_hud_status_eval_state(
             "⚠ 等待手动完成安全验证…",
@@ -1600,7 +2065,6 @@ impl CollectBridge {
         blacklisted_uids: Option<&HashSet<String>>,
         // 平台专属额外筛选的待点击文案(抖音视频时长/搜索范围/内容形式),展开筛选浮层后逐个点击
         extra_filters: &[String],
-        vision_provider: Option<&super::slider::VisionProvider>,
     ) -> Result<()> {
         // 导航到搜索结果页;新页面会重挂 hook,session 未就绪期间命中响应进页内缓冲
         let search_template = &cfg.collect.search_url_template;
@@ -1630,8 +2094,17 @@ impl CollectBridge {
             .eval(build_search_eval(search_template, keyword, &extra_query))
             .map_err(|e| CrawlerError::Config(format!("导航搜索页失败: {e}")))?;
 
-        // 等导航与 hook 就绪后注入会话 ID,触发首屏缓冲回放
-        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+        // 等页面开始产出拦截响应再注入会话:快网秒回,弱网在 NAV_RESPONSE_WAIT_MS 内不误判;
+        // 仍收不到(页面无响应 / 风控拦死)时按旧行为继续,交给下方停滞判定兜底结束。
+        let nav_ready = wait_nav_response(window, sink, None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS).await;
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            if nav_ready {
+                "🌐 搜索结果已开始返回 · 注入采集会话"
+            } else {
+                "⏳ 未拦到搜索响应(超时)· 按原流程继续"
+            },
+        ));
         window
             .eval(build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
@@ -1686,6 +2159,29 @@ impl CollectBridge {
             ));
             // 网络静默后再给框架少量渲染缓冲,确保选项已可点
             tokio::time::sleep(Duration::from_millis(400)).await;
+            // 面板型平台(抖音/小红书):网络静默 ≠ 渲染/水合完成,再轮询「筛选」入口按钮
+            // 真的出现后才开始点(等结果超时的路径尤其需要);超时未出现也继续,由点选告警暴露
+            let panel_lbls = filter_panel_labels(&cfg.id);
+            if !panel_lbls.is_empty() {
+                let start = std::time::Instant::now();
+                let mut entry_ready = false;
+                while start.elapsed().as_millis() as u64 <= FILTER_ENTRY_READY_TIMEOUT_MS {
+                    if crate::webview::filter_locate::locate_by_labels_quiet(window, &panel_lbls)
+                        .await
+                        .is_some()
+                    {
+                        entry_ready = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(FILTER_PANEL_POLL_MS)).await;
+                }
+                if !entry_ready {
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        "⚠️ 未等到「筛选」入口出现 · 仍尝试应用筛选(可能文案不符/页面异常)",
+                    ));
+                }
+            }
         }
         apply_sort_time(window, &cfg.id, eff_sort, eff_time, extra_filters).await;
 
@@ -1713,6 +2209,10 @@ impl CollectBridge {
             },
         ));
 
+        // 增量解析游标:两个缓冲(原生 sink / invoke 通道)会话内只追加(清空都在进循环前),
+        // 每轮只克隆并解析游标之后新到的响应;seen 跨轮累计去重,增量口径与整份重解析等价
+        let mut sink_cursor: usize = 0;
+        let mut channel_cursor: usize = 0;
         let mut round: u32 = 0;
         loop {
             round += 1;
@@ -1734,7 +2234,6 @@ impl CollectBridge {
                         &verify_eval,
                         &cfg.collect.verify_url_patterns,
                         &cfg.id,
-                        vision_provider,
                     )
                     .await
                 {
@@ -1798,17 +2297,27 @@ impl CollectBridge {
                 continue;
             }
 
-            // 解析当前已拦截的累计响应,统计去重后的内容数(只为判断进度,不落库)
+            // 解析本轮新到的响应,统计去重后的内容数(只为判断进度,不落库)。
+            // 此前每轮整份 clone 累计缓冲再从头重解析,随轮数增长成 O(n²) 热点,改为游标增量。
             // 原生拦截缓冲(sink)为主,并入 invoke 通道(channel)已收的本会话数据:
             // 使智能停止不依赖单一通道——mac 原生路径异常时仍能据 channel 计数,
             // 不会因 sink 空而误判「无数据」跑满 NO_RESPONSE_STOP。后续 adapter 按 id 去重。
             let mut snapshot = sink
-                .and_then(|s| s.lock().ok().map(|buf| buf.clone()))
+                .and_then(|s| {
+                    s.lock().ok().map(|buf| {
+                        let fresh = buf.get(sink_cursor..).map(<[_]>::to_vec).unwrap_or_default();
+                        sink_cursor = buf.len();
+                        fresh
+                    })
+                })
                 .unwrap_or_default();
-            snapshot.extend(self.channel.peek_session(session_id));
-            let _resp_count = snapshot.len();
+            let (channel_fresh, channel_total) =
+                self.channel.peek_session_from(session_id, channel_cursor);
+            channel_cursor = channel_total;
+            snapshot.extend(channel_fresh);
             // 响应侧风控检测:拦截到的接口 URL 命中验证特征(覆盖整页跳转到验证中心、DOM 选择器
             // 抓不到的场景)→ 置验证态,下一轮顶部即暂停;清除交给注入脚本(回正常页报 present=false)。
+            // 只查增量还捎带修了旧行为的隐患:验证清除后,老响应里的验证 URL 不会再被重复命中而误重挂验证态。
             if !self.control.is_verifying(session_id)
                 && response_hits_verify(&snapshot, &cfg.collect.verify_url_patterns)
             {
@@ -2008,9 +2517,18 @@ impl CollectBridge {
             let _ = window.eval(crate::webview::build_search_eval(search_url_template, keyword, ""));
         }
         // 窗口可能刚创建 / 刚导航,页面仍在加载;此时 eval 的脚本会随导航被清除 = 等于没注入,
-        // 表现为不打字也不滚动。故先等加载稳定再注入;复用的已加载窗口多等片刻无害,
-        // RPA 首步 waitFor 仍会兜底轮询。
-        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+        // 表现为不打字也不滚动。故先等加载稳定再注入。判断标准从「固定睡 2.5s」改为
+        // 「页面已开始产出拦截响应」:有响应说明新页面上下文已运行、hook 已挂,此时注入的
+        // RPA 脚本不会被随后到达的导航清除;无响应时退回固定等待,RPA 首步 waitFor 仍会兜底轮询。
+        let nav_ready = wait_nav_response(window, sink, None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS).await;
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            if nav_ready {
+                "🌐 页面已开始响应 · 注入拟人 RPA"
+            } else {
+                "⏳ 页面暂未响应 · 按固定等待继续"
+            },
+        ));
 
         // 滚动从 JS 步骤中分离:输入/搜索/等待由 JS 拟人执行,滚动由 Rust 用真实滚轮
         // (WM_MOUSEWHEEL)驱动——小红书靠真实滚轮事件触发懒加载,程序 scrollBy 无效。
@@ -2246,18 +2764,28 @@ impl CollectBridge {
         }
         let (window, session_id, sink) = self.setup_collect_session(app, cfg, req.account_id, "", None, "")?;
         // 导航详情页:新页面重挂 hook,session 未就绪期间命中的详情响应进页内缓冲
-        window
+        // 结果先存住不早退:与 collect_comments 同理,导航失败也必须取走会话并清停止标志,
+        // 否则 open_session 开的拦截会话条目会泄漏在 InterceptChannel.sessions 里
+        let nav_result = window
             .eval(build_detail_eval(
                 &cfg.collect.detail_url_template,
                 req.content_id,
                 req.xsec_token,
             ))
-            .map_err(|e| CrawlerError::Config(format!("导航详情页失败: {e}")))?;
-        // 等导航与 hook 就绪后注入会话 ID,回放首屏(含详情接口响应)缓冲
-        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+            .map_err(|e| CrawlerError::Config(format!("导航详情页失败: {e}")));
+        if let Err(e) = nav_result {
+            let _ = self.take_collected_responses(session_id, sink.as_ref());
+            self.control.clear(session_id);
+            return Err(e);
+        }
+        // 等页面开始产出拦截响应再注入会话(快网秒回);随后等网络静默收齐首屏详情响应
+        // (最多 DETAIL_FETCH_WAIT_MS),兼顾快网提速与慢网完整。
+        let nav_ready =
+            wait_nav_response(&window, sink.as_ref(), None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS)
+                .await;
+        tracing::debug!(nav_ready, "详情补取:导航后等首屏响应");
         let _ = window.eval(build_set_session_eval(session_id));
-        // 详情接口随首屏发出,多等一会确保响应入会话缓冲
-        tokio::time::sleep(Duration::from_millis(DETAIL_FETCH_WAIT_MS)).await;
+        let _ = wait_network_idle(&window, sink.as_ref(), 800, DETAIL_FETCH_WAIT_MS).await;
 
         let responses = self.take_collected_responses(session_id, sink.as_ref());
         self.control.clear(session_id);
@@ -2287,8 +2815,18 @@ impl CollectBridge {
             ))
             .map_err(|e| CrawlerError::Config(format!("导航详情页失败: {e}")))?;
 
-        // 等导航与 hook 就绪后注入会话 ID,触发首屏(含首屏评论)缓冲回放
-        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+        // 等页面开始产出拦截响应再注入会话:详情/评论接口随首屏发出,快网秒回;
+        // 弱网在 NAV_RESPONSE_WAIT_MS 内不误判,超时后按旧行为继续。
+        let nav_ready =
+            wait_nav_response(window, sink, None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS).await;
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            if nav_ready {
+                "🌐 详情页已开始响应 · 注入评论会话"
+            } else {
+                "⏳ 详情页未响应(超时)· 按原流程继续"
+            },
+        ));
         window
             .eval(build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
@@ -2301,6 +2839,44 @@ impl CollectBridge {
         );
         if !verify_eval.is_empty() {
             let _ = window.eval(&verify_eval);
+        }
+
+        // 主页模态详情默认可能停在「详情」tab 或评论面板未展开:点「评论」tab(无文案 tab 的沉浸式
+        // 布局兜底点动作栏评论图标)激活评论列表 + 触发 comment/list。慢网络下 modal 渲染慢,
+        // 点一次元素可能还没出来,故带重试:每轮点完等一会,回读到「全部评论」/评论条目出现即停
+        // (面板已开时点击 JS 内部 no-op,重试幂等无副作用)
+        let panel_open_js = r#"(function(){ return { open: document.body.innerText.indexOf('全部评论') !== -1 || !!document.querySelector('[data-e2e="comment-item"]') }; })()"#;
+        // 点击前记录 sink 长度:评论接口一旦有新响应 = 面板已激活并触发分页,比 DOM 回读更稳,
+        // 且不依赖 Windows 专属 eval_json(mac 上同样生效)。
+        let sink_len_before = sink
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|b| b.len()))
+            .unwrap_or(0);
+        let mut panel_opened = false;
+        for _ in 0..6 {
+            let _ = window.eval(crate::webview::build_comment_tab_eval());
+            tokio::time::sleep(Duration::from_millis(COMMENT_TAB_SETTLE_MS)).await;
+            let sink_grew = sink
+                .as_ref()
+                .and_then(|s| s.lock().ok().map(|b| b.len() > sink_len_before))
+                .unwrap_or(false);
+            if sink_grew {
+                panel_opened = true;
+                break;
+            }
+            panel_opened = crate::webview::script_eval::eval_json(window.as_ref(), panel_open_js)
+                .await
+                .map(|s| s.contains("\"open\":true"))
+                .unwrap_or(false);
+            if panel_opened {
+                break;
+            }
+        }
+        if !panel_opened {
+            let _ = window.eval(build_hud_log_eval(
+                "warn",
+                "⚠️ 评论面板未展开(多次尝试未检测到「全部评论」)· 仍将尝试滚动采集",
+            ));
         }
 
         // limit>0 时按量停止,否则按配置固定轮数兜底(评论无目标时不宜无限滚)
@@ -2319,6 +2895,9 @@ impl CollectBridge {
             },
         ));
 
+        // 增量解析游标:同搜索循环,缓冲会话内只追加,每轮只克隆并解析新到的响应
+        let mut sink_cursor: usize = 0;
+        let mut channel_cursor: usize = 0;
         let mut round: u32 = 0;
         loop {
             round += 1;
@@ -2335,7 +2914,6 @@ impl CollectBridge {
                         &verify_eval,
                         &cfg.collect.verify_url_patterns,
                         &cfg.id,
-                        None,
                     )
                     .await
             {
@@ -2345,13 +2923,21 @@ impl CollectBridge {
                 ));
                 break;
             }
-            // 评论区滚动:程序 scrollTo + Windows 真实滚轮兜底。
-            // ⚠️ 抖音详情页评论区多为右侧内部滚动容器,这两种通用滚动未必精准命中,
-            // 需本机抓包/实测后按真实容器选择器调整(与 search/rpa 同属待校准点)。
-            let _ = window.eval(build_scroll_eval());
+            // 评论区滚动,两种布局都要覆盖:
+            // ① 页面侧定向滚动(build_comment_scroll_eval):按评论标记找可滚祖先容器滚到底,
+            //    命中「评论在右侧面板」的内部滚动容器;内含整页 scrollTo 兜底(评论在下方的布局)。
+            // ② Windows 真实滚轮:中心落点(下方布局)+ 右侧落点(右侧面板布局,
+            //    WM_MOUSEWHEEL 按落点路由,落进面板即驱动其内部滚动)。落点比例待真机实测校准。
+            let _ = window.eval(build_comment_scroll_eval());
             #[cfg(windows)]
             if let Ok(parent) = window.hwnd() {
                 let _ = win_wheel::real_wheel(parent, -3);
+                let _ = win_wheel::real_wheel_at(
+                    parent,
+                    -3,
+                    COMMENT_WHEEL_RIGHT_X_RATIO,
+                    COMMENT_WHEEL_RIGHT_Y_RATIO,
+                );
             }
             // 非 Windows(mac 等):合成 WheelEvent 触发评论区懒加载
             #[cfg(not(windows))]
@@ -2384,15 +2970,24 @@ impl CollectBridge {
                 continue;
             }
 
-            // 解析当前累计响应,按去重 comment_id 统计(只为判断何时停,落库另算)
+            // 解析本轮新到的响应,按去重 comment_id 统计(只为判断何时停,落库另算)。
+            // 同搜索循环:游标增量替代整份 clone + 从头重解析(O(n²) 热点)。
             // 原生拦截缓冲(sink)为主,并入 invoke 通道(channel)已收的本会话数据:
             // 使智能停止不依赖单一通道——mac 原生路径异常时仍能据 channel 计数,
             // 不会因 sink 空而误判「无数据」跑满 NO_RESPONSE_STOP。后续 adapter 按 id 去重。
             let mut snapshot = sink
-                .and_then(|s| s.lock().ok().map(|buf| buf.clone()))
+                .and_then(|s| {
+                    s.lock().ok().map(|buf| {
+                        let fresh = buf.get(sink_cursor..).map(<[_]>::to_vec).unwrap_or_default();
+                        sink_cursor = buf.len();
+                        fresh
+                    })
+                })
                 .unwrap_or_default();
-            snapshot.extend(self.channel.peek_session(session_id));
-            let _resp_count = snapshot.len();
+            let (channel_fresh, channel_total) =
+                self.channel.peek_session_from(session_id, channel_cursor);
+            channel_cursor = channel_total;
+            snapshot.extend(channel_fresh);
             // 响应侧风控检测(同搜索路径):评论接口 URL 命中验证特征即置验证态,下一轮顶部暂停
             if !self.control.is_verifying(session_id)
                 && response_hits_verify(&snapshot, &cfg.collect.verify_url_patterns)
@@ -2451,8 +3046,10 @@ impl CollectBridge {
                     &format!("⏳ 评论加载中 · 已等待 {waiting}/{NO_RESPONSE_STOP} 次"),
                 ));
                 if waiting >= NO_RESPONSE_STOP {
+                    // 游标即已消费的响应总数,两者之和 = 会话累计拦截数(与改增量解析前口径一致)
                     tracing::info!(
-                        "评论采集自动结束 session={session_id} 已采={now} 本轮累计拦截响应={_resp_count} 验证中={}",
+                        "评论采集自动结束 session={session_id} 已采={now} 累计拦截响应={} 验证中={}",
+                        sink_cursor + channel_cursor,
                         self.control.is_verifying(session_id)
                     );
                     let _ = window.eval(build_hud_log_eval(
@@ -2553,8 +3150,11 @@ impl CollectBridge {
             ))
             .map_err(|e| CrawlerError::Config(format!("导航作者主页失败: {e}")))?;
 
-        // 等导航与 hook 就绪后注入会话,回放首屏(含画像接口)缓冲
-        tokio::time::sleep(Duration::from_millis(NAV_SETTLE_MS)).await;
+        // 等页面开始产出拦截响应再注入会话(快网秒回),画像接口加载即发、拦到即进入短滚动;
+        // 收不到时退回固定等待,由下方短滚动 + 超时兜底。
+        let nav_ready =
+            wait_nav_response(window, sink, None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS).await;
+        tracing::debug!(nav_ready, "画像补采:导航后等首屏响应");
         window
             .eval(build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;

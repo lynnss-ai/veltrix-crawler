@@ -17,13 +17,26 @@ use veltrix_core::error::Result;
 const PLATFORM_ID: &str = "douyin";
 /// 搜索接口 URL 特征,与平台配置 intercept_patterns 对应。
 const SEARCH_PATH: &str = "/aweme/v1/web/general/search/";
+/// 搜索接口 URL 特征(备选路径),抖音可能走此路径返回结果。
+const SEARCH_PATH_ALT: &str = "/aweme/v1/web/search/item/";
 /// 一级评论接口 URL 特征,与平台配置 intercept_patterns 对应。
 const COMMENT_PATH: &str = "/aweme/v1/web/comment/list/";
 /// 内容详情接口 URL 特征(补取/刷新视频直链用),与平台配置 intercept_patterns 对应。
 const DETAIL_PATH: &str = "/aweme/v1/web/aweme/detail/";
+/// 作者主页视频列表接口 URL 特征(定向采集「主页链接」用),与平台配置 intercept_patterns 对应。
+/// 主页加载与滚动分页都走该接口,响应 `aweme_list` 每项即作品详情(结构同搜索项)。
+const POST_PATH: &str = "/aweme/v1/web/aweme/post/";
 /// 作者主页画像接口 URL 特征(画像补采用),与平台配置 builtin_profile_patterns 对应。
 /// 抖音主页加载时请求该接口返回 `user`(含粉丝/关注/获赞总数/属地)。真实路径需本机抓包核对。
 const PROFILE_PATH: &str = "/aweme/v1/web/user/profile/other/";
+
+/// 从 JSON Value 取字符串值,兼容字符串和数字两种序列化形态(id 字段可能被序列化为 JSON number)。
+fn value_as_string(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::to_string)
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .or_else(|| v.as_f64().map(|n| n.to_string()))
+}
 
 #[derive(Default)]
 pub struct DouyinAdapter;
@@ -35,7 +48,7 @@ impl DouyinAdapter {
 
     /// 把单条 aweme_info 解析为 Content;缺 aweme_id 视为非内容卡(用户卡/相关词),返回 None。
     fn parse_aweme(info: &Value, collected_at: i64) -> Option<Content> {
-        let content_id = info.get("aweme_id").and_then(Value::as_str)?.to_string();
+        let content_id = value_as_string(info.get("aweme_id")?)?;
         if content_id.is_empty() {
             return None;
         }
@@ -246,16 +259,15 @@ impl DouyinAdapter {
 
     /// 把单条评论解析为 Comment;缺 cid 视为无效返回 None。本期只采一级评论,parent_id 恒为 None。
     fn parse_comment(item: &Value, collected_at: i64) -> Option<Comment> {
-        let comment_id = item.get("cid").and_then(Value::as_str)?.to_string();
+        let comment_id = value_as_string(item.get("cid")?)?;
         if comment_id.is_empty() {
             return None;
         }
         // 评论自带所属 aweme_id;缺失时留空,落库仍可按 comment_id 去重
         let content_id = item
             .get("aweme_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .and_then(value_as_string)
+            .unwrap_or_default();
         Some(Comment {
             platform: PLATFORM_ID.to_string(),
             content_id,
@@ -285,7 +297,15 @@ impl DouyinAdapter {
 
         for resp in &ctx.responses {
             // 只认搜索接口;其余命中的接口(如评论)结构不同,跳过不报错
-            if !resp.url.contains(SEARCH_PATH) {
+            let is_search = resp.url.contains(SEARCH_PATH) || resp.url.contains(SEARCH_PATH_ALT);
+            if !is_search {
+                // 非搜索接口命中拦截但无解析分支,打日志便于排查平台改版
+                if resp.url.contains("/aweme/v1/web/") {
+                    tracing::warn!(
+                        url_prefix = %&resp.url[..resp.url.len().min(120)],
+                        "拦截到 aweme 响应但未匹配任何解析分支,可能需更新适配器 URL 常量"
+                    );
+                }
                 continue;
             }
             // 单条脏响应不拖垮整批
@@ -329,9 +349,11 @@ impl DouyinAdapter {
                 continue;
             }
             let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                tracing::warn!(url = %resp.url, "解析画像响应 JSON 失败,可能平台改版");
                 continue;
             };
             let Some(user) = root.get("user") else {
+                tracing::warn!(url = %resp.url, "画像响应缺少 user 字段,可能平台改版");
                 continue;
             };
             // 头像:大图优先,逐级回退
@@ -383,6 +405,7 @@ impl DouyinAdapter {
                 continue;
             }
             let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                tracing::warn!(url = %resp.url, "解析评论响应 JSON 失败,可能平台改版");
                 continue;
             };
             let Some(items) = root.get("comments").and_then(Value::as_array) else {
@@ -402,6 +425,40 @@ impl DouyinAdapter {
         }
     }
 
+    /// 解析作者主页视频列表接口响应为内容列表(定向采集「主页链接」用,comments 恒空)。
+    /// `/aweme/v1/web/aweme/post/` 响应 `aweme_list` 每项本身即作品详情(同搜索 aweme_list 形态),
+    /// 复用 parse_aweme;多个分页响应逐批解析,由调用方按 content_id 去重。
+    fn parse_user_posts(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut contents = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(POST_PATH) {
+                continue;
+            }
+            // 单条脏响应不拖垮整批
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                tracing::warn!(url = %resp.url, "解析主页作品响应 JSON 失败,可能平台改版");
+                continue;
+            };
+            let Some(items) = root.get("aweme_list").and_then(Value::as_array) else {
+                tracing::warn!(url = %resp.url, "主页作品响应缺少 aweme_list,可能平台改版");
+                continue;
+            };
+            for item in items {
+                // aweme_list 每项本身即详情;兼容个别变体的 aweme_info 包裹
+                let info = item.get("aweme_info").unwrap_or(item);
+                if let Some(content) = Self::parse_aweme(info, collected_at) {
+                    contents.push(content);
+                }
+            }
+        }
+        FetchOutput {
+            contents,
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
+
     /// 解析内容详情接口响应为单条内容(供「补取/刷新视频直链」)。详情接口
     /// `/aweme/v1/web/aweme/detail/` 返回 `aweme_detail`(结构同搜索项的 aweme_info),
     /// 复用 parse_aweme 提取,主要为拿到新鲜的 video.play_addr 直链。
@@ -413,6 +470,7 @@ impl DouyinAdapter {
                 continue;
             }
             let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                tracing::warn!(url = %resp.url, "解析详情响应 JSON 失败,可能平台改版");
                 continue;
             };
             // 详情接口把详情包在 aweme_detail;兼容个别变体的 aweme_info 顶层
@@ -444,15 +502,26 @@ impl PlatformAdapter for DouyinAdapter {
                 | TaskKind::Comments
                 | TaskKind::ContentDetail
                 | TaskKind::UserProfile
+                | TaskKind::UserPosts
         )
     }
 
+    fn detail_pattern(&self) -> Option<&str> {
+        Some(DETAIL_PATH)
+    }
+
+    fn posts_pattern(&self) -> Option<&str> {
+        Some(POST_PATH)
+    }
+
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
-        // 按任务类型分流:评论解析一级评论,详情补取解析单条直链,画像补采解析主页 user,其余按搜索内容解析
+        // 按任务类型分流:评论解析一级评论,详情补取解析单条直链,画像补采解析主页 user,
+        // 主页链接定向采集解析作品列表,其余按搜索内容解析
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::ContentDetail => Self::parse_detail(ctx),
             TaskKind::UserProfile => Self::parse_profile(ctx),
+            TaskKind::UserPosts => Self::parse_user_posts(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)

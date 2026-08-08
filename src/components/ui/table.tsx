@@ -4,9 +4,17 @@ import * as React from "react"
 
 import { cn } from "@/lib/utils"
 
-function Table({ className, ...props }: React.ComponentProps<"table">) {
+function Table({
+  className,
+  containerRef,
+  ...props
+}: React.ComponentProps<"table"> & {
+  // 滚动容器(div)的 ref:行虚拟化等场景需要拿到真正的滚动元素
+  containerRef?: React.Ref<HTMLDivElement>;
+}) {
   return (
     <div
+      ref={containerRef}
       data-slot="table-container"
       // h-full + overflow-auto:让纵向滚动发生在本层,thead 的 sticky 才相对真正滚动容器吸顶。
       // 非限高父级下 h-full 退化为 auto、不影响普通表格。

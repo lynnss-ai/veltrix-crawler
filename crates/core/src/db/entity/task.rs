@@ -31,7 +31,9 @@ pub struct Model {
     pub per_keyword_limit: i32,
     /// 最低点赞数(<该值丢弃)
     pub min_likes: i32,
-    /// 是否启用 AI 文案提取
+    /// 是否启用音频提取(视频下载并转 mp3 留存;AI 文案提取开启时隐含开启)
+    pub audio_extract: bool,
+    /// 是否启用 AI 文案提取(依赖音频提取:转音频后做语音转写)
     pub ai_extract: bool,
     /// 是否采集评论(开启后内容采集完进入评论采集阶段)
     pub collect_comments: bool,
@@ -73,6 +75,16 @@ pub struct Model {
     /// JSON 对象 `{维度id: 选中文案}`,空对象 `{}` = 全「不限」。
     /// 采集时在结果页「筛选」浮层按选中文案点击应用;不同平台维度由前端 PLATFORM_EXTRA_FILTERS 声明。
     pub extra_filters: String,
+    /// 定向采集目标链接 JSON 数组(视频链接 / 作者主页链接),例如 `["https://…"]`;
+    /// 空数组 `[]` = 关键词搜索任务。定向任务的 keywords 存占位词「定向采集」。
+    pub target_urls: String,
+    /// 失败自动重试次数上限(0=不自动重试)。失败后按 1min / 5min / 15min 指数退避重跑,
+    /// 只重试「瞬时可恢复」的失败(开窗失败 / 导航无响应 / 网络抖动),重试仍失败则落终态。
+    pub max_retries: i32,
+    /// 当前失败序列已自动重试的次数(成功或手动重跑新序列后归零)。
+    pub retry_count: i32,
+    /// 下次自动重试时间(unix 秒);None=未排期(未开重试 / 已耗尽 / 运行中 / 成功)。
+    pub next_retry_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

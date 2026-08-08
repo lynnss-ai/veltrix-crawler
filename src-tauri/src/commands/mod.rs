@@ -85,6 +85,11 @@ pub struct AppState {
 /// 不同账号 / 平台仍可并行,但不会因调度同点拉起一堆任务而一次性弹出过多窗口。
 pub const MAX_CONCURRENT_COLLECT: usize = 3;
 
+/// 账号采集锁的 key 口径(平台-账号):全工程统一从这生成,防手写 format! 漂移
+pub(crate) fn account_lock_key(platform: &str, account_id: &str) -> String {
+    format!("{platform}-{account_id}")
+}
+
 /// 取某「平台-账号」的采集互斥锁(惰性创建)。外层 std Mutex 仅做表查找,绝不跨 await 持有。
 #[allow(clippy::type_complexity)]
 fn account_collect_lock(
@@ -288,24 +293,44 @@ pub async fn set_intent_config(
     Ok(())
 }
 
-/// 保存语音转写配置(系统设置「语音转写」)。只存厂商 id 引用 + 模型名;
-/// api_key 仍存数据库,不落配置文件。目前仅支持 ASR 的厂商(小米 MiMo)可用。
+/// 保存语音转写配置(系统设置「语音转写」)。存厂商 code + API 地址 + 模型名;
+/// api_key 仍存数据库,不落配置文件。仅支持 ASR 的厂商(小米 MiMo、智谱 GLM)可用。
 #[tauri::command]
 pub async fn set_transcription_config(
     state: State<'_, AppState>,
+    provider: String,
     api_url: String,
     model: String,
     api_key: String,
+    concurrency: u32,
 ) -> Result<()> {
     {
         let mut cfg = lock_config(&state)?;
+        cfg.transcription.provider = provider;
         cfg.transcription.api_url = api_url;
         cfg.transcription.model = model;
+        // 并发数最小 1;前端异常传 0 时回退默认,避免 buffer_unordered(0) 空转
+        cfg.transcription.concurrency = if concurrency == 0 {
+            veltrix_core::config::DEFAULT_ASR_CONCURRENCY
+        } else {
+            concurrency
+        };
         cfg.save(&state.config_dir)?;
     }
     if !api_key.trim().is_empty() {
         set_secret(&state.db, "transcription_api_key", &api_key).await?;
     }
+    Ok(())
+}
+
+/// 保存海外平台音频拉流的代理(系统设置「网络代理」)。
+/// proxy:空 = 自动探测本机代理、"off" = 关闭(直连)、其余按代理 URL 使用。
+/// 仅作用于下次任务(采集任务启动时快照 media 配置),不影响正在跑的任务。
+#[tauri::command]
+pub async fn set_media_proxy(state: State<'_, AppState>, proxy: String) -> Result<()> {
+    let mut cfg = lock_config(&state)?;
+    cfg.media.proxy = proxy.trim().to_string();
+    cfg.save(&state.config_dir)?;
     Ok(())
 }
 
@@ -496,7 +521,8 @@ pub fn save_binary_file(path: String, content_base64: String) -> Result<()> {
 ///    为 false 时只清库,已下载的素材文件原样保留。
 ///
 /// 平台 / 账号 / 用户 / 客户 / 行业 / 厂商 / 提示词等配置类数据一律保留。
-/// 采集去重台账(collect_records)也刻意不清:清空后重采时据它跳过曾采过的内容,避免重复入库。
+/// 采集去重台账(collect_records)也保留:重采时曾采过的内容仍会入库,台账只用于
+/// 智能停止的「新增计数」(重复内容不占目标配额)。
 #[tauri::command]
 pub async fn clear_business_data(
     state: State<'_, AppState>,
@@ -629,7 +655,6 @@ pub struct AccountView {
     pub cookie: String,
     pub status: String,
     pub risk_count: i64,
-    pub cooldown_until: i64,
     pub last_used_at: i64,
     pub created_at: i64,
     pub code: String,
@@ -641,7 +666,6 @@ impl From<Account> for AccountView {
     fn from(a: Account) -> Self {
         let status = match a.status {
             AccountStatus::Active => "active",
-            AccountStatus::Cooldown => "cooldown",
             AccountStatus::Invalid => "invalid",
             AccountStatus::Disabled => "disabled",
         };
@@ -652,7 +676,6 @@ impl From<Account> for AccountView {
             cookie: a.cookie,
             status: status.into(),
             risk_count: a.risk_count,
-            cooldown_until: a.cooldown_until,
             last_used_at: a.last_used_at,
             created_at: a.created_at,
             code: a.code,

@@ -10,7 +10,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tauri::State;
 use veltrix_core::db::entity::{collect_log, comment, content, task, task_run};
 use veltrix_core::error::{CrawlerError, Result};
@@ -32,6 +32,8 @@ pub struct TaskView {
     pub industry: String,
     pub platform: String,
     pub keywords: Vec<String>,
+    /// 定向采集目标链接(视频链接 / 主页链接);空数组 = 关键词搜索任务
+    pub target_urls: Vec<String>,
     /// once-now / daily / watching
     pub trigger: String,
     pub scheduled_at: Option<String>,
@@ -40,6 +42,9 @@ pub struct TaskView {
     pub time_range: String,
     pub per_keyword_limit: i32,
     pub min_likes: i32,
+    /// 音频提取开关(视频转 mp3 留存)
+    pub audio_extract: bool,
+    /// AI 文案提取开关(依赖音频提取)
     pub ai_extract: bool,
     /// 评论采集开关
     pub collect_comments: bool,
@@ -70,6 +75,12 @@ pub struct TaskView {
     pub auto_sync_obsidian: bool,
     /// 平台专属额外筛选(抖音:视频时长 / 搜索范围 / 内容形式),对象 {维度id: 选中文案};{} = 全不限
     pub extra_filters: serde_json::Value,
+    /// 失败自动重试次数上限(0=不自动重试)
+    pub max_retries: i32,
+    /// 当前失败序列已自动重试的次数
+    pub retry_count: i32,
+    /// 下次自动重试时间(unix 秒);None=未排期
+    pub next_retry_at: Option<i64>,
     pub owner: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -84,12 +95,15 @@ impl From<task::Model> for TaskView {
     fn from(m: task::Model) -> Self {
         // keywords 反序列化失败回退空数组,避免一条脏数据拖死整表
         let keywords: Vec<String> = serde_json::from_str(&m.keywords).unwrap_or_default();
+        // 定向采集目标链接;老数据无此列值时迁移已回填 '[]',解析失败同样回退空数组
+        let target_urls: Vec<String> = serde_json::from_str(&m.target_urls).unwrap_or_default();
         Self {
             id: m.id,
             name: m.name,
             industry: m.industry,
             platform: m.platform,
             keywords,
+            target_urls,
             trigger: m.trigger_type,
             scheduled_at: m.scheduled_at,
             watch_interval_min: m.watch_interval_min,
@@ -97,6 +111,7 @@ impl From<task::Model> for TaskView {
             time_range: m.time_range,
             per_keyword_limit: m.per_keyword_limit,
             min_likes: m.min_likes,
+            audio_extract: m.audio_extract,
             ai_extract: m.ai_extract,
             collect_comments: m.collect_comments,
             comment_time_range: m.comment_time_range,
@@ -117,6 +132,9 @@ impl From<task::Model> for TaskView {
             auto_sync_obsidian: m.auto_sync_obsidian,
             extra_filters: serde_json::from_str(&m.extra_filters)
                 .unwrap_or_else(|_| serde_json::json!({})),
+            max_retries: m.max_retries,
+            retry_count: m.retry_count,
+            next_retry_at: m.next_retry_at,
             owner: m.owner,
             created_at: m.created_at,
             updated_at: m.updated_at,
@@ -135,6 +153,9 @@ pub struct TaskInput {
     pub industry: String,
     pub platform: String,
     pub keywords: Vec<String>,
+    /// 定向采集目标链接(前端可能不传,默认空数组 = 关键词搜索任务)
+    #[serde(default)]
+    pub target_urls: Vec<String>,
     pub trigger: String,
     pub scheduled_at: Option<String>,
     pub watch_interval_min: Option<i32>,
@@ -142,6 +163,9 @@ pub struct TaskInput {
     pub time_range: String,
     pub per_keyword_limit: i32,
     pub min_likes: i32,
+    /// 音频提取开关(前端可能不传,默认关闭)
+    #[serde(default)]
+    pub audio_extract: bool,
     pub ai_extract: bool,
     /// 评论采集开关(前端可能不传,默认关闭)
     #[serde(default)]
@@ -161,17 +185,15 @@ pub struct TaskInput {
     /// 平台专属额外筛选(对象 {维度id: 选中文案});缺省 / 非对象归一化为空 {}
     #[serde(default)]
     pub extra_filters: serde_json::Value,
-}
-
-fn owner_of(state: &AppState) -> Result<String> {
-    current_user(state)
-        .map(|u| u.name)
-        .ok_or_else(|| CrawlerError::Config("未登录".into()))
+    /// 失败自动重试次数上限(0=不自动重试;缺省视为 0)
+    #[serde(default)]
+    pub max_retries: i32,
 }
 
 /// 单次最多返回 N 行,防止前端 IPC 被几万行数据噎住。
-/// 数据量超出时应改走分页接口(暂留 TODO)。
-const LIST_HARD_CAP: u64 = 1000;
+/// 数据量超出时应改走分页接口(暂留 TODO)。任务穿透视图请用 list_contents 的
+/// task_id 参数服务端过滤,不要靠放大此上限解决单任务可见性。
+const LIST_HARD_CAP: u64 = 10000;
 
 /// 采集日志单任务返回上限(日志比内容多,放宽);超出只回最近 N 条。
 const LOG_HARD_CAP: u64 = 2000;
@@ -192,11 +214,32 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
 
     // 采集明细只统计「最后一次运行(started_at)之后」采到的:重采即从 0 起算(历史数据不删)。
     // 从没运行过(started_at 为 None)的任务不参与统计,采集明细自然为 0。
+    //
+    // 仅对活跃任务(query 时前端正在轮询进度的)查询 per-keyword 统计;
+    // 已完成/失败任务的 keyword_stats 是静态数据,跳过查询直接给空。
+    // 累计总量(total_contents/total_comments)直接用任务行的 content_count/comment_count,
+    // 不再扫描全量 content+comment 表聚合(此前每次轮询都无条件 all(db) 全扫,库到十万行级后
+    // 每次 IPC 搬运数十 MB 数据)。
+    let active_ids: HashSet<String> = rows
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.status.as_str(),
+                "running"
+                    | "collecting_comments"
+                    | "analyzing_comments"
+                    | "downloading_media"
+                    | "paused"
+            )
+        })
+        .map(|m| m.id.clone())
+        .collect();
     let task_started: HashMap<String, i64> = rows
         .iter()
+        .filter(|m| active_ids.contains(&m.id))
         .filter_map(|m| m.started_at.map(|s| (m.id.clone(), s)))
         .collect();
-    let (stats, totals) = keyword_stats_for_tasks(&state.db, &task_started).await;
+    let stats = keyword_stats_for_tasks(&state.db, &task_started).await;
 
     Ok(rows
         .into_iter()
@@ -216,30 +259,25 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
                     }
                 })
                 .collect();
-            // 采集结果:累计总量(库里该任务去重后的全部内容 / 评论数)
-            let (total_c, total_m) = totals.get(&view.id).copied().unwrap_or((0, 0));
-            view.total_contents = total_c;
-            view.total_comments = total_m;
+            // 累计总量直接用任务行字段(采集时增量维护),不再全表扫描 content/comment 聚合
+            view.total_contents = view.content_count;
+            view.total_comments = view.comment_count;
             view
         })
         .collect())
 }
 
-/// 聚合给定任务集的「关键词 → (内容数, 评论数)」。content 表自带 keyword 直接计数;
-/// comment 表无 keyword,先取 content 的 (content_id → keyword) 映射,再把每条内容的评论数归入对应关键词。
-/// 返回 task_id → (keyword → (content_count, comment_count))。查询失败按空处理,不阻断任务列表。
+/// 仅对活跃任务聚合 per-keyword 统计(content 表自带 keyword 直接计数;
+/// comment 表无 keyword,先取 content 的 (content_id → keyword) 映射,再把每条内容的评论数归入对应关键词)。
+/// 仅统计 collected_at >= started_at 的行(collected_at 是实体插入时的 Unix 秒,与任务 started_at 同源)。
+/// 查询失败按空处理,不阻断任务列表。
 async fn keyword_stats_for_tasks(
     db: &sea_orm::DatabaseConnection,
     task_started: &HashMap<String, i64>,
-) -> (
-    HashMap<String, HashMap<String, (i64, i64)>>,
-    HashMap<String, (i64, i64)>,
-) {
-    // result:「本次采集」per-keyword(collected_at >= started_at);totals:累计总量(全部行,去重累计)
+) -> HashMap<String, HashMap<String, (i64, i64)>> {
     let mut result: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
-    let mut totals: HashMap<String, (i64, i64)> = HashMap::new();
     if task_started.is_empty() {
-        return (result, totals);
+        return result;
     }
     let task_ids: Vec<String> = task_started.keys().cloned().collect();
 
@@ -273,7 +311,6 @@ async fn keyword_stats_for_tasks(
     let mut content_keyword: HashMap<(String, String), String> = HashMap::new();
     for r in content_rows {
         let started = task_started.get(&r.task_id).copied().unwrap_or(i64::MAX);
-        totals.entry(r.task_id.clone()).or_insert((0, 0)).0 += 1;
         content_keyword.insert((r.task_id.clone(), r.content_id.clone()), r.keyword.clone());
         if r.collected_at >= started {
             result
@@ -298,7 +335,6 @@ async fn keyword_stats_for_tasks(
         .unwrap_or_default();
     for r in comment_rows {
         let started = task_started.get(&r.task_id).copied().unwrap_or(i64::MAX);
-        totals.entry(r.task_id.clone()).or_insert((0, 0)).1 += 1;
         if r.collected_at < started {
             continue;
         }
@@ -312,16 +348,19 @@ async fn keyword_stats_for_tasks(
         }
     }
 
-    (result, totals)
+    result
 }
 
 #[tauri::command]
 pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result<()> {
     let db = &state.db;
     let now = Utc::now().timestamp();
-    let owner = owner_of(&state)?;
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let owner = me.name.clone();
     let keywords_json = serde_json::to_string(&input.keywords)
         .map_err(|e| CrawlerError::Config(format!("序列化关键词失败: {e}")))?;
+    let target_urls_json = serde_json::to_string(&input.target_urls)
+        .map_err(|e| CrawlerError::Config(format!("序列化定向目标失败: {e}")))?;
 
     let existing = task::Entity::find_by_id(input.id.clone())
         .one(db)
@@ -333,13 +372,22 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
     } else {
         "{}".to_string()
     };
+    // AI 文案提取依赖音频提取:开文案提取时强制带上音频提取(防御前端绕过联动)
+    let audio_extract = input.audio_extract || input.ai_extract;
+    // 自动重试上限夹在 0~10,避免误填超大值把调度器拖进无限重试循环
+    let max_retries = input.max_retries.clamp(0, 10);
     match existing {
         Some(model) => {
+            // self scope 用户只能改自己的任务(与 set_author_monitored_by_id 检查口径一致)
+            if me.scope == "self" && model.owner != me.name {
+                return Err(CrawlerError::Config("无权修改该任务".into()));
+            }
             let mut am = model.into_active_model();
             am.name = Set(input.name);
             am.industry = Set(input.industry);
             am.platform = Set(input.platform);
             am.keywords = Set(keywords_json);
+            am.target_urls = Set(target_urls_json);
             am.trigger_type = Set(input.trigger);
             am.scheduled_at = Set(input.scheduled_at);
             am.watch_interval_min = Set(input.watch_interval_min);
@@ -347,6 +395,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.time_range = Set(input.time_range);
             am.per_keyword_limit = Set(input.per_keyword_limit);
             am.min_likes = Set(input.min_likes);
+            am.audio_extract = Set(audio_extract);
             am.ai_extract = Set(input.ai_extract);
             am.collect_comments = Set(input.collect_comments);
             am.comment_time_range = Set(input.comment_time_range);
@@ -354,6 +403,11 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.analyze_comment_intent = Set(input.analyze_comment_intent);
             am.auto_sync_obsidian = Set(input.auto_sync_obsidian);
             am.extra_filters = Set(extra_filters_json);
+            am.max_retries = Set(max_retries);
+            // 关闭自动重试时顺带清掉已排期的重试(避免改配置后调度器仍拉起)
+            if max_retries == 0 {
+                am.next_retry_at = Set(None);
+            }
             am.updated_at = Set(now);
             am.update(db)
                 .await
@@ -366,6 +420,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 industry: Set(input.industry),
                 platform: Set(input.platform),
                 keywords: Set(keywords_json),
+                target_urls: Set(target_urls_json),
                 trigger_type: Set(input.trigger),
                 scheduled_at: Set(input.scheduled_at),
                 watch_interval_min: Set(input.watch_interval_min),
@@ -373,6 +428,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 time_range: Set(input.time_range),
                 per_keyword_limit: Set(input.per_keyword_limit),
                 min_likes: Set(input.min_likes),
+                audio_extract: Set(audio_extract),
                 ai_extract: Set(input.ai_extract),
                 collect_comments: Set(input.collect_comments),
                 comment_time_range: Set(input.comment_time_range),
@@ -380,6 +436,9 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 analyze_comment_intent: Set(input.analyze_comment_intent),
                 auto_sync_obsidian: Set(input.auto_sync_obsidian),
                 extra_filters: Set(extra_filters_json),
+                max_retries: Set(max_retries),
+                retry_count: Set(0),
+                next_retry_at: Set(None),
                 archived: Set(false),
                 status: Set("pending".into()),
                 progress: Set(0),
@@ -420,6 +479,17 @@ pub async fn update_task_status(
     state: State<'_, AppState>,
     patch: TaskStatusPatch,
 ) -> Result<()> {
+    // 白名单校验:仅允许合法状态,防止前端 bug / 恶意调用写入不存在状态导致调度器误判
+    const VALID_STATUSES: &[&str] = &[
+        "pending", "running", "paused", "collecting_comments",
+        "analyzing_comments", "downloading_media", "completed", "failed", "cancelled",
+    ];
+    if !VALID_STATUSES.contains(&patch.status.as_str()) {
+        return Err(CrawlerError::Config(format!(
+            "非法的任务状态: {}",
+            patch.status
+        )));
+    }
     let db = &state.db;
     let now = Utc::now().timestamp();
     let model = task::Entity::find_by_id(patch.id.clone())
@@ -446,6 +516,9 @@ pub async fn update_task_status(
 }
 
 #[tauri::command]
+/// 删除任务:仅删除任务行,contents/comments/logs 成为孤儿数据。
+/// 全量库按 task_id 穿透仍能看见内容但行业关联为空。
+/// 需要完整清理可先调 remove_contents 再删任务,或在 DB 层直接 DELETE CASCADE。
 pub async fn remove_task(state: State<'_, AppState>, id: String) -> Result<()> {
     task::Entity::delete_by_id(id)
         .exec(&state.db)
@@ -570,9 +643,17 @@ impl From<content::Model> for ContentView {
 
 /// 全量库:列出采集落库的全部内容,按采集时间倒序。dataScope=self 仅看自己。
 #[tauri::command]
-pub async fn list_contents(state: State<'_, AppState>) -> Result<Vec<ContentView>> {
+pub async fn list_contents(
+    state: State<'_, AppState>,
+    task_id: Option<String>,
+) -> Result<Vec<ContentView>> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let mut q = content::Entity::find().order_by_desc(content::Column::CollectedAt);
+    // 任务穿透视图:服务端按任务过滤后再限量,避免全局 LIST_HARD_CAP 按时间倒序
+    // 截断把较旧任务的整条内容挤出返回集(界面上表现为「该任务一条数据都没有」)
+    if let Some(tid) = task_id.filter(|t| !t.is_empty()) {
+        q = q.filter(content::Column::TaskId.eq(tid));
+    }
     if me.scope == "self" {
         q = q.filter(content::Column::Owner.eq(me.name.clone()));
     }
@@ -726,19 +807,33 @@ pub async fn get_content_detail(
             .and_then(|x| x.as_i64())
     };
 
-    // 同 owner + platform + author_uid 的全部内容,聚合作者维度统计
-    let author_contents = content::Entity::find()
-        .filter(content::Column::Owner.eq(row.owner.clone()))
-        .filter(content::Column::Platform.eq(row.platform.clone()))
-        .filter(content::Column::AuthorUid.eq(row.author_uid.clone()))
+    // 同 owner + platform + author_uid 的内容统计:视频数走 COUNT,时间/评论关联只取
+    // content_id + 两个时间列——不把整行(含转写全文 transcript / author_json)拉回内存,
+    // 作者作品多时详情打开明显卡(曾整行全取再内存聚合)。
+    let author_scoped = || {
+        content::Entity::find()
+            .filter(content::Column::Owner.eq(row.owner.clone()))
+            .filter(content::Column::Platform.eq(row.platform.clone()))
+            .filter(content::Column::AuthorUid.eq(row.author_uid.clone()))
+    };
+    let video_count = author_scoped()
+        .filter(content::Column::Kind.eq("video"))
+        .count(&state.db)
+        .await
+        .unwrap_or(0) as i64;
+    let light_rows: Vec<(String, i64, Option<i64>)> = author_scoped()
+        .select_only()
+        .column(content::Column::ContentId)
+        .column(content::Column::CollectedAt)
+        .column(content::Column::PublishedAt)
+        .into_tuple()
         .all(&state.db)
         .await
         .unwrap_or_default();
-    let video_count = author_contents.iter().filter(|c| c.kind == "video").count() as i64;
-    let content_ids: Vec<String> = author_contents.iter().map(|c| c.content_id.clone()).collect();
-    let first_collected_at = author_contents.iter().map(|c| c.collected_at).min();
-    let last_published_at = author_contents.iter().filter_map(|c| c.published_at).max();
-    let last_collected_at = author_contents.iter().map(|c| c.collected_at).max();
+    let content_ids: Vec<String> = light_rows.iter().map(|r| r.0.clone()).collect();
+    let first_collected_at = light_rows.iter().map(|r| r.1).min();
+    let last_published_at = light_rows.iter().filter_map(|r| r.2).max();
+    let last_collected_at = light_rows.iter().map(|r| r.1).max();
 
     // 该作者内容下已采评论数
     let comment_count = if content_ids.is_empty() {
@@ -1218,6 +1313,19 @@ pub async fn migrate_authors_from_contents(db: &sea_orm::DatabaseConnection) {
 /// 删除一条采集内容(全量库 / 内容库的「删除」操作)。仅删库记录,媒体文件不动。
 #[tauri::command]
 pub async fn remove_content(state: State<'_, AppState>, id: String) -> Result<()> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    if me.scope == "self" {
+        let Some(row) = content::Entity::find_by_id(&id)
+            .one(&state.db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
+        else {
+            return Ok(()); // 不存在则幂等
+        };
+        if row.owner != me.name {
+            return Err(CrawlerError::Config("无权删除该内容".into()));
+        }
+    }
     content::Entity::delete_by_id(id)
         .exec(&state.db)
         .await

@@ -8,10 +8,15 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
   c,
   retrying,
   onRetry,
+  retryingTranscript = false,
+  onRetryTranscript,
 }: {
   c: ContentView;
   retrying: boolean;
   onRetry: () => void;
+  // 文案转写重试(可选):转写失败且有音频可转时展示「重试文案」按钮
+  retryingTranscript?: boolean;
+  onRetryTranscript?: () => void;
 }) {
   if (retrying) {
     return (
@@ -71,6 +76,28 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
           >
             <RefreshCw className="size-3" />
             重试
+          </button>
+        </SimpleTooltip>
+      )}
+      {/* 文案未转写(灰)或转写失败(红),且有音频可转:提供转写/重试,无需重跑素材链路 */}
+      {!c.transcript && c.audioPath && onRetryTranscript && (
+        <SimpleTooltip
+          content={
+            transcriptState === false ? "点击重新转写文案" : "点击转写文案"
+          }
+        >
+          <button
+            type="button"
+            onClick={onRetryTranscript}
+            disabled={retryingTranscript}
+            className="inline-flex cursor-pointer items-center gap-0.5 whitespace-nowrap rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 transition-colors hover:bg-rose-200 disabled:opacity-60 dark:bg-rose-950/60 dark:text-rose-300 dark:hover:bg-rose-900/60"
+          >
+            {retryingTranscript ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3" />
+            )}
+            {transcriptState === false ? "重试文案" : "转写文案"}
           </button>
         </SimpleTooltip>
       )}

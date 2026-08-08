@@ -24,24 +24,27 @@ pub struct EmitCtx {
 /// 推给前端的响应体截断长度(仅展示用,避免大响应撑爆事件通道)。
 #[cfg(windows)]
 const EMIT_BODY_CAP: usize = 16 * 1024;
-/// Agent 模式下网络缓冲最多保留条数(长会话防无限增长;采集每轮清空、传 None 不限长)。
+/// Agent 模式 / 非采集窗口的网络缓冲最多保留条数(长会话防无限增长;
+/// 采集窗口不丢——滚动循环按游标增量消费,丢了会漏解析)。
 #[cfg(windows)]
 const SINK_MAX_ENTRIES: usize = 300;
 
 /// 给 webview 安装原生响应拦截器。非 Windows 平台为空实现(退回页面 hook 路径)。
 /// `patterns` 为空 = 全量拦截(仅 content-type 含 json 的响应),用于浏览器 Agent;
 /// 非空 = 仅放行 URL 命中特征的响应(采集行为不变)。`emit` 见 [`EmitCtx`]。
+/// `cap_entries` = 缓冲限长(非采集窗口,如登录/访问平台,长期开着防内存线性膨胀);采集窗口传 false。
 #[cfg(windows)]
 pub fn install(
     webview: &Webview,
     patterns: Arc<Vec<String>>,
     sink: ResponseSink,
     emit: Option<EmitCtx>,
+    cap_entries: bool,
 ) {
     // with_webview 把闭包调度到 WebView 线程执行;失败仅告警,不阻断采集
     if let Err(e) = webview.with_webview(move |pw| {
         // SAFETY: 在 WebView2 自身线程上访问其 COM 接口
-        unsafe { win::install(pw, patterns, sink, emit) }
+        unsafe { win::install(pw, patterns, sink, emit, cap_entries) }
     }) {
         tracing::warn!("安装原生网络拦截失败(退回页面 hook): {e}");
     }
@@ -56,6 +59,7 @@ pub fn install(
     _patterns: Arc<Vec<String>>,
     sink: ResponseSink,
     _emit: Option<EmitCtx>,
+    _cap_entries: bool,
 ) {
     if let Err(e) = webview.with_webview(move |pw| {
         // SAFETY: with_webview 在 macOS 主线程回调,可安全访问 WKWebView / UCC 的 AppKit 接口
@@ -72,6 +76,7 @@ pub fn install(
     _patterns: Arc<Vec<String>>,
     _sink: ResponseSink,
     _emit: Option<EmitCtx>,
+    _cap_entries: bool,
 ) {
 }
 
@@ -97,6 +102,7 @@ mod win {
         patterns: Arc<Vec<String>>,
         sink: ResponseSink,
         emit: Option<EmitCtx>,
+        cap_entries: bool,
     ) {
         let core = match webview.controller().CoreWebView2() {
             Ok(c) => c,
@@ -131,13 +137,18 @@ mod win {
                 // 仅命中关键词才打,避免刷屏;这是定位风控形态的关键信号。
                 {
                     let lu = url.to_ascii_lowercase();
+                    // 只对 path 部分(? 之前)匹配:抖音正常业务接口(评论 / 收藏 / 详情等)的 query 里
+                    // 普遍带 x-secsdk-web-signature / verifyFp=verify_... / fp=verify_... 等签名参数,
+                    // 含 "secsdk" / "verify" 子串。拿整条 URL 匹配会把正常接口全误判成风控刷屏。
+                    // 真正的验证码 SDK 请求特征在 path 里(rc-verifycenter/rmc-nocaptcha 等)。
+                    let path = lu.split('?').next().unwrap_or(lu.as_str());
                     // redcaptcha/v2/getconfig 是小红书每次都预加载的验证码 SDK 配置(良性,非真验证),
                     // 排除掉,避免误报"疑似风控"刷屏。真正的验证挑战会走其它 redcaptcha 接口。
-                    let is_benign_preload = lu.contains("redcaptcha/v2/getconfig");
+                    let is_benign_preload = path.contains("redcaptcha/v2/getconfig");
                     if !is_benign_preload
-                        && ["captcha", "secsdk", "verifycenter", "vc_captcha", "shark"]
+                        && ["captcha", "verifycenter", "vc_captcha", "secsdk", "shark"]
                             .iter()
-                            .any(|k| lu.contains(k))
+                            .any(|k| path.contains(k))
                     {
                         tracing::info!("拦截诊断:疑似风控请求 {url}");
                     }
@@ -160,14 +171,15 @@ mod win {
                 let completed = WebResourceResponseViewGetContentCompletedHandler::create(Box::new(
                     move |_result: windows::core::Result<()>, stream: Option<IStream>| {
                         let Some(stream) = stream else { return Ok(()) };
-                        let body = read_stream(&stream);
+                        let body = read_stream(&stream, STREAM_READ_CAP);
                         if let Ok(mut buf) = sink.lock() {
                             buf.push(InterceptedResponse {
                                 url: url.clone(),
                                 body: body.clone(),
                             });
-                            // Agent 长会话防缓冲无限增长:超限丢最旧(采集传 None 不限长)
-                            if agent_mode && buf.len() > SINK_MAX_ENTRIES {
+                            // 缓冲限长:Agent 长会话(emit)与非采集窗口(登录/访问,cap_entries)
+                            // 超限丢最旧;采集窗口不丢(滚动循环按游标增量消费,丢了会漏解析)
+                            if (agent_mode || cap_entries) && buf.len() > SINK_MAX_ENTRIES {
                                 let overflow = buf.len() - SINK_MAX_ENTRIES;
                                 buf.drain(0..overflow);
                             }
@@ -226,10 +238,16 @@ mod win {
         s
     }
 
+    /// 采集模式下响应体最大读取字节数(约 2MB),超出截断。
+    /// WebView2 GetContent 回调在 UI 线程执行,大响应需限制读取量防卡顿与内存膨胀。
+    const STREAM_READ_CAP: usize = 2 * 1024 * 1024;
+
     /// 把响应内容流读成字符串(UTF-8 lossy);响应体通常是 JSON 文本。
-    unsafe fn read_stream(stream: &IStream) -> String {
+    /// `cap` 为 0 时不限长;非 0 时超出截断丢弃并打 warn。
+    unsafe fn read_stream(stream: &IStream, cap: usize) -> String {
         let mut data: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 16384];
+        let max = if cap > 0 { cap } else { usize::MAX };
         loop {
             let mut read: u32 = 0;
             let hr = stream.Read(
@@ -238,10 +256,16 @@ mod win {
                 Some(&mut read),
             );
             if read > 0 {
-                data.extend_from_slice(&chunk[..read as usize]);
+                let remaining = max.saturating_sub(data.len());
+                let take = (read as usize).min(remaining).min(chunk.len());
+                data.extend_from_slice(&chunk[..take]);
             }
             // read==0 即读完(S_FALSE);出错也停止,取已读部分
             if read == 0 || hr.is_err() {
+                break;
+            }
+            if data.len() >= max {
+                tracing::warn!("响应体超过 {} 字节,已截断", max);
                 break;
             }
         }

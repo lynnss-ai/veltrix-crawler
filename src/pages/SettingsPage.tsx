@@ -220,7 +220,12 @@ export function SettingsPage() {
             )}
             {active === "remote-control" && <RemoteControlSection />}
             {active === "transcription" && (
-              <TranscriptionSection initial={cfg?.transcription} />
+              <TranscriptionSection
+                initial={cfg?.transcription}
+                providers={caps
+                  .filter((c) => c.asr)
+                  .map((c) => ({ code: c.code, name: c.name, apiUrl: c.apiUrl }))}
+              />
             )}
             {active === "role-models" && (
               <RoleModelSection providers={providers} />
@@ -661,6 +666,10 @@ function GeneralSection({
   const [testing, setTesting] = useState(false);
   const [dbPath, setDbPath] = useState<string | null>(null);
   const [dataDir, setDataDir] = useState("");
+  // 海外平台音频拉流代理:三态 auto(空)/ off / custom(URL);baseline 存后端原始 proxy 串
+  const [proxyMode, setProxyMode] = useState<"auto" | "off" | "custom">("auto");
+  const [proxyUrl, setProxyUrl] = useState("");
+  const [proxyBaseline, setProxyBaseline] = useState("");
 
   useEffect(() => {
     api
@@ -692,11 +701,28 @@ function GeneralSection({
       setDbUrl(url);
       setMaxConn(conn);
       setDbBaseline({ url, maxConn: conn });
+      // 代理:空=自动、off=关闭、其余=自定义地址
+      const proxy = cfg.media?.proxy ?? "";
+      setProxyBaseline(proxy);
+      if (proxy === "") {
+        setProxyMode("auto");
+        setProxyUrl("");
+      } else if (proxy.toLowerCase() === "off") {
+        setProxyMode("off");
+        setProxyUrl("");
+      } else {
+        setProxyMode("custom");
+        setProxyUrl(proxy);
+      }
     }
   }, [cfg]);
 
   const storageDirty = storagePath !== storageBaseline;
   const dbDirty = dbUrl !== dbBaseline.url || maxConn !== dbBaseline.maxConn;
+  // 当前代理配置串(与 baseline 比较判断是否有改动)
+  const proxyValue =
+    proxyMode === "auto" ? "" : proxyMode === "off" ? "off" : proxyUrl.trim();
+  const proxyDirty = proxyValue !== proxyBaseline;
 
   // 选择目录(Tauri dialog)
   async function pickStorageDir() {
@@ -800,6 +826,57 @@ function GeneralSection({
               </SimpleTooltip>
             </p>
           )}
+        </div>
+      </SettingsCard>
+
+      <SettingsCard
+        title="网络代理"
+        description="仅作用于海外平台(TikTok/YouTube)音频拉流,国内平台恒直连。注:代理不是 TikTok 成败关键(真凶是会话 Cookie,已修),此项主要用于地域封锁兜底或指定专用代理。"
+        dirty={proxyDirty}
+        onSave={() => {
+          // 自定义模式必须填地址,避免存入空值当成「自动」造成误解
+          if (proxyMode === "custom" && !proxyValue) {
+            toast.error("请填写代理地址,或改选「自动探测」/「关闭」");
+            return;
+          }
+          api
+            .setMediaProxy(proxyValue)
+            .then(() => {
+              setProxyBaseline(proxyValue);
+              toast.success("网络代理已保存,下次任务生效");
+            })
+            .catch((e) => toast.error(String(e)));
+        }}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="proxy-mode">代理模式</Label>
+          <Select
+            value={proxyMode}
+            onValueChange={(v) => setProxyMode(v as "auto" | "off" | "custom")}
+          >
+            <SelectTrigger id="proxy-mode">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">自动探测本机代理(默认)</SelectItem>
+              <SelectItem value="off">关闭 · 直连</SelectItem>
+              <SelectItem value="custom">自定义代理地址</SelectItem>
+            </SelectContent>
+          </Select>
+          {proxyMode === "custom" && (
+            <Input
+              placeholder="http://127.0.0.1:7897"
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+            />
+          )}
+          <p className="text-xs text-muted-foreground">
+            {proxyMode === "auto"
+              ? "跟随本机代理环境变量 / Windows 系统代理,换端口自动跟随。"
+              : proxyMode === "off"
+                ? "海外平台音频也直连,不走任何代理。"
+                : "指定形如 http://host:port 的代理,仅海外平台音频拉流使用。"}
+          </p>
         </div>
       </SettingsCard>
 
@@ -1004,45 +1081,108 @@ function ObsidianSection() {
   );
 }
 // 语音转写默认接入(未配置过时自动预填,用户只需补 API Key 即可保存生效)
+const DEFAULT_ASR_PROVIDER = "mimo";
 const DEFAULT_ASR_API_URL = "https://api.xiaomimimo.com/v1";
 const DEFAULT_ASR_MODEL = "mimo-v2.5-asr";
+// 转写并发默认 3 路(与后端 DEFAULT_ASR_CONCURRENCY 一致)
+const DEFAULT_ASR_CONCURRENCY = "3";
+
+// 各 ASR 厂商的可选模型(下拉选项;与后端 speech.rs 的厂商实现一一对应)
+const ASR_MODELS: Record<string, string[]> = {
+  mimo: ["mimo-v2.5-asr"],
+  glm: ["glm-asr-2512"],
+};
+
+// 支持 ASR 的厂商预设(由 listProviderCapabilities 按 asr 过滤后传入)
+interface AsrProviderOption {
+  code: string;
+  name: string;
+  apiUrl: string;
+}
 
 function TranscriptionSection({
   initial,
+  providers,
 }: {
-  initial?: { api_url: string; model: string };
+  initial?: {
+    provider: string;
+    api_url: string;
+    model: string;
+    concurrency: number;
+  };
+  providers: AsrProviderOption[];
 }) {
+  const [provider, setProvider] = useState(DEFAULT_ASR_PROVIDER);
   const [apiUrl, setApiUrl] = useState("");
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [concurrency, setConcurrency] = useState(DEFAULT_ASR_CONCURRENCY);
+  const [baseProvider, setBaseProvider] = useState(DEFAULT_ASR_PROVIDER);
   const [baseUrl, setBaseUrl] = useState("");
   const [baseModel, setBaseModel] = useState("");
+  const [baseConcurrency, setBaseConcurrency] = useState(DEFAULT_ASR_CONCURRENCY);
 
-  // 回填(api_url/model 来自配置;api_key 存数据库不回显)。
+  // 回填(provider/api_url/model/concurrency 来自配置;api_key 存数据库不回显)。
   // 未配置过(空值)时回退到 MiMo 默认,与 base 一致避免一进页面就显示「未保存」。
   useEffect(() => {
+    const p = initial?.provider || DEFAULT_ASR_PROVIDER;
     const url = initial?.api_url || DEFAULT_ASR_API_URL;
     const m = initial?.model || DEFAULT_ASR_MODEL;
+    const c = String(initial?.concurrency || DEFAULT_ASR_CONCURRENCY);
+    setProvider(p);
     setApiUrl(url);
     setModel(m);
+    setConcurrency(c);
+    setBaseProvider(p);
     setBaseUrl(url);
     setBaseModel(m);
+    setBaseConcurrency(c);
     setApiKey("");
   }, [initial]);
 
-  const dirty = apiUrl !== baseUrl || model !== baseModel || apiKey.trim() !== "";
+  const dirty =
+    provider !== baseProvider ||
+    apiUrl !== baseUrl ||
+    model !== baseModel ||
+    concurrency !== baseConcurrency ||
+    apiKey.trim() !== "";
+
+  // 厂商下拉选项:能力接口未返回时(加载中)也保证当前厂商可见
+  const providerOptions: AsrProviderOption[] = providers.some(
+    (p) => p.code === provider,
+  )
+    ? providers
+    : [
+        ...providers,
+        { code: provider, name: provider, apiUrl: apiUrl || DEFAULT_ASR_API_URL },
+      ];
+
+  // 模型下拉选项:预设模型 + 当前模型(兼容配置里存的非常规模型名)
+  const modelOptions = Array.from(
+    new Set([...(ASR_MODELS[provider] ?? []), ...(model ? [model] : [])]),
+  );
+
+  // 切换厂商:联动预设 API 地址与默认模型(仍可手改地址)
+  function handleProviderChange(code: string) {
+    setProvider(code);
+    const preset = providers.find((p) => p.code === code);
+    if (preset) setApiUrl(preset.apiUrl);
+    setModel(ASR_MODELS[code]?.[0] ?? "");
+  }
 
   return (
     <SettingsCard
       title="语音转写"
-      description="直接配置语音识别(ASR)接口:API 地址、密钥与模型(采集完成后把视频音频转写为文案)。"
+      description="配置语音识别(ASR)厂商、接口地址、密钥与模型(采集完成后把视频音频转写为文案;超长音频自动切片转写拼接)。"
       dirty={dirty}
       onSave={() => {
         api
-          .setTranscriptionConfig(apiUrl, model, apiKey)
+          .setTranscriptionConfig(provider, apiUrl, model, apiKey, Math.max(1, Number(concurrency) || 3))
           .then(() => {
+            setBaseProvider(provider);
             setBaseUrl(apiUrl);
             setBaseModel(model);
+            setBaseConcurrency(concurrency);
             setApiKey("");
             toast.success("语音转写配置已保存");
           })
@@ -1050,6 +1190,21 @@ function TranscriptionSection({
       }}
     >
       <div className="grid gap-4 sm:grid-cols-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="asr-provider">厂商</Label>
+          <Select value={provider} onValueChange={handleProviderChange}>
+            <SelectTrigger id="asr-provider">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {providerOptions.map((p) => (
+                <SelectItem key={p.code} value={p.code}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
         <div className="space-y-1.5">
           <Label htmlFor="asr-url">API 地址</Label>
           <Input
@@ -1071,12 +1226,31 @@ function TranscriptionSection({
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="asr-model">模型</Label>
+          <Select value={model} onValueChange={setModel}>
+            <SelectTrigger id="asr-model">
+              <SelectValue placeholder="选择模型" />
+            </SelectTrigger>
+            <SelectContent>
+              {modelOptions.map((m) => (
+                <SelectItem key={m} value={m}>
+                  {m}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="asr-concurrency">转写并发数</Label>
           <Input
-            id="asr-model"
-            placeholder="mimo-v2.5-asr"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
+            id="asr-concurrency"
+            type="number"
+            min={1}
+            value={concurrency}
+            onChange={(e) => setConcurrency(e.target.value)}
           />
+          <p className="text-xs text-muted-foreground">
+            同时在飞的转写请求数,过高易被厂商限流
+          </p>
         </div>
       </div>
     </SettingsCard>

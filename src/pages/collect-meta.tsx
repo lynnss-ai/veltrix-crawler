@@ -514,6 +514,7 @@ export const DEFAULT_STRATEGY = {
   timeRange: "any" as TimeRange,
   perKeywordLimit: 50,
   minLikes: 0,
+  audioExtract: false,
   aiExtract: false,
   collectComments: false,
   commentTimeRange: "any" as CommentTimeRange,

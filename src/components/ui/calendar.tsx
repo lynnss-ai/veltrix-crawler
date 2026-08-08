@@ -1,8 +1,10 @@
 "use client";
 
 import * as React from "react";
+import { format } from "date-fns";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { DayPicker } from "react-day-picker";
+import { zhCN } from "react-day-picker/locale";
 import "react-day-picker/style.css";
 
 import { cn } from "@/lib/utils";
@@ -13,6 +15,11 @@ export type CalendarProps = React.ComponentProps<typeof DayPicker>;
 function Calendar({ className, classNames, showOutsideDays = true, ...props }: CalendarProps) {
   return (
     <DayPicker
+      // 全局中文:星期/月份用 zh-CN(周一起始),标题按中文习惯显示「2026年1月」
+      locale={zhCN}
+      formatters={{
+        formatCaption: (month) => format(month, "yyyy年M月"),
+      }}
       showOutsideDays={showOutsideDays}
       className={cn("relative p-3", className)}
       classNames={{

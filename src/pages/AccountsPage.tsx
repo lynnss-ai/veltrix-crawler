@@ -71,7 +71,6 @@ import {
 const ACCOUNT_STATUS_META: Record<string, { label: string; tone: StatusTone }> =
   {
     active: { label: "正常", tone: "success" },
-    cooldown: { label: "冷却中", tone: "warning" },
     invalid: { label: "失效", tone: "danger" },
     disabled: { label: "停用", tone: "neutral" },
   };
@@ -270,7 +269,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
               </Button>
             );
           }
-          // 冷却中 / 停用:保留状态徽章
+          // 停用:保留状态徽章
           const meta = statusMetaOf(a.status);
           return <StatusBadge tone={meta.tone}>{meta.label}</StatusBadge>;
         },

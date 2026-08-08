@@ -16,6 +16,7 @@ import { type RemoteStatus } from "@/components/RemoteConnect";
 import { api, type UserView } from "@/lib/api";
 import { TitleBar } from "@/components/TitleBar";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -348,6 +349,8 @@ function App() {
 
   // 窗口启动隐藏(tauri.conf visible:false)以避免白屏,首帧渲染后再显示
   useEffect(() => {
+    // 纯浏览器调试(bun run dev)没有 Tauri 环境,getCurrentWindow 会同步抛错并触发全局错误边界,必须跳过
+    if (!isTauri()) return;
     getCurrentWindow()
       .show()
       .catch((e) => console.warn("显示主窗口失败:", e));

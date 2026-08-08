@@ -18,7 +18,7 @@ pub struct Model {
     pub completion_tokens: i64,
     /// 合计 token
     pub total_tokens: i64,
-    /// 来源: chat / agent_chat / coding / rpa / computer
+    /// 来源: chat / agent_chat / coding / rpa / computer / transcription(语音转写)
     pub source: String,
     /// 归属用户
     pub owner: String,

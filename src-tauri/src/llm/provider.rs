@@ -39,7 +39,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         code: "glm",
         name: "智谱 GLM",
         api_url: "https://open.bigmodel.cn/api/paas/v4",
-        asr: false,
+        asr: true,
     },
     ProviderPreset {
         code: "minimax",

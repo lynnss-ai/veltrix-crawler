@@ -31,8 +31,10 @@ export const api = {
   setAgentGuidelines: (kind: string, text: string) =>
     invoke<void>("set_agent_guidelines", { kind, text }),
   // 保存语音转写配置(系统设置「语音转写」)
-  setTranscriptionConfig: (apiUrl: string, model: string, apiKey: string) =>
-    invoke<void>("set_transcription_config", { apiUrl, model, apiKey }),
+  setTranscriptionConfig: (provider: string, apiUrl: string, model: string, apiKey: string, concurrency: number) =>
+    invoke<void>("set_transcription_config", { provider, apiUrl, model, apiKey, concurrency }),
+  // 保存海外平台音频拉流代理(系统设置「网络代理」):空=自动探测、"off"=关闭、其余=代理 URL
+  setMediaProxy: (proxy: string) => invoke<void>("set_media_proxy", { proxy }),
   // 各厂商能力(chat / asr),供「语音转写」按 ASR 能力过滤厂商下拉
   listProviderCapabilities: () =>
     invoke<
@@ -411,8 +413,10 @@ export const api = {
   removeTask: (id: string) => invoke<void>("remove_task", { id }),
   // 启动任务采集:后端选账号 + 后台遍历关键词(自动开窗 + 拟人 RPA),立即返回
   runTask: (taskId: string) => invoke<void>("run_task", { taskId }),
-  // 全量库:列出采集落库的全部内容(按采集时间倒序)
-  listContents: () => invoke<ContentView[]>("list_contents"),
+  // 全量库:列出采集落库的内容(按采集时间倒序);传 taskId 时服务端按任务过滤
+  // (任务穿透视图专用:不受全局数量上限按时间截断影响,旧任务的内容也能查全)
+  listContents: (taskId?: string) =>
+    invoke<ContentView[]>("list_contents", { taskId: taskId ?? null }),
   // 评论库:列出采集落库的评论(task_id 可选,按任务过滤)
   listComments: (taskId?: string) =>
     invoke<CommentView[]>("list_comments", { taskId: taskId ?? null }),
@@ -435,9 +439,16 @@ export const api = {
   // 批量删除采集内容(全量库多选),返回实际删除条数
   removeContents: (ids: string[]) =>
     invoke<number>("remove_contents", { ids }),
-  // 失败重试:重跑单条内容的素材下载(注意:视频直链可能已过期,仍会 403)
+  // 失败重试:重跑单条内容的素材下载(注意:视频直链可能已过期,仍会 403);
+  // 音频提取重试成功且尚无文案时会顺带补一次语音转写
   retryContentMedia: (id: string) =>
     invoke<MediaStatusView>("retry_content_media", { id }),
+  // 文案转写失败重试:对已有音频的单条内容重跑语音转写
+  retryContentTranscript: (id: string) =>
+    invoke<MediaStatusView>("retry_content_transcript", { id }),
+  // 批量转写:对指定 id(当前筛选列表中「有音频无文案」的条目)重跑语音转写,返回处理条数
+  retryFailedTranscripts: (ids: string[]) =>
+    invoke<number>("retry_failed_transcripts", { ids }),
   // 失败任务补偿:按采集参数补做缺失的后处理(意向分析 / 素材下载 / 转写)
   compensateTask: (id: string) => invoke<void>("compensate_task", { id }),
   // ffmpeg 安装检测:用于「AI 文案提取」处按是否已装切换提示(已装隐藏下载引导)

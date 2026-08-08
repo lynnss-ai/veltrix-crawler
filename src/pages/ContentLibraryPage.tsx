@@ -1,11 +1,12 @@
 // 资产库:展示采集落库的内容(contents 表)。全量库/内容库/图片库共用本组件。
 // 筛选:左侧栏(行业 + 创建时间 + 发布时间)+ 顶部(平台 chip + 关键字搜索)。
 // 关键字匹配 标题 / 采集关键词 / 文案;时间为预设范围。
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowLeft,
   Eye,
+  FileSpreadsheet,
   LayoutGrid,
   List,
   Loader2,
@@ -18,6 +19,9 @@ import {
 } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
+import * as XLSX from "xlsx";
+import { save } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
@@ -49,7 +53,9 @@ import {
   type IndustryView,
   type PlatformConfig,
 } from "@/lib/api";
-import { platformChipClass } from "@/lib/platforms";
+import { platformChipClass, contentDetailUrl } from "@/lib/platforms";
+import { formatTimestamp } from "@/lib/utils";
+import { recordDownload } from "@/lib/download-history";
 import type { TaskContentFilter } from "./collect-meta";
 import { ContentDetailDialog } from "@/components/content-detail-dialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -66,6 +72,12 @@ import { MediaStatusBadge } from "@/components/MediaStatusBadge";
 
 // 瀑布流每次渲染/加载的卡片数:首屏与「加载更多」步长一致,避免一次性挂载海量图片
 const GRID_PAGE_SIZE = 48;
+
+// 有音频但无文案(待转写):含转写失败与从未转写(如当时缺 API Key 被跳过)两类,
+// 与后端批量转写的筛选口径一致
+function needsTranscript(c: ContentView): boolean {
+  return !(c.transcript ?? "").trim() && !!c.audioPath;
+}
 
 // 图片库/内容库视图模式(瀑布流/表格)的 localStorage 持久化键(按库区分)
 function viewModeStorageKey(kind: string): string {
@@ -102,8 +114,16 @@ export function ContentLibraryPage({
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
   // 正在重试素材下载的内容 id 集合(行级 loading,避免重复点击)
   const [retrying, setRetrying] = useState<Set<string>>(new Set());
+  // 文案转写重试中的内容 id 集合(与素材重试分开,互不影响)
+  const [retryingTranscript, setRetryingTranscript] = useState<Set<string>>(
+    new Set(),
+  );
   // 批量导出 Obsidian 进行中(防重复点击)
   const [batchSyncing, setBatchSyncing] = useState(false);
+  // 批量导出 Excel 进行中(防重复点击)
+  const [batchExporting, setBatchExporting] = useState(false);
+  // 批量重试转写失败进行中(防重复点击)
+  const [batchRetryingTranscripts, setBatchRetryingTranscripts] = useState(false);
   // 待确认的批量删除:ids + 确认后清空表格选择的回调;null=未弹确认框
   const [pendingDelete, setPendingDelete] = useState<{
     ids: string[];
@@ -136,17 +156,66 @@ export function ContentLibraryPage({
   const [imageSource, setImageSource] = useState<"image" | "cover">("image");
   // 瀑布流增量加载:当前可见卡片数,筛选/视图变化时重置回首屏
   const [visibleCount, setVisibleCount] = useState(GRID_PAGE_SIZE);
+  // 搜索词延迟值:输入即时回显,筛选/大列表重渲染延后到空闲帧,避免逐键卡顿
+  const deferredSearch = useDeferredValue(search);
+  // 瀑布流「加载更多」:稳定引用,配合 WaterfallCard 的 memo 避免整列无效重渲染
+  const handleLoadMore = useCallback(
+    () => setVisibleCount((prev) => prev + GRID_PAGE_SIZE),
+    [],
+  );
 
   const platformName = useCallback((id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
 
+  // 任务穿透时按任务拉取(服务端过滤,旧任务内容不被全量上限截断);开关/目标任务变化时重取
+  const penetratedTaskId =
+    taskFilter && taskFilterOn ? taskFilter.taskId : undefined;
   useEffect(() => {
     api
-      .listContents()
+      .listContents(penetratedTaskId)
       .then(setContents)
       .catch((e) => toast.error(`加载内容失败: ${e}`));
+  }, [penetratedTaskId]);
+
+  useEffect(() => {
     api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
     api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
+  }, []);
+
+  // 转写完成实时刷新:后端每写完一条 transcript 发事件,就地更新该行,
+  // 「未转写 N 条」计数随批量/采集后转写进度实时递减(无需等整批结束或手动刷新)。
+  // 批量转写期间事件很密:积攒 300ms 合帧一次 setContents——否则每条都整表重算
+  // (筛选/行模型/50 张卡片重渲染),列表会明显卡顿。
+  useEffect(() => {
+    type Payload = {
+      id: string;
+      transcript: string | null;
+      transcriptError: string | null;
+    };
+    const pending = new Map<string, Payload>();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      timer = null;
+      if (pending.size === 0) return;
+      const batch = new Map(pending);
+      pending.clear();
+      setContents((prev) =>
+        prev.map((x) => {
+          const p = batch.get(x.id);
+          return p
+            ? { ...x, transcript: p.transcript, transcriptError: p.transcriptError }
+            : x;
+        }),
+      );
+    };
+    const unlisten = listen<Payload>("content-transcript-updated", (e) => {
+      pending.set(e.payload.id, e.payload);
+      if (!timer) timer = setTimeout(flush, 300);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten.then((f) => f());
+    };
   }, []);
 
   // 按内容形态过滤:图片库=图文 / 内容库=视频 / 全量库=全部。
@@ -201,8 +270,8 @@ export function ContentLibraryPage({
         return false;
       if (!inDateRange(c.collectedAt, createdRange)) return false;
       if (!inDateRange(c.publishedAt, publishedRange)) return false;
-      if (search) {
-        const q = search.toLowerCase();
+      if (deferredSearch) {
+        const q = deferredSearch.toLowerCase();
         return (
           (c.title ?? "").toLowerCase().includes(q) ||
           c.keyword.toLowerCase().includes(q) ||
@@ -218,13 +287,34 @@ export function ContentLibraryPage({
     industryFilter,
     createdRange,
     publishedRange,
-    search,
+    deferredSearch,
   ]);
 
-  // 筛选结果或视图模式变化时,瀑布流回到首屏(避免停留在已加载更多的页码)
+  // 筛选条件或视图模式变化时,瀑布流回到首屏(避免停留在已加载更多的页码)。
+  // 依赖刻意取「筛选条件」而非 filtered 结果:批量转写期间 contents 每 300ms 就地更新,
+  // 若依赖 filtered,visibleCount 会被反复重置,用户滚动位置被顶回首屏
   useEffect(() => {
     setVisibleCount(GRID_PAGE_SIZE);
-  }, [filtered, viewMode]);
+  }, [
+    viewMode,
+    platformFilter,
+    kindSearch,
+    industryFilter,
+    createdRange,
+    publishedRange,
+    deferredSearch,
+    kindFilter,
+    imageSource,
+    taskFilter,
+    taskFilterOn,
+  ]);
+
+  // 待转写(有音频无文案):按当前列表口径统计(含任务穿透 / 平台 / 行业 / 时间 / 搜索筛选),
+  // 全量库据此显示批量转写按钮,点击也只处理这批
+  const untranscribedItems = useMemo(
+    () => filtered.filter(needsTranscript),
+    [filtered],
+  );
 
   // 是否有任意筛选生效(决定显示「重置」)
   const hasFilter =
@@ -244,10 +334,11 @@ export function ContentLibraryPage({
     setSearch("");
   }
 
-  // 删除一条内容:与批量删除共用红色确认弹窗(删除不可恢复,单条也必须确认)
-  function handleDelete(id: string) {
+  // 删除一条内容:与批量删除共用红色确认弹窗(删除不可恢复,单条也必须确认)。
+  // useCallback 稳定引用:作为 prop 传给 memo 的瀑布流卡片,避免父组件重渲染时整列跟着重渲染
+  const handleDelete = useCallback((id: string) => {
     setPendingDelete({ ids: [id], reset: () => {} });
-  }
+  }, []);
 
   // 批量导出到当前用户的 Obsidian vault;成功后标记已同步并清空选择
   async function handleBatchSync(ids: string[], reset: () => void) {
@@ -288,9 +379,107 @@ export function ContentLibraryPage({
     }
   }
 
+  // 批量导出 Excel:仅导出选中里「有文案」的内容;路径经系统保存对话框选定
+  async function handleBatchExportExcel(selected: ContentView[]) {
+    if (batchExporting) return;
+    const withTranscript = selected.filter((c) => c.transcript?.trim());
+    if (withTranscript.length === 0) {
+      toast.error("所选内容均无文案,没有可导出的数据");
+      return;
+    }
+    setBatchExporting(true);
+    try {
+      const rows = withTranscript.map((c) => ({
+        平台: platformName(c.platform),
+        行业: c.industry,
+        // 抖音等平台无独立标题(正文在 desc):标题列回退用 desc,简介列此时留空不重复
+        标题: c.title ?? c.desc ?? "",
+        简介: c.title ? (c.desc ?? "") : "",
+        作者: c.authorNickname,
+        点赞数: c.likeCount ?? 0,
+        评论数: c.commentCount ?? 0,
+        收藏数: c.collectCount ?? 0,
+        分享数: c.shareCount ?? 0,
+        采集关键词: c.keyword,
+        文案: c.transcript ?? "",
+        内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
+        发布时间: formatTimestamp(c.publishedAt),
+        采集时间: formatTimestamp(c.collectedAt),
+      }));
+      const ws = XLSX.utils.json_to_sheet(rows);
+      // 表头样式:居中 + 靛蓝背景 + 加粗白字
+      const headerStyle = {
+        font: { bold: true, color: { rgb: "FFFFFF" } },
+        fill: { fgColor: { rgb: "4F46E5" } },
+        alignment: { horizontal: "center" as const, vertical: "center" as const },
+      };
+      if (ws["!ref"]) {
+        const range = XLSX.utils.decode_range(ws["!ref"]);
+        for (let col = range.s.c; col <= range.e.c; col++) {
+          const addr = XLSX.utils.encode_cell({ r: 0, c: col });
+          const cell = ws[addr];
+          if (cell) (cell as Record<string, unknown>).s = headerStyle;
+        }
+      }
+      // 列宽(字符数),与导出字段顺序对应
+      ws["!cols"] = [
+        { wch: 8 }, // 平台
+        { wch: 12 }, // 行业
+        { wch: 30 }, // 标题
+        { wch: 36 }, // 简介
+        { wch: 16 }, // 作者
+        { wch: 8 }, // 点赞数
+        { wch: 8 }, // 评论数
+        { wch: 8 }, // 收藏数
+        { wch: 8 }, // 分享数
+        { wch: 18 }, // 采集关键词
+        { wch: 60 }, // 文案
+        { wch: 46 }, // 内容链接
+        { wch: 20 }, // 发布时间
+        { wch: 20 }, // 采集时间
+      ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "文案内容");
+      const base64 = XLSX.write(wb, { type: "base64", bookType: "xlsx" });
+      const now = new Date();
+      const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+      // 当天导出流水号:每天从 001 起递增,导出成功才消耗(取消保存不计)
+      const SEQ_KEY = "veltrix.content-export-seq";
+      let prevSeq: { date: string; seq: number } = { date: "", seq: 0 };
+      try {
+        const raw = localStorage.getItem(SEQ_KEY);
+        if (raw) prevSeq = JSON.parse(raw);
+      } catch {
+        // 本地记录损坏则从头计
+      }
+      const seq = prevSeq.date === ymd ? prevSeq.seq + 1 : 1;
+      const fileName = `文案内容-${ymd}-${String(seq).padStart(3, "0")}.xlsx`;
+      const path = await save({
+        defaultPath: fileName,
+        filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
+      });
+      if (!path) return; // 用户取消保存
+      await api.saveBinaryFile(path, base64);
+      recordDownload({ path, name: fileName, kind: "内容导出" });
+      localStorage.setItem(SEQ_KEY, JSON.stringify({ date: ymd, seq }));
+      // 部分选中无文案被跳过时在结果里说明
+      const skipped = selected.length - withTranscript.length;
+      toast.success(
+        skipped > 0
+          ? `已导出 ${withTranscript.length} 条(跳过 ${skipped} 条无文案)`
+          : `已导出 ${withTranscript.length} 条`,
+      );
+    } catch (e) {
+      toast.error(`导出失败:${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBatchExporting(false);
+    }
+  }
+
   // 重新拉取素材:重跑下载并就地刷新该行状态。
   // 视频直链可能已过期(403),重试不一定成功——失败时提示需重新采集。
-  async function handleRetry(c: ContentView) {
+  // useCallback 稳定引用:作为 prop 传给 memo 的瀑布流卡片;仅重试集合变化时重建
+  const handleRetry = useCallback(async (c: ContentView) => {
     if (retrying.has(c.id)) return;
     setRetrying((prev) => new Set(prev).add(c.id));
     try {
@@ -303,6 +492,8 @@ export function ContentLibraryPage({
                 mediaStatus: res.mediaStatus,
                 audioExtracted: res.audioExtracted,
                 mediaError: res.mediaError,
+                transcript: res.transcript,
+                transcriptError: res.transcriptError,
               }
             : x,
         ),
@@ -322,6 +513,62 @@ export function ContentLibraryPage({
         next.delete(c.id);
         return next;
       });
+    }
+  }, [retrying]);
+
+  // 重新转写文案:仅重跑语音转写(素材/音频不动),就地刷新该行文案状态
+  async function handleRetryTranscript(c: ContentView) {
+    if (retryingTranscript.has(c.id)) return;
+    setRetryingTranscript((prev) => new Set(prev).add(c.id));
+    try {
+      const res = await api.retryContentTranscript(c.id);
+      setContents((prev) =>
+        prev.map((x) =>
+          x.id === res.id
+            ? { ...x, transcript: res.transcript, transcriptError: res.transcriptError }
+            : x,
+        ),
+      );
+      if (res.transcript) {
+        toast.success("文案已重新转写");
+      } else {
+        toast.error(
+          `转写仍失败${res.transcriptError ? `: ${res.transcriptError}` : ""}`,
+        );
+      }
+    } catch (e) {
+      toast.error(`转写重试失败: ${e}`);
+    } finally {
+      setRetryingTranscript((prev) => {
+        const next = new Set(prev);
+        next.delete(c.id);
+        return next;
+      });
+    }
+  }
+
+  // 批量转写:后端对当前列表中「有音频无文案」的条目按任务分组重跑语音转写
+  // (并发遵循系统设置「语音转写」),完成后整表刷新,用处理数与这批剩余待转写数算出成功数
+  async function handleBatchRetryTranscripts() {
+    if (batchRetryingTranscripts || untranscribedItems.length === 0) return;
+    setBatchRetryingTranscripts(true);
+    try {
+      const ids = untranscribedItems.map((c) => c.id);
+      const retried = await api.retryFailedTranscripts(ids);
+      const list = await api.listContents(penetratedTaskId);
+      setContents(list);
+      const idSet = new Set(ids);
+      const remain = list.filter((c) => idSet.has(c.id) && needsTranscript(c)).length;
+      const ok = Math.max(0, retried - remain);
+      toast.success(
+        remain > 0
+          ? `批量转写完成 · 共处理 ${retried} 条,成功 ${ok} 条,仍有 ${remain} 条未转写`
+          : `批量转写完成 · ${retried} 条全部成功`,
+      );
+    } catch (e) {
+      toast.error(`批量转写失败: ${e}`);
+    } finally {
+      setBatchRetryingTranscripts(false);
     }
   }
 
@@ -374,6 +621,8 @@ export function ContentLibraryPage({
             c={row.original}
             retrying={retrying.has(row.original.id)}
             onRetry={() => handleRetry(row.original)}
+            retryingTranscript={retryingTranscript.has(row.original.id)}
+            onRetryTranscript={() => handleRetryTranscript(row.original)}
           />
         ),
       },
@@ -408,6 +657,16 @@ export function ContentLibraryPage({
                     重新拉取素材
                   </DropdownMenuItem>
                 )}
+                {/* 文案未转写(含当时缺 API Key 被跳过的)或转写失败,且有音频:只重跑语音转写 */}
+                {!c.transcript && c.audioPath && (
+                  <DropdownMenuItem
+                    disabled={retryingTranscript.has(c.id)}
+                    onClick={() => handleRetryTranscript(c)}
+                  >
+                    <RefreshCw className="size-4" />
+                    {c.transcriptError ? "重新转写文案" : "转写文案"}
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   variant="destructive"
                   onClick={() => handleDelete(c.id)}
@@ -421,9 +680,9 @@ export function ContentLibraryPage({
         },
       },
     ],
-    // 依赖 retrying:行级重试态变化时重建列,徽章 loading / 禁用态才能刷新
+    // 依赖 retrying/retryingTranscript:行级重试态变化时重建列,徽章 loading / 禁用态才能刷新
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [platforms, platformName, retrying],
+    [platforms, platformName, retrying, retryingTranscript],
   );
 
   return (
@@ -542,22 +801,41 @@ export function ContentLibraryPage({
                 <X />
               </Button>
             )}
-            {supportsWaterfall && (
-              <div className="ml-auto inline-flex h-10 items-center rounded-md border p-0.5">
-                <ViewModeButton
-                  active={viewMode === "grid"}
-                  label="瀑布流"
-                  icon={LayoutGrid}
-                  onClick={() => changeViewMode("grid")}
-                />
-                <ViewModeButton
-                  active={viewMode === "list"}
-                  label="表格"
-                  icon={List}
-                  onClick={() => changeViewMode("list")}
-                />
-              </div>
-            )}
+            {/* 右侧操作区:视图切换(图片库/内容库)+ 全量库批量转写,整体靠右;批量转写在最右侧 */}
+            <div className="ml-auto flex items-center gap-2">
+              {supportsWaterfall && (
+                <div className="inline-flex h-10 items-center rounded-md border p-0.5">
+                  <ViewModeButton
+                    active={viewMode === "grid"}
+                    label="瀑布流"
+                    icon={LayoutGrid}
+                    onClick={() => changeViewMode("grid")}
+                  />
+                  <ViewModeButton
+                    active={viewMode === "list"}
+                    label="表格"
+                    icon={List}
+                    onClick={() => changeViewMode("list")}
+                  />
+                </div>
+              )}
+              {/* 全量库:待转写(有音频无文案)计数 + 一键批量转写;高度 h-10 对齐筛选输入框 */}
+              {!kindFilter && untranscribedItems.length > 0 && (
+                <Button
+                  variant="outline"
+                  className="h-10 cursor-pointer border-amber-500/40 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+                  disabled={batchRetryingTranscripts}
+                  onClick={handleBatchRetryTranscripts}
+                >
+                  {batchRetryingTranscripts ? (
+                    <Loader2 className="animate-spin" />
+                  ) : (
+                    <RefreshCw />
+                  )}
+                  未转写 {untranscribedItems.length} 条 · 批量转写
+                </Button>
+              )}
+            </div>
           </div>
           {/* 平台筛选(不选即全部,点已选取消)+ 图片库图源切换,同一行展示 */}
           <div className="flex flex-wrap items-center gap-2">
@@ -602,9 +880,7 @@ export function ContentLibraryPage({
             <ImageWaterfall
               items={filtered}
               visibleCount={visibleCount}
-              onLoadMore={() =>
-                setVisibleCount((prev) => prev + GRID_PAGE_SIZE)
-              }
+              onLoadMore={handleLoadMore}
               platformName={platformName}
               retrying={retrying}
               onOpenDetail={setDetailId}
@@ -618,6 +894,7 @@ export function ContentLibraryPage({
               itemLabel="内容"
               getRowId={(c) => c.id}
               defaultPageSize={50}
+              pageSizeOptions={[50, 100, 200, 500, 1000]}
               renderToolbar={(table) => {
                 const ids = table
                   .getSelectedRowModel()
@@ -642,6 +919,27 @@ export function ContentLibraryPage({
                         <NotebookPen />
                       )}
                       导出到 Obsidian
+                    </Button>
+                    {/* 导出 Excel:仅导出有文案的;无文案的在结果提示里说明跳过数 */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="cursor-pointer"
+                      disabled={batchExporting}
+                      onClick={() =>
+                        handleBatchExportExcel(
+                          table
+                            .getSelectedRowModel()
+                            .rows.map((r) => r.original),
+                        )
+                      }
+                    >
+                      {batchExporting ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <FileSpreadsheet />
+                      )}
+                      导出 Excel
                     </Button>
                     <Button
                       variant="destructive"

@@ -1,7 +1,7 @@
 //! 大模型能力封装:chat(意向分析)、speech(语音转写)。
 //!
 //! 设计:5 家厂商 chat 全 OpenAI 兼容,统一走 `chat::chat_completion`;
-//! 语音识别按 provider code 分发(目前仅小米 MiMo),经 `speech::transcribe`。
+//! 语音识别按 provider code 分发(小米 MiMo、智谱 GLM),经 `speech::transcribe`。
 //! 统一超时 + 指数退避重试在 `http`,稳定高可用;能力元数据在 `provider`,便于扩展。
 
 pub mod chat;

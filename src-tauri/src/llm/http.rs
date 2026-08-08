@@ -85,7 +85,12 @@ pub async fn send_with_retry(
                     retry_server_errors && (code == 429 || (500..=599).contains(&code));
                 if retryable && attempt < MAX_RETRIES {
                     attempt += 1;
-                    backoff_sleep(attempt).await;
+                    // 429 优先读 Retry-After 响应头做退避时长;无头/不可解析时走指数退避
+                    if code == 429 {
+                        sleep_retry_after(&resp, attempt).await;
+                    } else {
+                        backoff_sleep(attempt).await;
+                    }
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
@@ -106,10 +111,30 @@ pub async fn send_with_retry(
                     backoff_sleep(attempt).await;
                     continue;
                 }
-                return Err(CrawlerError::Config(format!("{label} 请求失败: {e}")));
+                return Err(CrawlerError::Config(format!(
+                    "{label} 请求失败: {}",
+                    error_chain(&e)
+                )));
             }
         }
     }
+}
+
+/// 429 限流退避:优先读 Retry-After 响应头(秒数或 HTTP-date),不可解析时回退指数退避。
+async fn sleep_retry_after(resp: &reqwest::Response, attempt: u32) {
+    // 尝试解析 Retry-After 头(秒数格式,如 "Retry-After: 5")
+    if let Some(val) = resp.headers().get("retry-after") {
+        if let Ok(secs) = val.to_str().unwrap_or("").trim().parse::<u64>() {
+            // 厂商可能返回极大值(如 3600),取 min(头值, 30s) 防止无限等
+            let max_secs = 30;
+            let wait = secs.min(max_secs).max(1);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            return;
+        }
+    }
+    // 无 Retry-After 头时回退:对 429 用更长的退避(2s/4s/8s 比默认 800ms/1.6s/3.2s 长)
+    let base = (RETRY_BASE_MS * 3).saturating_mul(1u64 << attempt.min(6));
+    tokio::time::sleep(std::time::Duration::from_millis(base)).await;
 }
 
 /// 指数退避 + 轻抖动。抖动复用系统时间纳秒作廉价熵,不引入 rand 依赖。
@@ -121,6 +146,18 @@ async fn backoff_sleep(attempt: u32) {
         .unwrap_or(0)
         % 300;
     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+}
+
+/// reqwest 顶层 Display 只有「error sending request for url (...)」,真正的根因
+/// (超时 / 连接被拒 / TLS 失败 / 连接被重置)在 source 链里。拼出整条链便于定位网络问题类型。
+fn error_chain(err: &reqwest::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        msg.push_str(&format!(": {e}"));
+        source = std::error::Error::source(e);
+    }
+    msg
 }
 
 /// 按字符截断,避免错误信息把超长响应体灌进日志。

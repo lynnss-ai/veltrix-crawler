@@ -17,7 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { platformClass, platformChipClass } from "@/lib/platforms";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Archive, Check, ChevronLeft, Clock, Database, Eye, Filter, Loader2, MoreHorizontal, SquarePen, Play, Plus, RotateCcw, Search, Square, Trash2, Wrench, X, type LucideIcon } from "lucide-react";
+import { Archive, Check, ChevronDown, ChevronLeft, Clock, Crosshair, Database, Eye, Filter, Loader2, MoreHorizontal, SquarePen, Play, Plus, RotateCcw, Search, Square, Trash2, Wrench, X, type LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -135,20 +135,26 @@ export function CollectPage({
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   // 任务表单用:启用平台 + 各自账号统计
   const [platformOptions, setPlatformOptions] = useState<PlatformOption[]>([]);
+  // 操作 pending 态:正在执行操作的按钮 disabled + spinner
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
+  // 停止/终止确认弹窗
+  const [stopConfirmTask, setStopConfirmTask] = useState<TaskItem | null>(null);
 
   // 平台 id → 名称,首列任务名前的标签和 toolbar 都用这个查表
   const platformName = (id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id;
 
+  // 首次加载标记:区分「加载中」与「真空列表」,避免误导用户(此前直接显示"暂无任务")
+  const [initialLoading, setInitialLoading] = useState(true);
   // 加载任务列表;每次 mutate 后重拉(简单粗暴,数据量不大时 OK)
-  const reload = () => {
-    api
+  const reload = (): Promise<void> => {
+    return api
       .listTasks()
       .then(setTasks)
-      .catch((e) => toast.error(`加载任务失败: ${e}`));
+      .catch((e) => { toast.error(`加载任务失败: ${e}`); });
   };
   useEffect(() => {
-    reload();
+    reload().then(() => setInitialLoading(false));
     api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
     api
       .listPlatforms()
@@ -234,6 +240,8 @@ export function CollectPage({
   // 详情页 task id;非空时整页切到 TaskDetailPage
   const [detailId, setDetailId] = useState<string | null>(null);
   const [editingTask, setEditingTask] = useState<TaskItem | null>(null);
+  // 表单模式:keyword=关键词采集(默认);targeted=定向采集(按账号主页/内容链接)
+  const [formMode, setFormMode] = useState<"keyword" | "targeted">("keyword");
 
   const filtered = useMemo(() => {
     const inTab = (t: TaskItem) => {
@@ -252,7 +260,9 @@ export function CollectPage({
         const q = search.toLowerCase();
         return (
           t.name.toLowerCase().includes(q) ||
-          t.keywords.some((k) => k.toLowerCase().includes(q))
+          t.keywords.some((k) => k.toLowerCase().includes(q)) ||
+          // 定向任务关键词是占位词「定向采集」,同时按目标链接匹配
+          (t.targetUrls ?? []).some((u) => u.toLowerCase().includes(q))
         );
       }
       return true;
@@ -299,8 +309,8 @@ export function CollectPage({
 
   // 只允许变更 status + started/finished 时间,其他字段保留(后端 update_task_status)
   function updateTask(id: string, patch: Partial<TaskItem>) {
-    if (!patch.status) return;
-    api
+    if (!patch.status) return Promise.resolve();
+    return api
       .updateTaskStatus({
         id,
         status: patch.status,
@@ -314,7 +324,7 @@ export function CollectPage({
 
   // 启动采集:接后端 run_task(选账号 → 后台开窗 + 拟人 RPA 采集),启动后轮询看进度
   function runTask(id: string) {
-    api
+    return api
       .runTask(id)
       .then(() => {
         toast.success("已启动采集");
@@ -345,12 +355,18 @@ export function CollectPage({
         if (!editingTask && input.trigger === "once-now") {
           api.runTask(input.id).catch((e) => toast.error(`自动启动失败: ${e}`));
         }
+        // 定向采集归属「快速任务」:保存后切到该 tab,直接看到新任务进度
+        if (!editingTask && formMode === "targeted") {
+          setTab("quick");
+        }
       })
       .catch((e) => toast.error(`保存失败: ${e}`));
   }
 
   function onEdit(t: TaskItem) {
     setEditingTask(t);
+    // 定向任务(targetUrls 非空)用定向模式编辑,其余回到关键词模式
+    setFormMode(t.targetUrls?.length ? "targeted" : "keyword");
     setFormOpen(true);
   }
   function onDetail(t: TaskItem) {
@@ -388,20 +404,21 @@ export function CollectPage({
           }
           // 进行中显示「终止」,其余显示「开始 / 重新运行」
           if (isInProgress(t)) {
+            const isPending = pendingActions.has(t.id);
             return (
               <SimpleTooltip content="终止">
                 <Button
                   variant="ghost"
                   size="icon"
+                  disabled={isPending}
                   className="cursor-pointer text-amber-600 hover:text-amber-600 dark:text-amber-400"
-                  onClick={() =>
-                    updateTask(t.id, {
-                      status: "cancelled",
-                      finishedAt: Math.floor(Date.now() / 1000),
-                    })
-                  }
+                  onClick={() => setStopConfirmTask(t)}
                 >
-                  <Square className="size-5" />
+                  {isPending ? (
+                    <Loader2 className="size-5 animate-spin" />
+                  ) : (
+                    <Square className="size-5" />
+                  )}
                 </Button>
               </SimpleTooltip>
             );
@@ -411,10 +428,24 @@ export function CollectPage({
               <Button
                 variant="ghost"
                 size="icon"
+                disabled={pendingActions.has(t.id)}
                 className="cursor-pointer text-emerald-600 hover:text-emerald-600 dark:text-emerald-400"
-                onClick={() => runTask(t.id)}
+                onClick={() => {
+                  setPendingActions((prev) => new Set(prev).add(t.id));
+                  runTask(t.id).finally(() =>
+                    setPendingActions((prev) => {
+                      const next = new Set(prev);
+                      next.delete(t.id);
+                      return next;
+                    }),
+                  );
+                }}
               >
-                <Play className="size-5" />
+                {pendingActions.has(t.id) ? (
+                  <Loader2 className="size-5 animate-spin" />
+                ) : (
+                  <Play className="size-5" />
+                )}
               </Button>
             </SimpleTooltip>
           );
@@ -485,6 +516,12 @@ export function CollectPage({
                 {t.aiExtract && (
                   <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-primary">
                     AI文案
+                  </span>
+                )}
+                {/* 只开音频提取(未开 AI 文案)时单独标注;开 AI 文案已隐含音频,不重复显示 */}
+                {t.audioExtract && !t.aiExtract && (
+                  <span className="whitespace-nowrap rounded bg-teal-500/10 px-1.5 py-0.5 text-teal-600 dark:text-teal-400">
+                    音频
                   </span>
                 )}
                 {t.collectComments && (
@@ -899,16 +936,43 @@ export function CollectPage({
                     <X />
                   </Button>
                 )}
-                <Button
-                  onClick={() => {
-                    setEditingTask(null);
-                    setFormOpen(true);
-                  }}
-                  className="h-10 shrink-0 cursor-pointer"
-                >
-                  <Plus />
-                  创建采集任务
-                </Button>
+                {/* 拆分按钮:主区创建关键词采集任务;右侧箭头下拉提供「定向采集任务」入口 */}
+                <div className="flex h-10 shrink-0 items-stretch">
+                  <Button
+                    onClick={() => {
+                      setEditingTask(null);
+                      setFormMode("keyword");
+                      setFormOpen(true);
+                    }}
+                    className="h-10 cursor-pointer rounded-r-none"
+                  >
+                    <Plus />
+                    创建采集任务
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        className="h-10 cursor-pointer rounded-l-none border-l border-primary-foreground/20 px-2"
+                        aria-label="更多创建方式"
+                      >
+                        <ChevronDown />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        className="cursor-pointer"
+                        onClick={() => {
+                          setEditingTask(null);
+                          setFormMode("targeted");
+                          setFormOpen(true);
+                        }}
+                      >
+                        <Crosshair />
+                        定向采集任务
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
             </div>
 
@@ -921,7 +985,13 @@ export function CollectPage({
                 renderToolbar={renderPlatformBar}
                 customizeKey="veltrix.collect-tasks-columns"
                 emptyState={
-                  <EmptyState title="暂无任务,点击右上角「创建采集任务」开始" />
+                  initialLoading ? (
+                    <div className="flex items-center justify-center py-16">
+                      <Loader2 className="size-6 animate-spin text-muted-foreground" />
+                    </div>
+                  ) : (
+                    <EmptyState title="暂无任务,点击右上角「创建采集任务」开始" />
+                  )
                 }
               />
             </TabsContent>
@@ -980,17 +1050,62 @@ export function CollectPage({
       </div>
 
       <TaskFormSheet
-        key={formOpen ? (editingTask?.id ?? "new") : "idle"}
+        key={formOpen ? `${editingTask?.id ?? "new"}-${formMode}` : "idle"}
         open={formOpen}
+        mode={formMode}
         initial={editingTask}
         industries={industries}
         platforms={platformOptions}
         onOpenChange={(v) => {
           setFormOpen(v);
-          if (!v) setEditingTask(null);
+          if (!v) {
+            setEditingTask(null);
+            setFormMode("keyword");
+          }
         }}
         onSubmit={handleSaveTask}
       />
+
+      {/* 停止/终止任务确认弹窗:防止误触(归档/删除都有确认,停止也应该有) */}
+      <AlertDialog
+        open={!!stopConfirmTask}
+        onOpenChange={(open) => {
+          if (!open) setStopConfirmTask(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>终止任务</AlertDialogTitle>
+            <AlertDialogDescription>
+              将终止任务「{stopConfirmTask?.name ?? "未知"}」,已采集的数据保留,可重新运行。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer">取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="cursor-pointer bg-amber-600 text-white hover:bg-amber-700"
+              onClick={() => {
+                if (!stopConfirmTask) return;
+                const id = stopConfirmTask.id;
+                setPendingActions((prev) => new Set(prev).add(id));
+                updateTask(id, {
+                  status: "cancelled",
+                  finishedAt: Math.floor(Date.now() / 1000),
+                }).finally(() => {
+                  setPendingActions((prev) => {
+                    const next = new Set(prev);
+                    next.delete(id);
+                    return next;
+                  });
+                  setStopConfirmTask(null);
+                });
+              }}
+            >
+              确认终止
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -1199,6 +1314,7 @@ const TaskActionsCell = memo(function TaskActionsCell({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
     </div>
   );
 });
