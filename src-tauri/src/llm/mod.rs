@@ -16,4 +16,4 @@ pub mod speech;
 pub use intent::{analyze_intent, IntentRequest, IntentVerdict};
 pub use provider::{all_capabilities, ProviderCapability};
 pub use role::AgentRole;
-pub use speech::{transcribe, TranscribeRequest};
+pub use speech::{transcribe, transcribe_stream, TranscribeRequest};

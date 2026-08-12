@@ -35,14 +35,14 @@ function SectionLabel({ icon: Icon, children }: { icon: LucideIcon; children: Re
 }
 
 // ffmpeg 依赖与检测状态:用 [] 紧跟标题后;音频提取 / AI 文案提取两卡片共用。
-// null=检测中,false=未安装(给下载引导),true=已安装(绿色就绪)
+// null=检测中,false=不可用(给下载引导兜底),true=可用(绿色就绪;内置 ffmpeg 时恒为此态)
 function FfmpegNote({ available }: { available: boolean | null }) {
   return (
     <span className="text-xs">
       {available === false ? (
         // 未安装:整段红色,下载链接同色加下划线
         <span className="text-red-600 dark:text-red-400">
-          [依赖 ffmpeg · 未安装,
+          [依赖 ffmpeg · 不可用,
           <button
             type="button"
             className="cursor-pointer underline underline-offset-2 hover:text-red-700 dark:hover:text-red-300"
@@ -59,7 +59,7 @@ function FfmpegNote({ available }: { available: boolean | null }) {
       ) : available === true ? (
         // 已安装:绿色表示就绪
         <span className="text-emerald-600 dark:text-emerald-400">
-          [依赖 ffmpeg · 已安装]
+          [依赖 ffmpeg · 已就绪]
         </span>
       ) : (
         <span className="text-muted-foreground">[依赖 ffmpeg]</span>
@@ -204,8 +204,12 @@ export function TaskFormSheet({
   const [commentTimeRange, setCommentTimeRange] = useState<CommentTimeRange>(
     initial?.commentTimeRange ?? DEFAULT_STRATEGY.commentTimeRange,
   );
+  // 单视频评论上限默认:定向采集目标明确,默认不限(0)抓全;搜索采集限 100 条防爆量
   const [commentLimit, setCommentLimit] = useState(
-    String(initial?.commentLimit ?? DEFAULT_STRATEGY.commentLimit),
+    String(
+      initial?.commentLimit ??
+        (mode === "targeted" ? 0 : DEFAULT_STRATEGY.commentLimit),
+    ),
   );
   const [analyzeCommentIntent, setAnalyzeCommentIntent] = useState(
     initial?.analyzeCommentIntent ?? DEFAULT_STRATEGY.analyzeCommentIntent,

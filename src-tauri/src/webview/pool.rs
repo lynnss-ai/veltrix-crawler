@@ -1,9 +1,15 @@
 //! 可见 WebView 池 + 高层采集桥接 `CollectBridge`。
 //!
-//! `WebviewPool` 维护「(平台, 账号) -> 可见窗口」映射。设计要点:
-//! - **单窗口既登录又采集**:同一账号用同一窗口,登录态天然延续到采集;
+//! `WebviewPool` 维护「窗口 label -> 可见窗口」映射,label 分两级:
+//! - **账号级**(`window_label`,登录窗口):「(平台, 账号)」唯一,登录态写入该账号数据目录;
+//! - **任务级**(`collect_window_label`,采集窗口):「(平台, 账号, 任务)」唯一,
+//!   每个采集任务独立窗口——同账号任务 A 进入素材下载阶段(不再占窗口)后,任务 B
+//!   复用同账号开采,若仍共用窗口,A 的素材日志会写进 B 的窗口 HUD(串数据/串日志)。
+//! 设计要点:
 //! - **多账号隔离**:每账号一个独立 `data_directory`(WebView2 用户数据目录),
 //!   使不同账号的 Cookie / localStorage 互不覆盖,实现「同平台多账号」并存;
+//!   任务级采集窗口**仍用账号级数据目录**(登录态在账号目录里),靠 `account_collect_lock`
+//!   串行化同账号采集,不会两窗并发占用同一目录;
 //! - **窗口可见**:用户能看到 RPA 操作过程,必要时手动过验证码。
 //!
 //! `CollectBridge` 在池之上对外暴露「关键词 → 拦截到的接口响应集合」的统一采集调用。
@@ -19,8 +25,9 @@ use crate::webview::{
     build_hud_task_eval,
     build_intercept_init_script,
     build_comment_scroll_eval, build_scroll_eval, build_search_eval, build_select_eval,
-    build_set_session_eval,
+    build_set_session_eval, build_ssr_first_screen_eval,
     emit_collect_log, CollectControl, InterceptChannel, InterceptedResponse, RpaChannel,
+    SSR_FALLBACK_URL_PREFIX,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -526,16 +533,52 @@ const DIRECT_DETAIL_WAIT_MS: u64 = 15_000;
 /// 每轮约触发一页(抖音 ~18 条),还要预留接口在途时的空转轮;真正的收尾靠
 /// 「接口 has_more=0 / 长停滞」判定,此上限只防死循环,不能成为漏采来源。
 const PROFILE_POSTS_MAX_ROUNDS: u32 = 400;
-/// 定向主页采集:每轮滚动后的等待(毫秒),等分页接口返回再判增长。
-const PROFILE_POSTS_ROUND_MS: u64 = 2200;
+/// 定向主页采集:每轮滚动后的最长等待(毫秒)。期间轮询拦截总数,有新响应到达即提前
+/// 进入下一轮(快时不空等),慢接口则给足等待,见 collect_profile_posts 滚动循环。
+const PROFILE_POSTS_ROUND_MS: u64 = 5_000;
+/// 每轮等待内检查新响应的轮询间隔(毫秒)。
+const PROFILE_POSTS_POLL_MS: u64 = 300;
 /// 定向主页采集:接口明确还有下一页(has_more=1)但响应停滞时的容忍轮数。
-/// 快速翻页下抖音常风控延迟/停发几秒,只按 STAGNANT_STOP(≈6.6s)收尾会误判到底、
-/// 漏掉后面所有页;给 ~18s 容忍,仍不增长才放弃。
-const PROFILE_POSTS_STALL_STOP: u32 = 8;
+/// 实测多数情况是分页加载慢而非风控:保持节奏继续滚动等待,20 轮(≈44s)仍无增长才放弃。
+const PROFILE_POSTS_STALL_STOP: u32 = 20;
+
+/// 评论 API 直采(抖音):完成回传的轮询间隔(毫秒)。
+const COMMENT_API_POLL_MS: u64 = 500;
+/// 评论 API 直采:整体等待上限(秒)。页内脚本可能被导航 / 冻结打断永不回传,
+/// 超时按失败处理、结束本视频评论采集,不能死等。
+const COMMENT_API_MAX_WAIT_SECS: u64 = 300;
+/// 评论 API 直采:停滞上限(秒)。评论响应数长时间不增长 = 页内脚本大概率已死
+/// (页面冻结 / 导航 / 风控静默),主动结束而不是死等整体超时。
+const COMMENT_API_STALL_SECS: u64 = 90;
+
+/// 评论 API 直采(抖音)的尝试结果。
+enum CommentApiOutcome {
+    /// 直采完成:评论响应已进会话缓冲(与滚动路径同轨),调用方直接收尾。
+    Done,
+    /// 用户手动停止:保留已采部分,不再滚动。
+    Aborted,
+    /// 直采不可用(无签名函数 / 接口异常 / 超时等):调用方回退滚动采集。
+    Fallback,
+}
 
 /// WebView 窗口标签拼装规则。统一前缀便于在 Tauri 端区分管理类窗口。
 pub(crate) fn window_label(platform: &str, account_id: &str) -> String {
     format!("veltrix-{platform}-{account_id}")
+}
+
+/// 采集窗口标签:按「平台 + 账号 + 任务」唯一,任务间互不共用窗口(串数据/串日志的根因修复)。
+/// 登录窗口仍用 `window_label`(按账号);任务内多关键词/评论/定向复用同一任务窗口。
+pub(crate) fn collect_window_label(platform: &str, account_id: &str, task_id: &str) -> String {
+    format!("veltrix-{platform}-{account_id}-task-{task_id}")
+}
+
+/// 采集路径的窗口标签解析:带 task_id(非空)→ 任务级采集窗口;
+/// None / 空(联调单采、手动补采等无任务上下文)→ 账号级窗口(兼容旧行为)。
+pub(crate) fn task_window_label(platform: &str, account_id: &str, task_id: Option<&str>) -> String {
+    match task_id {
+        Some(t) if !t.is_empty() => collect_window_label(platform, account_id, t),
+        _ => window_label(platform, account_id),
+    }
 }
 
 /// 拦截到的响应里是否有 URL 命中验证特征(响应侧风控检测)。patterns 空时恒 false。
@@ -755,6 +798,8 @@ fn scroll_once(window: &WebviewWindow, notches: i32) {
 struct WindowSpec<'a> {
     platform: &'a str,
     account_id: &'a str,
+    /// 所属任务 id:Some(非空)时窗口按任务级 label(采集窗口),None 为账号级(登录)窗口。
+    task_id: Option<&'a str>,
     /// 首次创建时加载的初始页(通常是登录页);窗口已存在时忽略。
     initial_url: &'a str,
     /// 该平台需拦截的接口 URL 特征,编译进早期注入脚本。
@@ -780,6 +825,9 @@ pub struct WebviewPool {
     /// convId -> 内嵌主窗口右栏的浏览器 Agent 子 webview(`Window::add_child`)。
     /// 与采集独立窗口分开管理:Agent 不弹独立窗口,真实 webview 直接贴在主窗口右栏区域。
     agent_webviews: Mutex<HashMap<String, Webview>>,
+    /// 页内信号桥用的采集控制句柄,由 CollectBridge 构造时注入(OnceLock,只取首个);
+    /// ensure_intercept 据此给窗口注册 WebMessageReceived 信号桥(api_done / verify / stop)。
+    control: std::sync::OnceLock<Arc<CollectControl>>,
 }
 
 impl WebviewPool {
@@ -787,9 +835,27 @@ impl WebviewPool {
         Self::default()
     }
 
-    /// 确保指定账号的可见 WebView 存在;已存在则复用(保留登录态)。
+    /// 确保指定窗口存在;已存在则复用(保留登录态)。
+    /// 采集窗口(spec.task_id 非空)按任务级 label;登录 / 访问平台窗口按账号级 label。
     fn ensure_window(&self, app: &AppHandle, spec: &WindowSpec<'_>) -> Result<WebviewWindow> {
-        let label = window_label(spec.platform, spec.account_id);
+        let label = task_window_label(spec.platform, spec.account_id, spec.task_id);
+
+        // 任务级采集窗口与账号级(登录)窗口共用同一 WebView2 用户数据目录,两窗并存可能冲突;
+        // 开采集窗前先接管——关掉该账号的账号级窗口(此前采集本就复用登录窗口本身,等价行为)。
+        // 同账号采集已由 account_collect_lock 串行化,不会出现两个同账号任务窗口并发占用同一目录。
+        if matches!(spec.task_id, Some(t) if !t.is_empty()) {
+            let account_label = window_label(spec.platform, spec.account_id);
+            // 先从 map remove 再 close,避免 Destroyed 监听重入同一把锁
+            let win = self
+                .windows
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&account_label));
+            if let Some(win) = win {
+                let _ = win.close();
+            }
+            self.forget(&account_label);
+        }
 
         // 复用只信 Tauri 权威句柄:窗口真实存活才返回 Some,二次进入不重建、登录态延续。
         // 不能用本地 windows 缓存复用——窗口被关闭后缓存句柄已失效,会导致
@@ -819,8 +885,11 @@ impl WebviewPool {
             )));
         }
 
-        // 每账号独立用户数据目录,隔离 Cookie / 登录态(WebView2 在 Windows 生效)
-        let data_dir = self.account_data_dir(app, &label)?;
+        // 每账号独立用户数据目录,隔离 Cookie / 登录态(WebView2 在 Windows 生效)。
+        // 注意:数据目录始终按**账号级** label 派生——登录态在账号目录里,任务级采集窗口
+        // 必须共用同一账号目录,绝不能按任务分目录(会丢登录态且目录膨胀)。
+        let account_label = window_label(spec.platform, spec.account_id);
+        let data_dir = self.account_data_dir(app, &account_label)?;
         tracing::info!(
             label = %label,
             data_dir = %data_dir.display(),
@@ -843,8 +912,9 @@ impl WebviewPool {
         #[cfg(target_os = "macos")]
         {
             let _ = &data_dir; // mac 不用目录隔离,但仍保留路径计算以兼容 clear_login_data
+            // data_store_identifier 同样按账号级 label 派生:任务级窗口共用账号数据存储(登录态延续)
             builder = builder
-                .data_store_identifier(account_store_id(&label))
+                .data_store_identifier(account_store_id(&account_label))
                 .initialization_script(crate::webview::build_native_intercept_init_script_mac(
                     spec.patterns,
                 ));
@@ -919,18 +989,24 @@ impl WebviewPool {
     ) -> ResponseSink {
         // 先用单次持锁完成 check-then-insert,防止并发双装竞态(两次调用各拿到
         // None → 各装一个拦截器 → 后装的 sink 覆盖先装的,先装那个成无人消费的孤儿)
+        // 页内信号桥:控制句柄已由 CollectBridge 注入时,随拦截器一起注册
+        // (远程页面的 Tauri invoke 会被 ACL 拒,信号走 WebView 原生消息)
+        let signals = self.control.get().map(|c| native_intercept::SignalCtx {
+            app: webview.app_handle().clone(),
+            control: c.clone(),
+        });
         if let Ok(mut map) = self.sinks.lock() {
             if let Some(sink) = map.get(label) {
                 return sink.clone();
             }
             let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
-            native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries);
+            native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries, signals);
             map.insert(label.to_string(), sink.clone());
             return sink;
         }
         // 锁异常时降级:直接装但不记录(下次调用再试)
         let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
-        native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries);
+        native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries, signals);
         sink
     }
 
@@ -970,12 +1046,33 @@ impl WebviewPool {
         account_id: &str,
     ) -> Result<()> {
         let label = window_label(platform, account_id);
-        // 先关窗并清掉缓存句柄 / 拦截缓冲,释放对存储的占用
+        // 先关窗并清掉缓存句柄 / 拦截缓冲,释放对存储的占用。
+        // 任务级采集窗口(前缀 `账号级label-task-`)与账号级窗口共用同一数据目录,必须一并关闭,
+        // 否则清数据目录时任务窗口仍占用会冲突、账号删除也会泄漏窗口。
+        let task_prefix = format!("{label}-task-");
+        let mut closed_labels: Vec<String> = Vec::new();
+        let mut wins: Vec<WebviewWindow> = Vec::new();
         if let Ok(mut map) = self.windows.lock() {
-            if let Some(win) = map.remove(&label) {
-                let _ = win.close();
+            // 先收集并从 map remove,再在锁外统一 close,避免 Destroyed 监听重入同一把锁
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|k| k.as_str() == label || k.starts_with(&task_prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(win) = map.remove(&k) {
+                    closed_labels.push(k);
+                    wins.push(win);
+                }
             }
         }
+        for win in wins {
+            let _ = win.close();
+        }
+        for l in &closed_labels {
+            self.forget(l);
+        }
+        // 账号级 label 不在 map 时(窗口未开 / 已关)也要清其可能残留的拦截缓冲(forget 幂等)
         self.forget(&label);
 
         // macOS:登录态在 WKWebsiteDataStore(data_store_identifier),不在数据目录
@@ -1041,6 +1138,8 @@ impl WebviewPool {
         let spec = WindowSpec {
             platform,
             account_id,
+            // 登录窗口按账号级 label(不带任务)
+            task_id: None,
             initial_url: &cfg.login_url,
             patterns: &cfg.collect.intercept_patterns,
             // 登录 / 访问平台不是采集,不注入采集 HUD 浮层
@@ -1206,14 +1305,50 @@ impl WebviewPool {
         Ok(())
     }
 
-    /// 关闭并移除某窗口(账号被删除时调用,避免句柄泄漏)。
+    /// 关闭并移除指定 label 的窗口(缓存句柄 + 拦截缓冲一并清)。
+    pub fn drop_window_by_label(&self, label: &str) -> Result<()> {
+        // 先从 map remove 再 close,避免 Destroyed 监听重入同一把锁
+        let win = self
+            .windows
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(label));
+        if let Some(win) = win {
+            let _ = win.close();
+        }
+        self.forget(label);
+        Ok(())
+    }
+
+    /// 关闭并移除某账号的全部窗口(账号级登录窗口 + 所有任务级采集窗口)。
+    /// 账号被删除时调用,避免句柄泄漏;任务窗口与账号共用数据目录,不一并关会泄漏。
     pub fn drop_window(&self, platform: &str, account_id: &str) -> Result<()> {
         let label = window_label(platform, account_id);
+        let task_prefix = format!("{label}-task-");
+        let mut labels: Vec<String> = Vec::new();
+        let mut wins: Vec<WebviewWindow> = Vec::new();
         if let Ok(mut map) = self.windows.lock() {
-            if let Some(win) = map.remove(&label) {
-                let _ = win.close();
+            // 先收集并从 map remove,再在锁外统一 close,避免重入
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|k| k.as_str() == label || k.starts_with(&task_prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(win) = map.remove(&k) {
+                    labels.push(k);
+                    wins.push(win);
+                }
             }
         }
+        for win in wins {
+            let _ = win.close();
+        }
+        for l in &labels {
+            self.forget(l);
+        }
+        // 账号级 label 不在 map 时也要清其可能残留的拦截缓冲(forget 幂等)
+        self.forget(&label);
         Ok(())
     }
 
@@ -1332,6 +1467,8 @@ pub struct DetailFetchRequest<'a> {
     pub xsec_token: &'a str,
     /// 平台配置:提供详情页 URL 模板与拦截特征。
     pub platform_cfg: &'a PlatformConfig,
+    /// 所属任务 id:Some 时直链补取复用该任务的采集窗口(任务级 label),None 回退账号级窗口。
+    pub task_id: Option<&'a str>,
 }
 
 /// 一次「作者主页画像补采」调用的参数。集中成结构体以遵守「参数 ≤ 4」。
@@ -1390,6 +1527,8 @@ impl CollectBridge {
         rpa: Arc<RpaChannel>,
         control: Arc<CollectControl>,
     ) -> Self {
+        // 注入页内信号桥用的控制句柄(重复注入忽略,首个生效)
+        let _ = pool.control.set(control.clone());
         Self {
             pool,
             channel,
@@ -1398,24 +1537,27 @@ impl CollectBridge {
         }
     }
 
-    /// 采集完成后关闭指定账号的采集窗口,释放资源。
-    pub fn close_collect_window(&self, platform: &str, account_id: &str) {
-        if let Err(e) = self.pool.drop_window(platform, account_id) {
+    /// 采集完成后关闭指定任务的采集窗口,释放资源。
+    /// task_id 为 None / 空(联调单采、手动补采)时关账号级窗口。
+    /// 只关本任务自己的窗口:不能走 drop_window(会连账号级登录窗口与别的任务窗口一起关)。
+    pub fn close_collect_window(&self, platform: &str, account_id: &str, task_id: Option<&str>) {
+        let label = task_window_label(platform, account_id, task_id);
+        if let Err(e) = self.pool.drop_window_by_label(&label) {
             tracing::warn!(platform, account_id, "关闭采集窗口失败: {e}");
         }
     }
 
 
     /// 任务开始前重置采集窗口「被手动关闭」标记(配合 is_collect_window_closed 使用)。
-    pub fn reset_collect_window_closed(&self, platform: &str, account_id: &str) {
+    pub fn reset_collect_window_closed(&self, platform: &str, account_id: &str, task_id: Option<&str>) {
         self.pool
-            .clear_user_closed(&window_label(platform, account_id));
+            .clear_user_closed(&task_window_label(platform, account_id, task_id));
     }
 
     /// 采集窗口是否已被用户手动关闭:采集主循环据此终止任务,而非重建窗口继续采集。
-    pub fn is_collect_window_closed(&self, platform: &str, account_id: &str) -> bool {
+    pub fn is_collect_window_closed(&self, platform: &str, account_id: &str, task_id: Option<&str>) -> bool {
         self.pool
-            .is_user_closed(&window_label(platform, account_id))
+            .is_user_closed(&task_window_label(platform, account_id, task_id))
     }
 
     /// 任务开始前重置该任务的「结束」停止标记,避免上次运行的点击影响本次重跑。
@@ -1449,6 +1591,8 @@ impl CollectBridge {
         let spec = WindowSpec {
             platform: &platform_cfg.id,
             account_id,
+            // 采集窗口按任务级 label;task_id None / 空(联调单采)回退账号级窗口
+            task_id,
             initial_url: &platform_cfg.login_url,
             patterns: &platform_cfg.collect.intercept_patterns,
             with_hud: true,
@@ -1457,7 +1601,8 @@ impl CollectBridge {
         };
         let window = self.pool.ensure_window(app, &spec)?;
 
-        let label = window_label(&platform_cfg.id, account_id);
+        // 取本任务窗口的原生拦截缓冲(label 口径与 ensure_window 一致,任务级)
+        let label = task_window_label(&platform_cfg.id, account_id, task_id);
         let sink = self.pool.window_sink(&label);
         if let Some(s) = &sink {
             if let Ok(mut buf) = s.lock() {
@@ -1525,6 +1670,82 @@ impl CollectBridge {
                     .and_then(|r| parse(&r.body))
             })
         })
+    }
+
+    /// 主页采集收尾审计(逐条进 HUD):
+    /// ① 首屏 SSR 兜底结果——补采条数(items 形态)或「首屏疑似丢失 N 条」(仅 ID 形态);
+    /// ② 作品接口响应解析失败页数(拦截器截断 / 风控脏页,该页内容已丢失);
+    /// ③ 对账——拦截响应里画像 `user.aweme_count`(作者声明总数) vs 去重后实采 aweme_id 数,
+    ///    不一致打 ⚠️(含两个数字),一致打 ✅;拿不到 aweme_count 时不出对账日志。
+    fn report_profile_collect_audit(
+        &self,
+        app: &AppHandle,
+        window: &WebviewWindow,
+        task_id: Option<&str>,
+        posts_pattern: Option<&str>,
+        responses: &[InterceptedResponse],
+    ) {
+        // ① SSR 兜底标记(可能多条,正常只一条)
+        for resp in responses
+            .iter()
+            .filter(|r| r.url.starts_with(SSR_FALLBACK_URL_PREFIX))
+        {
+            match parse_ssr_fallback_marker(resp) {
+                Some(SsrFallback::Items(n)) => self.log_step(
+                    app,
+                    window,
+                    task_id,
+                    "info",
+                    &format!("📥 首屏 SSR 兜底补采 {n} 条 · 与滚动期拦截按 aweme_id 去重合并"),
+                ),
+                Some(SsrFallback::Ids(n)) => self.log_step(
+                    app,
+                    window,
+                    task_id,
+                    "warn",
+                    &format!(
+                        "⚠️ 首屏疑似丢失 {n} 条(SSR 数据不可用,仅扫到作品 ID)· 本轮未逐条补采"
+                    ),
+                ),
+                None => {}
+            }
+        }
+        let Some(pattern) = posts_pattern else { return };
+        // ② 解析失败页数:命中作品接口但响应体不是合法 JSON(多为 2MB 截断产出半个 JSON / 风控)
+        let failed = count_posts_parse_failures(responses, pattern);
+        if failed > 0 {
+            self.log_step(
+                app,
+                window,
+                task_id,
+                "warn",
+                &format!("⚠️ {failed} 页作品接口响应解析失败(可能被截断或风控)· 该页内容已丢失"),
+            );
+        }
+        // ③ 对账:作者声明总数 vs 去重后实采数
+        if let Some(declared) = extract_declared_posts_count(responses) {
+            let got = count_distinct_aweme_ids(responses, pattern);
+            if got as i64 == declared {
+                self.log_step(
+                    app,
+                    window,
+                    task_id,
+                    "info",
+                    &format!("✅ 对账一致:作者声明 {declared} 条 · 实采去重 {got} 条"),
+                );
+            } else {
+                self.log_step(
+                    app,
+                    window,
+                    task_id,
+                    "warn",
+                    &format!(
+                        "⚠️ 对账不符:作者声明 {declared} 条 · 实采去重 {got} 条(差 {} 条)",
+                        declared - got as i64
+                    ),
+                );
+            }
+        }
     }
 
     /// 用关键词在某账号的 WebView 内执行一次 RPA 采集,返回拦截到的接口响应集合。
@@ -1598,7 +1819,8 @@ impl CollectBridge {
         // 判定本次是否被用户主动停止——必须在 clear 之前读 is_stopping(clear 会清掉该标志)。
         // 关窗用「窗口已不在(句柄消失)/ Destroyed 标记」同步判定,避免只依赖异步 Destroyed 事件
         // 带来的竞态(否则下个关键词可能在标记落定前又重建窗口继续采集)。
-        let label = window_label(&cfg.id, req.account_id);
+        // label 按任务级解析:与 setup_collect_session 开窗口径一致
+        let label = task_window_label(&cfg.id, req.account_id, req.task_id);
         let task_stopping = req
             .task_id
             .map(|t| self.control.is_task_stopping(t))
@@ -1728,7 +1950,8 @@ impl CollectBridge {
         let responses = self.take_collected_responses(session_id, sink.as_ref());
         // 停止判定与 collect 一致:关窗(句柄消失 / Destroyed 标记)→ WindowClosed;
         // HUD 结束 / 任务级停止 → UserEnded。必须在 clear 之前读 is_stopping。
-        let label = window_label(&cfg.id, req.account_id);
+        // label 按任务级解析:与 setup_collect_session 开窗口径一致
+        let label = task_window_label(&cfg.id, req.account_id, req.task_id);
         let task_stopping = req
             .task_id
             .map(|t| self.control.is_task_stopping(t))
@@ -1772,7 +1995,8 @@ impl CollectBridge {
     }
 
     /// 定向采集「主页链接」:在某账号的 WebView 内导航到作者主页,滚动加载作品分页,
-    /// 直到「连续多轮无新响应(到底)/ 手动停 / 关窗 / 达轮数上限」后取走全部拦截响应。
+    /// 直到「连续多轮无新响应(到底)/ 接口 has_more=0 / 手动停 / 关窗 / 达轮数上限」后取走全部拦截响应。
+    /// 滚动中弹安全验证会暂停等手动完成;has_more=1 但响应暂未返回(加载慢)时保持节奏继续滚动等待。
     ///
     /// 与 `collect_direct`(单条内容链接)的区别:主页作品靠滚动分页加载,需要滚动循环;
     /// 列表接口(如抖音 /aweme/v1/web/aweme/post/)随首屏与每轮滚动发出。
@@ -1832,65 +2056,173 @@ impl CollectBridge {
                 }
             };
             let _ = window.eval(build_set_session_eval(session_id));
+            // 注入安全验证自检(平台配了验证特征时):滚动翻页中弹滑块/跳验证页即回传 verifying,
+            // 滚动循环据此暂停等手动完成(此前主页路径无此检测,风控弹验证会被误判成停滞到底)
+            let verify_eval = crate::webview::build_verify_check_eval(
+                session_id,
+                &cfg.collect.verify_selectors,
+                &cfg.collect.verify_texts,
+                &cfg.collect.verify_url_patterns,
+            );
+            if !verify_eval.is_empty() {
+                let _ = window.eval(&verify_eval);
+            }
             if !hit {
-                let _ = window.eval(build_hud_log_eval(
-                    "info",
+                self.log_step(
+                    app,
+                    &window,
+                    req.task_id,
+                    "warn",
                     "⚠️ 未拦到作品列表接口(超时)· 仍尝试滚动加载",
-                ));
+                );
+            }
+            // 首屏兜底补采:首屏(约 18-24 条,含置顶)是 SSR 直出,可能根本不发作品接口
+            // XHR 或命中缓存拿不到 body,整页丢失。导航完成后从页面 SSR 数据提取首屏作品,
+            // 经 intercept_push 合成标记响应进会话缓冲,随拦截响应一并解析、按 aweme_id 去重;
+            // SSR 不可用时退化为扫 DOM 作品链接只回 ID(收尾审计记「首屏疑似丢失 N 条」)。
+            if let Some(pattern) = req.posts_pattern {
+                let _ = window.eval(build_ssr_first_screen_eval(session_id, pattern));
             }
             // 滚动加载分页:按「拦截缓冲 + 会话通道的响应总数是否增长」判停滞;
             // 结合最新一页作品接口的 has_more 区分「真到底」与「风控/慢响应停滞」——
             // 接口明确 has_more=0 立即收尾;has_more=1 但响应停滞给更长容忍,防漏采。
             let mut last_len = 0usize;
             let mut stagnant = 0u32;
+            // 「接口较慢」提示每段停滞只报一次(恢复增长后重置,下一段停滞再报)
+            let mut stall_logged = false;
             for _round in 0..PROFILE_POSTS_MAX_ROUNDS {
                 if self.control.is_stopping(session_id) || collect_window_gone(&window) {
                     break;
                 }
+                // 兜底上限即将触顶:正常不会到这(收尾靠 has_more/停滞判定),落库便于发现异常
+                if _round + 1 == PROFILE_POSTS_MAX_ROUNDS {
+                    self.log_step(
+                        app,
+                        &window,
+                        req.task_id,
+                        "warn",
+                        &format!(
+                            "⚠️ 滚动达轮数上限 {PROFILE_POSTS_MAX_ROUNDS} · 强制收尾(共拦到 {last_len} 条接口响应)"
+                        ),
+                    );
+                }
+                // 安全验证:自检脚本检测到滑块/验证页后置 verifying,暂停滚动等用户手动完成;
+                // 解除后重置停滞基线(验证期间的拦截缓冲不计入增长判定),超时/手动结束则收尾
+                if self.control.is_verifying(session_id) {
+                    self.log_step(
+                        app,
+                        &window,
+                        req.task_id,
+                        "warn",
+                        "⚠️ 主页采集遇到安全验证 · 已暂停滚动 · 请在采集窗口手动完成验证",
+                    );
+                    if !self
+                        .wait_verify_cleared(
+                            &window,
+                            session_id,
+                            &verify_eval,
+                            &cfg.collect.verify_url_patterns,
+                            &cfg.id,
+                        )
+                        .await
+                    {
+                        self.log_step(
+                            app,
+                            &window,
+                            req.task_id,
+                            "warn",
+                            "⚠️ 安全验证等待结束(超时未完成或被手动结束)· 收尾(已采数据保留)",
+                        );
+                        break;
+                    }
+                    self.log_step(
+                        app,
+                        &window,
+                        req.task_id,
+                        "info",
+                        "✅ 安全验证已完成 · 恢复主页采集",
+                    );
+                    stagnant = 0;
+                    stall_logged = false;
+                    last_len = sink
+                        .as_ref()
+                        .and_then(|s| s.lock().ok().map(|b| b.len()))
+                        .unwrap_or(0)
+                        + self.channel.session_len(session_id);
+                }
                 let _ = window.eval(build_scroll_eval());
                 #[cfg(windows)]
                 if let Ok(parent) = window.hwnd() {
-                    let _ = win_wheel::real_wheel(parent, -2);
+                    // 每轮 10 个滚轮格:加大单轮滚动距离,更快触发分页加载
+                    let _ = win_wheel::real_wheel(parent, -10);
                 }
                 #[cfg(not(windows))]
                 let _ = window.eval(&crate::webview::build_wheel_eval());
-                tokio::time::sleep(Duration::from_millis(PROFILE_POSTS_ROUND_MS)).await;
-                let len = sink
-                    .as_ref()
-                    .and_then(|s| s.lock().ok().map(|b| b.len()))
-                    .unwrap_or(0)
-                    + self.channel.session_len(session_id);
+                // 每轮最长等 PROFILE_POSTS_ROUND_MS:期间每 PROFILE_POSTS_POLL_MS 检查一次
+                // 拦截总数,有新响应到达即提前进入下一轮(快时不空等);慢接口则等满整轮
+                let wait_start = std::time::Instant::now();
+                let mut len = last_len;
+                while wait_start.elapsed() < Duration::from_millis(PROFILE_POSTS_ROUND_MS) {
+                    tokio::time::sleep(Duration::from_millis(PROFILE_POSTS_POLL_MS)).await;
+                    len = sink
+                        .as_ref()
+                        .and_then(|s| s.lock().ok().map(|b| b.len()))
+                        .unwrap_or(0)
+                        + self.channel.session_len(session_id);
+                    if len > last_len {
+                        break;
+                    }
+                }
                 if len > last_len {
                     last_len = len;
                     stagnant = 0;
+                    stall_logged = false;
                     // 接口明确到底(has_more=0):不必再等停滞轮,直接收尾
                     if self.latest_posts_has_more(sink.as_ref(), session_id, req.posts_pattern)
                         == Some(false)
                     {
-                        let _ = window.eval(build_hud_log_eval(
+                        self.log_step(
+                            app,
+                            &window,
+                            req.task_id,
                             "info",
-                            "✅ 作品接口返回已到底 · 结束滚动",
-                        ));
+                            "✅ 作品接口返回已到底(has_more=0)· 结束滚动",
+                        );
                         break;
                     }
                 } else {
                     stagnant += 1;
                     // has_more=1(或接口信息缺失)时按长停滞容忍收尾;明确无 has_more 信息
                     // 的兜底场景退回原口径(STAGNANT_STOP 轮无增长即停)
-                    let limit = match self.latest_posts_has_more(
-                        sink.as_ref(),
-                        session_id,
-                        req.posts_pattern,
-                    ) {
+                    let has_more =
+                        self.latest_posts_has_more(sink.as_ref(), session_id, req.posts_pattern);
+                    let limit = match has_more {
                         Some(true) => PROFILE_POSTS_STALL_STOP,
                         Some(false) => STAGNANT_STOP,
                         None => STAGNANT_STOP,
                     };
-                    if stagnant >= limit {
-                        let _ = window.eval(build_hud_log_eval(
+                    // 接口说还有下一页却暂未出数:多为分页加载慢,保持节奏继续滚动等它返回;
+                    // 每段停滞只提示一次(恢复增长后重置,下一段停滞再报)
+                    if has_more == Some(true) && !stall_logged {
+                        stall_logged = true;
+                        self.log_step(
+                            app,
+                            &window,
+                            req.task_id,
                             "info",
-                            "✅ 连续多轮无新作品 · 已到底 · 结束滚动",
-                        ));
+                            "⏳ 作品接口响应较慢(仍有下一页)· 保持滚动继续等待加载",
+                        );
+                    }
+                    if stagnant >= limit {
+                        self.log_step(
+                            app,
+                            &window,
+                            req.task_id,
+                            "info",
+                            &format!(
+                                "✅ 连续 {stagnant} 轮无新作品响应 · 判定到底 · 结束滚动(共拦到 {last_len} 条接口响应)"
+                            ),
+                        );
                         break;
                     }
                 }
@@ -1900,8 +2232,16 @@ impl CollectBridge {
         .await;
 
         let responses = self.take_collected_responses(session_id, sink.as_ref());
-        // 停止判定与 collect 一致(必须在 clear 之前读 is_stopping)
-        let label = window_label(&cfg.id, req.account_id);
+        // 收尾审计:SSR 兜底结果 / 作品接口解析失败页数 / 作者声明总数对账(全部进 HUD)
+        self.report_profile_collect_audit(
+            app,
+            &window,
+            req.task_id,
+            req.posts_pattern,
+            &responses,
+        );
+        // 停止判定与 collect 一致(必须在 clear 之前读 is_stopping);label 按任务级解析
+        let label = task_window_label(&cfg.id, req.account_id, req.task_id);
         let task_stopping = req
             .task_id
             .map(|t| self.control.is_task_stopping(t))
@@ -2663,10 +3003,11 @@ impl CollectBridge {
         }
     }
 
-    /// 在某账号的 WebView 内导航到内容详情页,滚动评论区采集**一级评论**,返回拦截到的接口响应。
+    /// 在某账号的 WebView 内导航到内容详情页采集**一级评论**,返回拦截到的接口响应。
     ///
-    /// 流程:复用登录态窗口 → 导航详情页 → 注入会话回放首屏评论 → 滚动评论区触发分页 →
-    /// 取走本视频命中的评论响应。时间范围过滤与精确截断由调用方(run_task)负责,此处只管采。
+    /// 流程:复用登录态窗口 → 导航详情页 → 注入会话回放首屏评论 → 抖音走「API 直采」
+    /// (借页面签名翻页 comment/list),其他平台滚动评论区触发分页 → 取走本视频命中的
+    /// 评论响应。时间范围过滤与精确截断由调用方(run_task)负责,此处只管采。
     pub async fn collect_comments(
         &self,
         app: &AppHandle,
@@ -2762,7 +3103,7 @@ impl CollectBridge {
                 cfg.id
             )));
         }
-        let (window, session_id, sink) = self.setup_collect_session(app, cfg, req.account_id, "", None, "")?;
+        let (window, session_id, sink) = self.setup_collect_session(app, cfg, req.account_id, "", req.task_id, "")?;
         // 导航详情页:新页面重挂 hook,session 未就绪期间命中的详情响应进页内缓冲
         // 结果先存住不早退:与 collect_comments 同理,导航失败也必须取走会话并清停止标志,
         // 否则 open_session 开的拦截会话条目会泄漏在 InterceptChannel.sessions 里
@@ -2806,6 +3147,49 @@ impl CollectBridge {
         adapter: &Arc<dyn PlatformAdapter>,
         limit: usize,
     ) -> Result<()> {
+        // 抖音:评论纯 API 直采,不导航详情页、不点评论面板。页内脚本用标准参数 +
+        // aweme_id 构造请求、借页面签名函数翻页——窗口停在哪个抖音页面都行,
+        // 它的意义是提供登录态 / 签名环境,以及触发风控时人工解除。
+        if cfg.id == "douyin" {
+            // 等页面就绪再注入:评论窗口可能是刚新建的,页面还在加载——此时 eval 的脚本
+            // 会随导航提交被整页冲掉(或 signer 尚未挂载),脚本静默丢失、无任何回传,
+            // 只能等停滞看门狗兜底。
+            let page_ready = self.wait_page_ready(window, session_id).await;
+            if !page_ready {
+                let _ = window.eval(build_hud_log_eval(
+                    "warn",
+                    "⏳ 页面未就绪(签名函数未加载)· 仍将尝试直采",
+                ));
+            }
+            window
+                .eval(build_set_session_eval(session_id))
+                .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
+            let verify_eval = crate::webview::build_verify_check_eval(
+                session_id,
+                &cfg.collect.verify_selectors,
+                &cfg.collect.verify_texts,
+                &cfg.collect.verify_url_patterns,
+            );
+            if !verify_eval.is_empty() {
+                let _ = window.eval(&verify_eval);
+            }
+            // 无模板构造直采(标准参数 + aweme_id);签名函数缺失 / 接口异常 /
+            // 停滞 / 超时结束本视频采集
+            match self
+                .run_comment_api_collect(window, cfg, session_id, sink, content_id, limit)
+                .await
+            {
+                CommentApiOutcome::Done | CommentApiOutcome::Aborted => return Ok(()),
+                CommentApiOutcome::Fallback => {
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        "⚠️ API 直采不可用 · 本视频评论采集结束",
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
         // 导航到内容详情页;新页面重挂 hook,session 未就绪期间命中响应进页内缓冲
         window
             .eval(build_detail_eval(
@@ -2846,20 +3230,37 @@ impl CollectBridge {
         // 点一次元素可能还没出来,故带重试:每轮点完等一会,回读到「全部评论」/评论条目出现即停
         // (面板已开时点击 JS 内部 no-op,重试幂等无副作用)
         let panel_open_js = r#"(function(){ return { open: document.body.innerText.indexOf('全部评论') !== -1 || !!document.querySelector('[data-e2e="comment-item"]') }; })()"#;
-        // 点击前记录 sink 长度:评论接口一旦有新响应 = 面板已激活并触发分页,比 DOM 回读更稳,
-        // 且不依赖 Windows 专属 eval_json(mac 上同样生效)。
-        let sink_len_before = sink
-            .as_ref()
-            .and_then(|s| s.lock().ok().map(|b| b.len()))
-            .unwrap_or(0);
+        // 点击前记录 sink 中一级评论响应数:评论接口一旦有新响应 = 面板已激活并触发分页,
+        // 比 DOM 回读更稳,且不依赖 Windows 专属 eval_json(mac 上同样生效)。
+        // 注意必须按 comment/list 特征计数,不能看缓冲总长度:suggest_words 等无关接口
+        // 也会让缓冲增长,造成「面板已开」误判,后续直采拿不到模板 URL 直接结束。
+        let comment_pat = cfg
+            .collect
+            .intercept_patterns
+            .iter()
+            .find(|p| p.contains("comment/list"))
+            .cloned();
+        let count_comment_hits = |s: &ResponseSink, pat: &str| -> usize {
+            s.lock()
+                .map(|b| {
+                    b.iter()
+                        .filter(|r| r.url.contains(pat) && !r.url.contains("reply"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let hits_before = match (sink, comment_pat.as_deref()) {
+            (Some(s), Some(pat)) => count_comment_hits(s, pat),
+            _ => 0,
+        };
         let mut panel_opened = false;
         for _ in 0..6 {
             let _ = window.eval(crate::webview::build_comment_tab_eval());
             tokio::time::sleep(Duration::from_millis(COMMENT_TAB_SETTLE_MS)).await;
-            let sink_grew = sink
-                .as_ref()
-                .and_then(|s| s.lock().ok().map(|b| b.len() > sink_len_before))
-                .unwrap_or(false);
+            let sink_grew = match (sink, comment_pat.as_deref()) {
+                (Some(s), Some(pat)) => count_comment_hits(s, pat) > hits_before,
+                _ => false,
+            };
             if sink_grew {
                 panel_opened = true;
                 break;
@@ -3072,6 +3473,298 @@ impl CollectBridge {
         Ok(())
     }
 
+    /// 等页面就绪(加载完成 + 抖音签名函数可用),最多 10s。新建窗口 / 导航中的页面直接
+    /// eval 注入脚本,会随导航提交被整页冲掉、或 signer 尚未挂载,脚本静默丢失无回传。
+    async fn wait_page_ready(&self, window: &WebviewWindow, session_id: u64) -> bool {
+        let ready_js = r#"(function(){ return document.readyState === 'complete' && !!(window.byted_acrawler && (window.byted_acrawler.frontierSign || window.byted_acrawler.sign)); })()"#;
+        for _ in 0..20 {
+            if self.control.is_stopping(session_id) {
+                return false;
+            }
+            let ready = crate::webview::script_eval::eval_json(window.as_ref(), ready_js)
+                .await
+                .map(|s| s.contains("true"))
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// 处理评论直采完成回传(原生信号桥 / invoke / eval 回读三通道共用):
+    /// 校验归属(防跨视频串号)、判定成败并打日志。
+    /// 返回 Some(outcome) = 本视频已有结论;None = 残留的串号结果,丢弃继续等。
+    fn handle_comment_api_result(
+        &self,
+        window: &WebviewWindow,
+        content_id: &str,
+        result: &str,
+    ) -> Option<CommentApiOutcome> {
+        let v: serde_json::Value = serde_json::from_str(result).unwrap_or_default();
+        // 跨视频串号防护:上个视频的脚本被中止后仍可能延迟回传,awemeId 对不上
+        // 说明是残留结果,丢弃后继续等本视频的(不能误判为本视频失败)
+        let belongs = v.get("awemeId").and_then(|x| x.as_str()).unwrap_or("");
+        if !belongs.is_empty() && belongs != content_id {
+            return None;
+        }
+        let used = v.get("used").and_then(|x| x.as_bool()).unwrap_or(false);
+        let pages = v.get("pages").and_then(|x| x.as_i64()).unwrap_or(0);
+        let comments = v.get("comments").and_then(|x| x.as_i64()).unwrap_or(0);
+        let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+        let no_comments = v.get("noComments").and_then(|x| x.as_bool()).unwrap_or(false);
+        if used {
+            let msg = if no_comments {
+                "✅ API 直采完成 · 该视频无评论(接口确认 total=0)".to_string()
+            } else {
+                format!("✅ API 直采完成 · {pages} 页共 {comments} 条评论")
+            };
+            let _ = window.eval(build_hud_log_eval("info", &msg));
+            return Some(CommentApiOutcome::Done);
+        }
+        let _ = window.eval(build_hud_log_eval(
+            "warn",
+            &format!(
+                "⚠️ API 直采不可用({}) · 跳过本视频评论采集",
+                if error.is_empty() { "未知原因" } else { error }
+            ),
+        ));
+        Some(CommentApiOutcome::Fallback)
+    }
+
+    /// 抖音评论「API 直采」:标准公共参数 + 页面环境现取 msToken,用 aweme_id 凭空构造
+    /// comment/list 请求,注入脚本借页面签名函数翻页直拉评论接口。响应由页内 fetch hook
+    /// 按既有特征自动回流本会话,与滚动采集同通道,下游解析 / 入库零改动。
+    /// 抖音评论只走此路径:不可用 / 失败返回 Fallback,由调用方结束本视频评论采集
+    /// (不再回退滚动)。
+    async fn run_comment_api_collect(
+        &self,
+        window: &WebviewWindow,
+        cfg: &PlatformConfig,
+        session_id: u64,
+        sink: Option<&Arc<Mutex<Vec<InterceptedResponse>>>>,
+        content_id: &str,
+        limit: usize,
+    ) -> CommentApiOutcome {
+        // 一级评论接口特征(排除二级回复 reply)
+        let Some(pattern) = cfg
+            .collect
+            .intercept_patterns
+            .iter()
+            .find(|p| p.contains("comment/list"))
+        else {
+            tracing::warn!(platform = %cfg.id, "平台未配置 comment/list 拦截特征,API 直采不可用");
+            return CommentApiOutcome::Fallback;
+        };
+        // 页数上限:限量按 20 条/页折算(+2 页余量);不限量给安全封顶(防死循环,万条级)
+        let max_pages = if limit > 0 { (limit / 20 + 2) as u32 } else { 500 };
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            "⚡ 尝试 API 直采评论(借页面签名翻页)",
+        ));
+        // 借原生 CookieManager 取指纹/会话 Cookie(含 HttpOnly,页内 document.cookie
+        // 读不到),给凭空构造的请求补 msToken / verifyFp / fp——页面真实评论请求都带
+        // 这组参数,缺了更容易被风控直接回 HTML 验证页。非 Windows 返回空,脚本自动
+        // 退回 document.cookie 现取。
+        let cookies = native_intercept::get_cookies(
+            window.as_ref(),
+            "https://www.douyin.com/",
+            &["msToken", "s_v_web_id"],
+        )
+        .await;
+        let find_cookie = |name: &str| -> String {
+            cookies
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let ms_token = find_cookie("msToken");
+        let fp = find_cookie("s_v_web_id");
+        if let Err(e) = window.eval(crate::webview::build_comment_api_collect_eval(
+            session_id,
+            "",
+            content_id,
+            limit,
+            max_pages,
+            &ms_token,
+            &fp,
+        )) {
+            tracing::warn!("注入评论直采脚本失败: {e}");
+            return CommentApiOutcome::Fallback;
+        }
+        let mut deadline =
+            std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
+        // 停滞检测:页内脚本死掉(页面冻结 / 导航 / 风控静默吞请求)时评论响应数不再
+        // 增长,停滞过久主动结束,不死等整体超时
+        let mut last_hits = 0usize;
+        let mut last_growth = std::time::Instant::now();
+        // 风控滑块:验证由用户在窗口里手动完成,期间挂起的 fetch 验证通过后会继续返回。
+        // 故验证态不计停滞、整体超时顺延。验证态的置位依赖页内链路(初始化脚本全帧运行,
+        // 验证码 iframe 子帧 postMessage 到顶层 → report_collect_verify):原生拦截缓冲只收
+        // intercept_patterns 命中的 URL,captcha 请求不进缓冲,响应侧扫描不可行,勿在此加。
+        let mut verify_logged = false;
+        // 回读兜底的分频计数:每 4 轮(≈2s)eval 一次 __veltrixCommentApiResult
+        let mut poll_tick: u32 = 0;
+        loop {
+            if self.control.is_stopping(session_id) {
+                let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                // 给页内脚本收尾时间(已采部分经 hook 回流后正常 finish)
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = self.control.take_api_done(session_id);
+                let _ = window.eval(build_hud_log_eval("info", "⏹️ 已手动结束 · 保留已采评论"));
+                return CommentApiOutcome::Aborted;
+            }
+            if self.control.is_verifying(session_id) {
+                if !verify_logged {
+                    verify_logged = true;
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        "🛡️ 检测到安全验证(滑块)· 请在采集窗口中完成,完成后自动继续",
+                    ));
+                }
+                last_growth = std::time::Instant::now();
+                deadline =
+                    std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
+                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+                continue;
+            }
+            if verify_logged {
+                verify_logged = false;
+                let _ = window.eval(build_hud_log_eval("info", "✅ 安全验证已通过 · 继续直采"));
+            }
+            if let Some(result) = self.control.take_api_done(session_id) {
+                match self.handle_comment_api_result(window, content_id, &result) {
+                    Some(outcome) => return outcome,
+                    // 串号残留:丢弃,继续等本视频的回传
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+                        continue;
+                    }
+                }
+            }
+            // 回读兜底(每 4 轮 ≈ 2s 一次):信号桥(postMessage / invoke)在部分环境会静默
+            // 丢失——页内已打 🏁 收尾但 Rust 收不到,干等 90s 停滞看门狗。脚本 finish 时把
+            // 结果留在 window.__veltrixCommentApiResult,这里 eval 回读(读即清)与信号桥
+            // 同口径处理;mac 无 eval 回读实现,自动跳过、维持原有桥通道。
+            if poll_tick % 4 == 0 {
+                if let Some(raw) = crate::webview::script_eval::eval_json(
+                    window.as_ref(),
+                    "(function(){ var r = window.__veltrixCommentApiResult || ''; window.__veltrixCommentApiResult = ''; return r; })()",
+                )
+                .await
+                {
+                    // ExecuteScript 的返回值是 JSON 序列化串:字符串结果会再包一层引号,先解包
+                    let unwrapped = serde_json::from_str::<String>(&raw).unwrap_or_default();
+                    if !unwrapped.is_empty() {
+                        if let Some(outcome) =
+                            self.handle_comment_api_result(window, content_id, &unwrapped)
+                        {
+                            return outcome;
+                        }
+                    }
+                }
+            }
+            poll_tick += 1;
+            if std::time::Instant::now() > deadline {
+                let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                let _ = window.eval(build_hud_log_eval(
+                    "warn",
+                    "⚠️ API 直采超时 · 跳过本视频评论采集",
+                ));
+                return CommentApiOutcome::Fallback;
+            }
+            if let Some(s) = sink {
+                // 只数本视频的响应(URL 带当前 aweme_id):sink 是全会话累积的,
+                // 跨视频混数会让停滞/终态判定失真
+                let idq = format!("aweme_id={content_id}");
+                let probe = s
+                    .lock()
+                    .map(|b| {
+                        b.iter()
+                            .filter(|r| {
+                                r.url.contains(pattern)
+                                    && !r.url.contains("reply")
+                                    && r.url.contains(&idq)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if probe > last_hits {
+                    last_hits = probe;
+                    last_growth = std::time::Instant::now();
+                    // 评论接口恢复出数 = 验证已通过(重试成功),解除验证态
+                    if self.control.is_verifying(session_id) {
+                        self.control.set_verifying(session_id, false);
+                    }
+                    // 完成信号备用通道:页内 comment_api_done 回传可能丢失(Tauri IPC
+                    // 对远程页面不稳定),按「响应终态」直接判定——出现不足一页 /
+                    // has_more=0 / total=0 的响应,或累计达限量,即本视频已采完。
+                    // 与页内脚本的到底条件保持同口径(不足一页即到底,has_more 不可靠)
+                    let terminal = s
+                        .lock()
+                        .map(|b| {
+                            let mut total = 0usize;
+                            let mut terminal = false;
+                            for r in b.iter().filter(|r| {
+                                r.url.contains(pattern)
+                                    && !r.url.contains("reply")
+                                    && r.url.contains(&idq)
+                            }) {
+                                let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body)
+                                else {
+                                    continue;
+                                };
+                                let Some(arr) =
+                                    v.get("comments").and_then(|c| c.as_array())
+                                else {
+                                    continue;
+                                };
+                                let n = arr.len();
+                                total += n;
+                                let has_more = v
+                                    .get("has_more")
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(true);
+                                let declared_empty =
+                                    v.get("total").and_then(|x| x.as_i64()) == Some(0);
+                                if (n > 0 && n < 20) || (n == 0 && declared_empty) || !has_more {
+                                    terminal = true;
+                                }
+                            }
+                            if limit > 0 && total >= limit {
+                                terminal = true;
+                            }
+                            terminal
+                        })
+                        .unwrap_or(false);
+                    if terminal {
+                        // 页内脚本理论上已收尾(或正卡在重试眠里),中止它并取走残留
+                        // 回传,避免污染下个视频的判定
+                        let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                        let _ = self.control.take_api_done(session_id);
+                        let _ = window.eval(build_hud_log_eval(
+                            "info",
+                            &format!("✅ API 直采完成 · {probe} 页(按响应终态判定)"),
+                        ));
+                        return CommentApiOutcome::Done;
+                    }
+                } else if last_growth.elapsed() > Duration::from_secs(COMMENT_API_STALL_SECS) {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        &format!(
+                            "⚠️ API 直采停滞({COMMENT_API_STALL_SECS} 秒无新响应)· 结束本视频评论采集(已采部分保留)"
+                        ),
+                    ));
+                    return CommentApiOutcome::Fallback;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+        }
+    }
+
     /// 作者主页画像补采:复用登录态窗口 → 导航作者主页 → 注入会话回放首屏 →
     /// 短滚动几轮触发并等待画像接口返回 → 取走本会话拦截到的画像响应。
     /// 解析与落库由调用方(enrich_authors)负责,此处只管把响应采回来。
@@ -3132,6 +3825,9 @@ impl CollectBridge {
 
     /// 主页停留:导航 → 注入会话 → 短滚动几轮触发懒加载并等画像接口返回。
     /// 画像接口多在加载即发,拦到响应即提前结束;固定上限兜底避免空等。
+    /// 抖音优先「API 直采」——sec_user_id + 标准参数构造 profile/other 请求,借页面
+    /// 签名函数直接 fetch(与评论直采同机制,秒级完成);直采不可用(网关拦截 / 签名
+    /// 失效)时回退下方的导航停留路径——页面自发 profile/other 请求,慢但可靠。
     async fn run_profile_dwell(
         &self,
         window: &WebviewWindow,
@@ -3141,6 +3837,94 @@ impl CollectBridge {
         session_id: u64,
         sink: Option<&ResponseSink>,
     ) -> Result<()> {
+        if cfg.id == "douyin" {
+            if !self.wait_page_ready(window, session_id).await {
+                let _ = window.eval(build_hud_log_eval(
+                    "warn",
+                    "⏳ 页面未就绪(签名函数未加载)· 仍将尝试画像直采",
+                ));
+            }
+            window
+                .eval(build_set_session_eval(session_id))
+                .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
+            window
+                .eval(crate::webview::build_profile_api_eval(session_id, uid))
+                .map_err(|e| CrawlerError::Config(format!("注入画像直采脚本失败: {e}")))?;
+            // 直采等待 45s 封顶:脚本 6 次重试典型耗时 ~36s;超时即回退导航主页,
+            // 不在直采上死等(成功靠下方「响应到达」判定,秒级结束)
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            let mut direct_ok = false;
+            loop {
+                if self.control.is_stopping(session_id) {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    return Ok(());
+                }
+                if let Some(result) = self.control.take_api_done(session_id) {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&result).unwrap_or_default();
+                    // 跨作者串号防护:上个作者脚本的残留回传直接丢弃
+                    let belongs = v.get("secUid").and_then(|x| x.as_str()).unwrap_or("");
+                    if !belongs.is_empty() && belongs != uid {
+                        tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+                        continue;
+                    }
+                    let used = v.get("used").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+                    let _ = window.eval(build_hud_log_eval(
+                        if used { "info" } else { "warn" },
+                        &if used {
+                            "✅ 画像直采完成".to_string()
+                        } else {
+                            format!(
+                                "⚠️ 画像直采失败({})",
+                                if error.is_empty() { "未知原因" } else { error }
+                            )
+                        },
+                    ));
+                    direct_ok = used;
+                    break;
+                }
+                // 完成信号备用通道:回传可能丢失,画像响应到达(URL 带本作者 sec_uid
+                // 且 body 含 user 对象)即判定成功——与评论直采的终态判定同思路
+                let got_profile = sink
+                    .and_then(|s| {
+                        s.lock().ok().map(|b| {
+                            b.iter().any(|r| {
+                                r.url.contains("profile/other")
+                                    && r.url.contains(uid)
+                                    && serde_json::from_str::<serde_json::Value>(&r.body)
+                                        .ok()
+                                        .and_then(|v| v.get("user").cloned())
+                                        .is_some()
+                            })
+                        })
+                    })
+                    .unwrap_or(false);
+                if got_profile {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    let _ = self.control.take_api_done(session_id);
+                    let _ = window.eval(build_hud_log_eval("info", "✅ 画像直采完成(按响应判定)"));
+                    direct_ok = true;
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    let _ = window.eval(build_hud_log_eval("warn", "⚠️ 画像直采超时"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+            }
+            if direct_ok {
+                return Ok(());
+            }
+            // 直采不可用:回退「打开作者主页」原始路径——导航后页面自发 profile/other
+            // 请求,经拦截通道采回(拦截特征已含画像接口,解析 / 落库零改动)
+            let _ = window.eval(build_hud_log_eval(
+                "info",
+                "↩️ 回退打开作者主页采集画像(页面自发请求,稍慢)",
+            ));
+        }
+
         // 复用详情页导航脚本:模板 {id}=uid,{token}=xsec_token(无 token 占位的平台传空无害)
         window
             .eval(build_detail_eval(
@@ -3187,3 +3971,176 @@ impl CollectBridge {
         Ok(())
     }
 }
+
+/// 首屏 SSR 兜底标记响应的解析结果(items=完整 aweme 对象列表,ids=仅作品 ID 列表)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SsrFallback {
+    Items(usize),
+    Ids(usize),
+}
+
+/// 解析 SSR 兜底标记响应体:URL 命中 `SSR_FALLBACK_URL_PREFIX` 前缀时,
+/// 把 body 归一为 Items(n)(`aweme_list` 数组长度)或 Ids(n)(`aweme_ids` 数组长度);
+/// 非标记 URL / body 非法 / 两种形态都没有时返回 None。
+fn parse_ssr_fallback_marker(resp: &InterceptedResponse) -> Option<SsrFallback> {
+    if !resp.url.starts_with(SSR_FALLBACK_URL_PREFIX) {
+        return None;
+    }
+    let root: serde_json::Value = serde_json::from_str(&resp.body).ok()?;
+    if let Some(n) = root
+        .get("aweme_list")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+    {
+        return Some(SsrFallback::Items(n));
+    }
+    root.get("aweme_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .map(SsrFallback::Ids)
+}
+
+/// 命中作品接口(posts_pattern)但响应体不是合法 JSON 的页数(截断/风控脏页)。
+fn count_posts_parse_failures(responses: &[InterceptedResponse], posts_pattern: &str) -> usize {
+    responses
+        .iter()
+        .filter(|r| r.url.contains(posts_pattern))
+        .filter(|r| serde_json::from_str::<serde_json::Value>(&r.body).is_err())
+        .count()
+}
+
+/// 从拦截响应里取作者声明的作品总数:画像/用户信息响应 `user.aweme_count`(取首个命中)。
+fn extract_declared_posts_count(responses: &[InterceptedResponse]) -> Option<i64> {
+    responses.iter().find_map(|r| {
+        let root: serde_json::Value = serde_json::from_str(&r.body).ok()?;
+        root.get("user")?.get("aweme_count")?.as_i64()
+    })
+}
+
+/// 取单条 aweme 的 aweme_id(兼容 aweme_info 包裹与字符串/数字两种序列化形态)。
+fn aweme_id_of(item: &serde_json::Value) -> Option<String> {
+    let info = item.get("aweme_info").unwrap_or(item);
+    let v = info.get("aweme_id")?;
+    v.as_str()
+        .map(str::to_string)
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+/// 去重后的实采作品数:所有命中作品接口的响应(含 SSR 兜底合成响应)的 aweme_id 集合大小。
+fn count_distinct_aweme_ids(responses: &[InterceptedResponse], posts_pattern: &str) -> usize {
+    let mut seen: HashSet<String> = HashSet::new();
+    for resp in responses.iter().filter(|r| r.url.contains(posts_pattern)) {
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(&resp.body) else {
+            continue;
+        };
+        let Some(items) = root.get("aweme_list").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if let Some(id) = aweme_id_of(item) {
+                seen.insert(id);
+            }
+        }
+    }
+    seen.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(url: &str, body: &str) -> InterceptedResponse {
+        InterceptedResponse {
+            url: url.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    const POSTS_PATTERN: &str = "/aweme/v1/web/aweme/post/";
+    const SSR_ITEMS_URL: &str =
+        "https://veltrix.local/ssr-first-screen/aweme/v1/web/aweme/post/";
+    const SSR_IDS_URL: &str = "https://veltrix.local/ssr-first-screen/aweme-ids";
+
+    #[test]
+    fn ssr_marker_items_shape() {
+        let r = resp(SSR_ITEMS_URL, r#"{"aweme_list":[{"aweme_id":"1"},{"aweme_id":"2"}]}"#);
+        assert_eq!(parse_ssr_fallback_marker(&r), Some(SsrFallback::Items(2)));
+    }
+
+    #[test]
+    fn ssr_marker_ids_shape() {
+        let r = resp(SSR_IDS_URL, r#"{"aweme_ids":["11","22","33"]}"#);
+        assert_eq!(parse_ssr_fallback_marker(&r), Some(SsrFallback::Ids(3)));
+    }
+
+    #[test]
+    fn ssr_marker_rejects_non_marker_url_and_bad_body() {
+        // 普通接口响应不识别为标记
+        let normal = resp(
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?a=1",
+            r#"{"aweme_list":[{"aweme_id":"1"}]}"#,
+        );
+        assert_eq!(parse_ssr_fallback_marker(&normal), None);
+        // 标记 URL 但 body 非法 / 两种形态都没有
+        let bad = resp(SSR_ITEMS_URL, "{not json");
+        assert_eq!(parse_ssr_fallback_marker(&bad), None);
+        let empty = resp(SSR_ITEMS_URL, r#"{"foo":1}"#);
+        assert_eq!(parse_ssr_fallback_marker(&empty), None);
+    }
+
+    #[test]
+    fn count_distinct_aweme_ids_dedup_across_pages_and_ssr() {
+        // 真实分页(数字 id + aweme_info 包裹)+ SSR 合成页(字符串 id,与分页部分重叠)
+        let page1 = resp(
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?cursor=0",
+            r#"{"aweme_list":[{"aweme_id":100},{"aweme_info":{"aweme_id":"101"}}]}"#,
+        );
+        let ssr = resp(
+            SSR_ITEMS_URL,
+            r#"{"aweme_list":[{"aweme_id":"100"},{"aweme_id":"102"}]}"#,
+        );
+        // 其它接口(评论等)不计入
+        let other = resp(
+            "https://www.douyin.com/aweme/v1/web/comment/list/",
+            r#"{"aweme_list":[{"aweme_id":"999"}]}"#,
+        );
+        let all = vec![page1, ssr, other];
+        assert_eq!(count_distinct_aweme_ids(&all, POSTS_PATTERN), 3); // 100/101/102
+    }
+
+    #[test]
+    fn count_posts_parse_failures_only_counts_bad_posts_bodies() {
+        let good = resp(
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?cursor=0",
+            r#"{"aweme_list":[]}"#,
+        );
+        // 截断产出的半个 JSON
+        let truncated = resp(
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?cursor=20",
+            r#"{"aweme_list":[{"aweme_id":"1""#,
+        );
+        let ssr = resp(SSR_IDS_URL, r#"{"aweme_ids":["1"]}"#); // 标记 URL 不含接口特征,不计
+        let all = vec![good, truncated, ssr];
+        assert_eq!(count_posts_parse_failures(&all, POSTS_PATTERN), 1);
+    }
+
+    #[test]
+    fn extract_declared_posts_count_from_profile_user() {
+        let profile = resp(
+            "https://www.douyin.com/aweme/v1/web/user/profile/other/?sec_uid=x",
+            r#"{"user":{"nickname":"n","aweme_count":448}}"#,
+        );
+        let posts = resp(
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?cursor=0",
+            r#"{"aweme_list":[{"aweme_id":"1"}],"has_more":1}"#,
+        );
+        assert_eq!(
+            extract_declared_posts_count(&[posts.clone(), profile]),
+            Some(448)
+        );
+        // 没有画像响应时拿不到声明总数
+        assert_eq!(extract_declared_posts_count(&[posts]), None);
+    }
+}
+

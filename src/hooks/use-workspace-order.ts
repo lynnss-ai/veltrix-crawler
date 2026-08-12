@@ -1,4 +1,4 @@
-// 工作区(营销 / 对话 / 协作)排列顺序:存 localStorage,系统配置里可调,侧栏即时响应。
+// 工作区(营销 / 对话 / 创作)排列顺序:存 localStorage,系统配置里可调,侧栏即时响应。
 import { useEffect, useState } from "react";
 import type { Workspace } from "@/components/app-sidebar";
 

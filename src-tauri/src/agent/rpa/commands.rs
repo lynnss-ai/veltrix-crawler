@@ -107,6 +107,7 @@ pub async fn send_browser_message(
         &mut RpaHooks,
         &registry,
         &mut messages,
+        None,
     )
     .await?;
 
@@ -171,6 +172,7 @@ pub async fn run_rpa_subtask(
     };
     let result = crate::agent::core::react::react_run(
         db, app, conversation_id, provider_ref, config, &mut RpaHooks, &registry, &mut messages,
+        None,
     )
     .await?;
     let _ = veltrix_core::db::entity::model_usage_record::Model::record(

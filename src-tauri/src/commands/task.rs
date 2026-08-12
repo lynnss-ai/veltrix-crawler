@@ -6,8 +6,8 @@
 use crate::commands::{current_user, AppState};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, IntoActiveModel, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1310,37 +1310,47 @@ pub async fn migrate_authors_from_contents(db: &sea_orm::DatabaseConnection) {
     tracing::info!("已从存量内容回填 {total} 位作者到 authors 表");
 }
 
-/// 删除一条采集内容(全量库 / 内容库的「删除」操作)。仅删库记录,媒体文件不动。
+/// 删除一条采集内容(全量库 / 内容库的「删除」操作)。仅删库记录,媒体文件不动;
+/// 级联删除该内容的评论,避免评论库留下无关联的孤儿数据。
 #[tauri::command]
 pub async fn remove_content(state: State<'_, AppState>, id: String) -> Result<()> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    if me.scope == "self" {
-        let Some(row) = content::Entity::find_by_id(&id)
-            .one(&state.db)
-            .await
-            .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
-        else {
-            return Ok(()); // 不存在则幂等
-        };
-        if row.owner != me.name {
-            return Err(CrawlerError::Config("无权删除该内容".into()));
-        }
+    // 删除前取回行:权限校验 + 级联删评论需要 (task_id, platform, content_id) 关联键
+    let Some(row) = content::Entity::find_by_id(&id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
+    else {
+        return Ok(()); // 不存在则幂等
+    };
+    if me.scope == "self" && row.owner != me.name {
+        return Err(CrawlerError::Config("无权删除该内容".into()));
     }
-    content::Entity::delete_by_id(id)
+    content::Entity::delete_by_id(&id)
         .exec(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("删除内容失败: {e}")))?;
+    cascade_delete_comments(&state.db, &[(&row.task_id, &row.platform, &row.content_id)]).await?;
     Ok(())
 }
 
-/// 批量删除采集内容(全量库多选删除)。仅删库记录,媒体文件不动;
-/// dataScope=self 的用户只能删自己 owner 的内容(越权 id 静默跳过)。返回实际删除条数。
+/// 批量删除采集内容(全量库多选删除)。仅删库记录,媒体文件不动;级联删除这些内容的
+/// 评论。dataScope=self 的用户只能删自己 owner 的内容(越权 id 静默跳过)。返回实际删除条数。
 #[tauri::command]
 pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    // 先按同一权限口径取回待删行的关联键,供级联删评论
+    let mut find = content::Entity::find().filter(content::Column::Id.is_in(ids.clone()));
+    if me.scope == "self" {
+        find = find.filter(content::Column::Owner.eq(me.name.clone()));
+    }
+    let rows = find
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询待删内容失败: {e}")))?;
     let mut q = content::Entity::delete_many().filter(content::Column::Id.is_in(ids));
     if me.scope == "self" {
         q = q.filter(content::Column::Owner.eq(me.name.clone()));
@@ -1349,7 +1359,38 @@ pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Re
         .exec(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("批量删除内容失败: {e}")))?;
+    let keys: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.task_id.as_str(), r.platform.as_str(), r.content_id.as_str()))
+        .collect();
+    cascade_delete_comments(&state.db, &keys).await?;
     Ok(res.rows_affected)
+}
+
+/// 级联删除一批内容的评论:按 (task_id, platform, content_id) 三元组精确匹配,
+/// 与评论落库 / list_comments 的关联口径一致。
+async fn cascade_delete_comments(
+    db: &sea_orm::DatabaseConnection,
+    keys: &[(&str, &str, &str)],
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut cond = Condition::any();
+    for (task_id, platform, content_id) in keys {
+        cond = cond.add(
+            Condition::all()
+                .add(comment::Column::TaskId.eq(*task_id))
+                .add(comment::Column::Platform.eq(*platform))
+                .add(comment::Column::ContentId.eq(*content_id)),
+        );
+    }
+    comment::Entity::delete_many()
+        .filter(cond)
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("级联删除评论失败: {e}")))?;
+    Ok(())
 }
 
 /// 评论库视图。author_avatar 从完整作者 JSON 解析(实体只单列了 uid/nickname)。

@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 
-import { sortLabelOf, timeLabelOf, extraFilterChipsOf, nextRunTs, formatCountdown, isInProgress, type TaskContentFilter } from "./collect-meta";
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, nextRunTs, formatCountdown, isInProgress, displayKeyword, type TaskContentFilter } from "./collect-meta";
 import type { PageKey } from "@/components/app-sidebar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -175,10 +175,11 @@ interface SubTask {
 }
 
 // 从父任务派生子任务列表(每关键词一条);真实接入时替换为 api.listSubTasks
+// 关键词展示名统一过 displayKeyword:定向任务的链接显示为「定向采集」
 function deriveSubTasks(task: TaskView): SubTask[] {
   return task.keywords.map((kw, idx) => ({
     id: `${task.id}-sub-${idx}`,
-    keyword: kw,
+    keyword: displayKeyword(kw),
     // 简化:把父任务整体状态投射到每个子任务
     status: task.status,
     contentCount: Math.round(task.contentCount / Math.max(1, task.keywords.length)),

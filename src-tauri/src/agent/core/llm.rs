@@ -116,6 +116,9 @@ pub struct LlmRequest<'a> {
     pub messages: &'a [ChatMsg],
     pub tools: &'a [ToolDef],
     pub options: &'a LlmOptions,
+    /// 可选取消令牌:仅流式(chat_stream)接取消——读流循环 select! 即时中断;
+    /// 非流式暂不接(各 Agent 均走流式,非流式仅剩意图分类等短调用)。
+    pub cancel: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 /// 核心接口:屏蔽各家差异。
@@ -224,8 +227,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
             body["max_tokens"] = json!(m);
         }
 
-        // 流式:复用 CHAT 档共享 client(连接池保活);流式重试涉及半截流,故此处不退避,仅连接层快速失败。
-        let client = http::shared_client(http::CHAT_TIMEOUT_SECS)?;
+        // 流式:专用共享 client 无总超时(长生成合法地远超 CHAT 档 120s,不能被总超时掐断);
+        // 存活判死靠读流 idle 超时。流式重试涉及半截流,故此处不退避,仅连接层快速失败。
+        let client = http::streaming_client()?;
         let resp = client
             .post(&endpoint)
             .bearer_auth(&req.provider.api_key)
@@ -251,8 +255,33 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let mut tool_acc: Vec<(String, String, String)> = Vec::new();
         let mut finish = FinishReason::Stop;
         let mut usage = TokenUsage::default();
+        let mut cancelled = false;
+        let idle = std::time::Duration::from_secs(http::STREAM_IDLE_TIMEOUT_SECS);
 
-        while let Some(chunk) = stream.next().await {
+        // 读流循环:select! 同时等「下一个 chunk(带 idle 超时)」与「取消令牌」;
+        // 取消立即 break(drop 响应即断连),不再等下一个 chunk 才发现取消。
+        loop {
+            let next = if let Some(token) = req.cancel {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    r = tokio::time::timeout(idle, stream.next()) => r,
+                }
+            } else {
+                tokio::time::timeout(idle, stream.next()).await
+            };
+            let chunk = match next {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(CrawlerError::Config(format!(
+                        "大模型流停滞超时({} 秒无新数据),已中断",
+                        http::STREAM_IDLE_TIMEOUT_SECS
+                    )))
+                }
+            };
             let bytes = chunk.map_err(|e| CrawlerError::Config(format!("读取流失败: {e}")))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(pos) = buf.find('\n') {
@@ -344,6 +373,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
         }
 
+        // 取消时丢弃半截工具调用累积:参数分片可能不完整,执行会出错;正文保留已累积部分
+        if cancelled {
+            tool_acc.clear();
+        }
         // 累积分片 → ToolCall;arguments 字符串解析为 JSON(解析失败给空对象兜底)
         let tool_calls: Vec<ToolCall> = tool_acc
             .into_iter()

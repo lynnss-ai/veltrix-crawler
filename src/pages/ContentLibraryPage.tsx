@@ -10,6 +10,7 @@ import {
   LayoutGrid,
   List,
   Loader2,
+  MessagesSquare,
   MoreHorizontal,
   NotebookPen,
   RefreshCw,
@@ -40,12 +41,28 @@ import {
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import {
   api,
@@ -56,7 +73,11 @@ import {
 import { platformChipClass, contentDetailUrl } from "@/lib/platforms";
 import { formatTimestamp } from "@/lib/utils";
 import { recordDownload } from "@/lib/download-history";
-import type { TaskContentFilter } from "./collect-meta";
+import type {
+  CommentTimeRange,
+  TaskContentFilter,
+} from "./collect-meta";
+import { COMMENT_LIMIT_OPTIONS, COMMENT_TIME_RANGE_META } from "./collect-meta";
 import { ContentDetailDialog } from "@/components/content-detail-dialog";
 import { EmptyState } from "@/components/EmptyState";
 import {
@@ -77,6 +98,12 @@ const GRID_PAGE_SIZE = 48;
 // 与后端批量转写的筛选口径一致
 function needsTranscript(c: ContentView): boolean {
   return !(c.transcript ?? "").trim() && !!c.audioPath;
+}
+
+// 待提取评论:未采过评论且接口统计评论数非 0(0 条采了也是空跑;数量未知的保留),
+// 与后端补采评论的跳过口径一致
+function needsComments(c: ContentView): boolean {
+  return c.commentCollected !== true && c.commentCount !== 0;
 }
 
 // 图片库/内容库视图模式(瀑布流/表格)的 localStorage 持久化键(按库区分)
@@ -124,6 +151,17 @@ export function ContentLibraryPage({
   const [batchExporting, setBatchExporting] = useState(false);
   // 批量重试转写失败进行中(防重复点击)
   const [batchRetryingTranscripts, setBatchRetryingTranscripts] = useState(false);
+  // 补采评论弹窗:目标 ids + 确认后清空表格选择的回调;null=未打开
+  const [commentDialog, setCommentDialog] = useState<{
+    ids: string[];
+    reset: () => void;
+  } | null>(null);
+  // 补采评论参数(与新建任务表单评论采集项一致):时间范围 / 单视频上限 / 意向分析
+  const [cmTimeRange, setCmTimeRange] = useState<CommentTimeRange>("any");
+  const [cmLimit, setCmLimit] = useState("0");
+  const [cmIntent, setCmIntent] = useState(false);
+  // 补采评论进行中(防重复点击;逐视频开详情页采集,耗时较长)
+  const [collectingComments, setCollectingComments] = useState(false);
   // 待确认的批量删除:ids + 确认后清空表格选择的回调;null=未弹确认框
   const [pendingDelete, setPendingDelete] = useState<{
     ids: string[];
@@ -313,6 +351,13 @@ export function ContentLibraryPage({
   // 全量库据此显示批量转写按钮,点击也只处理这批
   const untranscribedItems = useMemo(
     () => filtered.filter(needsTranscript),
+    [filtered],
+  );
+
+  // 待提取评论(未采过评论且评论数非 0):与待转写同口径,按当前列表统计,
+  // 全量库「提取评论」按钮点击也只处理这批
+  const pendingCommentItems = useMemo(
+    () => filtered.filter(needsComments),
     [filtered],
   );
 
@@ -572,6 +617,38 @@ export function ContentLibraryPage({
     }
   }
 
+  // 补采评论:对选中内容按弹窗参数重采一级评论(后端逐视频开详情页采集,耗时较长),
+  // 完成后刷新列表并清空选择;跳过/失败明细量多,toast 只给汇总,逐条打控制台
+  async function handleRecollectComments() {
+    if (!commentDialog || collectingComments) return;
+    setCollectingComments(true);
+    const toastId = toast.loading(
+      `正在提取 ${commentDialog.ids.length} 条内容的评论 · 会逐个打开详情页,请稍候…`,
+    );
+    try {
+      const s = await api.recollectComments(commentDialog.ids, {
+        commentTimeRange: cmTimeRange,
+        commentLimit: Number(cmLimit) || 0,
+        analyzeIntent: cmIntent,
+      });
+      toast.success(
+        `提取评论完成 · 成功 ${s.succeeded} 条内容 / 入库评论 ${s.comments} 条` +
+          (s.failed > 0 ? ` · 失败 ${s.failed}` : "") +
+          (s.skipped > 0 ? ` · 跳过 ${s.skipped}` : ""),
+        { id: toastId },
+      );
+      if (s.messages.length) console.warn("提取评论明细:", s.messages);
+      commentDialog.reset();
+      setCommentDialog(null);
+      const list = await api.listContents(penetratedTaskId);
+      setContents(list);
+    } catch (e) {
+      toast.error(`提取评论失败: ${e}`, { id: toastId });
+    } finally {
+      setCollectingComments(false);
+    }
+  }
+
   const columns = useMemo<ColumnDef<ContentView>[]>(
     () => [
       {
@@ -801,7 +878,7 @@ export function ContentLibraryPage({
                 <X />
               </Button>
             )}
-            {/* 右侧操作区:视图切换(图片库/内容库)+ 全量库批量转写,整体靠右;批量转写在最右侧 */}
+            {/* 右侧操作区:视图切换(图片库/内容库),整体靠右;提取评论/文案按钮在下方平台行右侧 */}
             <div className="ml-auto flex items-center gap-2">
               {supportsWaterfall && (
                 <div className="inline-flex h-10 items-center rounded-md border p-0.5">
@@ -818,22 +895,6 @@ export function ContentLibraryPage({
                     onClick={() => changeViewMode("list")}
                   />
                 </div>
-              )}
-              {/* 全量库:待转写(有音频无文案)计数 + 一键批量转写;高度 h-10 对齐筛选输入框 */}
-              {!kindFilter && untranscribedItems.length > 0 && (
-                <Button
-                  variant="outline"
-                  className="h-10 cursor-pointer border-amber-500/40 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
-                  disabled={batchRetryingTranscripts}
-                  onClick={handleBatchRetryTranscripts}
-                >
-                  {batchRetryingTranscripts ? (
-                    <Loader2 className="animate-spin" />
-                  ) : (
-                    <RefreshCw />
-                  )}
-                  未转写 {untranscribedItems.length} 条 · 批量转写
-                </Button>
               )}
             </div>
           </div>
@@ -874,6 +935,47 @@ export function ContentLibraryPage({
                 {platformName(id)}
               </button>
             ))}
+            {/* 全量库批量提取入口:与平台行同排靠右(不与上方筛选行对齐)。
+                提取评论:待提计数 + 弹窗设评论参数,无选择上下文 reset 传空操作 */}
+            {!kindFilter && pendingCommentItems.length > 0 && (
+              <Button
+                variant="outline"
+                className="ml-auto h-7 cursor-pointer border-violet-500/40 px-3 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
+                disabled={collectingComments}
+                onClick={() =>
+                  setCommentDialog({
+                    ids: pendingCommentItems.map((c) => c.id),
+                    reset: () => {},
+                  })
+                }
+              >
+                {collectingComments ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <MessagesSquare />
+                )}
+                提取评论 · {pendingCommentItems.length} 条
+              </Button>
+            )}
+            {/* 提取文案:待提(有音频无文案)计数 + 一键批量提取;
+                评论按钮不在(已提完)时用 ml-auto 保持靠右 */}
+            {!kindFilter && untranscribedItems.length > 0 && (
+              <Button
+                variant="outline"
+                className={`h-7 cursor-pointer border-amber-500/40 px-3 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400 ${
+                  pendingCommentItems.length > 0 ? "" : "ml-auto"
+                }`}
+                disabled={batchRetryingTranscripts}
+                onClick={handleBatchRetryTranscripts}
+              >
+                {batchRetryingTranscripts ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <RefreshCw />
+                )}
+                提取文案 · {untranscribedItems.length} 条
+              </Button>
+            )}
           </div>
 
           {supportsWaterfall && viewMode === "grid" ? (
@@ -941,6 +1043,16 @@ export function ContentLibraryPage({
                       )}
                       导出 Excel
                     </Button>
+                    {/* 提取评论:弹窗设置评论参数(与新建任务表单的评论采集项一致)后逐视频采集 */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="cursor-pointer"
+                      onClick={() => setCommentDialog({ ids, reset })}
+                    >
+                      <MessagesSquare />
+                      提取评论
+                    </Button>
                     <Button
                       variant="destructive"
                       size="sm"
@@ -976,6 +1088,96 @@ export function ContentLibraryPage({
         activeId={detailId}
         onActiveIdChange={setDetailId}
       />
+      {/* 提取评论参数弹窗:三项与新建任务表单的评论采集项一致(评论时间 / 单视频上限 / 意图分析);
+          两个入口共用:顶部「提取评论」(当前筛选待提批)与选中行工具栏(勾选批) */}
+      <Dialog
+        open={!!commentDialog}
+        onOpenChange={(o) => {
+          if (!o && !collectingComments) setCommentDialog(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              提取评论 · 共 {commentDialog?.ids.length ?? 0} 条内容
+            </DialogTitle>
+            <DialogDescription>
+              按下列参数采集这批内容的一级评论;评论数为 0 的内容会自动跳过,已采过的评论按评论
+              ID 去重入库。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="recollect-comment-time">评论时间</Label>
+              <Select
+                value={cmTimeRange}
+                onValueChange={(v) => setCmTimeRange(v as CommentTimeRange)}
+              >
+                <SelectTrigger id="recollect-comment-time" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(COMMENT_TIME_RANGE_META) as CommentTimeRange[]).map(
+                    (k) => (
+                      <SelectItem key={k} value={k}>
+                        {COMMENT_TIME_RANGE_META[k].label}
+                      </SelectItem>
+                    ),
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="recollect-comment-limit">单视频上限</Label>
+              <Select value={cmLimit} onValueChange={setCmLimit}>
+                <SelectTrigger id="recollect-comment-limit" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {COMMENT_LIMIT_OPTIONS.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {o.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="recollect-comment-intent">评论意图分析</Label>
+              <Select
+                value={cmIntent ? "1" : "0"}
+                onValueChange={(v) => setCmIntent(v === "1")}
+              >
+                <SelectTrigger id="recollect-comment-intent" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">否</SelectItem>
+                  <SelectItem value="1">是</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              className="cursor-pointer"
+              disabled={collectingComments}
+              onClick={() => setCommentDialog(null)}
+            >
+              取消
+            </Button>
+            <Button
+              className="cursor-pointer"
+              disabled={collectingComments}
+              onClick={handleRecollectComments}
+            >
+              {collectingComments && <Loader2 className="animate-spin" />}
+              开始提取
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {/* 批量删除确认:删除不可恢复,弹窗确认避免误触 */}
       <AlertDialog
         open={!!pendingDelete}

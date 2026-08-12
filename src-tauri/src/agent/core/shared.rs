@@ -30,6 +30,121 @@ pub const MAX_ITERS: usize = 25;
 /// computer / local 等带危险工具的 Agent 共用。
 pub const CONFIRM_TIMEOUT_SECS: u64 = 180;
 
+/// 工具结果入上下文 / 落库前的最大字符数:超出截断并追加「(已截断,共 N 字)」。
+/// 无截断时一次「读大文件 / 抓大页面」就能把 ReAct 上下文撑爆(每轮全量重发)。
+pub const TOOL_RESULT_MAX_CHARS: usize = 20000;
+
+/// 截断工具结果:超长时保留前 TOOL_RESULT_MAX_CHARS 字并追加总长提示(供模型感知被截)。
+pub fn truncate_tool_result(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= TOOL_RESULT_MAX_CHARS {
+        return content.to_string();
+    }
+    let kept: String = content.chars().take(TOOL_RESULT_MAX_CHARS).collect();
+    format!("{kept}\n(已截断,共 {total} 字)")
+}
+
+/// 每会话取消令牌表(conversation_id → CancellationToken)。
+/// chat 流式 / 编排器 / 编程 Agent 共用一轨:stop 命令对令牌 cancel(),
+/// 读流循环经 tokio::select! 立即中断;回合结束(含错误路径)由 CancelTokenGuard 摘除。
+pub type CancelTokenMap =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>;
+
+/// 登记一枚新取消令牌并返回 (令牌, 摘除守卫)。令牌用一次即弃:每回合新建,
+/// 守卫 Drop 时从表中摘除,保证错误路径也不残留(残留会让下一次 stop 误伤新回合)。
+pub fn begin_cancel_token(
+    map: &CancelTokenMap,
+    conversation_id: &str,
+) -> (tokio_util::sync::CancellationToken, CancelTokenGuard) {
+    let token = tokio_util::sync::CancellationToken::new();
+    {
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        m.insert(conversation_id.to_string(), token.clone());
+    }
+    (
+        token,
+        CancelTokenGuard {
+            map: map.clone(),
+            conversation_id: conversation_id.to_string(),
+        },
+    )
+}
+
+/// 取消令牌的摘除守卫(RAII):Drop 时把自己这回合的令牌从表里摘掉。
+pub struct CancelTokenGuard {
+    map: CancelTokenMap,
+    conversation_id: String,
+}
+
+impl Drop for CancelTokenGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        m.remove(&self.conversation_id);
+    }
+}
+
+/// chat-stream 增量 emit 合批器:攒缓冲,距上次 flush 超过时间窗才 emit;
+/// 流结束(Drop)强制 flush。事件格式不变(纯后端合批,前端无感)。
+/// 高频小 delta(逐 token)直发会刷爆 IPC,前端虽有合刷但事件洪峰本身也是开销。
+pub struct DeltaBatcher {
+    app: AppHandle,
+    conversation_id: String,
+    content_buf: String,
+    reasoning_buf: String,
+    last_flush: std::time::Instant,
+}
+
+/// 合批时间窗:30–50ms 一档,取 40ms。
+const DELTA_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(40);
+
+impl DeltaBatcher {
+    pub fn new(app: AppHandle, conversation_id: String) -> Self {
+        Self {
+            app,
+            conversation_id,
+            content_buf: String::new(),
+            reasoning_buf: String::new(),
+            last_flush: std::time::Instant::now(),
+        }
+    }
+
+    /// 攒一段增量;距上次 flush 超窗则立即 flush。kind ∈ {"content","reasoning"}。
+    pub fn push(&mut self, kind: &str, piece: &str) {
+        match kind {
+            "reasoning" => self.reasoning_buf.push_str(piece),
+            _ => self.content_buf.push_str(piece),
+        }
+        if self.last_flush.elapsed() >= DELTA_BATCH_WINDOW {
+            self.flush();
+        }
+    }
+
+    /// 把攒下的增量按 kind 各发一帧(帧格式与逐条直发完全一致)。
+    pub fn flush(&mut self) {
+        self.last_flush = std::time::Instant::now();
+        if !self.content_buf.is_empty() {
+            let _ = self.app.emit(
+                "chat-stream",
+                json!({ "conversationId": &self.conversation_id, "kind": "content", "delta": &self.content_buf }),
+            );
+            self.content_buf.clear();
+        }
+        if !self.reasoning_buf.is_empty() {
+            let _ = self.app.emit(
+                "chat-stream",
+                json!({ "conversationId": &self.conversation_id, "kind": "reasoning", "delta": &self.reasoning_buf }),
+            );
+            self.reasoning_buf.clear();
+        }
+    }
+}
+
+impl Drop for DeltaBatcher {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// 危险操作「暂停 — 等用户确认」通道(场景无关)。
 ///
 /// 形态同 webview::RpaChannel:为每次确认分配 confirm_id,用 oneshot 等前端回执。
@@ -146,6 +261,8 @@ pub struct MessageView {
     pub attachments: Vec<MessageAttachmentView>,
     /// assistant 思考过程(模型推理内容);仅推理型模型非空,供前端折叠展示
     pub reasoning: Option<String>,
+    /// 用户反馈("like" / "dislike" / None);供前端回显点赞点踩状态
+    pub feedback: Option<String>,
     pub created_at: i64,
 }
 
@@ -166,6 +283,7 @@ impl From<msg::Model> for MessageView {
             tool_name: m.tool_name,
             attachments,
             reasoning: m.reasoning,
+            feedback: m.feedback,
             created_at: m.created_at,
         }
     }
@@ -417,5 +535,40 @@ pub async fn load_agent_guidelines(config_dir: &std::path::Path, kind: &str) -> 
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 工具结果未超限原样返回() {
+        let s = "正常结果".repeat(100);
+        assert_eq!(truncate_tool_result(&s), s);
+    }
+
+    #[test]
+    fn 工具结果超限截断并追加总长() {
+        let total = TOOL_RESULT_MAX_CHARS + 5000;
+        let s = "字".repeat(total);
+        let out = truncate_tool_result(&s);
+        assert!(out.starts_with(&"字".repeat(TOOL_RESULT_MAX_CHARS)));
+        assert!(out.contains(&format!("(已截断,共 {total} 字)")));
+    }
+
+    #[test]
+    fn 工具结果按字符而非字节截断() {
+        // 多字节字符按字节切会产生非法 UTF-8 / 乱码;按字符切保证边界合法
+        let s = "汉".repeat(TOOL_RESULT_MAX_CHARS + 1);
+        let out = truncate_tool_result(&s);
+        assert!(out.chars().count() > TOOL_RESULT_MAX_CHARS); // 截断正文 + 后缀
+        assert!(out.contains("已截断"));
+    }
+
+    #[test]
+    fn 工具结果恰好等于上限不截断() {
+        let s = "x".repeat(TOOL_RESULT_MAX_CHARS);
+        assert_eq!(truncate_tool_result(&s), s);
     }
 }

@@ -27,7 +27,7 @@ import {
   type IndustryView,
   type PlatformConfig,
 } from "@/lib/api";
-import { formatTimestamp } from "@/lib/utils";
+import { formatTimestamp, formatDateTime } from "@/lib/utils";
 import {
   platformClass,
   platformChipClass,
@@ -399,7 +399,7 @@ export function CommentLibraryPage() {
         ),
         cell: ({ row }) => (
           <span className="text-xs text-muted-foreground">
-            {formatTimestamp(row.original.collectedAt)}
+            {formatDateTime(row.original.collectedAt)}
           </span>
         ),
       },
@@ -428,7 +428,7 @@ export function CommentLibraryPage() {
         所属内容标题: c.contentTitle ?? "",
         内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
         评论时间: formatTimestamp(c.createdAt),
-        创建时间: formatTimestamp(c.collectedAt),
+        创建时间: formatDateTime(c.collectedAt),
       }));
       const ws = XLSX.utils.json_to_sheet(rows);
       // 表头样式:居中 + 靛蓝背景 + 加粗白字

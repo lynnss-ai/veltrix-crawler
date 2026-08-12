@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, PromptCategoryView, PromptCategoryInput, ShotPromptView, ShotPromptInput, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -253,16 +253,22 @@ export const api = {
     invoke<string>("read_workspace_file", { conversationId, path }),
   writeWorkspaceFile: (conversationId: string, path: string, content: string) =>
     invoke<void>("write_workspace_file", { conversationId, path, content }),
-  // 编程沙盒(host / docker)配置与生命周期
+  // 编程沙盒(本地进程沙盒:Job Object / 进程组)状态与生命周期
   getSandboxConfig: () => invoke<SandboxConfigView>("get_sandbox_config"),
-  // 沙盒容器实时资源占用(docker stats 单次采样)
+  // 沙盒资源占用(Job 会计:累计 CPU / 峰值内存 / 存活进程数 / 存储占用)
   getSandboxStats: () => invoke<SandboxStatsView>("get_sandbox_stats"),
-  setSandboxConfig: (image: string, container: string) =>
-    invoke<void>("set_sandbox_config", { image, container }),
-  sandboxStart: () => invoke<string>("sandbox_start"),
+  // 沙盒限额配置(内存/网络/CPU/进程数/IO/空闲回收,单对象参数;0=不限/关闭);
+  // 改了会 terminate 现存沙盒,下次动作按新配置惰性重建
+  setSandboxConfig: (config: SandboxConfigInput) =>
+    invoke<void>("set_sandbox_config", { config }),
+  // 某沙盒的命令审计日志(尾部 limit 条,JSON 行;无记录返回空)
+  getSandboxAudit: (sandboxId: string, limit?: number) =>
+    invoke<string[]>("get_sandbox_audit", { sandboxId, limit: limit ?? 50 }),
+  // 清空该沙盒的存储目录(会删工作区全部文件;先杀进程,带根目录护栏)
+  clearSandboxStorage: (sandboxId: string) =>
+    invoke<void>("clear_sandbox_storage", { sandboxId }),
+  // 停止全部沙盒进程(terminate 所有会话 Job;工作区文件保留,下次编程动作自动重建)
   sandboxStop: () => invoke<void>("sandbox_stop"),
-  // 强制重建容器(删旧 + 正确挂载新建),用于旧容器挂载错误导致「文件不在沙盒」时一键修复。
-  sandboxRecreate: () => invoke<string>("sandbox_recreate"),
   // 意图分类:首条消息判断该用哪个 Agent(chat/coding/rpa/computer/local),用于发送时自动切布局。
   // 混合策略:关键词命中直接返回(零延迟);仅关键词落到 chat 且像可执行任务时,后端才用所选模型做一次 LLM 兜底。
   classifyAgentType: (text: string, providerId?: string, model?: string) =>
@@ -304,9 +310,9 @@ export const api = {
     }),
   transcribeChatAudio: (audioBase64: string, format: string) =>
     invoke<string>("transcribe_chat_audio", { audioBase64, format }),
-  // 实时语音转写:定时发送音频片段
-  transcribeAudioChunk: (audioBase64: string, format: string) =>
-    invoke<string>("transcribe_audio_chunk", { audioBase64, format }),
+  // 实时语音转写:定时发送音频片段(流式:增量经 asr-stream 事件返回,invoke 返回完整文本)
+  transcribeAudioChunk: (audioBase64: string, format: string, requestId: string) =>
+    invoke<string>("transcribe_audio_chunk", { audioBase64, format, requestId }),
 
   // AI 对话:长期记忆(跨会话,设置页「AI 记忆」管理)
   listChatMemories: () => invoke<ChatMemoryView[]>("list_chat_memories"),
@@ -390,21 +396,6 @@ export const api = {
     invoke<void>("upsert_keyword", { keyword }),
   removeKeyword: (id: string) => invoke<void>("remove_keyword", { id }),
 
-  // 内容创作:提示词分类目录
-  listPromptCategories: () =>
-    invoke<PromptCategoryView[]>("list_prompt_categories"),
-  upsertPromptCategory: (category: PromptCategoryInput) =>
-    invoke<void>("upsert_prompt_category", { category }),
-  removePromptCategory: (id: string) =>
-    invoke<void>("remove_prompt_category", { id }),
-
-  // 内容创作:分镜镜头提示词
-  listShotPrompts: (categoryId: string) =>
-    invoke<ShotPromptView[]>("list_shot_prompts", { categoryId }),
-  upsertShotPrompt: (prompt: ShotPromptInput) =>
-    invoke<void>("upsert_shot_prompt", { prompt }),
-  removeShotPrompt: (id: string) => invoke<void>("remove_shot_prompt", { id }),
-
   // 采集任务
   listTasks: () => invoke<TaskView[]>("list_tasks"),
   upsertTask: (input: TaskInput) => invoke<void>("upsert_task", { input }),
@@ -413,6 +404,9 @@ export const api = {
   removeTask: (id: string) => invoke<void>("remove_task", { id }),
   // 启动任务采集:后端选账号 + 后台遍历关键词(自动开窗 + 拟人 RPA),立即返回
   runTask: (taskId: string) => invoke<void>("run_task", { taskId }),
+  // 终止任务:登记停止标记,运行中的采集滚动 / 素材下载 / 语音转写各阶段据此中断
+  // (仅改 DB 状态不会停运行体,必须显式登记;任务未在运行时登记无副作用)
+  stopTask: (taskId: string) => invoke<void>("stop_collect", { taskId }),
   // 全量库:列出采集落库的内容(按采集时间倒序);传 taskId 时服务端按任务过滤
   // (任务穿透视图专用:不受全局数量上限按时间截断影响,旧任务的内容也能查全)
   listContents: (taskId?: string) =>
@@ -449,6 +443,21 @@ export const api = {
   // 批量转写:对指定 id(当前筛选列表中「有音频无文案」的条目)重跑语音转写,返回处理条数
   retryFailedTranscripts: (ids: string[]) =>
     invoke<number>("retry_failed_transcripts", { ids }),
+  // 全量库补采评论:对选中内容按评论参数(时间范围 / 单视频上限 / 意向分析)重采一级评论
+  recollectComments: (
+    ids: string[],
+    params: {
+      commentTimeRange: string;
+      commentLimit: number;
+      analyzeIntent: boolean;
+    },
+  ) =>
+    invoke<RecollectCommentsSummary>("recollect_comments", {
+      ids,
+      commentTimeRange: params.commentTimeRange,
+      commentLimit: params.commentLimit,
+      analyzeIntent: params.analyzeIntent,
+    }),
   // 失败任务补偿:按采集参数补做缺失的后处理(意向分析 / 素材下载 / 转写)
   compensateTask: (id: string) => invoke<void>("compensate_task", { id }),
   // ffmpeg 安装检测:用于「AI 文案提取」处按是否已装切换提示(已装隐藏下载引导)

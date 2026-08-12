@@ -16,6 +16,14 @@ export interface ChatContextValue {
   /** 交接给新布局的首条消息:对话页按意图判为编程时,建好 coding 会话后把首条消息交给 CodingLayout 自动发送 */
   pendingFirstMessage: string | null;
   setPendingFirstMessage: (m: string | null) => void;
+  /** 首条消息自动交接后的顶部提示条(「已为你切换到 XX 智能体」):ChatPage 交接时置位,ConversationShell 在新布局顶部渲染 */
+  handoffNotice: { convId: string; type: string; text: string } | null;
+  setHandoffNotice: (
+    n: { convId: string; type: string; text: string } | null,
+  ) => void;
+  /** 「改回普通对话」预填文本:把交接前的首条消息放进 ChatPage 输入框(不自动发送),消费后清空 */
+  prefillMessage: string | null;
+  setPrefillMessage: (m: string | null) => void;
   /** 从后端重新拉取会话列表(新建 / 删除 / 改标题后调用) */
   reload: () => Promise<void>;
 }

@@ -36,8 +36,6 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import html2canvas from "html2canvas-pro";
-import { jsPDF } from "jspdf";
 import { toast } from "sonner";
 
 import {
@@ -158,22 +156,26 @@ const AGENT_LABELS: Record<string, string> = {
   local: "本机助手",
 };
 
-// AI 生成中加载:流光进度条(纯 CSS,无图标)。一道渐变高光在细胶囊条上从左扫到右、循环,无闪烁。
-// compact=只显示细条(输出中的「仍在生成」);否则细条 + 文字(首 token 前)。
-function ShimmerBar({ label, compact }: { label?: string; compact?: boolean }) {
-  const bar = (
-    <span
-      className={`relative inline-block h-1.5 overflow-hidden rounded-full bg-muted ${
-        compact ? "w-16" : "w-24"
-      }`}
-    >
-      <span className="absolute inset-y-0 left-0 w-1/3 rounded-full bg-gradient-to-r from-transparent via-primary to-transparent animate-[veltrix-shimmer_1.4s_linear_infinite]" />
+// AI 生成中加载:三点打字指示器(纯 CSS,无图标)。三点错相起伏,模拟「正在输入」节奏。
+// compact=只显示小号三点(输出中的「仍在生成」);否则三点 + 文字(首 token 前)。
+function TypingDots({ label, compact }: { label?: string; compact?: boolean }) {
+  const dots = (
+    <span className="inline-flex items-center gap-1">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className={`rounded-full bg-primary animate-[veltrix-dot-bounce_1.2s_ease-in-out_infinite] ${
+            compact ? "size-1" : "size-1.5"
+          }`}
+          style={{ animationDelay: `${i * 0.15}s` }}
+        />
+      ))}
     </span>
   );
-  if (compact) return bar;
+  if (compact) return dots;
   return (
     <div className="inline-flex items-center gap-2.5 text-sm text-muted-foreground">
-      {bar}
+      {dots}
       {label ?? "正在生成…"}
     </div>
   );
@@ -429,6 +431,9 @@ export function ChatPage() {
     providers,
     setPendingAgentType,
     setPendingFirstMessage,
+    setHandoffNotice,
+    prefillMessage,
+    setPrefillMessage,
     reload,
   } = useChat();
   // 屏幕录制(输入框加号里的「屏幕录制」):加号只打开悬浮条,开始/停止在悬浮条上手动操作
@@ -465,8 +470,8 @@ export function ChatPage() {
   const models = useMemo(() => buildModelOptions(providers), [providers]);
   // 新会话默认模型(value);开新会话时用它
   const [pickedModel, setPickedModel] = useState("");
-  // 智能搜索开关(输入框加号右侧):开启后本轮对话走智能搜索增强(后端能力接入前先作为状态保留)
-  const [smartSearch, setSmartSearch] = useState(false);
+  // 「智能搜索」开关已下线:后端搜索能力未接入,开关点了无效果(死开关),为避免误导从输入区移除
+  // (连同 placeholder 联动;能力就绪后再恢复)
   // 思考模式:开启才显示思考过程(实时 + 历史,默认展开);关闭则全部隐藏(原文仍保留,可再开回看)
   const [thinkingMode, setThinkingMode] = useState(() => {
     try { return localStorage.getItem("veltrix.thinking") === "on"; } catch { return false; }
@@ -483,6 +488,22 @@ export function ChatPage() {
   // 流式思考过程(推理型模型):与正文分轨,先于正文出现
   const [streamingReasoning, setStreamingReasoning] = useState<string | null>(null);
   const streamingConvRef = useRef<string | null>(null);
+  // activeId 的 ref 镜像:流式完成/失败的异步回调里比对,用户已切走时不碰当前视图
+  const activeIdRef = useRef<string | null>(activeId);
+  activeIdRef.current = activeId;
+  // 会话消息加载代际:快速 A→B→A 切换时,后到的过期响应按 token 丢弃,防乱序覆盖
+  const loadGenRef = useRef(0);
+  // 已流出正文累计(ref 镜像,异步 catch 里 streamingContent 闭包是旧值,从这里取部分内容)
+  const streamedTextRef = useRef("");
+  // 流式失败内联错误条:错误文案 + 可重试的最后一条用户消息(点「重试」原样重发),不再只剩 toast
+  const [streamError, setStreamError] = useState<{
+    convId: string;
+    message: string;
+    retryText: string;
+    retryAtts: PendingAttachment[];
+  } | null>(null);
+  // 本次发送失败是否已转内联错误条(handleSend 据此跳过输入回滚,改由「重试」接管)
+  const inlineErrorRef = useRef(false);
   // 抑制「本次发送自建的新会话」触发加载 effect:setActiveId 会让 [activeId] 加载 effect 与
   // 本次发送的乐观追加/回复抢跑,导致首条消息重复或被清空。记下新会话 id,加载 effect 命中即跳过一次。
   const skipLoadRef = useRef<string | null>(null);
@@ -515,10 +536,13 @@ export function ChatPage() {
   >({ copy: [], image: [] });
   // 图片附件预览(灯箱):当前预览的图片在图片附件列表中的下标;null=未预览
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
-  // 每条 AI 回复的点赞/点踩(纯前端态,按消息 id)
+  // 每条 AI 回复的点赞/点踩(按消息 id;加载会话时由后端 feedback 字段水合)
   const [feedback, setFeedback] = useState<
     Record<number, "like" | "dislike">
   >({});
+  // feedback 的 ref 镜像:toggleFeedback 借此做空依赖 useCallback,保持回调身份稳定(memo bubble 不全体失效)
+  const feedbackRef = useRef(feedback);
+  feedbackRef.current = feedback;
   // 重命名 / 删除会话的自定义弹框(替代原生 prompt/confirm)
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
@@ -534,17 +558,24 @@ export function ChatPage() {
   const isOrchestrator = active?.agentType !== "chat";
   // 发送相关「忙碌」总开关:意图判断 + 发送中都算,统一控制发送按钮禁用与回车拦截
   const busy = sending;
-  // 编排器会话:隐藏 tool 结果行与纯工具调用(无正文)的 assistant,保持 transcript 干净
-  // (子智能体逐步往返的内联富渲染在 Phase 2)。legacy chat 不过滤。
+  // 编排器会话:隐藏 tool 结果行与所有带工具调用的 assistant(那些是委派/子智能体的步骤旁白,
+  // 如「继续查看其他可能位置:」——整批刷出来像对话错乱),只留用户消息与最终答复,保持 transcript 干净。
+  // legacy chat 不过滤。
   const shownMessages = isOrchestrator
     ? messages.filter(
         (m) =>
           m.role === "user" ||
-          (m.role === "assistant" && !!(m.content?.trim() || m.reasoning?.trim())),
+          (m.role === "assistant" &&
+            !!(m.content?.trim() || m.reasoning?.trim()) &&
+            (!m.toolCalls || m.toolCalls === "[]")),
       )
     : messages;
-  // 右侧富面板:取最近一次委派的子智能体(coding/rpa 才有面板;computer/local 无)
-  const activeSubAgent = useMemo<"coding" | "rpa" | null>(() => {
+  // 右侧富面板:取最近一次委派的子智能体(coding/rpa 才有面板;computer/local 无面板,
+  // 跳过并继续向前找——委派它们不收起已有面板,保持最后一个有产出的面板呈现)。
+  // 两路信号:liveSubAgent = 流式期间 agent-panel 事件实时捕获(委派发生即展开);
+  // scannedSubAgent = 消息落库后从 toolCalls 倒扫(历史会话 / 无事件时的兜底)。
+  const [liveSubAgent, setLiveSubAgent] = useState<"coding" | "rpa" | null>(null);
+  const scannedSubAgent = useMemo<"coding" | "rpa" | null>(() => {
     if (!isOrchestrator) return null;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
@@ -555,7 +586,7 @@ export function ChatPage() {
           const n = calls[j]?.name;
           if (n === "delegate_to_coding") return "coding";
           if (n === "delegate_to_rpa") return "rpa";
-          if (n === "delegate_to_computer" || n === "delegate_to_local") return null;
+          // delegate_to_computer / delegate_to_local 无面板:跳过,继续找更早的 coding/rpa 委派
         }
       } catch {
         /* 忽略坏 JSON */
@@ -563,6 +594,8 @@ export function ChatPage() {
     }
     return null;
   }, [isOrchestrator, messages]);
+  // 实时信号优先(本轮回合的委派可能尚未落库),落空再用落库扫描结果
+  const activeSubAgent = liveSubAgent ?? scannedSubAgent;
   // 左右分栏宽度(%)+ 拖拽分隔
   const [leftPct, setLeftPct] = useState(48);
   const splitRef = useRef<HTMLDivElement>(null);
@@ -583,7 +616,7 @@ export function ChatPage() {
   }
   const workPanel =
     activeSubAgent === "coding" ? (
-      <CodingWorkPanel conversationId={activeId} />
+      <CodingWorkPanel conversationId={activeId} sending={sending} />
     ) : activeSubAgent === "rpa" ? (
       <RpaWorkPanel conversationId={activeId} sending={sending} />
     ) : null;
@@ -598,7 +631,10 @@ export function ChatPage() {
       lastFlushRef.current = Date.now();
       const chunk = pendingDeltaRef.current;
       pendingDeltaRef.current = "";
-      if (chunk) setStreamingContent((prev) => (prev ?? "") + chunk);
+      if (chunk) {
+        streamedTextRef.current += chunk; // 累计已流出正文,失败时保留部分内容用
+        setStreamingContent((prev) => (prev ?? "") + chunk);
+      }
       const rChunk = pendingReasoningRef.current;
       pendingReasoningRef.current = "";
       if (rChunk) setStreamingReasoning((prev) => (prev ?? "") + rChunk);
@@ -660,6 +696,35 @@ export function ChatPage() {
     };
   }, []);
 
+  // 右侧分栏实时触发:编排器委派子智能体时,后端发类型化 agent-panel 事件(start/done 两相位),
+  // 委派发生即展开对应富面板、完成时再度确认(「有结果可呈现」时刻),不等消息落库。
+  // 只响应「当前正在查看的会话」;computer/local 无面板——不强制收起,保持最后一个有产出的面板。
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    listen<{ conversationId: string; agent: string; phase: string }>(
+      "agent-panel",
+      (e) => {
+        if (activeIdRef.current !== e.payload.conversationId) return;
+        if (e.payload.agent === "coding" || e.payload.agent === "rpa") {
+          setLiveSubAgent(e.payload.agent);
+        }
+      },
+    ).then(
+      (fn) => {
+        if (disposed) fn();
+        else dispose = fn;
+      },
+      (err) => {
+        console.error("agent-panel 监听注册失败:", err);
+      },
+    );
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, []);
+
   // 回执危险操作确认:允许则后端执行,拒绝则跳过。ref 同步守卫,避免按钮与 onOpenChange 各触发一次。
   async function resolveConfirm(approved: boolean) {
     const id = pendingConfirmRef.current;
@@ -683,7 +748,11 @@ export function ChatPage() {
 
   // 切换会话时加载消息
   useEffect(() => {
+    // 代际 token:快速 A→B→A 切换时,后到的过期响应直接丢弃,避免乱序覆盖
+    const gen = ++loadGenRef.current;
     setVisibleCount(CHAT_PAGE_SIZE); // 切会话回到「只渲染最近 N 条」,避免长对话一次性解析全部 Markdown
+    setStreamError(null); // 内联错误条属于旧会话上下文,切换即清
+    setLiveSubAgent(null); // 实时面板信号同属旧会话,切换即清(落库扫描兜底)
     if (!activeId) {
       setMessages([]);
       return;
@@ -693,11 +762,31 @@ export function ChatPage() {
       skipLoadRef.current = null;
       return;
     }
+    // 切换即清空旧会话消息,避免加载期间残留旧会话内容污染视图
+    setMessages([]);
     api
       .listChatMessages(activeId)
-      .then(setMessages)
+      .then((msgs) => {
+        if (gen !== loadGenRef.current) return; // 过期响应:期间又切了会话,丢弃
+        setMessages(msgs);
+        // 点赞反馈水合:后端返回的 feedback(like/dislike/null)回填本地点赞态
+        const fb: Record<number, "like" | "dislike"> = {};
+        for (const m of msgs) {
+          if (m.feedback === "like" || m.feedback === "dislike") {
+            fb[m.id] = m.feedback;
+          }
+        }
+        setFeedback(fb);
+      })
       .catch((e) => toast.error(`加载消息失败: ${e}`));
   }, [activeId]);
+
+  // 「改回普通对话」预填:交接提示条选回普通对话时,把原首条消息放进输入框(不自动发送,由用户决定)
+  useEffect(() => {
+    if (prefillMessage == null) return;
+    setInput(prefillMessage);
+    setPrefillMessage(null);
+  }, [prefillMessage, setPrefillMessage]);
 
   // 消息变化 / 流式增量时滚到底部:仅当用户已贴在底部(向上翻阅时不打断)
   useEffect(() => {
@@ -759,6 +848,7 @@ export function ChatPage() {
     }
     pendingDeltaRef.current = "";
     pendingReasoningRef.current = "";
+    streamedTextRef.current = "";
   }
 
   // 模型选择器选项:已有会话若绑定了已不在可用列表里的模型(厂商删了 Key / 改了模型行),
@@ -812,9 +902,6 @@ export function ChatPage() {
   // 未选到模型时按「不支持」处理,避免在能力未知时放行图片。
   const currentModelSupportsImage =
     currentModel?.capabilities.includes("vision") ?? false;
-  // 当前所选模型是否支持工具调用(tools):编排器靠它委派子智能体;不支持则只能纯对话
-  const currentModelSupportsTools =
-    currentModel?.capabilities.includes("tools") ?? false;
 
   // 切换模型:
   // - 新会话(未建)→ 只改本地待用值
@@ -1068,12 +1155,14 @@ export function ChatPage() {
     }
     const recording = pendingRecording; // 本次随消息一并发送的待发送录屏(若有)
     setSending(true);
+    setStreamError(null); // 新一轮发送:清掉上一轮的内联错误条
     // 乐观追加用户消息:正文 + 附件(图片带内联 base64 即时预览,落库后由后端 path 接管)
     const optimistic: ChatMessageView = {
       id: Date.now(),
       conversationId: activeId ?? "",
       role: "user",
       content: text,
+      feedback: null,
       attachments: atts.map((a) => ({
         name: a.name,
         mime: a.mime,
@@ -1086,8 +1175,9 @@ export function ChatPage() {
     setMessages((prev) => [...prev, optimistic]);
 
     let isNewConv = false;
+    // 提升到 try 外:catch 里的跨会话守卫 / 部分内容保留要用 convId
+    let convId: string | null = activeId;
     try {
-      let convId = activeId;
       // 新会话:先按所选模型建会话
       if (!convId) {
         const opt = models.find((m) => m.value === pickedModel) ?? models[0];
@@ -1117,14 +1207,18 @@ export function ChatPage() {
         // 编排器:子智能体在同会话落库 tool 往返,发送完整重载消息以拿回全部步骤(附件 Phase 1 暂不传)
         await api.sendOrchestratorMessage(convId, text);
         const fresh = await api.listChatMessages(convId);
-        setMessages(fresh);
+        // 跨会话守卫:用户已切走时不碰当前视图(消息已落库,重进该会话可见)
+        if (convId === activeIdRef.current) setMessages(fresh);
       } else {
         const reply = await api.sendChatMessageStream(
           convId,
           text,
           atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })),
         );
-        setMessages((prev) => [...prev, reply]);
+        // 跨会话守卫:完成追加只在仍停留该会话时落到当前视图
+        if (convId === activeIdRef.current) {
+          setMessages((prev) => [...prev, reply]);
+        }
       }
       // 刷新侧栏会话列表(标题由 AI 概括生成 + 排序更新)
       await reload();
@@ -1134,10 +1228,43 @@ export function ChatPage() {
       const raw = String(e);
       const msg = raw.replace(/^.*?(?:错误|失败)[:：]\s*/u, "") || raw;
       toast.error(msg);
-      setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
-      // 新建会话发送失败:重置 activeId,下次发送重新建会话(避免残留脏会话导致切换模型仍失败)
-      if (isNewConv) {
-        setActiveId(null);
+      // 跨会话守卫:用户已切走时不碰当前视图(消息以落库为准,重进该会话可见)
+      if (convId && convId === activeIdRef.current) {
+        if (isNewConv) {
+          // 新会话首发失败:清乐观消息 + 重置 activeId(下次发送重新建会话),输入由 handleSend 回滚
+          setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+          setActiveId(null);
+        } else {
+          // 失败保留:已流出部分落为一条 assistant 消息(尾部标注「已中断」),尾部内联错误条可「重试」
+          const partial = (
+            streamedTextRef.current + pendingDeltaRef.current
+          ).trim();
+          if (partial) {
+            const interrupted: ChatMessageView = {
+              id: -Date.now(), // 负数 id:本地临时消息,避免与落库消息撞 key
+              conversationId: convId,
+              role: "assistant",
+              content: `${partial}\n\n*(已中断)*`,
+              feedback: null,
+              createdAt: Math.floor(Date.now() / 1000),
+            };
+            // 保留乐观的用户消息,追加中断的 assistant 部分
+            setMessages((prev) => [...prev, interrupted]);
+          } else {
+            // 毫无内容流出:清掉乐观用户消息,只留错误条
+            setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+          }
+          inlineErrorRef.current = true;
+          setStreamError({
+            convId,
+            message: msg,
+            retryText: text,
+            retryAtts: atts,
+          });
+        }
+      } else if (!convId && activeIdRef.current === null) {
+        // 建会话前就失败(仍在新会话页):清掉乐观消息,输入由 handleSend 回滚
+        setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
       }
       return false;
     } finally {
@@ -1147,6 +1274,14 @@ export function ChatPage() {
       setStreamingReasoning(null);
       setSending(false);
     }
+  }
+
+  // 内联错误条「重试」:原样重发失败的那条用户消息(含当时的附件)
+  function retryFailedMessage() {
+    const err = streamError;
+    if (!err) return;
+    setStreamError(null);
+    void sendMessage(err.retryText, err.retryAtts);
   }
 
   // 交接到对应 Agent:建一个该类型的新会话接手这条消息(原 chat 会话保留),首条由对应 Layout 自动发送。
@@ -1168,6 +1303,8 @@ export function ChatPage() {
     setPendingFirstMessage(text);
     setPendingAgentType(type);
     setActiveId(id);
+    // 新布局顶部提示「已切换智能体」,可关闭或改回普通对话(ConversationShell 渲染)
+    setHandoffNotice({ convId: id, type, text });
     await reload();
   }
 
@@ -1196,6 +1333,7 @@ export function ChatPage() {
     const text = input.trim();
     if ((!text && attachments.length === 0 && !pendingRecording) || sending) return;
     dispatchingRef.current = true;
+    inlineErrorRef.current = false; // 新一轮发送:复位「已转内联错误条」标记
     setHandoffPrompt(null); // 新的一次发送:作废上一条悬而未决的交接提示
     try {
       // 仅录屏、无文字无附件:只落库视频,不走问答 / 不做意图分类
@@ -1252,8 +1390,8 @@ export function ChatPage() {
       setInput("");
       setAttachments([]);
       const ok = await sendMessage(text, atts);
-      // 失败回滚输入与附件,便于重发
-      if (!ok) {
+      // 失败回滚输入与附件,便于重发(已转内联错误条的由「重试」按钮接管,不再回滚输入)
+      if (!ok && !inlineErrorRef.current) {
         setInput(text);
         setAttachments(atts);
       }
@@ -1292,33 +1430,29 @@ export function ChatPage() {
     }
   }, []);
 
-  // 点赞 / 点踩:同值再点取消，持久化到后端
-  const toggleFeedback = useCallback(async (id: number, v: "like" | "dislike") => {
-    const current = feedback[id];
-    const newFeedback = current === v ? null : v;
-
+  // 点赞 / 点踩:同值再点取消,持久化到后端。
+  // 空依赖 useCallback(feedback 走 ref 镜像)+ 函数式 setState:回调身份稳定,点赞不使全部 memo bubble 失效
+  const toggleFeedback = useCallback((id: number, v: "like" | "dislike") => {
+    const current = feedbackRef.current[id];
+    const next = current === v ? null : v;
     // 乐观更新前端状态
     setFeedback((prev) => {
-      const next = { ...prev };
-      if (newFeedback) next[id] = newFeedback;
-      else delete next[id];
-      return next;
+      const updated = { ...prev };
+      if (next) updated[id] = next;
+      else delete updated[id];
+      return updated;
     });
-
-    // 持久化到后端
-    try {
-      await api.updateMessageFeedback(id, newFeedback);
-    } catch (e) {
-      // 回滚前端状态
+    // 持久化到后端,失败回滚
+    api.updateMessageFeedback(id, next).catch((e) => {
       setFeedback((prev) => {
-        const next = { ...prev };
-        if (current) next[id] = current;
-        else delete next[id];
-        return next;
+        const rolled = { ...prev };
+        if (current) rolled[id] = current;
+        else delete rolled[id];
+        return rolled;
       });
       toast.error(`反馈失败: ${e}`);
-    }
-  }, [feedback]);
+    });
+  }, []);
 
   // 整段对话拼成 markdown(分享/下载共用)
   function conversationMarkdown(): string {
@@ -1354,7 +1488,9 @@ export function ChatPage() {
   // 分页(避免拦腰截断)→ jsPDF 加页边距 + 首页标题 → 后端保存对话框写文件。
   async function downloadPdf() {
     if (messages.length === 0) return;
-    // 导出需完整内容:消息列表平时只渲染最近 N 条,先展开全部并等 DOM 提交后再截图
+    // 导出需完整内容:消息列表平时只渲染最近 N 条,先展开全部并等 DOM 提交后再截图;
+    // 记下原值,导出完(finally)还原,避免导出后长对话保持全量渲染
+    const prevVisibleCount = visibleCount;
     if (messages.length > visibleCount) {
       setVisibleCount(messages.length);
       await new Promise((r) =>
@@ -1362,9 +1498,17 @@ export function ChatPage() {
       );
     }
     const el = messagesContentRef.current;
-    if (!el) return;
+    if (!el) {
+      setVisibleCount(prevVisibleCount);
+      return;
+    }
     const t = toast.loading("正在生成 PDF…");
     try {
+      // 重型依赖按需加载:点击导出时才拉 html2canvas / jsPDF,不进首屏包
+      const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
+        import("html2canvas-pro"),
+        import("jspdf"),
+      ]);
       const isDark = document.documentElement.classList.contains("dark");
       const bgColor = isDark ? "#0b0b0c" : "#ffffff";
       // 截图缩放:2 倍兼顾清晰度与体积
@@ -1464,6 +1608,8 @@ export function ChatPage() {
     } catch (e) {
       toast.dismiss(t);
       toast.error(`导出 PDF 失败: ${e}`);
+    } finally {
+      setVisibleCount(prevVisibleCount); // 还原导出前的渲染窗口
     }
   }
 
@@ -1544,15 +1690,142 @@ export function ChatPage() {
   // 实时语音输入:录音过程中定时转写，实时显示结果
   const realtimeTranscriptRef = useRef<string>("");
   const realtimeTimerRef = useRef<number | null>(null);
+  // 录音开始时的输入框内容前缀:转写结果追加在其后,不覆盖用户已输入内容
+  const recordingInputPrefixRef = useRef("");
+  // 流式转写:当前段累计文本(asr-stream 增量逐字追加)、活跃段 requestId
+  const currentSegmentRef = useRef<string>("");
+  const asrActiveIdRef = useRef<string | null>(null);
+  // 段轮转:区分「3s 段轮转停止」与「用户最终停止」;转写串行链保序不丢段;代际号防旧录音迟到段串入
+  const stoppingRef = useRef(false);
+  const asrChainRef = useRef<Promise<void>>(Promise.resolve());
+  const recordingGenRef = useRef(0);
+  // 录音交互效果:声纹分析器(实时音量驱动波形条)与计时
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const voiceFxTimerRef = useRef<number | null>(null);
+  const [voiceBars, setVoiceBars] = useState<number[]>(Array(9).fill(0));
+  const [recordSeconds, setRecordSeconds] = useState(0);
+
+  // 录音交互效果清理(幂等):停采样、关 AudioContext、波形/计时复位
+  function stopVoiceFx() {
+    if (voiceFxTimerRef.current != null) {
+      clearInterval(voiceFxTimerRef.current);
+      voiceFxTimerRef.current = null;
+    }
+    void audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    setVoiceBars(Array(9).fill(0));
+    setRecordSeconds(0);
+  }
+
+  // 组合「前缀 + 已定稿转写 + 当前段流式增量」回填输入框
+  function applyTranscriptInput() {
+    const prefix = recordingInputPrefixRef.current.trim();
+    const full = (realtimeTranscriptRef.current + currentSegmentRef.current).trim();
+    setInput(prefix ? `${prefix} ${full}` : full);
+  }
+
+  // 流式转写增量:后端 asr-stream 事件逐字/逐句推送;只采纳当前活跃段(requestId 匹配)
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    listen<{ requestId: string; delta: string }>("asr-stream", (e) => {
+      if (e.payload.requestId !== asrActiveIdRef.current) return;
+      currentSegmentRef.current += e.payload.delta;
+      applyTranscriptInput();
+    }).then(
+      (fn) => {
+        if (disposed) fn();
+        else dispose = fn;
+      },
+      (err) => console.error("监听 asr-stream 失败:", err),
+    );
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, []);
+
+  // 转写一段完整 webm(带 EBML 头):base64 → 流式转写,增量经 asr-stream 事件实时上屏,
+  // resolve 后 finalize 进 realtimeTranscriptRef;gen 不符(旧录音的迟到段)直接丢弃结果
+  async function transcribeSegment(blob: Blob, mime: string, gen: number) {
+    if (blob.size < 1000) return; // 太小的音频跳过
+    try {
+      const buf = await blob.arrayBuffer();
+      const b64 = bytesToBase64(new Uint8Array(buf));
+      const fmt = mime.split(";")[0].split("/")[1] || "webm";
+
+      // 本段标记为活跃:asr-stream 增量按 requestId 归属,逐字进 currentSegmentRef
+      const requestId = crypto.randomUUID();
+      asrActiveIdRef.current = requestId;
+      currentSegmentRef.current = "";
+
+      // 流式:增量经事件实时上屏;invoke 返回该段完整文本,用于 finalize 兜底
+      const text = await api.transcribeAudioChunk(b64, fmt, requestId);
+      if (gen !== recordingGenRef.current) return; // 旧录音的迟到段,丢弃防串入
+      const seg = (currentSegmentRef.current || text || "").trim();
+      currentSegmentRef.current = "";
+      if (seg) {
+        realtimeTranscriptRef.current += seg + " ";
+        applyTranscriptInput();
+      }
+    } catch (e) {
+      // 实时转写失败不中断录音，只记录警告;丢弃本段未完成的流式增量
+      console.warn("实时转写失败:", e);
+      if (gen === recordingGenRef.current) currentSegmentRef.current = "";
+    }
+  }
+
+  // 每段一个独立 MediaRecorder(同一 stream 上重建):MediaRecorder 只在首帧带 EBML 头,
+  // 段轮转重建保证每段都是完整 webm(GLM 转码/MiMo 识别才不会因缺 EBML 头失败)。
+  // onstop 统一处理:段音频落齐 → 拼 blob 入转写串行链;再按 stoppingRef 分流轮转/最终停止。
+  function spawnSegmentRecorder(stream: MediaStream) {
+    const rec = new MediaRecorder(stream, {
+      mimeType: 'audio/webm;codecs=opus'
+    });
+    rec.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    rec.onstop = () => {
+      // 本段完整 webm(自带 EBML 头)入转写串行链:段间保序、不丢段,失败不堵后续段
+      const gen = recordingGenRef.current;
+      if (chunksRef.current.length > 0) {
+        const mime = rec.mimeType || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type: mime });
+        chunksRef.current = [];
+        asrChainRef.current = asrChainRef.current
+          .then(() => transcribeSegment(blob, mime, gen))
+          .catch(() => {});
+      }
+      if (stoppingRef.current) {
+        // 最终停止:停 track、收尾交互效果与定时器
+        stream.getTracks().forEach((t) => t.stop());
+        setRecording(false);
+        stopVoiceFx();
+        if (realtimeTimerRef.current) {
+          clearInterval(realtimeTimerRef.current);
+          realtimeTimerRef.current = null;
+        }
+      } else {
+        // 段轮转:立即起下一段(stop→start 间隙仅毫秒级,可忽略)
+        spawnSegmentRecorder(stream);
+      }
+    };
+    recorderRef.current = rec;
+    rec.start(1000); // 每秒触发一次 ondataavailable
+  }
 
   async function toggleRecording() {
     if (recording) {
-      // 停止录音
+      // 停止录音(最终停止):清轮转定时器,标记后 stop 当前段——尾段音频在 onstop 里照常入链转写
+      stoppingRef.current = true;
       if (realtimeTimerRef.current) {
         clearInterval(realtimeTimerRef.current);
         realtimeTimerRef.current = null;
       }
-      recorderRef.current?.stop();
+      // 段轮转间隙(stop 已发、新段未起)recorder 处于 inactive,stop 会抛错,跳过即可——
+      // 进行中的 onstop 会看到 stoppingRef 走最终停止分支
+      const rec = recorderRef.current;
+      if (rec && rec.state !== "inactive") rec.stop();
       return;
     }
 
@@ -1566,57 +1839,49 @@ export function ChatPage() {
       });
 
       // 录音状态（浏览器 MediaRecorder 内置降噪：echoCancellation/noiseSuppression/autoGainControl）
-      const recorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
       chunksRef.current = [];
       realtimeTranscriptRef.current = "";
+      currentSegmentRef.current = "";
+      asrActiveIdRef.current = null;
+      recordingGenRef.current += 1; // 新录音代际:旧录音迟到段的转写结果一律丢弃
+      stoppingRef.current = false;
+      recordingInputPrefixRef.current = input; // 记住已输入前缀,转写追加而非覆盖
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size >0) chunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop());
-        setRecording(false);
-        if (realtimeTimerRef.current) {
-          clearInterval(realtimeTimerRef.current);
-          realtimeTimerRef.current = null;
-        }
-      };
-
-      // 开始录音
-      recorder.start(1000); // 每秒触发一次 ondataavailable
-      recorderRef.current = recorder;
+      // 开始首段录音(每段独立 MediaRecorder,段数据自带 EBML 头)
+      spawnSegmentRecorder(stream);
       setRecording(true);
 
-      // 定时转写（每3秒）
-      realtimeTimerRef.current = window.setInterval(async () => {
-        if (chunksRef.current.length === 0) return;
-
-        const blob = new Blob(chunksRef.current, {
-          type: recorder.mimeType || "audio/webm",
-        });
-        if (blob.size < 1000) return; // 太小的音频跳过
-
-        chunksRef.current = []; // 清空已处理的块
-
-        try {
-          const buf = await blob.arrayBuffer();
-          const b64 = bytesToBase64(new Uint8Array(buf));
-          const fmt = (recorder.mimeType || "audio/webm")
-            .split(";")[0]
-            .split("/")[1] || "webm";
-
-          const text = await api.transcribeAudioChunk(b64, fmt);
-          if (text && text.trim()) {
-            realtimeTranscriptRef.current += text + " ";
-            setInput(() => realtimeTranscriptRef.current.trim());
+      // 交互效果:AnalyserNode 采样实时音量驱动波形条(100ms 一帧),同一计时器顺带走秒
+      try {
+        const ctx = new AudioContext();
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        ctx.createMediaStreamSource(stream).connect(analyser);
+        audioCtxRef.current = ctx;
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        const startAt = Date.now();
+        voiceFxTimerRef.current = window.setInterval(() => {
+          analyser.getByteTimeDomainData(buf);
+          // 时域 RMS → 0..1 音量,放大 3.5 倍让正常说话的幅度看得见
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
           }
-        } catch (e) {
-          // 实时转写失败不中断录音，只记录警告
-          console.warn("实时转写失败:", e);
-        }
+          const level = Math.min(1, Math.sqrt(sum / buf.length) * 3.5);
+          // 5 根条 = 最近 5 帧音量的滑动窗口,新帧从右进入
+          setVoiceBars((prev) => [...prev.slice(1), level]);
+          setRecordSeconds(Math.floor((Date.now() - startAt) / 1000));
+        }, 100);
+      } catch (e) {
+        console.warn("声纹分析初始化失败(不影响录音):", e);
+      }
+
+      // 段轮转定时(每3秒):stop 当前段触发 onstop → 段音频入链转写 + 起下一段
+      realtimeTimerRef.current = window.setInterval(() => {
+        // 仅录制中才轮转(轮转间隙/已停止时 recorder 非 recording,stop 会抛错)
+        const rec = recorderRef.current;
+        if (rec && rec.state === "recording") rec.stop();
       }, 3000);
 
     } catch {
@@ -1733,7 +1998,7 @@ export function ChatPage() {
               )}
             </div>
           ) : (
-            <div ref={messagesContentRef} className="mx-auto max-w-3xl space-y-3.5">
+            <div ref={messagesContentRef} className="mx-auto max-w-3xl space-y-5">
               {/* 只渲染最近 visibleCount 条;更早的折叠在「加载更早」后(切到长对话不卡) */}
               {shownMessages.length > visibleCount && (
                 <div className="flex justify-center">
@@ -1762,8 +2027,9 @@ export function ChatPage() {
                   onPreviewImage={setHistoryImagePreview}
                 />
               ))}
-              {/* 流式生成中:思考过程仅在「思考模式」开启时实时展示;始终显示波浪下划线直到完成 */}
-              {sending && (
+              {/* 流式生成中:思考过程仅在「思考模式」开启时实时展示;始终显示波浪下划线直到完成。
+                  门控:仅在流式归属会话仍是当前会话时渲染,切走不串台 */}
+              {sending && streamingConvRef.current === activeId && (
                 <div>
                   {thinkingMode && streamingReasoning != null && (
                     <ReasoningBlock
@@ -1778,15 +2044,39 @@ export function ChatPage() {
                   ) : (
                     // 尚无正文:显示生成中加载;思考模式开启且已有实时思考时由 ReasoningBlock 代替
                     !(thinkingMode && streamingReasoning != null) && (
-                      <ShimmerBar label="正在生成…" />
+                      <TypingDots label="正在生成…" />
                     )
                   )}
-                  {/* 输出中:流光细条作「仍在生成」脉冲 */}
+                  {/* 输出中:小号三点作「仍在生成」脉冲 */}
                   {streamingContent && (
                     <div className="mt-1.5">
-                      <ShimmerBar compact />
+                      <TypingDots compact />
                     </div>
                   )}
+                </div>
+              )}
+              {/* 流式失败内联错误条:已流出内容保留在上方,点「重试」原样重发最后一条用户消息 */}
+              {streamError && streamError.convId === activeId && (
+                <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  <span className="flex-1 break-words">
+                    {streamError.message}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={retryFailedMessage}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs font-medium text-white hover:bg-destructive/90"
+                  >
+                    <RotateCcw className="size-3.5" />
+                    重试
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStreamError(null)}
+                    title="关闭"
+                    className="shrink-0 text-destructive/70 hover:text-destructive"
+                  >
+                    <X className="size-3.5" />
+                  </button>
                 </div>
               )}
             </div>
@@ -1809,7 +2099,10 @@ export function ChatPage() {
           <div className="mx-auto max-w-3xl">
             {/* 待发送录屏:挂在输入框上方,发送时随消息一并加入对话,可移除 */}
             {pendingRecording && (
-              <RecordingChip onRemove={() => setPendingRecording(null)} />
+              <RecordingChip
+                path={pendingRecording}
+                onRemove={() => setPendingRecording(null)}
+              />
             )}
             {/* 附件 / 图片预览:输入框外侧上方。12 格栅格与输入框等宽、单行不换行;
                 图片显示缩略图(可点开预览),其余文件显示方形图标块,均可移除 */}
@@ -1905,11 +2198,25 @@ export function ChatPage() {
                 </button>
               </div>
             )}
-            {/* 编排器:当前模型不支持工具调用时提示——只能纯对话,无法委派子智能体实际执行 */}
-            {isOrchestrator && !currentModelSupportsTools && models.length > 0 && (
-              <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                <span className="flex-1">
-                  当前模型不支持「工具调用」。若已配置带工具能力的模型,委派子智能体时会自动改用它执行;否则只能纯对话。建议直接选用带「工具调用」能力的模型。
+            {/* 录音状态条:红点 + 实时声纹波形(随音量起伏)+ 时长;中性灰调,避免喧宾夺主 */}
+            {recording && (
+              <div className="mb-2 flex items-center gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2">
+                <span className="relative flex size-1.5 shrink-0">
+                  <span className="absolute inline-flex size-full animate-ping rounded-full bg-destructive opacity-40" />
+                  <span className="relative inline-flex size-1.5 rounded-full bg-destructive" />
+                </span>
+                <span className="flex h-5 flex-1 items-center justify-center gap-1">
+                  {voiceBars.map((v, i) => (
+                    <span
+                      key={i}
+                      className="w-1 rounded-full bg-muted-foreground/50 transition-[height] duration-150 ease-out"
+                      style={{ height: `${Math.max(12, Math.round(v * 100))}%` }}
+                    />
+                  ))}
+                </span>
+                <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                  {Math.floor(recordSeconds / 60)}:
+                  {String(recordSeconds % 60).padStart(2, "0")}
                 </span>
               </div>
             )}
@@ -1921,8 +2228,8 @@ export function ChatPage() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                // Enter 发送(忙碌中不发送,但允许继续输入),Shift+Enter 换行
-                if (e.key === "Enter" && !e.shiftKey) {
+                // Enter 发送(忙碌中不发送,但允许继续输入),Shift+Enter / Alt+Enter 换行;IME 组词中的 Enter(选词上屏)不触发
+                if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   if (!busy) void handleSend();
                 }
@@ -1932,16 +2239,15 @@ export function ChatPage() {
                   ? "语音输入中，实时转写中…点击麦克风结束"
                   : sending
                     ? "回复生成中,可继续输入,完成后发送…"
-                    : smartSearch
-                      ? "智能搜索:输入要搜索的内容,Enter 发送 / Shift+Enter 换行"
-                      : "输入消息,Enter 发送 / Shift+Enter 换行"
+                    : "请输入您的问题"
               }
               className="veltrix-thin-scrollbar max-h-52 min-h-10 w-full resize-none border-0 bg-transparent px-2 py-2 text-[15px] leading-6 tracking-normal shadow-none focus-visible:ring-0 dark:bg-transparent"
               rows={1}
             />
             {/* 第二行:开头放更多功能(附件);结尾依次为模型选择 → 语音 → 发送(发送仅在有文字/附件时出现在语音右侧) */}
             <div className="flex items-center justify-between gap-2">
-              {/* 左侧:加号(附件/资产)+ 智能搜索开关 */}
+              {/* 左侧:加号(附件/资产);「智能搜索」开关已隐藏——后端搜索能力未接入,开关为死状态,避免误导,
+                  能力就绪后再恢复(连同 placeholder 联动) */}
               <div className="flex shrink-0 items-center gap-1">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -1993,25 +2299,6 @@ export function ChatPage() {
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-                {/* 智能搜索开关:开启后高亮;点击切换 */}
-                <SimpleTooltip
-                  content={smartSearch ? "智能搜索已开启" : "开启智能搜索"}
-                >
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-pressed={smartSearch}
-                    onClick={() => setSmartSearch((v) => !v)}
-                    className={`h-8 shrink-0 gap-1 rounded-xl border px-2 text-xs transition-colors ${
-                      smartSearch
-                        ? "border-primary/40 bg-primary/10 text-primary hover:bg-primary/15"
-                        : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
-                    }`}
-                  >
-                    智能搜索
-                  </Button>
-                </SimpleTooltip>
                 {/* 思考模式开关:开启后历史消息的思考过程默认展开 */}
                 <SimpleTooltip
                   content={thinkingMode ? "思考模式已开启:显示思考过程" : "开启思考模式后显示思考过程"}
@@ -2084,7 +2371,11 @@ export function ChatPage() {
                     className="size-9 shrink-0 cursor-pointer rounded-xl"
                     onClick={toggleRecording}
                   >
-                    <Mic className={recording ? "animate-pulse" : ""} />
+                    {recording ? (
+                      <Square className="size-4" fill="currentColor" />
+                    ) : (
+                      <Mic />
+                    )}
                   </Button>
                 </SimpleTooltip>
                 {/* 发送/停止:有文字 / 附件 / 待发送录屏(或正在发送/判断中)时才出现在语音右侧 */}
@@ -2224,7 +2515,8 @@ export function ChatPage() {
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
+                // IME 组词中的 Enter(选词上屏)不触发提交
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   void submitRename();
                 }
@@ -2450,8 +2742,8 @@ const MessageBubble = memo(function MessageBubble({
 
   return (
     <div className="group flex flex-col items-start gap-1">
-      {/* 助手回复:宽度与输入框一致(占满 max-w-3xl 容器),不显示时间 */}
-      <div className="w-full">
+      {/* 助手回复:宽度与输入框一致(占满 max-w-3xl 容器),不显示时间;py-1 给短回复一点上下呼吸感 */}
+      <div className="w-full py-1">
         {/* 思考过程仅在「思考模式」开启时显示(默认展开);关闭则隐藏,原文仍保留,开启即可回看 */}
         {thinkingMode && message.reasoning?.trim() && (
           <ReasoningBlock reasoning={message.reasoning} defaultOpen />

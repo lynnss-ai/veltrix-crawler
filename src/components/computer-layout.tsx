@@ -314,6 +314,7 @@ export function ComputerLayout() {
       conversationId: activeId ?? "",
       role: "user",
       content: text,
+      feedback: null,
       createdAt: Math.floor(Date.now() / 1000),
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -399,7 +400,7 @@ export function ComputerLayout() {
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void submitRename();
               }
@@ -564,13 +565,16 @@ export function ComputerLayout() {
         <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-3">
           <div className="flex flex-col gap-1 rounded-2xl border bg-card p-2 shadow-lg">
             {pendingRecording && (
-              <RecordingChip onRemove={() => setPendingRecording(null)} />
+              <RecordingChip
+                path={pendingRecording}
+                onRemove={() => setPendingRecording(null)}
+              />
             )}
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   if (!sending) handleSend();
                 }

@@ -2,9 +2,6 @@
 //! 基于通用 ReAct;模型支持 tools 时挂 4 个委派工具,否则空注册表 = 纯对话降级。
 //! 子智能体在本会话 conversation_id 下串行运行,落库与事件都归本会话(内联可见)。
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-
 use sea_orm::EntityTrait;
 use tauri::{AppHandle, State};
 use veltrix_core::db::entity::provider as provider_entity;
@@ -20,19 +17,14 @@ use crate::agent::core::summary as conv_summary;
 use crate::agent::core::{ChatMsg, ProviderKind, ProviderRef};
 use crate::commands::{current_user, AppState};
 
-/// 编排器钩子:仅在迭代间检查停止标志(Stop 在两次委派之间切断,不打断进行中的子任务)。
+/// 编排器钩子:迭代间检查取消令牌(双保险;步内取消由 LLM 流式读循环 select! 即时响应)。
 struct OrchestratorHooks {
-    agent_cancel: Arc<Mutex<HashSet<String>>>,
-    conversation_id: String,
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl ReactHooks for OrchestratorHooks {
     fn on_iter_end(&mut self, _iter: usize) -> IterDecision {
-        let stop = {
-            let mut set = self.agent_cancel.lock().unwrap_or_else(|e| e.into_inner());
-            set.remove(&self.conversation_id)
-        };
-        if stop {
+        if self.cancel_token.is_cancelled() {
             IterDecision::Finish("(已停止)".to_string())
         } else {
             IterDecision::Continue
@@ -81,6 +73,21 @@ pub async fn send_orchestrator_message(
     if text.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
     }
+
+    // 同会话发送互斥:并发发送排队串行(不拒绝),持锁到回合结束
+    let send_lock = {
+        let mut map = state
+            .chat_send_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(conversation_id.clone()).or_default().clone()
+    };
+    let _send_guard = send_lock.lock().await;
+
+    // 取消令牌:stop 命令 cancel 后,流式读循环 select! 即时中断;守卫收尾(含错误路径)摘除
+    let (cancel_token, _cancel_guard) =
+        crate::agent::core::shared::begin_cancel_token(&state.cancel_tokens, &conversation_id);
+
     let (conversation, provider, had_messages) =
         begin_agent_turn(&state.db, &me.name, &conversation_id, &text).await?;
 
@@ -115,7 +122,7 @@ pub async fn send_orchestrator_message(
             provider_ref.clone(),
             eff_provider.id.clone(),
             state.config_dir.clone(),
-            state.agent_cancel.clone(),
+            cancel_token.child_token(),
             CodingExecCtx::from_state(&state),
             state.webviews.clone(),
             state.agent_confirm.clone(),
@@ -173,14 +180,8 @@ pub async fn send_orchestrator_message(
         auto_fix_on_tool_error: false,
     };
 
-    // 进入前清残留取消标志
-    {
-        let mut set = state.agent_cancel.lock().unwrap_or_else(|e| e.into_inner());
-        set.remove(&conversation_id);
-    }
     let mut hooks = OrchestratorHooks {
-        agent_cancel: state.agent_cancel.clone(),
-        conversation_id: conversation_id.clone(),
+        cancel_token: cancel_token.clone(),
     };
 
     let result = crate::agent::core::react::react_run(
@@ -192,6 +193,7 @@ pub async fn send_orchestrator_message(
         &mut hooks,
         &registry,
         &mut messages,
+        Some(&cancel_token),
     )
     .await?;
 
@@ -206,14 +208,24 @@ pub async fn send_orchestrator_message(
     )
     .await;
 
+    let final_text = result.final_text;
     let final_msg = insert_final_assistant(
         &state.db,
         &conversation_id,
-        result.final_text,
+        final_text.clone(),
         result.final_reasoning,
     )
     .await?;
     finalize_conversation_meta(&state.db, conversation, had_messages, &text).await;
+
+    // 记忆提取(与 chat 路径对齐:编排器回合同样沉淀用户偏好 / 事实到全局记忆)
+    crate::agent::chat::commands::spawn_memory_extraction(
+        &state.db,
+        &me.name,
+        provider_ref.clone(),
+        &text,
+        &final_text,
+    );
 
     // 后台滚动摘要维护(杂活,优先 Summary 角色便宜模型,未配则回退会话模型)
     spawn_summary_maintenance(&state.db, &conversation_id, provider_ref);

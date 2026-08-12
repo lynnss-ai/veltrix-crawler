@@ -74,14 +74,80 @@ pub enum IterDecision {
 }
 
 /// 工具结果落库 / 入上下文的文本:截图回灌为图片时只存简短占位(避免把多 MB base64
-/// 既当 tool 文本、又当图片重复塞进上下文 / 数据库),其余情况用工具原始结果。
+/// 既当 tool 文本、又当图片重复塞进上下文 / 数据库),其余情况用工具原始结果(统一截断,
+/// 防一次「读大文件 / 抓大页面」把后续每轮上下文撑爆)。
 fn post_action_tool_text(post: &ToolPostAction, result: &ToolResult) -> String {
     match post {
         ToolPostAction::InjectUserImages { .. } => {
             "[截图已作为图片提供给视觉模型,见下条消息]".to_string()
         }
-        _ => result.content.clone(),
+        _ => shared::truncate_tool_result(&result.content),
     }
+}
+
+/// 死循环检测阈值:连续相同调用 / 连续工具错误达到该次数即判循环。
+const LOOP_DETECT_THRESHOLD: usize = 3;
+
+/// ReAct 死循环检测:连续 ≥ LOOP_DETECT_THRESHOLD 次「相同 (工具名, 规范化参数)」
+/// 或连续 ≥ LOOP_DETECT_THRESHOLD 次工具错误,判为陷入循环。纯逻辑抽出,便于单测。
+pub struct LoopDetector {
+    last_sig: Option<String>,
+    same_streak: usize,
+    error_streak: usize,
+}
+
+impl Default for LoopDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoopDetector {
+    pub fn new() -> Self {
+        Self {
+            last_sig: None,
+            same_streak: 0,
+            error_streak: 0,
+        }
+    }
+
+    /// 记录一次工具调用结果;返回 true 表示检测到死循环(调用方应引导模型收尾)。
+    pub fn record(&mut self, name: &str, args: &Value, is_error: bool) -> bool {
+        let sig = format!("{name}\u{1}{}", normalize_args(args));
+        if self.last_sig.as_deref() == Some(sig.as_str()) {
+            self.same_streak += 1;
+        } else {
+            self.last_sig = Some(sig);
+            self.same_streak = 1;
+        }
+        if is_error {
+            self.error_streak += 1;
+        } else {
+            self.error_streak = 0;
+        }
+        self.same_streak >= LOOP_DETECT_THRESHOLD || self.error_streak >= LOOP_DETECT_THRESHOLD
+    }
+}
+
+/// 规范化工具参数(对象键递归排序后序列化):让「键序不同、内容相同」的 JSON 判同,
+/// 否则模型仅调换参数键序就能绕过相同调用检测。
+fn normalize_args(v: &Value) -> String {
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sorted(&m[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            _ => v.clone(),
+        }
+    }
+    sorted(v).to_string()
 }
 
 /// ReAct 循环钩子(各 Agent 实现自己的差异逻辑)。
@@ -130,6 +196,7 @@ pub struct ReactResult {
 ///
 /// 前奏(begin_agent_turn)和收尾(finalize_conversation_meta)由调用方负责,
 /// 本函数只封装中间的循环骨架。
+/// `cancel`:可选取消令牌——迭代间检查 + 穿透进 LLM 流式读循环(步内 select! 即时中断)。
 #[allow(clippy::too_many_arguments)]
 pub async fn react_run(
     db: &sea_orm::DatabaseConnection,
@@ -140,6 +207,7 @@ pub async fn react_run(
     hooks: &mut dyn ReactHooks,
     registry: &super::llm::ToolRegistry,
     messages: &mut Vec<ChatMsg>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<ReactResult> {
     let llm = super::llm::provider_for(provider_ref.kind);
     let tool_defs = registry.defs();
@@ -164,23 +232,37 @@ pub async fn react_run(
         );
     };
 
-    // 流式输出:通过 chat-stream 事件发送增量给前端
-    let app_clone2 = app.clone();
-    let cid_clone2 = conversation_id.to_string();
-    let mut on_delta = move |delta: String| {
-        let _ = app_clone2.emit(
-            "chat-stream",
-            json!({ "conversationId": &cid_clone2, "kind": "content", "delta": delta }),
-        );
+    // 委派工具(delegate_to_*)的类型化事件:前端据此开右栏分栏呈现结果。
+    // 相比从 agent-step 文案里字符串匹配,类型化信号不靠文案、不被文案调整打断;
+    // start/done 两相位都发,done 即「有结果可呈现」的时刻(对齐 Claude 的 artifact 触发点)。
+    let app_panel = app.clone();
+    let cid_panel = conversation_id.to_string();
+    let emit_panel = move |tool_name: &str, phase: &str| {
+        if let Some(agent) = tool_name.strip_prefix("delegate_to_") {
+            let _ = app_panel.emit(
+                "agent-panel",
+                json!({ "conversationId": &cid_panel, "agent": agent, "phase": phase }),
+            );
+        }
     };
+
+    // 流式输出:增量经合批器按时间窗攒批后 emit chat-stream 事件(格式不变,前端无感)
+    let mut batcher = shared::DeltaBatcher::new(app.clone(), conversation_id.to_string());
 
     let mut final_text = String::new();
     let mut final_reasoning: Option<String> = None;
     let mut consecutive_tool_errors = 0;
+    // 死循环检测:连续相同调用 / 连续工具错误达阈值即引导收尾并强制停止
+    let mut loop_detector = LoopDetector::new();
     // 累计本轮全部 LLM 调用的 token 用量(coding/rpa/computer 多步循环最耗 token,逐步累加供计费)
     let mut usage = TokenUsage::default();
 
     for iter in 0..config.max_iters {
+        // 迭代间取消检查(双保险;步内取消由 LLM 流式读循环的 select! 即时响应)
+        if cancel.is_some_and(|t| t.is_cancelled()) {
+            final_text = "(已停止)".to_string();
+            break;
+        }
         emit(&format!("思考中…(第 {} 步)", iter + 1));
 
         // 上下文窗口管理:截断过长的消息列表(保留 system 消息)
@@ -188,17 +270,28 @@ pub async fn react_run(
             truncate_messages(messages, max_len);
         }
 
-        // LLM 调用(带重试)
-        let resp = call_llm_with_retry(
-            &*llm,
-            provider_ref,
-            messages,
-            &tool_defs,
-            &options,
-            config.enable_streaming,
-            &mut on_delta,
-            config.max_retries,
-        ).await?;
+        // LLM 调用(带重试);增量闭包借用合批器,调用结束后强制 flush 再进入工具执行
+        let resp = {
+            let mut on_delta = |delta: String| batcher.push("content", &delta);
+            call_llm_with_retry(
+                &*llm,
+                provider_ref,
+                messages,
+                &tool_defs,
+                &options,
+                config.enable_streaming,
+                &mut on_delta,
+                config.max_retries,
+                cancel,
+            ).await?
+        };
+        batcher.flush();
+
+        // 步内取消:流式读循环被令牌中断后在此统一收尾(半截工具调用已被 llm 层丢弃)
+        if cancel.is_some_and(|t| t.is_cancelled()) {
+            final_text = "(已停止)".to_string();
+            break;
+        }
 
         // 累计 token 用量(厂商可能不返回则为 0,saturating 防溢出)
         usage.prompt = usage.prompt.saturating_add(resp.usage.prompt);
@@ -239,6 +332,7 @@ pub async fn react_run(
         let mut pending_injects: Vec<ChatMsg> = Vec::new();
         let tool_calls = &resp.tool_calls;
         let mut has_tool_error = false;
+        let mut loop_detected = false;
 
         if tool_calls.len() > 1 && config.enable_parallel_tools {
             // 并行执行多个工具
@@ -253,6 +347,9 @@ pub async fn react_run(
             for (call, result) in tool_calls.iter().zip(results) {
                 if result.is_error {
                     has_tool_error = true;
+                }
+                if loop_detector.record(&call.name, &call.arguments, result.is_error) {
+                    loop_detected = true;
                 }
                 // 钩子:执行后处理
                 let post = hooks.on_after_tool(&call.name, &call.arguments, &result);
@@ -275,6 +372,7 @@ pub async fn react_run(
             // 串行执行工具(单个工具或禁用并行时)
             for call in tool_calls {
                 emit(&format!("🔧 {}", call.name));
+                emit_panel(&call.name, "start");
 
                 // 钩子:执行前拦截(可异步,如危险操作等用户确认)
                 let result = match hooks.on_before_tool(&call.name, &call.arguments).await {
@@ -284,9 +382,13 @@ pub async fn react_run(
 
                 let flag = if result.is_error { "✗" } else { "✓" };
                 emit(&format!("{flag} {}", call.name));
+                emit_panel(&call.name, "done");
 
                 if result.is_error {
                     has_tool_error = true;
+                }
+                if loop_detector.record(&call.name, &call.arguments, result.is_error) {
+                    loop_detected = true;
                 }
 
                 // 钩子:执行后处理
@@ -306,6 +408,18 @@ pub async fn react_run(
                     content: tool_text,
                 });
             }
+        }
+
+        // 死循环检测:命中则注入「必须立即收尾」引导并强制停止(防模型无限重复同一调用空转)
+        if loop_detected {
+            emit("检测到工具调用循环,已强制收尾");
+            messages.push(ChatMsg::User(
+                "系统检测到工具调用陷入循环(连续重复相同调用或连续失败)。必须立即停止调用工具,直接收尾。"
+                    .to_string(),
+            ));
+            final_text =
+                "(检测到工具调用陷入循环,已强制停止。可换个问法或把任务拆小后重试。)".to_string();
+            break;
         }
 
         // 错误恢复:工具执行失败时自动注入修复提示
@@ -472,6 +586,7 @@ async fn call_llm_with_retry(
     enable_streaming: bool,
     on_delta: &mut (dyn FnMut(String) + Send),
     max_retries: u32,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<super::llm::LlmResponse> {
     let mut last_error = None;
 
@@ -483,6 +598,7 @@ async fn call_llm_with_retry(
                     messages,
                     tools: tool_defs,
                     options,
+                    cancel,
                 },
                 on_delta,
             )
@@ -493,6 +609,7 @@ async fn call_llm_with_retry(
                 messages,
                 tools: tool_defs,
                 options,
+                cancel,
             })
             .await
         };
@@ -501,6 +618,10 @@ async fn call_llm_with_retry(
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_error = Some(e);
+                // 已取消:不再退避重试,直接把错误交上层(正常取消走 Ok 分支,这里兜竞态)
+                if cancel.is_some_and(|t| t.is_cancelled()) {
+                    break;
+                }
                 if attempt < max_retries {
                     // 等待一段时间后重试
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (attempt + 1) as u64)).await;
@@ -510,4 +631,61 @@ async fn call_llm_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| veltrix_core::error::CrawlerError::Config("LLM 调用失败".into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 规范化参数键序无关() {
+        let a = json!({ "x": 1, "y": [2, { "b": 1, "a": 2 }] });
+        let b = json!({ "y": [2, { "a": 2, "b": 1 }], "x": 1 });
+        assert_eq!(normalize_args(&a), normalize_args(&b));
+    }
+
+    #[test]
+    fn 连续相同调用达阈值判循环() {
+        let mut d = LoopDetector::new();
+        let args = json!({ "path": "a.rs" });
+        assert!(!d.record("read_file", &args, false));
+        assert!(!d.record("read_file", &args, false));
+        assert!(d.record("read_file", &args, false));
+    }
+
+    #[test]
+    fn 参数不同则重新计数() {
+        let mut d = LoopDetector::new();
+        assert!(!d.record("read_file", &json!({ "path": "a" }), false));
+        assert!(!d.record("read_file", &json!({ "path": "a" }), false));
+        // 第三次换了参数:不判循环
+        assert!(!d.record("read_file", &json!({ "path": "b" }), false));
+        assert!(!d.record("read_file", &json!({ "path": "b" }), false));
+    }
+
+    #[test]
+    fn 键序不同的相同参数也判循环() {
+        let mut d = LoopDetector::new();
+        assert!(!d.record("run", &json!({ "a": 1, "b": 2 }), false));
+        assert!(!d.record("run", &json!({ "b": 2, "a": 1 }), false));
+        assert!(d.record("run", &json!({ "a": 1, "b": 2 }), false));
+    }
+
+    #[test]
+    fn 连续工具错误达阈值判循环() {
+        let mut d = LoopDetector::new();
+        assert!(!d.record("a", &json!({}), true));
+        assert!(!d.record("b", &json!({}), true)); // 错误累积与调用签名无关
+        assert!(d.record("c", &json!({}), true));
+    }
+
+    #[test]
+    fn 成功调用重置错误连击() {
+        let mut d = LoopDetector::new();
+        assert!(!d.record("a", &json!({}), true));
+        assert!(!d.record("b", &json!({}), true));
+        assert!(!d.record("c", &json!({}), false)); // 成功:错误连击清零
+        assert!(!d.record("d", &json!({}), true));
+        assert!(!d.record("e", &json!({}), true));
+    }
 }

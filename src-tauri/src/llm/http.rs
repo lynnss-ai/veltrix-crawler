@@ -13,6 +13,10 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 15;
 pub const CHAT_TIMEOUT_SECS: u64 = 120;
 /// 语音识别总超时:音频上传 + 转写更慢,给足。
 pub const ASR_TIMEOUT_SECS: u64 = 300;
+/// 流式读流 idle 超时(秒):超过该时长没有任何新 chunk 即判死(流停滞)。
+/// 流式响应不设总超时——长生成(大段代码 / 长文)合法地远超 CHAT 档 120s,
+/// 只能靠「有无新数据」判断存活,故读流循环用本常量做 idle 判死。
+pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// 最大重试次数(总尝试 = 1 + MAX_RETRIES)。
 const MAX_RETRIES: u32 = 3;
@@ -33,9 +37,16 @@ pub fn join_endpoint(base: &str, suffix: &str) -> String {
 
 /// 构造带连接/总超时的 reqwest client。
 pub fn build_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(total_timeout_secs))
+    build_client_inner(Some(total_timeout_secs))
+}
+
+fn build_client_inner(total_timeout_secs: Option<u64>) -> Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
+    if let Some(secs) = total_timeout_secs {
+        builder = builder.timeout(Duration::from_secs(secs));
+    }
+    builder
         .build()
         .map_err(|e| CrawlerError::Config(format!("创建 HTTP 客户端失败: {e}")))
 }
@@ -59,6 +70,23 @@ pub fn shared_client(total_timeout_secs: u64) -> Result<reqwest::Client> {
     Ok(CHAT_CLIENT
         .get()
         .expect("CHAT_CLIENT 刚 set 后必有值")
+        .clone())
+}
+
+/// 流式专用共享 client:只有连接超时、**无总超时**(reqwest 的 .timeout 含 body 读取,
+/// 会把长生成在 CHAT 档 120s 处掐断)。流式存活判死由读流循环的 idle 超时负责
+/// (STREAM_IDLE_TIMEOUT_SECS 无新 chunk 判停滞)。同样缓存复用连接池。
+static STREAM_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+pub fn streaming_client() -> Result<reqwest::Client> {
+    if let Some(client) = STREAM_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = build_client_inner(None)?;
+    let _ = STREAM_CLIENT.set(client);
+    Ok(STREAM_CLIENT
+        .get()
+        .expect("STREAM_CLIENT 刚 set 后必有值")
         .clone())
 }
 

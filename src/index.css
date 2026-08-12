@@ -285,12 +285,16 @@ body {
   }
 }
 
-/* AI 生成中加载:流光进度条。一道渐变高光从左扫到右,首尾都在条外(不可见)→ 循环无缝、无闪烁。 */
-@keyframes veltrix-shimmer {
-  from {
-    transform: translateX(-120%);
+/* AI 生成中加载:三点打字指示器。三点依次起伏(错相 0.15s),模拟「正在输入」节奏。 */
+@keyframes veltrix-dot-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
   }
-  to {
-    transform: translateX(320%);
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
   }
 }

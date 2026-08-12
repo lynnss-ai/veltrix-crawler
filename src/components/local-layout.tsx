@@ -248,6 +248,7 @@ export function LocalLayout() {
       conversationId: activeId ?? "",
       role: "user",
       content: text,
+      feedback: null,
       createdAt: Math.floor(Date.now() / 1000),
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -328,7 +329,7 @@ export function LocalLayout() {
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void submitRename();
               }
@@ -496,7 +497,7 @@ export function LocalLayout() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   if (!sending) handleSend();
                 }

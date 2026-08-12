@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::agent::resolve_in_workspace;
 use crate::agent::core::{Tool, ToolDef, ToolRegistry, ToolResult};
+use crate::sandbox::LocalSandbox;
 
 /// 单次 read_file 返回上限(字节);超出截断,避免撑爆上下文。
 const MAX_FILE_READ_BYTES: usize = 200_000;
@@ -166,12 +167,16 @@ pub fn verify_before_finish_prompt() -> String {
         .to_string()
 }
 
-/// 命令执行环境:本机 host,或 Docker 沙盒(共享容器内的某工作目录)。
-/// 文件读写工具始终走宿主(workspace 目录已挂载进容器),只有 run_command 按此路由。
+/// 命令执行环境:本地进程沙盒(Windows Job Object / macOS 进程组)。
+/// 每会话一个会话级沙盒(仅挂常驻 dev server);run_command 每条命令另建临时沙盒(见 run_command_in)。
+/// 文件读写工具始终走宿主路径约束,只有 run_command / dev server 进沙盒。
 #[derive(Clone)]
-pub enum ExecConfig {
-    Host,
-    Docker { container: String, workdir: String },
+pub struct ExecConfig {
+    pub sandbox: Arc<LocalSandbox>,
+    /// 会话沙盒 id(审计日志归属;命令级临时沙盒的命令也记到会话名下)。
+    pub sandbox_id: String,
+    /// 配置根目录(审计日志落盘路径由此派生)。
+    pub config_dir: PathBuf,
 }
 
 /// Agent 工作模式:Plan(只调研出方案)/ Act(亲自动手执行)。
@@ -193,7 +198,7 @@ impl AgentMode {
     }
 }
 
-/// 构造编程 Agent 的工具注册表(文件工具绑定宿主工作区;run_command 按 exec 路由 host/Docker)。
+/// 构造编程 Agent 的工具注册表(文件工具绑定宿主工作区;run_command 进本地沙盒)。
 /// 按 mode 从源头裁剪可用工具:Plan 只注册只读工具(read_file/list_dir/search_files),
 /// 从根上不挂 write_file/replace_in_file/run_command,杜绝 Plan 模式越权改动或执行。
 /// 跨场景任务由「统一编排器」按 agent 即 tool 委派,编程 Agent 自身不再持委派工具(递归护栏)。
@@ -214,34 +219,27 @@ pub fn build_registry(workspace: PathBuf, exec: ExecConfig, mode: AgentMode) -> 
     registry
 }
 
-/// 构造执行命令:Docker 走 `docker exec <容器> sh -lc "cd '<workdir>' && <cmd>"`;
-/// host 走 cmd /C(Windows)或 sh -c 并设 cwd。不设 kill_on_drop / stdio(调用方设)。
+/// 构造执行命令:本机 cmd /C(Windows)或 sh -c(其余)并设 cwd。不设 kill_on_drop / stdio(调用方设)。
+/// Windows 前缀 `chcp 65001`:让 cmd 内建命令按 UTF-8 输出,避免中文系统(默认 GBK 代码页)
+/// 输出被 from_utf8_lossy 解成乱码(与 agent/shell 的终端工具同一处理);`>nul` 抑制 chcp 提示行。
+/// unix 侧由 `configure_command` 把子进程放进独立进程组,供沙盒 killpg 整树杀。
 pub fn build_exec_command(
     exec: &ExecConfig,
     workspace: &Path,
     command: &str,
 ) -> tokio::process::Command {
-    match exec {
-        ExecConfig::Docker { container, workdir } => {
-            let script = format!("cd '{}' && {}", workdir.replace('\'', "'\\''"), command);
-            let mut c = tokio::process::Command::new("docker");
-            c.arg("exec").arg(container).arg("sh").arg("-lc").arg(script);
-            c
-        }
-        ExecConfig::Host => {
-            let mut c = if cfg!(windows) {
-                let mut c = tokio::process::Command::new("cmd");
-                c.arg("/C").arg(command);
-                c
-            } else {
-                let mut c = tokio::process::Command::new("sh");
-                c.arg("-c").arg(command);
-                c
-            };
-            c.current_dir(workspace);
-            c
-        }
-    }
+    let mut c = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(format!("chcp 65001>nul && {command}"));
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    c.current_dir(workspace);
+    exec.sandbox.configure_command(&mut c);
+    c
 }
 
 /// update_plan:产出 / 更新分步计划。工具层只校验并回显进度、不碰 DB——
@@ -460,31 +458,64 @@ impl Tool for RunCommandTool {
     }
 }
 
-/// 执行一条 shell 命令(host 或 Docker 沙盒;超时 + kill_on_drop + 输出截断)。
+/// 执行一条 shell 命令(本地沙盒内;超时 + 整树终止 + 输出截断 + 审计)。
 /// 供编程 Agent 的 run_command 工具与「用户在终端直接敲命令」共用。
+/// 每条命令用「命令专用」临时沙盒:超时 terminate 只杀该命令的进程树,
+/// 不会误杀会话沙盒里常驻的 dev server(二者若共用会话 Job,超时会连预览一起杀掉)。
 pub async fn run_command_in(workspace: &Path, command: &str, exec: &ExecConfig) -> ToolResult {
-    let mut cmd = build_exec_command(exec, workspace, command);
+    let scoped = match LocalSandbox::new() {
+        Ok(s) => Arc::new(s),
+        Err(e) => return ToolResult::err(format!("创建命令沙盒失败: {e}")),
+    };
+    let scoped_exec = ExecConfig { sandbox: scoped.clone(), sandbox_id: exec.sandbox_id.clone(), config_dir: exec.config_dir.clone() };
+    let mut cmd = build_exec_command(&scoped_exec, workspace, command);
     cmd.kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolResult::err(format!("命令启动失败: {e}")),
+    };
+    // 入沙盒失败仅告警(best-effort):进程仍会跑,只是失去整树杀 / 会计能力
+    if let Some(pid) = child.id() {
+        if let Err(e) = scoped.assign_pid(pid) {
+            tracing::warn!("命令进程挂入沙盒失败(降级为无隔离执行): {e}");
+        }
+    }
+
+    let start = std::time::Instant::now();
     let out = match tokio::time::timeout(
         std::time::Duration::from_secs(RUN_TIMEOUT_SECS),
-        cmd.output(),
+        child.wait_with_output(),
     )
     .await
     {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return ToolResult::err(match exec {
-                ExecConfig::Docker { .. } => format!(
-                    "Docker 命令启动失败: {e}(检查 Docker 是否运行、沙盒容器是否就绪,或在沙盒设置切回本机执行)"
-                ),
-                ExecConfig::Host => format!("命令启动失败: {e}"),
-            });
+        Ok(Err(e)) => return ToolResult::err(format!("命令执行失败: {e}")),
+        Err(_) => {
+            // 只终止本命令的临时沙盒(整树),会话沙盒里的 dev server 不受影响;
+            // 此后 scoped 随之 Drop,句柄关闭再兜底一次(KILL_ON_JOB_CLOSE)
+            scoped.terminate();
+            crate::sandbox::audit(
+                &exec.config_dir,
+                &exec.sandbox_id,
+                command,
+                None,
+                start.elapsed().as_millis(),
+                true,
+            );
+            return ToolResult::err(format!("命令超时(>{RUN_TIMEOUT_SECS}s)已终止"));
         }
-        Err(_) => return ToolResult::err(format!("命令超时(>{RUN_TIMEOUT_SECS}s)已终止")),
     };
+    crate::sandbox::audit(
+        &exec.config_dir,
+        &exec.sandbox_id,
+        command,
+        out.status.code(),
+        start.elapsed().as_millis(),
+        false,
+    );
 
     let mut s = format!("exit: {}\n", out.status.code().unwrap_or(-1));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -756,7 +787,7 @@ impl Tool for SearchFilesTool {
 
 /// 本轮开始前打检查点:git 初始化(幂等)+ 暂存全部 + 提交(--allow-empty 保证首轮即建立 HEAD)。
 /// 这样 Agent 本轮的改动若改崩,可经 checkpoint_rollback 一键回到发送前状态。
-/// best-effort:失败只记日志,不阻断发送(如本机/容器无 git)。
+/// best-effort:失败只记日志,不阻断发送(如本机无 git)。
 pub async fn checkpoint(workspace: &Path, exec: &ExecConfig, label: &str) {
     let msg = checkpoint_message(label);
     // label 已清洗掉会破坏双引号串 / 注入的字符,可安全嵌入 -m "..."

@@ -42,6 +42,8 @@ tokio = { version = "1", features = [
     "process",
     "io-util",
 ] }
+# 取消令牌:AI 对话 / Agent 流式读流的即时中断(tokio::select! 配合,不再等下一个 chunk)
+tokio-util = { version = "0.7", features = ["rt"] }
 # HTTP 采集器;用 rustls 避免在 Windows 上引入 openssl 编译依赖
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
@@ -97,6 +99,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # 效率工具(跨平台纯 Rust):文件系统遍历(walkdir)+ 系统 / 进程信息(sysinfo)
 walkdir = "2"
 sysinfo = "0.39"
+webrtc-vad = "0.4.0"
 
 # Windows 真实滚轮:WebView2 窗口化宿主没有 SendMouseInput(那是合成宿主才有),
 # 改用 PostMessage WM_MOUSEWHEEL 给渲染子窗口投递真实滚轮消息触发懒加载;
@@ -118,9 +121,19 @@ windows = { version = "0.61", features = [
     "Win32_UI_Accessibility",
     # 读「系统代理」(Internet Settings 注册表):ffmpeg 子进程拉海外 CDN 需复用同源代理
     "Win32_System_Registry",
+    # 编程本地沙盒:Job Object 承载会话进程树(KILL_ON_JOB_CLOSE 整树杀 + 资源会计)
+    "Win32_System_JobObjects",
+    # CreateJobObjectW 的安全描述符参数类型
+    "Win32_Security",
+    # OpenProcess(spawn 后把子进程挂进 Job)
+    "Win32_System_Threading",
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"
+
+# macOS / Linux 编程本地沙盒:killpg 杀进程组(Windows 侧走 Job Object,见上)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS WKWebView 原生网络拦截 + 账号隔离:用 WKScriptMessageHandler 把页面 hook 到的
 # 接口响应直接回传 Rust(等价于 Windows 的 WebResourceResponseReceived),不走 Tauri invoke,

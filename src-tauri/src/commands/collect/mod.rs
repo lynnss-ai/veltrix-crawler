@@ -72,6 +72,8 @@ struct MediaDownloadParams<'a> {
     transcription_cfg: &'a veltrix_core::config::TranscriptionConfig,
     /// 音频提取(视频下载 + 转 mp3);含 AI 文案提取隐含的音频需求
     audio_extract: bool,
+    /// 任务停止标记来源:素材下载 / 语音转写阶段据此中断(每完成一条检查一次)
+    bridge: &'a CollectBridge,
     /// AI 文案提取:素材结束后对音频做语音转写
     ai_extract: bool,
     /// 关窗前解析并留存的会话 Cookie(见 resolve_session_cookie);有则素材下载直接复用,
@@ -95,6 +97,13 @@ struct StreamRefreshParams<'a> {
 #[tauri::command]
 pub fn intercept_push(state: State<'_, AppState>, session_id: u64, url: String, body: String) {
     state.intercept_channel.push(session_id, url, body);
+}
+
+/// 抖音评论 API 直采的页内脚本完成回调:回传本次直采结果(JSON 字符串),
+/// 存 collect_control 由 pool 侧轮询取走(与 intercept_push 同属页面 → Rust 回传通道)。
+#[tauri::command]
+pub fn comment_api_done(state: State<'_, AppState>, session_id: u64, result: String) {
+    state.collect_control.set_api_done(session_id, result);
 }
 
 /// HUD「结束」按钮回传:请求停止采集。任务采集传 task_id(跨关键词稳定),联调单采传 session_id。
@@ -487,9 +496,9 @@ pub async fn run_task(
         }));
         if body.catch_unwind().await.is_err() {
             tracing::error!(task_id = %task_id_guard, "采集任务 panic,已落 failed");
-            bridge_guard.close_collect_window(&platform_guard, &account_id_guard);
+            bridge_guard.close_collect_window(&platform_guard, &account_id_guard, Some(&task_id_guard));
             // 自清主动关窗置位的「被手动关闭」标记,防污染下次「关窗即终止」判定
-            bridge_guard.reset_collect_window_closed(&platform_guard, &account_id_guard);
+            bridge_guard.reset_collect_window_closed(&platform_guard, &account_id_guard, Some(&task_id_guard));
             write_task_failed(
                 &app_guard,
                 &db_guard,
@@ -559,11 +568,15 @@ fn spawn_content_consumer(
     platform: String,
     account_id: String,
     progress: i32,
+    existing_ids: std::sync::Arc<HashSet<String>>,
     mut seen_contents: HashSet<String>,
     mut seen_comments: HashSet<String>,
 ) -> tauri::async_runtime::JoinHandle<(HashSet<String>, HashSet<String>)> {
     tauri::async_runtime::spawn(async move {
-        while let Some(batch) = rx.recv().await {
+        while let Some(mut batch) = rx.recv().await {
+            // 去重台账:本任务已采 / 同平台台账已登记的内容整体跳过——不再入库,
+            // 后续评论 / 素材阶段也不会处理(兜底解析处同口径过滤)
+            batch.retain(|c| !existing_ids.contains(&c.content_id));
             if batch.is_empty() {
                 continue;
             }
@@ -574,7 +587,7 @@ fn spawn_content_consumer(
                 let title = log_content_title(c);
                 let likes = c.stats.like_count.unwrap_or(0);
                 let msg = format!("[{seq}] {title} | 点赞:{likes}");
-                crate::webview::hud_log(&app, &platform, &account_id, "info", &msg);
+                crate::webview::hud_log(&app, &platform, &account_id, Some(&task_id), "info", &msg);
                 emit_collect_entry(
                     &app,
                     &task_id,
@@ -638,6 +651,8 @@ async fn collect_keywords(
     }
     // 内容逐条日志的任务内序号(跨关键词连续);consumer 子任务共享,故用原子量
     let content_seq = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // 去重跳过快照:consumer 子任务按 Arc 共享(本任务已采 ∪ 台账已登记,运行开始后不变)
+    let existing_ids_shared = std::sync::Arc::new(existing_ids.clone());
 
     for (idx, keyword) in keywords.iter().enumerate() {
         // 用户点 HUD「结束」(按 task_id 登记,跨关键词稳定)= 终止任务:在切下个关键词、重开窗口前
@@ -653,7 +668,7 @@ async fn collect_keywords(
             break;
         }
         // 用户手动关闭采集窗口 = 终止任务:不再为后续关键词重建窗口继续采集(已采数据保留)
-        if bridge.is_collect_window_closed(&cfg.id, account_id) {
+        if bridge.is_collect_window_closed(&cfg.id, account_id, Some(task_id)) {
             shared.window_closed = true;
             emit_collect_log(
                 app,
@@ -683,6 +698,7 @@ async fn collect_keywords(
                     rx, db.clone(), task_id.to_string(), owner.to_string(),
                     keyword.clone(), app.clone(), content_seq.clone(),
                     cfg.id.clone(), account_id.to_string(), progress,
+                    existing_ids_shared.clone(),
                     shared.seen_contents.clone(), shared.seen_comments.clone(),
                 );
 
@@ -750,6 +766,21 @@ async fn collect_keywords(
                                         || !blacklisted_uids.contains(&c.author.uid)
                                 });
                             }
+                            // 去重台账:本任务已采 / 同平台台账已登记的内容整体跳过
+                            // (不入库、不进 contents_for_media,评论 / 素材阶段自然不处理)
+                            let before = output.contents.len();
+                            output
+                                .contents
+                                .retain(|c| !existing_ids.contains(&c.content_id));
+                            let skipped = before - output.contents.len();
+                            if skipped > 0 {
+                                emit_collect_log(
+                                    app,
+                                    task_id,
+                                    "info",
+                                    format!("⏭️ 「{keyword}」跳过已采内容 {skipped} 条(去重台账)"),
+                                );
+                            }
                             shared.contents_for_media.extend(output.contents.iter().cloned());
                             persist_collected(
                                 db,
@@ -784,6 +815,7 @@ async fn collect_keywords(
                     app,
                     &cfg.id,
                     account_id,
+                    Some(task_id),
                     "info",
                     &format!("📦 「{keyword}」已保存 · 内容 {c} / 评论 {m}"),
                 );
@@ -893,6 +925,7 @@ async fn collect_direct_urls(
     task_name: &str,
     owner: &str,
     urls: &[String],
+    existing_ids: &HashSet<String>,
     adapter: &Option<Arc<dyn crate::adapter::PlatformAdapter>>,
     shared: &mut CollectSharedState,
 ) {
@@ -927,7 +960,7 @@ async fn collect_direct_urls(
             );
             break;
         }
-        if bridge.is_collect_window_closed(&cfg.id, account_id) {
+        if bridge.is_collect_window_closed(&cfg.id, account_id, Some(task_id)) {
             shared.window_closed = true;
             emit_collect_log(
                 app,
@@ -1037,15 +1070,39 @@ async fn collect_direct_urls(
                 responses,
             };
             match adapter_arc.parse(&kind, &ctx).await {
-                Ok(output) => {
-                    if output.contents.is_empty() {
-                        shared.had_error = true;
+                Ok(mut output) => {
+                    // 去重台账:已采过的内容 / 主页作品整体跳过(口径同关键词阶段)
+                    let before = output.contents.len();
+                    output
+                        .contents
+                        .retain(|c| !existing_ids.contains(&c.content_id));
+                    let skipped = before - output.contents.len();
+                    if skipped > 0 {
                         emit_collect_log(
                             app,
                             task_id,
-                            "warn",
-                            format!("⚠️ 链接 {url} 未解析到内容(视频可能已删除 / 被风控)"),
+                            "info",
+                            format!("⏭️ 链接 {url} 跳过已采内容 {skipped} 条(去重台账)"),
                         );
+                    }
+                    if output.contents.is_empty() {
+                        if skipped > 0 {
+                            // 解析正常但全部已采过:去重跳过的正常情形,不算异常
+                            emit_collect_log(
+                                app,
+                                task_id,
+                                "info",
+                                format!("✅ 链接 {url} 的内容此前均已采集 · 本次跳过"),
+                            );
+                        } else {
+                            shared.had_error = true;
+                            emit_collect_log(
+                                app,
+                                task_id,
+                                "warn",
+                                format!("⚠️ 链接 {url} 未解析到内容(视频可能已删除 / 被风控)"),
+                            );
+                        }
                     } else {
                         emit_collect_log(
                             app,
@@ -1144,6 +1201,13 @@ async fn collect_comments_phase(
             }
         }
     };
+    // 评论数为 0 的视频直接跳过(接口统计已知无评论,采了也是空跑);
+    // 数量未知(None)的仍尝试:部分平台不回传统计(如 YouTube 恒 None),按 0 处理会全量漏采
+    let zero_comment = shared
+        .contents_for_media
+        .iter()
+        .filter(|c| c.stats.comment_count == Some(0))
+        .count();
     let video_ids: Vec<(String, String, String, String)> = shared
         .contents_for_media
         .iter()
@@ -1168,13 +1232,20 @@ async fn collect_comments_phase(
         .collect();
     let cutoff = comment_time_cutoff(comment_time_range);
     let total_videos = video_ids.len();
-    let mut comment_seq: i64 = 0;
     write_task_collecting_comments(app, db, task_id, total_videos as i32).await;
     emit_collect_log(app, task_id, "info", format!(
         "💬 开始采集评论 · 共 {} 个视频 · 每视频最多 {}",
         video_ids.len(),
         if comment_limit == 0 { "不限".to_string() } else { comment_limit.to_string() }
     ));
+    if zero_comment > 0 {
+        emit_collect_log(
+            app,
+            task_id,
+            "info",
+            format!("⏭️ 跳过 {zero_comment} 个评论数为 0 的视频(接口统计无评论,不空跑)"),
+        );
+    }
 
     // 评论采集成功(拿到非空响应)的视频 id:仅这些在阶段末标 comment_collected=true;
     // 采集失败 / 零响应的留 false,下次运行可重采(此前全量标记,失败视频永久失去重采机会)
@@ -1194,7 +1265,7 @@ async fn collect_comments_phase(
             );
             break;
         }
-        if bridge.is_collect_window_closed(&cfg.id, account_id) {
+        if bridge.is_collect_window_closed(&cfg.id, account_id, Some(task_id)) {
             shared.window_closed = true;
             emit_collect_log(
                 app,
@@ -1207,8 +1278,32 @@ async fn collect_comments_phase(
         if vidx > 0 {
             tokio::time::sleep(random_comment_video_interval()).await;
         }
+        // 由详情页模板还原视频链接({id}=内容 id,{token}=sec_uid/xsec_token,与导航口径一致),
+        // 打进日志:排查「这条评论属于哪个视频」时可直接点链接核对,不用反查 content_id
+        let video_link = if cfg.collect.detail_url_template.is_empty() {
+            String::new()
+        } else {
+            cfg.collect
+                .detail_url_template
+                .replace("{id}", content_id)
+                .replace("{token}", xsec_token)
+        };
+        let link_part = if video_link.is_empty() {
+            String::new()
+        } else {
+            format!(" · {video_link}")
+        };
         emit_collect_log(app, task_id, "info",
-            format!("💬 [{}/{}] 正在采集「{title}」的评论", vidx + 1, total_videos));
+            format!("💬 [{}/{}] 正在采集「{title}」的评论{link_part}", vidx + 1, total_videos));
+        // HUD 同步一条(HUD 默认只显示逐条评论,看不到当前在采哪个视频)
+        crate::webview::hud_log(
+            app,
+            &cfg.id,
+            account_id,
+            Some(task_id),
+            "info",
+            &format!("💬 [{}/{}] 采集评论「{title}」{link_part}", vidx + 1, total_videos),
+        );
         match bridge
             .collect_comments(
                 app,
@@ -1242,17 +1337,22 @@ async fn collect_comments_phase(
                         comment_done_ids.push(format!("{task_id}-{}-{}", cfg.id, content_id));
                         output.comments =
                             filter_comments(output.comments, cutoff, comment_limit);
+                        // 评论编号按视频从 1 开始,并带「第几/共几个视频」——全局累加编号
+                        // 看不出评论属于哪个视频,跨视频排查时对不上号
+                        let mut vseq: i64 = 0;
                         for cm in &output.comments {
-                            comment_seq += 1;
+                            vseq += 1;
                             let text = truncate_chars(&cm.text, 60);
                             let likes = cm.like_count.unwrap_or(0);
-                            let msg =
-                                format!("[{comment_seq}] {text} | 点赞:{likes}");
+                            let msg = format!(
+                                "[视频{}/{total_videos} 评论{vseq}] {text} | 点赞:{likes}",
+                                vidx + 1
+                            );
                             crate::webview::hud_log(
-                                app, &cfg.id, account_id, "info", &msg,
+                                app, &cfg.id, account_id, Some(task_id), "info", &msg,
                             );
                             emit_collect_entry(app, task_id, msg, CollectEntry {
-                                kind: "comment".to_string(), seq: comment_seq,
+                                kind: "comment".to_string(), seq: vseq,
                                 avatar: cm.author.avatar.clone(), nickname: cm.author.nickname.clone(),
                                 title: text, content_kind: None,
                             });
@@ -1402,7 +1502,7 @@ async fn auto_enrich_authors_phase(
     for (idx, author) in batch.iter().enumerate() {
         // 手动结束 / 关窗即停:与评论采集同规则,不为补采重开窗口
         if args.bridge.is_task_stopping(task_id)
-            || args.bridge.is_collect_window_closed(&args.cfg.id, args.account_id)
+            || args.bridge.is_collect_window_closed(&args.cfg.id, args.account_id, args.task_id)
         {
             emit_collect_log(
                 args.app,
@@ -1437,44 +1537,17 @@ async fn auto_enrich_authors_phase(
 }
 
 /// 后处理(前半):意向分析 + 待下载清单 + 任务状态回写。均不占采集窗口,
-/// 返回待下载内容列表,交给「直链补取(占窗口)」与 `post_collect_download` 继续处理。
-#[allow(clippy::too_many_arguments)]
+/// 阶段2.7 前半:零产出失败判定 + 待下载清单 + 进度/状态回写(不占窗口)。
+/// 意向分析移到收尾阶段(评论采集之后,见 analyze_intent_phase);
+/// 终态 completed 也由调用方在所有阶段结束后统一写,这里只在失败时写 failed。
+/// 返回 (task_failed, 待下载内容列表),交给「直链补取(占窗口)」与素材下载继续处理。
 async fn post_collect_prepare(
     app: &AppHandle,
     db: &DatabaseConnection,
     task_id: &str,
-    intent_cfg: &veltrix_core::config::CommentIntentConfig,
-    analyze_comment_intent: bool,
-    collect_comments: bool,
     shared: &CollectSharedState,
-) -> Vec<Content> {
+) -> (bool, Vec<Content>) {
     let total_contents = shared.seen_contents.len();
-    let intent_ready = analyze_comment_intent
-        && collect_comments
-        && total_contents > 0
-        && !intent_cfg.api_url.is_empty()
-        && !intent_cfg.model.is_empty();
-    if intent_ready {
-        write_task_analyzing(app, db, task_id).await;
-        let analyzed = analyze_comments_intent(app, db, task_id, intent_cfg).await;
-        // 确有评论被分析出结果才标记;0 产出(缺 key / 批次全失败)标记会掩盖「实际没分析」,
-        // 库内再无标记能区分真假,也断了后续补偿的识别依据
-        if analyzed > 0 {
-            use sea_orm::sea_query::Expr;
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-            use veltrix_core::db::entity::content as content_entity;
-            if let Err(e) = content_entity::Entity::update_many()
-                .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
-                .filter(content_entity::Column::TaskId.eq(task_id))
-                .filter(content_entity::Column::CommentCollected.eq(true))
-                .exec(db)
-                .await
-            {
-                tracing::warn!("标记 intent_analyzed 失败: {e}");
-            }
-        }
-    }
-
     let total_comments = shared.seen_comments.len();
     if total_contents == 0 && shared.had_error {
         write_task_failed(app, db, task_id, "采集未获取到任何内容").await;
@@ -1484,7 +1557,7 @@ async fn post_collect_prepare(
             "error",
             "任务失败 · 未采集到内容,请检查账号登录态 / 风控".to_string(),
         );
-        Vec::new()
+        (true, Vec::new())
     } else {
         // 终态切换前强制落一次最新计数:节流窗口内的最后一批计数不能滞后到 UI
         write_task_progress(
@@ -1498,9 +1571,7 @@ async fn post_collect_prepare(
         )
         .await;
         let pending = filter_pending_media(db, task_id, shared.contents_for_media.clone()).await;
-        if pending.is_empty() {
-            write_task_done(app, db, task_id).await;
-        } else {
+        if !pending.is_empty() {
             write_task_downloading(app, db, task_id, pending.len() as i32).await;
         }
         emit_collect_log(
@@ -1509,56 +1580,45 @@ async fn post_collect_prepare(
             "info",
             format!("✅ 内容采集完成 · {total_contents} 条内容 · {total_comments} 条评论"),
         );
-        pending
+        (false, pending)
     }
 }
 
-/// 阶段3(后半):素材下载 + Obsidian 同步。均不占采集窗口(HTTP / LLM),
-/// 调用前直链补取已结束、窗口名额已释放,其他任务可并行开采。
-#[allow(clippy::too_many_arguments)]
-async fn post_collect_download(
+/// 收尾阶段:评论意向分析(LLM,不占窗口)。排在评论采集之后,分析的是本次最新采到的评论。
+async fn analyze_intent_phase(
     app: &AppHandle,
     db: &DatabaseConnection,
-    cfg: &veltrix_core::config::PlatformConfig,
-    account_id: &str,
     task_id: &str,
-    owner: &str,
-    config_dir: &PathBuf,
-    media_cfg: &veltrix_core::config::MediaConfig,
-    transcription_cfg: &veltrix_core::config::TranscriptionConfig,
-    audio_extract: bool,
-    ai_extract: bool,
-    auto_sync_obsidian: bool,
-    session_cookie: Option<String>,
-    to_download: Vec<Content>,
+    intent_cfg: &veltrix_core::config::CommentIntentConfig,
+    analyze_comment_intent: bool,
+    collect_comments: bool,
+    total_contents: i64,
 ) {
-    let media_params = MediaDownloadParams {
-        app,
-        db,
-        task_id,
-        platform: &cfg.id,
-        account_id,
-        config_dir,
-        media_cfg,
-        transcription_cfg,
-        audio_extract,
-        ai_extract,
-        session_cookie,
-    };
-    download_media_for_contents(
-        &media_params,
-        to_download,
-    )
-    .await;
-
-    if auto_sync_obsidian {
-        let synced = obsidian::sync_task_to_obsidian(db, task_id, owner).await;
-        emit_collect_log(
-            app,
-            task_id,
-            "info",
-            format!("✅ 已自动同步 {synced} 条内容到 Obsidian"),
-        );
+    let intent_ready = analyze_comment_intent
+        && collect_comments
+        && total_contents > 0
+        && !intent_cfg.api_url.is_empty()
+        && !intent_cfg.model.is_empty();
+    if !intent_ready {
+        return;
+    }
+    write_task_analyzing(app, db, task_id).await;
+    let analyzed = analyze_comments_intent(app, db, task_id, intent_cfg).await;
+    // 确有评论被分析出结果才标记;0 产出(缺 key / 批次全失败)标记会掩盖「实际没分析」,
+    // 库内再无标记能区分真假,也断了后续补偿的识别依据
+    if analyzed > 0 {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use veltrix_core::db::entity::content as content_entity;
+        if let Err(e) = content_entity::Entity::update_many()
+            .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
+            .filter(content_entity::Column::TaskId.eq(task_id))
+            .filter(content_entity::Column::CommentCollected.eq(true))
+            .exec(db)
+            .await
+        {
+            tracing::warn!("标记 intent_analyzed 失败: {e}");
+        }
     }
 }
 
@@ -1747,8 +1807,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
         let mut metrics = RunMetrics::default();
         let run_started = std::time::Instant::now();
 
-        // 重置本账号采集窗口的「已被手动关闭」标记,使本次任务能正常开窗
-        bridge.reset_collect_window_closed(&cfg.id, &account_id);
+        // 重置本任务采集窗口的「已被手动关闭」标记,使本次任务能正常开窗
+        bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
         // 重置本任务的「结束」停止标记,避免上次运行点过结束影响本次重跑
         bridge.reset_task_stop(&task_id);
 
@@ -1806,6 +1866,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 &task_name,
                 &owner,
                 &direct_urls,
+                &existing_ids,
                 &adapter,
                 &mut shared,
             )
@@ -1819,7 +1880,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
 
         // 用户中途手动关闭采集窗口 → 终止任务:不再采评论 / 不跑后处理(二者都会重建采集窗口),
         // 标记 cancelled 收尾;已增量落库的内容保留,素材可日后重跑补齐。
-        if shared.window_closed || bridge.is_collect_window_closed(&cfg.id, &account_id) {
+        if shared.window_closed || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id)) {
             emit_collect_log(
                 &app,
                 &task_id,
@@ -1836,7 +1897,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 run_started.elapsed().as_millis() as u64,
             );
             finalize_task_run(&db, &task_id, &run_id, now, Some(&metrics)).await;
-            bridge.close_collect_window(&cfg.id, &account_id);
+            bridge.close_collect_window(&cfg.id, &account_id, Some(&task_id));
             return;
         }
 
@@ -1853,47 +1914,14 @@ async fn run_task_body(ctx: RunTaskCtx) {
             );
             // 关窗前先留存会话 Cookie(含 httponly tt_chain_token),供后续素材下载复用——
             // 此前先关窗后下载,下载只能退回 DB Cookie(常为空),TikTok 类 CDN 批量 403
-            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id).await;
-            bridge.close_collect_window(&cfg.id, &account_id);
+            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
+            bridge.close_collect_window(&cfg.id, &account_id, Some(&task_id));
             // 程序主动关窗(非用户手动关窗),自清 Destroyed 置位的标记,理由同主链路收尾
-            bridge.reset_collect_window_closed(&cfg.id, &account_id);
+            bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
         }
 
-        // 阶段2:评论采集(手动结束后不再采评论,避免重开采集窗口)
-        let comments_start = std::time::Instant::now();
-        if collect_comments && total_contents > 0 && !shared.user_ended {
-            if let Some(adapter_arc) = &adapter {
-                collect_comments_phase(
-                    &app,
-                    &db,
-                    &bridge,
-                    adapter_arc,
-                    &cfg,
-                    &account_id,
-                    &task_id,
-                    &owner,
-                    &comment_time_range,
-                    comment_limit,
-                    &mut shared,
-                )
-                .await;
-            } else {
-                // 用户开了「采评论」但平台无适配器:此前静默跳过,用户无从得知评论没采
-                emit_collect_log(
-                    &app,
-                    &task_id,
-                    "warn",
-                    format!("⚠️ 平台 {} 未注册适配器,跳过评论采集", cfg.id),
-                );
-            }
-        }
-        metrics.stages_ms.insert(
-            "comments".to_string(),
-            comments_start.elapsed().as_millis() as u64,
-        );
-
-        // 阶段2.5:作者画像自动补采(粉丝/关注/获赞/属地缺失的作者,复用采集窗口开主页补齐;
-        // 手动结束 / 关窗后跳过,避免重开窗口)
+        // 阶段2:作者画像自动补采(粉丝/关注/获赞/属地缺失的作者,复用采集窗口开主页补齐;
+        // 手动结束 / 关窗后跳过,避免重开窗口)。评论采集同在窗口占用阶段内(见阶段3)。
         let enrich_start = std::time::Instant::now();
         if !shared.user_ended && !shared.window_closed {
             if let Some(adapter_arc) = &adapter {
@@ -1918,17 +1946,113 @@ async fn run_task_body(ctx: RunTaskCtx) {
             enrich_start.elapsed().as_millis() as u64,
         );
 
-        // WebView 占用阶段(关键词采集 + 评论采集)已结束,释放同账号互斥锁与全局并发名额;
-        // 后续意向分析(LLM)与素材下载(HTTP)不占窗口,其他任务可立即用该账号 / 名额开采。
+        // 阶段2.7:待下载清单(DB 计算,不占窗口);task_failed / to_download 供后续阶段用
+        let media_start = std::time::Instant::now();
+        let (task_failed, mut to_download) =
+            post_collect_prepare(&app, &db, &task_id, &shared).await;
+
+        // 阶段3:评论采集(占窗口)。与内容采集同一次开窗内做完:此前放在素材下载之后,
+        // 窗口关了又开、开了又关,且重开窗口途中弹出的风控滑块用户不易察觉。
+        // 现收回窗口占用阶段——一次开窗做完所有需要窗口的事,关窗后只剩纯 HTTP 阶段。
+        // 仍持有采集锁与全局并发名额,无需重新获取;手动结束 / 关窗 / 任务失败则跳过
+        // (窗口已销毁,不为评论重开)
+        let comments_start = std::time::Instant::now();
+        if collect_comments
+            && total_contents > 0
+            && !shared.user_ended
+            && !shared.window_closed
+            && !task_failed
+        {
+            if let Some(adapter_arc) = &adapter {
+                let comments_aborted = bridge.is_task_stopping(&task_id)
+                    || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
+                if comments_aborted {
+                    emit_collect_log(
+                        &app,
+                        &task_id,
+                        "info",
+                        "ℹ️ 已手动结束 · 跳过评论采集".to_string(),
+                    );
+                } else {
+                    collect_comments_phase(
+                        &app,
+                        &db,
+                        &bridge,
+                        adapter_arc,
+                        &cfg,
+                        &account_id,
+                        &task_id,
+                        &owner,
+                        &comment_time_range,
+                        comment_limit,
+                        &mut shared,
+                    )
+                    .await;
+                }
+            } else {
+                // 用户开了「采评论」但平台无适配器:此前静默跳过,用户无从得知评论没采
+                emit_collect_log(
+                    &app,
+                    &task_id,
+                    "warn",
+                    format!("⚠️ 平台 {} 未注册适配器,跳过评论采集", cfg.id),
+                );
+            }
+        }
+        metrics.stages_ms.insert(
+            "comments".to_string(),
+            comments_start.elapsed().as_millis() as u64,
+        );
+
+        // 阶段4:直链补取(逐条开详情页,占窗口)。刻意排在评论采集之后、关窗之前:
+        // 评论耗时可能很长,先补取再评论会让签名直链在评论期间过期;最后补取保证
+        // 关窗即下载时直链最新。手动结束 / 关窗后跳过(缺直链按失败落库,可日后重试)。
+        // 需要下载视频(音频提取含 AI 文案提取)才补直链;不下载视频则无需刷新
+        if audio_extract
+            && !to_download.is_empty()
+            && !shared.user_ended
+            && !shared.window_closed
+        {
+            let refresh_aborted = bridge.is_task_stopping(&task_id)
+                || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
+            if refresh_aborted {
+                emit_collect_log(
+                    &app, &task_id, "info",
+                    "ℹ️ 已手动结束 · 跳过直链补取".to_string(),
+                );
+            } else {
+                let stream_params = StreamRefreshParams {
+                    app: &app,
+                    bridge: &bridge,
+                    registry: &registry,
+                    db: &db,
+                    cfg: &cfg,
+                    account_id: &account_id,
+                    task_id: &task_id,
+                };
+                refresh_stream_urls(
+                    &stream_params,
+                    &mut to_download,
+                    false,
+                )
+                .await;
+            }
+        }
+
+        // WebView 占用阶段(内容采集 + 画像补采 + 评论采集 + 直链补取)结束,释放同账号互斥锁与全局并发名额;
+        // 后续素材下载(HTTP)不占窗口,其他任务可立即用该账号 / 名额开采。
         // 放锁前必须完成关窗:锁一放,同账号下一任务即可复用本窗口开采,窗口若留到媒体下载后
         // 才关,会误杀新任务正在使用的窗口(新任务据此误判「窗口被手动关闭」而取消)。
         // 关窗前留存会话 Cookie 供素材下载(销毁而非隐藏:隐藏会占住数据目录锁,下次新建冲突)。
         if !shared.user_ended && !shared.window_closed {
-            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id).await;
-            bridge.close_collect_window(&cfg.id, &account_id);
-            // 主动关窗会触发 Destroyed 把「被手动关闭」标记置位,自清掉,
-            // 避免污染画像补采等「关窗即终止」检查的下次判定
-            bridge.reset_collect_window_closed(&cfg.id, &account_id);
+            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
+            // 用户在画像 / 补取期间手动关窗时标记已置位,此处只清「未被用户关闭」的情形
+            // (窗口是我们主动关的,Destroyed 置位的标记需自清)
+            let user_closed = bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
+            bridge.close_collect_window(&cfg.id, &account_id, Some(&task_id));
+            if !user_closed {
+                bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
+            }
         }
         drop(collect_guard);
         drop(collect_permit);
@@ -1948,98 +2072,77 @@ async fn run_task_body(ctx: RunTaskCtx) {
             );
         }
 
-        // 阶段3a:意向分析 + 待下载清单 + 状态回写(不占窗口)
-        let media_start = std::time::Instant::now();
-        let mut to_download = post_collect_prepare(
+        // 阶段5:素材下载 + 音频提取(纯 HTTP,不占窗口——评论采集已前移至窗口占用阶段)
+        let audios = if task_failed {
+            Vec::new()
+        } else {
+            let media_params = MediaDownloadParams {
+                app: &app,
+                db: &db,
+                task_id: &task_id,
+                platform: &cfg.id,
+                account_id: &account_id,
+                config_dir: &config_dir,
+                media_cfg: &media_cfg,
+                transcription_cfg: &transcription_cfg,
+                audio_extract,
+                ai_extract,
+                session_cookie,
+                bridge: &bridge,
+            };
+            download_media_core(&media_params, to_download).await
+        };
+        metrics.stages_ms.insert(
+            "media".to_string(),
+            media_start.elapsed().as_millis() as u64,
+        );
+
+        // 阶段6:语音转写(AI 文案提取):素材音频已就绪,统一下载后转写;
+        // 失败仅告警不影响任务终态
+        if ai_extract && !audios.is_empty() && !bridge.is_task_stopping(&task_id) {
+            transcribe_for_contents(
+                &app,
+                &db,
+                &task_id,
+                &cfg.id,
+                &account_id,
+                &transcription_cfg,
+                media_cfg.ffmpeg_path.clone(),
+                Some(&bridge),
+                audios,
+            )
+            .await;
+        }
+
+        // 阶段7:评论意向分析(LLM,不占窗口):排在评论采集之后,分析本次最新采到的评论
+        analyze_intent_phase(
             &app,
             &db,
             &task_id,
             &intent_cfg,
             analyze_comment_intent,
             collect_comments,
-            &shared,
+            total_contents,
         )
         .await;
 
-        // 阶段3b:直链补取(要逐条开详情页,占采集窗口)。手动结束 / 关窗后窗口已销毁,
-        // 跳过(素材缺直链按失败落库,可日后重试)——否则刚关掉的窗口会重新弹出。
-        // 窗口名额(collect_guard/permit)已释放,故重新拿同账号互斥锁 + 全局并发闸,
-        // 防止与另一任务的采集阶段并发操控同一 WebView、互吃拦截响应。
-        // 需要下载视频(音频提取含 AI 文案提取)才补直链;不下载视频则无需刷新
-        if audio_extract
-            && !to_download.is_empty()
-            && !shared.user_ended
-            && !shared.window_closed
-        {
-            let refresh_permit = collect_semaphore.acquire().await.ok();
-            let refresh_lock =
-                account_collect_lock(&collect_locks, &account_lock_key(&cfg.id, &account_id));
-            let _refresh_guard = refresh_lock.lock().await;
-            // 等锁可能排队较久:期间用户点「结束」/ 手动关窗不会被发现,拿到锁后复查,
-            // 已终止则不再开窗补取(缺直链的内容按下载失败落库,可日后补偿)
-            let refresh_aborted = bridge.is_task_stopping(&task_id)
-                || bridge.is_collect_window_closed(&cfg.id, &account_id);
-            if refresh_aborted {
-                emit_collect_log(
-                    &app, &task_id, "info",
-                    "ℹ️ 已手动结束 · 跳过直链补取".to_string(),
-                );
-            } else {
-            let stream_params = StreamRefreshParams {
-                app: &app,
-                bridge: &bridge,
-                registry: &registry,
-                db: &db,
-                cfg: &cfg,
-                account_id: &account_id,
-                task_id: &task_id,
-            };
-            refresh_stream_urls(
-                &stream_params,
-                &mut to_download,
-                false,
-            )
-            .await;
-            // 直链与本次窗口会话绑定:关窗前重取会话 Cookie 供素材下载;
-            // 关窗须在持锁期间完成(放锁后窗口可能被下一任务复用,迟关会误杀)
-            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id).await;
-            // 用户在补取期间手动关窗时标记已置位,此处只清「未被用户关闭」的情形
-            // (窗口是我们主动关的,Destroyed 置位的标记需自清,理由同上)
-            let user_closed = bridge.is_collect_window_closed(&cfg.id, &account_id);
-            bridge.close_collect_window(&cfg.id, &account_id);
-            if !user_closed {
-                bridge.reset_collect_window_closed(&cfg.id, &account_id);
-            }
-            }
-            drop(_refresh_guard);
-            drop(refresh_permit);
+        // Obsidian 同步:排在转写 / 意向之后,同步出去的文案与意向最全
+        if auto_sync_obsidian {
+            let synced = obsidian::sync_task_to_obsidian(&db, &task_id, &owner).await;
+            emit_collect_log(
+                &app,
+                &task_id,
+                "info",
+                format!("✅ 已自动同步 {synced} 条内容到 Obsidian"),
+            );
         }
 
-        // 阶段3c:素材下载 + Obsidian 同步(不占窗口)
-        post_collect_download(
-            &app,
-            &db,
-            &cfg,
-            &account_id,
-            &task_id,
-            &owner,
-            &config_dir,
-            &media_cfg,
-            &transcription_cfg,
-            audio_extract,
-            ai_extract,
-            auto_sync_obsidian,
-            session_cookie,
-            to_download,
-        )
-        .await;
+        // 终态:failed / cancelled 已在前面分支写入,这里统一收尾 completed
+        if !task_failed {
+            write_task_done(&app, &db, &task_id).await;
+        }
 
-        metrics.stages_ms.insert(
-            "media".to_string(),
-            media_start.elapsed().as_millis() as u64,
-        );
-
-        // 阶段4:收尾执行历史(终态 + 本次新增量 + 运行指标)
+        // 收尾:执行历史(终态 + 本次新增量 + 运行指标)
         metrics.intercepted = shared.intercepted_total;
         metrics.persisted_contents = shared.seen_contents.len();
         metrics.persisted_comments = shared.seen_comments.len();
@@ -2338,7 +2441,7 @@ async fn refresh_stream_urls(
         // 不再为后续内容把刚关掉的窗口重新弹出
         if params
             .bridge
-            .is_collect_window_closed(&params.cfg.id, params.account_id)
+            .is_collect_window_closed(&params.cfg.id, params.account_id, Some(params.task_id))
         {
             emit_collect_log(
                 params.app,
@@ -2374,6 +2477,8 @@ async fn refresh_stream_urls(
                     content_id: &content.content_id,
                     xsec_token: &token,
                     platform_cfg: params.cfg,
+                    // 直链补取复用本任务的采集窗口(任务级 label)
+                    task_id: Some(params.task_id),
                 },
             )
             .await
@@ -2433,7 +2538,8 @@ async fn update_content_video_url(db: &DatabaseConnection, id: &str, video_url: 
 }
 
 /// 媒体下载 / 转写阶段的日志双写:既推前端日志面板(事件 + 落库),也写采集窗口 HUD 浮层。
-/// 该阶段已无 window 句柄,故用 hud_log 按 platform+account 定位 HUD 窗口写入(窗口不存在则静默)。
+/// 该阶段已无 window 句柄,故用 hud_log 按 平台+账号+任务 定位 HUD 窗口写入;
+/// 此时采集窗口已主动关闭,定位不到即静默丢弃属预期(日志仍经 emit_collect_log 落库推前端,不丢)。
 fn emit_media_log(
     app: &AppHandle,
     task_id: &str,
@@ -2444,7 +2550,7 @@ fn emit_media_log(
 ) {
     let msg = message.into();
     emit_collect_log(app, task_id, level, msg.clone());
-    crate::webview::hud_log(app, platform, account_id, level, &msg);
+    crate::webview::hud_log(app, platform, account_id, Some(task_id), level, &msg);
 }
 
 /// 平台主页 URL:按域取会话 Cookie 用(GetCookies 按该 URL 的域 / 路径 / secure 过滤命中的 Cookie)。
@@ -2464,15 +2570,17 @@ fn platform_home_url(platform: &str) -> Option<&'static str> {
 /// 解析素材下载用的 Cookie。**优先**从仍存活的采集窗口读实时 Cookie(含 httponly 的
 /// `tt_chain_token`,且与本次会话签发的直链匹配——这是 TikTok 能下到音频的关键);取不到再退回
 /// DB 账号 Cookie。注意:采集主链路在释放账号锁前就会关窗,调用方须在关窗前调用并留存结果。
+/// task_id 用于定位任务级采集窗口(与开窗 label 口径一致);None / 空回退账号级窗口。
 async fn resolve_session_cookie(
     app: &AppHandle,
     db: &DatabaseConnection,
     platform: &str,
     account_id: &str,
+    task_id: Option<&str>,
 ) -> Option<String> {
     use tauri::Manager;
     if let Some(home) = platform_home_url(platform) {
-        let label = crate::webview::pool::window_label(platform, account_id);
+        let label = crate::webview::pool::task_window_label(platform, account_id, task_id);
         if let Some(window) = app.get_webview_window(&label) {
             if let Some(cookie) = crate::webview::cookies::read_cookies(&window, home).await {
                 return Some(cookie);
@@ -2514,15 +2622,36 @@ async fn fetch_platform_cookie(db: &DatabaseConnection, platform: &str) -> Optio
         .filter(|cookie| !cookie.is_empty())
 }
 
-/// 采集落库后下载内容素材。并发处理(限 10 路、不再限速),按 content_id 去重避免重复下载;
+/// 采集落库后下载内容素材。并发处理(限 15 路、不再限速),按 content_id 去重避免重复下载;
 /// 副产品失败已在 media::process_content 内部吞为告警,主素材成败回写到 contents 表。
 /// `platform`/`account_id` 用于把素材下载日志写进该账号采集窗口的 HUD 浮层。
+/// 本 wrapper 保持「下载 → 语音转写 → 写终态」的旧行为,供补偿 / 重试路径使用;
+/// 主链路(run_task)改用 download_media_core,把转写与终态排到评论采集之后。
 async fn download_media_for_contents(
     params: &MediaDownloadParams<'_>,
     contents: Vec<Content>,
 ) {
     if contents.is_empty() {
         return;
+    }
+    let audios = download_media_core(params, contents).await;
+    // 素材下载完成后统一做语音转写(视频音频→文案),仅任务开了「AI 文案提取」才转写;
+    // 只开「音频提取」时音频留存即可。失败仅告警不影响任务终态
+    if params.ai_extract && !params.bridge.is_task_stopping(params.task_id) {
+        transcribe_for_contents(params.app, params.db, params.task_id, params.platform, params.account_id, params.transcription_cfg, params.media_cfg.ffmpeg_path.clone(), Some(params.bridge), audios).await;
+    }
+    // 素材全部处理完毕,任务从 downloading_media 收尾为 completed
+    write_task_done(params.app, params.db, params.task_id).await;
+}
+
+/// 素材下载主体:并发下载 + 音频提取,逐条回写素材结果与进度。
+/// 返回转出的音频清单(content row id, mp3 路径);语音转写与任务终态由调用方决定。
+async fn download_media_core(
+    params: &MediaDownloadParams<'_>,
+    contents: Vec<Content>,
+) -> Vec<(String, String)> {
+    if contents.is_empty() {
+        return Vec::new();
     }
     let root = crate::media::media_root(params.config_dir, params.media_cfg);
     use futures_util::StreamExt;
@@ -2532,7 +2661,7 @@ async fn download_media_for_contents(
     let cookie = match &params.session_cookie {
         Some(c) => Some(c.clone()),
         None => {
-            resolve_session_cookie(params.app, params.db, params.platform, params.account_id).await
+            resolve_session_cookie(params.app, params.db, params.platform, params.account_id, Some(params.task_id)).await
         }
     };
     let cookie_ref = cookie.as_deref();
@@ -2546,6 +2675,11 @@ async fn download_media_for_contents(
         .collect();
     let total = targets.len();
     emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("开始下载素材 · 共 {total} 条"));
+    // 任务在采集阶段已被手动结束:整条素材阶段不再启动,音频清单为空(终态由调用方写)
+    if params.bridge.is_task_stopping(params.task_id) {
+        emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", "🛑 已手动结束 · 跳过素材下载与语音转写".to_string());
+        return Vec::new();
+    }
     let mut count = 0usize;
     let mut failed = 0usize;
     // 素材结果攒批回写:每攒够 MEDIA_OUTCOME_FLUSH_SIZE 条在一个事务里统一 UPDATE
@@ -2553,24 +2687,44 @@ async fn download_media_for_contents(
     // 素材进度回写节流:≤600ms 合并,最后一条必写
     let mut last_media_write =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
-    // 并发下载(限 10 路并发,不再串行限速),边完成边回写结果与进度
+    // 并发下载(限 15 路并发,不再串行限速),边完成边回写结果与进度
     let root_ref = &root;
-    let mut stream = futures_util::stream::iter(targets.into_iter().map(|content| async move {
+    // 任务停止标志:停止时置位,在飞的 ffmpeg 拉流转码 500ms 内被强杀(见 media::extract_audio_from_url)
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut stream = futures_util::stream::iter(targets.into_iter().map(|content| {
+        let cancel = cancel.clone();
+        async move {
         // 标题在下载前取(content 随后 move 进 process_content);用于 HUD 逐条日志展示
         let title = log_content_title(&content);
+        // 素材类型标签(实时日志按类型着色):视频且开了音频提取 → [音频];图文 → [图片];其余(仅封面/头像)→ [封面]
+        let tag = if content.kind == ContentKind::Video && params.audio_extract {
+            "素材[音频]"
+        } else if content.kind == ContentKind::Video {
+            "素材[封面]"
+        } else {
+            "素材[图片]"
+        };
         let outcome = crate::media::process_content(
             &content,
             root_ref,
             params.media_cfg,
             params.audio_extract,
             cookie_ref,
+            Some(cancel),
         )
         .await;
         let id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
-        (id, title, outcome)
+        (id, title, tag, outcome)
+        }
     }))
-    .buffer_unordered(10);
-    while let Some((id, title, outcome)) = stream.next().await {
+    .buffer_unordered(15);
+    while let Some((id, title, tag, outcome)) = stream.next().await {
+        // 任务被手动结束:不再启动新下载(stream 随 break 丢弃,未开始的条目不执行;在飞 ≤15 条跑完即弃)
+        if params.bridge.is_task_stopping(params.task_id) {
+            emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 已手动结束 · 停止素材下载(已完成 {count}/{total} 条保留)"));
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
         let ok = is_media_ok(&outcome);
         if !ok {
             failed += 1;
@@ -2594,7 +2748,7 @@ async fn download_media_for_contents(
                 params.platform,
                 params.account_id,
                 "info",
-                format!("素材 {count}/{total} · {title} · 完成{extra}"),
+                format!("{tag} {count}/{total} · {title} · 完成{extra}"),
             );
         } else {
             let reason = outcome.error.as_deref().unwrap_or("未知原因");
@@ -2604,7 +2758,7 @@ async fn download_media_for_contents(
                 params.platform,
                 params.account_id,
                 "warn",
-                format!("素材 {count}/{total} · {title} · 失败:{reason}"),
+                format!("{tag} {count}/{total} · {title} · 失败:{reason}"),
             );
         }
         // 逐条回写进度(节流合并),调度页据此刷新「素材下载中 done/total」;最后一条必写
@@ -2632,13 +2786,7 @@ async fn download_media_for_contents(
             root.display()
         ),
     );
-    // 素材下载完成后统一做语音转写(视频音频→文案),仅任务开了「AI 文案提取」才转写;
-    // 只开「音频提取」时音频留存即可。失败仅告警不影响任务终态
-    if params.ai_extract {
-        transcribe_for_contents(params.app, params.db, params.task_id, params.platform, params.account_id, params.transcription_cfg, params.media_cfg.ffmpeg_path.clone(), audios).await;
-    }
-    // 素材全部处理完毕,任务从 downloading_media 收尾为 completed
-    write_task_done(params.app, params.db, params.task_id).await;
+    audios
 }
 
 /// 采集结束后统一语音转写:把每条视频转出的音频逐条调 ASR 厂商,回写 content.transcript。
@@ -2653,12 +2801,19 @@ async fn transcribe_for_contents(
     transcription_cfg: &veltrix_core::config::TranscriptionConfig,
     // 大音频(>10MB)切片用的 ffmpeg 路径;None 用系统 PATH
     ffmpeg_path: Option<String>,
+    // 任务停止标记;None 表示不检查(内容库单条重试等无任务上下文的调用方)
+    bridge: Option<&CollectBridge>,
     audios: Vec<(String, String)>,
 ) {
     if audios.is_empty() {
         return;
     }
     use tauri::Emitter;
+    // 任务已被手动结束(素材下载期间点的结束):不再发起任何转写请求
+    if bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
+        emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 跳过语音转写".to_string());
+        return;
+    }
     let api_key = get_secret(db, "transcription_api_key").await;
     if api_key.trim().is_empty() {
         emit_media_log(
@@ -2673,7 +2828,7 @@ async fn transcribe_for_contents(
     }
 
     let total = audios.len();
-    // 并发调 ASR API:并发数取系统设置「语音转写」配置(0 兜底默认 3),buffer_unordered 限制同时在飞的请求数,避免打爆 rate limit
+    // 并发调 ASR API:并发数取系统设置「语音转写」配置(0 兜底默认 5);buffer_unordered 即滚动补位:同时在飞 ≤ concurrency,完成一个立刻拉取下一个,避免打爆 rate limit
     let concurrency = if transcription_cfg.concurrency == 0 {
         veltrix_core::config::DEFAULT_ASR_CONCURRENCY
     } else {
@@ -2681,6 +2836,8 @@ async fn transcribe_for_contents(
     } as usize;
     emit_media_log(app, task_id, platform, account_id, "info", format!("开始语音转写 · 共 {total} 条 · 并发 {concurrency} 路"));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 在飞计数监控:进入转写 +1、完成 -1,进度日志可见实时在飞路数;一旦超上限说明并发控制退化,记 error 便于排查
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // SQLite 写串行化:并发 ASR 调用完成后,DB 写入(record_transcription_usage + record_transcript)
     // 通过此 Mutex 串行执行,避免「database is locked」导致转写结果静默丢失。
     let db_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
@@ -2697,9 +2854,16 @@ async fn transcribe_for_contents(
         let platform = platform.to_string();
         let account_id = account_id.to_string();
         let done = done.clone();
+        let in_flight = in_flight.clone();
+        let concurrency = concurrency;
         let total_s = total.to_string();
         let db_write_lock = db_write_lock.clone();
         async move {
+            // 在飞 +1:buffer_unordered 保证完成一个才补一个,正常不会超 concurrency
+            let flying = in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if flying > concurrency {
+                tracing::error!(flying, concurrency, "转写在飞数超并发上限,并发控制失效");
+            }
             let result = crate::llm::transcribe(crate::llm::TranscribeRequest {
                 provider_code: &cfg_provider,
                 api_url: &cfg_url,
@@ -2735,11 +2899,18 @@ async fn transcribe_for_contents(
                 }
             }
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_media_log(&app, &task_id, &platform, &account_id, "info", format!("转写进度 {n}/{total_s}"));
+            let remain = in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+            emit_media_log(&app, &task_id, &platform, &account_id, "info", format!("转写进度 {n}/{total_s} · 在飞 {remain} 路"));
         }
     }))
     .buffer_unordered(concurrency);
-    while stream.next().await.is_some() {}
+    while stream.next().await.is_some() {
+        // 任务被手动结束:停止拉取后续转写(在飞条目跑完即弃,已完成结果已回写保留)
+        if bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
+            emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 停止后续语音转写(已完成条目保留)".to_string());
+            break;
+        }
+    }
     emit_media_log(app, task_id, platform, account_id, "info", format!("语音转写完成 · {total}/{total}"));
 }
 
@@ -2805,8 +2976,8 @@ async fn record_transcript(
 }
 
 /// 加载任务已采内容的 content_id 集合:智能停止「只数新增」(重复不占目标配额)的依据。
-/// 并入采集去重台账(同平台)的 content_id:曾采过的内容不计入本次目标配额(重采仍会
-/// 照常 upsert 入库刷新,台账只影响「新增计数」,不再拦截保存)。
+/// 并入采集去重台账(同平台)的 content_id:本任务已采 ∪ 台账已登记的内容构成「去重跳过集」,
+/// 采集时整体跳过(不再入库刷新,评论 / 素材阶段也不处理),避免重复采集。
 async fn load_existing_content_ids(
     db: &DatabaseConnection,
     task_id: &str,
@@ -2829,8 +3000,9 @@ async fn load_existing_content_ids(
         .into_iter()
         .collect();
     // 台账仅加载近 90 天记录:台账无限增长,全量加载随历史线性膨胀内存;
-    // 90 天外的历史内容极少被搜索召回,即便偶有重复也只影响智能停止"新增计数"
-    // (多算 1 条),不会丢数据。时间窗口是 pragmatic 的折中,避免 O(台账规模) 加载。
+    // 90 天外的历史内容极少被搜索召回,即便漏掉也只是把个别老视频当作新内容
+    // 重采一次(upsert 刷新 + 评论重采),不会丢数据。时间窗口是 pragmatic 的折中,
+    // 避免 O(台账规模) 加载。
     let cutoff = Utc::now().timestamp() - 90 * 24 * 3600;
     let recorded: Vec<String> = ledger_entity::Entity::find()
         .filter(ledger_entity::Column::Platform.eq(platform))
@@ -3152,7 +3324,7 @@ pub async fn retry_content_media(
     // 重试无绑定账号:取该平台一个可用账号的 Cookie 供 ffmpeg 拉流(防盗链 CDN 校验会话)
     let cookie = fetch_platform_cookie(&state.db, &row.platform).await;
     let mut outcome =
-        crate::media::process_content(&content, &root, &media_cfg, audio_extract, cookie.as_deref())
+        crate::media::process_content(&content, &root, &media_cfg, audio_extract, cookie.as_deref(), None)
             .await;
 
     // 视频素材失败(典型:直链短期签名过期;无直链时 process_video 未执行、
@@ -3176,7 +3348,7 @@ pub async fn retry_content_media(
                         state.collect_control.clone(),
                     );
                     // 重置残留的「手动关窗」标记(理由同补偿路径)
-                    bridge.reset_collect_window_closed(&row.platform, &acc.id);
+                    bridge.reset_collect_window_closed(&row.platform, &acc.id, Some(&row.task_id));
                     let before = content.video_url.clone();
                     let stream_params = StreamRefreshParams {
                         app: &app,
@@ -3198,16 +3370,16 @@ pub async fn retry_content_media(
                     // (含 httponly tt_chain_token;DB 里 acc.cookie 往往是空的,故必须读实时)
                     let changed = content.video_url != before;
                     let session_cookie = if changed {
-                        resolve_session_cookie(&app, &state.db, &row.platform, &acc.id).await
+                        resolve_session_cookie(&app, &state.db, &row.platform, &acc.id, Some(&row.task_id)).await
                     } else {
                         None
                     };
                     // 持锁期间关窗(防窗口遗留驻留 / 迟关误杀下一任务复用的窗口)。
                     // 媒体重试(下载 + ffmpeg,可达数分钟)不占窗口,必须移出锁外——
                     // 此前整个重试都在锁内,期间同账号所有采集/补采被堵死
-                    bridge.close_collect_window(&row.platform, &acc.id);
+                    bridge.close_collect_window(&row.platform, &acc.id, Some(&row.task_id));
                     // 自清主动关窗置位的「被手动关闭」标记(理由同采集主链路)
-                    bridge.reset_collect_window_closed(&row.platform, &acc.id);
+                    bridge.reset_collect_window_closed(&row.platform, &acc.id, Some(&row.task_id));
                     drop(refresh_guard);
                     changed.then_some(session_cookie)
                 };
@@ -3218,6 +3390,7 @@ pub async fn retry_content_media(
                         &media_cfg,
                         audio_extract,
                         session_cookie.as_deref(),
+                        None, // 单条重试:无任务停止标志
                     )
                     .await;
                 }
@@ -3248,6 +3421,7 @@ pub async fn retry_content_media(
                 "",
                 &transcription_cfg,
                 media_cfg.ffmpeg_path.clone(),
+                None, // 单条重试:无任务停止标记可查
                 vec![(id.clone(), audio_path)],
             )
             .await;
@@ -3314,6 +3488,7 @@ pub async fn retry_content_transcript(
         "",
         &transcription_cfg,
         ffmpeg_path,
+                None, // 单条重试:无任务停止标记可查
         vec![(id.clone(), audio_path)],
     )
     .await;
@@ -3397,6 +3572,7 @@ pub async fn retry_failed_transcripts(
             "",
             &transcription_cfg,
             ffmpeg_path.clone(),
+            None, // 批量补转写:无任务停止标记可查
             audios,
         )
         .await;
@@ -3550,7 +3726,7 @@ pub async fn compensate_task(
                         let _refresh_guard = refresh_lock.lock().await;
                         // 持锁期间该账号无采集在跑,残留的「手动关窗」标记只会是历史遗留,
                         // 重置后再补取(否则补取循环第一轮就误判终止)
-                        bridge.reset_collect_window_closed(&platform, &acc.id);
+                        bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
                         let stream_params = StreamRefreshParams {
                             app: &app,
                             bridge: &bridge,
@@ -3569,10 +3745,10 @@ pub async fn compensate_task(
                         // 直链与本次窗口会话绑定:关窗前留存 Cookie 供下载;
                         // 持锁期间关窗,避免窗口遗留驻留、或迟关误杀下一任务复用的窗口
                         session_cookie =
-                            resolve_session_cookie(&app, &db, &platform, &acc.id).await;
-                        bridge.close_collect_window(&platform, &acc.id);
+                            resolve_session_cookie(&app, &db, &platform, &acc.id, Some(&id)).await;
+                        bridge.close_collect_window(&platform, &acc.id, Some(&id));
                         // 自清主动关窗置位的「被手动关闭」标记(理由同采集主链路)
-                        bridge.reset_collect_window_closed(&platform, &acc.id);
+                        bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
                     }
                     (cfg_opt, acc_res) => {
                         // 不补直链也要说明原因:无平台配置 / 无可用账号时静默跳过,
@@ -3601,6 +3777,7 @@ pub async fn compensate_task(
                     audio_extract,
                     ai_extract,
                     session_cookie,
+                    bridge: &bridge,
                 };
                 download_media_for_contents(
                     &media_params,
@@ -3630,6 +3807,381 @@ pub async fn compensate_task(
     Ok(())
 }
 
+/// 全量库「补采评论」的结果汇总。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecollectCommentsSummary {
+    /// 请求的内容条数(前端选中数)。
+    pub requested: usize,
+    /// 实际发起评论采集的视频数(排除评论数为 0 / 平台不支持等跳过项)。
+    pub attempted: usize,
+    /// 采到非空评论响应且解析成功的视频数。
+    pub succeeded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    /// 本次入库的评论条数(按时间范围 / 单视频上限过滤后)。
+    pub comments: usize,
+    /// 跳过 / 失败明细(逐条;前端 toast 只显汇总,明细打控制台)。
+    pub messages: Vec<String>,
+}
+
+/// 全量库「补采评论」:对选中内容按评论参数(时间范围 / 单视频上限 / 意向分析)重采一级评论。
+/// 采集通道与任务评论阶段共用 `CollectBridge::collect_comments`(导航详情页 + 拦截 / API 直采);
+/// 窗口用账号级(task_id=None,与画像补采同口径),评论落库归属各内容原任务,
+/// 采成功的内容回写 comment_collected=true,可选按任务补做意向分析。
+#[tauri::command]
+pub async fn recollect_comments(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    ids: Vec<String>,
+    comment_time_range: String,
+    comment_limit: usize,
+    analyze_intent: bool,
+) -> Result<RecollectCommentsSummary> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use veltrix_core::db::entity::content as content_entity;
+
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let mut summary = RecollectCommentsSummary {
+        requested: ids.len(),
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        skipped: 0,
+        comments: 0,
+        messages: Vec::new(),
+    };
+    if ids.is_empty() {
+        return Ok(summary);
+    }
+
+    let mut query = content_entity::Entity::find().filter(content_entity::Column::Id.is_in(ids));
+    // 数据归属:self 用户只补采自己的内容
+    if me.scope == "self" {
+        query = query.filter(content_entity::Column::Owner.eq(&me.name));
+    }
+    let rows = query
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    if rows.len() < summary.requested {
+        let missing = summary.requested - rows.len();
+        summary.skipped += missing;
+        summary
+            .messages
+            .push(format!("{missing} 条内容不存在(可能已删除),已跳过"));
+    }
+
+    // 按平台分组:评论采集按平台取配置 / 适配器 / 账号;组间串行、组内逐视频串行
+    let mut by_platform: std::collections::HashMap<String, Vec<content_entity::Model>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        by_platform.entry(r.platform.clone()).or_default().push(r);
+    }
+
+    let bridge = CollectBridge::new(
+        state.webviews.clone(),
+        state.intercept_channel.clone(),
+        state.rpa_channel.clone(),
+        state.collect_control.clone(),
+    );
+    let intent_cfg = { lock_config(&state)?.intent.clone() };
+    let cutoff = comment_time_cutoff(&comment_time_range);
+    let mut seen_contents: HashSet<String> = HashSet::new();
+    let mut seen_comments: HashSet<String> = HashSet::new();
+    let mut comment_done_ids: Vec<String> = Vec::new();
+    // 采成功的内容所属任务集合:意向分析按任务跑(任务级幂等)
+    let mut succeeded_task_ids: HashSet<String> = HashSet::new();
+    // 本批开过采集窗口的(平台, 账号),结束后统一归还——只关自己开过的
+    let mut opened_windows: Vec<(String, String)> = Vec::new();
+    let mut processed = 0usize;
+
+    for (platform, group) in by_platform {
+        let cfg = {
+            lock_config(&state)
+                .ok()
+                .and_then(|c| c.platform(&platform).ok().cloned())
+        };
+        let adapter = state
+            .registry
+            .get(&platform)
+            .ok()
+            .filter(|ad| ad.supports(&TaskKind::Comments));
+        let (cfg, adapter) = match (cfg, adapter) {
+            (Some(c), Some(ad)) if !c.collect.detail_url_template.is_empty() => (c, ad),
+            _ => {
+                summary.skipped += group.len();
+                summary.messages.push(format!(
+                    "平台 {platform} 不支持评论补采(平台未启用 / 适配器不支持 / 未配置详情模板),已跳过 {} 条",
+                    group.len()
+                ));
+                continue;
+            }
+        };
+        let account_id = match state.cookies.acquire(&platform).await {
+            Ok(acc) => acc.id,
+            Err(_) => {
+                summary.skipped += group.len();
+                summary.messages.push(format!(
+                    "平台 {} 无可用账号,已跳过 {} 条",
+                    cfg.name,
+                    group.len()
+                ));
+                continue;
+            }
+        };
+        // 账号采集互斥(与采集主链路同一把锁):30s 等不到就跳过本平台,不阻塞整批
+        let account_lock =
+            account_collect_lock(&state.collect_locks, &account_lock_key(&platform, &account_id));
+        let _guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            account_lock.lock(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                summary.skipped += group.len();
+                summary.messages.push(format!(
+                    "平台 {} 账号窗口被采集任务占用,已跳过 {} 条",
+                    cfg.name,
+                    group.len()
+                ));
+                continue;
+            }
+        };
+        // 持锁期间该账号无采集在跑,残留的「手动关窗」标记只会是历史遗留,重置后再开始
+        // (否则首轮检查就误判终止);补采途中的关窗由逐条检查捕获
+        bridge.reset_collect_window_closed(&platform, &account_id, None);
+        opened_windows.push((platform.clone(), account_id.clone()));
+
+        let total = group.len();
+        let mut zero_comment = 0usize;
+        for (idx, row) in group.iter().enumerate() {
+            // 评论数为 0 的内容直接跳过(接口统计已知无评论,采了也是空跑);
+            // 数量未知(None)的仍尝试,与任务评论阶段同口径
+            if row.comment_count == Some(0) {
+                zero_comment += 1;
+                summary.skipped += 1;
+                continue;
+            }
+            // 补采途中手动关窗 = 终止本平台:剩余内容记跳过
+            if bridge.is_collect_window_closed(&platform, &account_id, None) {
+                let remaining = total - idx;
+                summary.skipped += remaining;
+                summary.messages.push(format!(
+                    "采集窗口已被手动关闭 · 终止平台 {} 补采(剩余 {remaining} 条跳过)",
+                    cfg.name
+                ));
+                break;
+            }
+            // 串行限速:首个不等,之后每个之间随机间隔降频
+            if processed > 0 {
+                tokio::time::sleep(random_comment_video_interval()).await;
+            }
+            processed += 1;
+            summary.attempted += 1;
+
+            let c = content_from_model(row);
+            // 详情页导航的第二参数({token} 占位)口径与任务评论阶段一致:
+            // 抖音走「主页模态」用作者 sec_uid;其他平台(小红书)用内容自带 xsec_token
+            let token = if cfg.id == "douyin" {
+                c.author.uid.clone()
+            } else {
+                c.extra
+                    .get("xsec_token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let title = log_content_title(&c);
+            crate::webview::hud_log(
+                &app,
+                &platform,
+                &account_id,
+                None,
+                "info",
+                &format!("💬 [{}/{}] 补采评论「{title}」", idx + 1, total),
+            );
+            match bridge
+                .collect_comments(
+                    &app,
+                    CommentCollectRequest {
+                        account_id: &account_id,
+                        content_id: &row.content_id,
+                        title: &title,
+                        xsec_token: &token,
+                        platform_cfg: &cfg,
+                        task_id: None,
+                        limit: comment_limit,
+                        adapter: adapter.clone(),
+                        keyword: &row.keyword,
+                        video_index: idx + 1,
+                        video_total: total,
+                    },
+                )
+                .await
+            {
+                Ok(responses) if !responses.is_empty() => {
+                    let ctx = FetchContext {
+                        keyword: row.content_id.clone(),
+                        responses,
+                    };
+                    match adapter.parse(&TaskKind::Comments, &ctx).await {
+                        Ok(mut output) => {
+                            output.comments =
+                                filter_comments(output.comments, cutoff, comment_limit);
+                            summary.comments += output.comments.len();
+                            // 逐条评论 HUD 日志:按视频从 1 编号 + 带「第几/共几个视频」,
+                            // 与任务评论阶段的日志格式一致
+                            let mut vseq: i64 = 0;
+                            for cm in &output.comments {
+                                vseq += 1;
+                                let text = truncate_chars(&cm.text, 60);
+                                let likes = cm.like_count.unwrap_or(0);
+                                crate::webview::hud_log(
+                                    &app,
+                                    &platform,
+                                    &account_id,
+                                    None,
+                                    "info",
+                                    &format!(
+                                        "[视频{}/{total} 评论{vseq}] {text} | 点赞:{likes}",
+                                        idx + 1
+                                    ),
+                                );
+                            }
+                            // 评论解析不产出内容,清空防误入库(keyword 口径是 content_id,混入会污染)
+                            output.contents = Vec::new();
+                            persist_collected(
+                                &state.db,
+                                &row.task_id,
+                                &row.owner,
+                                &row.content_id,
+                                output,
+                                &mut seen_contents,
+                                &mut seen_comments,
+                            )
+                            .await;
+                            comment_done_ids.push(row.id.clone());
+                            succeeded_task_ids.insert(row.task_id.clone());
+                            summary.succeeded += 1;
+                        }
+                        Err(e) => {
+                            summary.failed += 1;
+                            summary.messages.push(format!("「{title}」评论解析失败: {e}"));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    summary.failed += 1;
+                    summary.messages.push(format!("「{title}」未采到评论响应"));
+                }
+                Err(e) => {
+                    summary.failed += 1;
+                    summary.messages.push(format!("「{title}」评论采集失败: {e}"));
+                    crate::webview::hud_log(
+                        &app,
+                        &platform,
+                        &account_id,
+                        None,
+                        "warn",
+                        &format!("⚠️ 「{title}」评论补采失败: {e}"),
+                    );
+                }
+            }
+        }
+        if zero_comment > 0 {
+            summary.messages.push(format!(
+                "平台 {} 跳过 {zero_comment} 条评论数为 0 的内容(接口统计无评论,不空跑)",
+                cfg.name
+            ));
+        }
+    }
+
+    // 只标确有评论响应且解析成功的内容(与任务评论阶段同口径);失败/零响应留 false 供下次重采。
+    // 分批:is_in 超 SQLite 变量上限(999)会整批失败
+    for chunk in comment_done_ids.chunks(500) {
+        if let Err(e) = content_entity::Entity::update_many()
+            .col_expr(content_entity::Column::CommentCollected, Expr::value(true))
+            .filter(content_entity::Column::Id.is_in(chunk.iter().cloned()))
+            .exec(&state.db)
+            .await
+        {
+            tracing::warn!("补采评论:标记 comment_collected 失败: {e}");
+        }
+    }
+
+    // 任务累计评论数回写:任务列表「采集结果」的评论总数直接读 tasks.comment_count
+    // (采集时增量维护),补采入库的评论不经过该链路——按任务实算一次,避免总数少计
+    {
+        use sea_orm::PaginatorTrait;
+        use veltrix_core::db::entity::{
+            comment as comment_entity, task as task_entity,
+        };
+        for task_id in &succeeded_task_ids {
+            let count = comment_entity::Entity::find()
+                .filter(comment_entity::Column::TaskId.eq(task_id))
+                .count(&state.db)
+                .await;
+            match count {
+                Ok(n) => {
+                    if let Err(e) = task_entity::Entity::update_many()
+                        .col_expr(task_entity::Column::CommentCount, Expr::value(n as i64))
+                        .filter(task_entity::Column::Id.eq(task_id))
+                        .exec(&state.db)
+                        .await
+                    {
+                        tracing::warn!("补采评论:回写任务评论总数失败(task {task_id}): {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("补采评论:统计任务评论数失败(task {task_id}): {e}");
+                }
+            }
+        }
+    }
+
+    // 意向分析(可选):按内容所属任务逐个跑,analyze_comments_intent 内部按
+    // intent_level IS NULL 幂等筛选,只分析本次新采 + 历史未分析的评论
+    let intent_ready = analyze_intent
+        && !intent_cfg.api_url.trim().is_empty()
+        && !intent_cfg.model.trim().is_empty();
+    if analyze_intent && !intent_ready {
+        // 用户选了「是」但未配置,静默跳过会误以为已分析,必须留痕
+        summary.messages.push(
+            "意向分析未配置(系统设置 → 意向分析),已跳过该步".to_string(),
+        );
+    }
+    if intent_ready {
+        for task_id in &succeeded_task_ids {
+            let analyzed = analyze_comments_intent(&app, &state.db, task_id, &intent_cfg).await;
+            // 确有评论被分析出结果才标记(与采集主链路同口径)
+            if analyzed > 0 {
+                if let Err(e) = content_entity::Entity::update_many()
+                    .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
+                    .filter(content_entity::Column::TaskId.eq(task_id))
+                    .filter(content_entity::Column::CommentCollected.eq(true))
+                    .exec(&state.db)
+                    .await
+                {
+                    tracing::warn!("补采评论:标记 intent_analyzed 失败: {e}");
+                }
+            }
+        }
+    }
+
+    // 归还补采期间打开的采集窗口(正常结束或中断都执行):关窗会触发 Destroyed 把
+    // 「被手动关闭」标记置位,随即重置,避免自己关窗留下的标记污染下次补采(与画像补采同口径)
+    for (platform, account_id) in &opened_windows {
+        bridge.close_collect_window(platform, account_id, None);
+        bridge.reset_collect_window_closed(platform, account_id, None);
+    }
+
+    Ok(summary)
+}
+
 /// ffmpeg 探测结果:供前端在「AI 文案提取」处按是否已安装切换提示——已装则隐藏下载引导。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3640,14 +4192,23 @@ pub struct FfmpegStatus {
     pub version: Option<String>,
 }
 
-/// 检测 ffmpeg 是否可用:用配置的 ffmpeg_path(空则系统 PATH 的 `ffmpeg`)跑一次 `-version`。
+/// 检测 ffmpeg 是否可用:依次探测 配置路径 → 安装包内置 → 系统 PATH 的 `ffmpeg`,
+/// 任一可用即视为已安装(配置路径失效/内置被杀软清理时仍有 PATH 兜底)。
 /// 探测是阻塞的进程调用,挪到阻塞线程池,避免占用异步运行时工作线程。
 #[tauri::command]
-pub async fn check_ffmpeg(state: State<'_, AppState>) -> Result<FfmpegStatus> {
+pub async fn check_ffmpeg(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FfmpegStatus> {
     // clone 出路径再 spawn_blocking,避免把配置锁 guard 跨 await 持有
     let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
     let version = tauri::async_runtime::spawn_blocking(move || {
         crate::media::probe_ffmpeg(ffmpeg_path.as_deref())
+            .or_else(|| {
+                let bundled = crate::media::bundled_ffmpeg_path(&app);
+                crate::media::probe_ffmpeg(bundled.as_deref().and_then(|p| p.to_str()))
+            })
+            .or_else(|| crate::media::probe_ffmpeg(None))
     })
     .await
     .map_err(|e| CrawlerError::Config(format!("ffmpeg 探测任务失败: {e}")))?;
@@ -3703,8 +4264,9 @@ async fn persist_contents(
         return;
     }
 
-    // 采集去重台账:查出本批哪些 (platform, content_id) 已登记(仅用于首次登记与智能停止计数,
-    // 不再据此跳过入库——曾采过的内容重采时照常 upsert,否则清空数据 / 换任务重采会一条不存)。
+    // 采集去重台账:查出本批哪些 (platform, content_id) 已登记。上游(consumer / 兜底解析 /
+    // 定向解析)已按「本任务已采 ∪ 台账(近 90 天)」整体跳过已采内容,能走到这里的基本都是
+    // 新内容;此处的 recorded 仅用于首次登记,避免重复写台账行。
     let ledger_ids: Vec<String> = candidates
         .iter()
         .map(|(_, c)| ledger_entity::ledger_key(&c.platform, &c.content_id))
@@ -3846,7 +4408,24 @@ async fn load_recorded_ledger_ids(db: &DatabaseConnection, ids: &[String]) -> Ha
         .collect()
 }
 
+/// 评论正文是否无文本价值:空 / 纯空白 / 纯表情。
+/// 判定:剔除「[表情名]」占位符(抖音自定义表情在 text 里的形态)后,
+/// 剩余字符不含任何字母 / 数字(含 CJK)即视为无文本——纯 emoji、纯标点都落在此列。
+fn is_textless_comment(text: &str) -> bool {
+    let mut in_placeholder = false;
+    for c in text.chars() {
+        match c {
+            '[' => in_placeholder = true,
+            ']' if in_placeholder => in_placeholder = false,
+            _ if !in_placeholder && c.is_alphanumeric() => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 /// 评论 upsert:按 comment_id 去重,on_conflict 更新点赞/回复数。
+/// 空文本 / 纯空白 / 纯表情评论无价值,直接不落库。
 async fn persist_comments(
     db: &DatabaseConnection,
     task_id: &str,
@@ -3858,6 +4437,7 @@ async fn persist_comments(
 
     let candidates: Vec<(String, &Comment)> = comments
         .iter()
+        .filter(|c| !is_textless_comment(&c.text))
         .filter_map(|c| {
             let id = format!("{task_id}-{}-{}", c.platform, c.comment_id);
             if !seen.insert(id.clone()) {
@@ -4871,6 +5451,39 @@ mod tests {
         let got = log_content_title(&titled(Some(&long), None));
         assert_eq!(got.chars().count(), 41, "应截断到 40 字 + 省略号");
         assert!(got.ends_with('…'));
+    }
+
+    // ---------- is_textless_comment ----------
+
+    #[test]
+    fn textless_comment_covers_empty_blank_emoji_and_placeholders() {
+        for s in [
+            "",
+            "   ",
+            "😂😂",
+            "👍",
+            "[捂脸]",
+            "[捂脸][看]",
+            "[捂脸] 😂",
+            "。。。",
+            "[图片]",
+        ] {
+            assert!(is_textless_comment(s), "应判为无文本: {s:?}");
+        }
+    }
+
+    #[test]
+    fn textless_comment_keeps_any_alphanumeric_content() {
+        for s in [
+            "哈哈哈",
+            "666",
+            "[捂脸]太真实了",
+            "好用吗?",
+            "1",
+            "苏州",
+        ] {
+            assert!(!is_textless_comment(s), "应保留: {s:?}");
+        }
     }
 
     // ---------- daily_task_due / watching_task_due ----------

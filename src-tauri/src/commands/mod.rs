@@ -66,14 +66,14 @@ pub struct AppState {
     pub login_verdicts: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// 编程 Agent 的常驻开发服务器状态(预览-开发服务器模式)。
     pub dev_server: Arc<Mutex<crate::agent::coding::commands::DevServer>>,
-    /// 沙盒容器「就绪结论」缓存:避免每个编程动作都重跑一串 docker 探测(慢且放大挂死面)。
-    pub sandbox_ready: Arc<Mutex<crate::agent::coding::commands::SandboxReady>>,
-    /// 应用句柄:供后台 / 非命令上下文(如 resolve_exec 回退本机时)向前端推送事件(弹窗等)。
-    pub app_handle: AppHandle,
-    /// 自主续航编程 Agent 的「请求停止」会话集合(stop_coding_agent 写入,续航循环每步消费)。
-    pub agent_cancel: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// 对话 Agent 流式输出的取消标志(stop_chat_agent 写入,流式循环检查)。
-    pub chat_cancel_flags: Arc<Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// 全局沙盒管理器(id → 本地进程沙盒台账;coding 会话沙盒是当前使用方):
+    /// 首个编程动作惰性创建,「停止沙盒」/ 退出应用时统一 terminate。
+    pub sandbox: Arc<crate::sandbox::SandboxManager>,
+    /// 每会话取消令牌(stop_chat_agent / stop_coding_agent 触发 cancel;流式读循环 select! 即时中断)。
+    pub cancel_tokens: crate::agent::core::shared::CancelTokenMap,
+    /// 令牌每回合新建、收尾由守卫摘除(原 agent_cancel / chat_cancel_flags 双轨合一)。
+    /// 每会话发送互斥:同会话「发送消息」排队串行(不拒绝,后到先等),防并发回合交错。
+    pub chat_send_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Agent 危险操作「暂停 — 等用户确认」通道(ReAct 循环命中危险工具时等待,前端
     /// `resolve_agent_confirm` 回执)。
     pub agent_confirm: Arc<crate::agent::core::shared::AgentConfirmChannel>,
@@ -516,7 +516,7 @@ pub fn save_binary_file(path: String, content_base64: String) -> Result<()> {
 
 /// 清空业务数据(系统配置「危险操作」)。不可恢复:
 /// 1. 用当前登录用户名 + 传入密码做 argon2 二次校验,未登录或密码错直接拒绝;
-/// 2. 按逻辑外键依赖顺序删空 comments → contents → tasks(无物理级联,手动顺序);
+/// 2. 按逻辑外键依赖顺序删空 comments → contents → tasks(无物理级联,手动顺序),再清 authors 作者库;
 /// 3. clear_media 为 true 时,递归清空媒体素材根目录下所有文件(保留目录本身);
 ///    为 false 时只清库,已下载的素材文件原样保留。
 ///
@@ -530,7 +530,9 @@ pub async fn clear_business_data(
     clear_media: bool,
 ) -> Result<()> {
     use veltrix_core::db::entity::{
-        collect_log as collect_log_entity, comment as comment_entity, content as content_entity,
+        author as author_entity, collect_log as collect_log_entity,
+        collect_record as collect_record_entity, comment as comment_entity,
+        content as content_entity,
         task as task_entity,
     };
 
@@ -559,10 +561,20 @@ pub async fn clear_business_data(
         .exec(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("清空内容失败: {e}")))?;
+    // 采集去重台账一并清空:台账驱动的「跳过已采」若保留,清空后重采会一条不入库
+    collect_record_entity::Entity::delete_many()
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("清空采集去重台账失败: {e}")))?;
     task_entity::Entity::delete_many()
         .exec(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("清空任务失败: {e}")))?;
+    // 作者库(作者聚合档案)同属业务数据,一并清空;注意会连带清掉作者级监控 / 拉黑标记
+    author_entity::Entity::delete_many()
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("清空作者库失败: {e}")))?;
 
     if clear_media {
         clear_dir_contents(&media_root)?;

@@ -33,9 +33,9 @@ veltrix-crawler 是抖音 / 小红书等平台的内容采集桌面应用(Tauri 
 ### 采集数据流(核心,改采集前先读懂)
 1. `commands::run_task` 选该平台一个可用账号,后台 `spawn` 异步采集,命令立即返回。
 2. `webview::pool` 复用该账号的 WebView2 窗口(**per-account 数据目录隔离** = 多账号互不串登录态),导航到搜索页,注入脚本 hook fetch/XHR。
-3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底(`STAGNANT_STOP`)/ 网络无响应(`NO_RESPONSE_STOP`)/ 手动停 即结束。计数排除库中已有的 content_id(重跑只数新增)。
+3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底(`STAGNANT_STOP`)/ 网络无响应(`NO_RESPONSE_STOP`)/ 手动停 即结束。计数排除库中已有的 content_id(重跑只数新增);**去重跳过**:本任务已采 ∪ 去重台账 `collect_records`(同平台、近 90 天)的内容整体跳过,不再入库、不采评论/素材——删单条内容不清台账(不会被重采找回),「清空业务数据」连带清台账。
 4. adapter(`DouyinAdapter` / `XhsAdapter`,注册在 `lib.rs`)把响应解析为统一 `Content` / `Comment`,**只解析、不发请求**。
-5. 边采边入库(`persist_collected`,on-conflict upsert 判重,更新点赞/评论等统计);采集主体结束转 `downloading_media` 态,后台**串行**下载素材(封面/头像/视频转音频,每条 3~10s 随机间隔,已成功的旧内容跳过),全部处理完才落 `completed`。
+5. 边采边入库(`persist_collected`,on-conflict upsert 判重,更新点赞/评论等统计)。阶段顺序:内容采集 → 作者画像补采 → **评论采集** → 直链补取(开「音频提取」时;刻意排在评论后、关窗前,保证下载时直链最新)→ 关窗放锁(需要窗口的阶段全部在一次开窗内完成)→ 素材下载(封面/头像/视频转音频,并发 15 路,不占窗口)→ **语音转写(「AI 文案提取」)** → **评论意向分析** → Obsidian 同步 → 落 `completed`。
 
 新增平台 = 加平台配置 + 实现 `PlatformAdapter` trait + 在 `lib.rs` 注册,不改调度/模型/上报。
 

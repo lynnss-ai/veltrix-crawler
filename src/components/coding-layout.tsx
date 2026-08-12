@@ -1,7 +1,6 @@
 // 编程 Agent 页面(IDE 双栏):左侧对话/步骤(消息流 + 工具卡),右侧工作区(文件 / 终端)。
 // 数据来自会话里的工具消息(assistant.toolCalls 与 role=tool 结果按 toolCallId 关联)。
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
   BatteryFull,
@@ -49,6 +48,7 @@ import { useAgentStepListener } from "@/hooks/use-agent-step-listener";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
 import { ReasoningBlock } from "@/components/ReasoningBlock";
 import { CodeEditor } from "@/components/code-editor";
+import { FileTree } from "@/components/file-tree";
 import { EmptyState } from "@/components/EmptyState";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { Button } from "@/components/ui/button";
@@ -202,16 +202,12 @@ export function CodingLayout() {
   const [termInput, setTermInput] = useState("");
   const [running, setRunning] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
-  // 沙盒可用性(用于头部「未隔离」提示)+ 容器运行状态(用于「沙盒」按钮状态点);null=未知
-  const [dockerOk, setDockerOk] = useState<boolean | null>(null);
+  // 沙盒运行状态(用于「沙盒」按钮状态点);本地沙盒始终进程级隔离,不再有「未隔离」情形
   const [sandboxRunning, setSandboxRunning] = useState(false);
   useEffect(() => {
     api
       .getSandboxConfig()
-      .then((c) => {
-        setDockerOk(c.dockerAvailable);
-        setSandboxRunning(c.containerRunning);
-      })
+      .then((c) => setSandboxRunning(c.running))
       .catch((e) => console.debug("获取沙箱配置失败:", e));
   }, [sandboxOpen]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -283,31 +279,6 @@ export function CodingLayout() {
   // 监听 Agent 进度事件(逐步标签):只显示「当前正在查看的会话」的步骤,
   // 其他会话在后台跑、步骤不抢占视图。统一走 useAgentStepListener。
   useAgentStepListener(activeIdRef, setSteps);
-
-  // 监听「Docker 沙盒不可用,已回退本机执行」事件 → 弹窗提示(后端在重新探测且回退时推送)。
-  // 用固定 toast id:即便短时多次回退也只刷新同一条提示,不堆叠刷屏。
-  useEffect(() => {
-    let dispose: (() => void) | undefined;
-    let disposed = false;
-    listen<{ reason: string }>("coding-sandbox-fallback", (e) => {
-      setDockerOk(false);
-      toast.warning("Docker 沙盒不可用,已回退本机执行(未隔离)", {
-        id: "coding-sandbox-fallback",
-        description: e.payload.reason,
-        duration: 8000,
-      });
-    }).then(
-      (fn) => {
-        if (disposed) fn();
-        else dispose = fn;
-      },
-      () => {},
-    );
-    return () => {
-      disposed = true;
-      dispose?.();
-    };
-  }, []);
 
   // 消息/步骤变化滚到底
   useEffect(() => {
@@ -455,6 +426,7 @@ export function CodingLayout() {
       conversationId: activeId ?? "",
       role: "user",
       content: text,
+      feedback: null,
       createdAt: Math.floor(Date.now() / 1000),
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -625,7 +597,7 @@ export function CodingLayout() {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <SandboxDialog open={sandboxOpen} onOpenChange={setSandboxOpen} />
+      <SandboxDialog open={sandboxOpen} onOpenChange={setSandboxOpen} conversationId={activeId} />
 
       {/* 会话重命名(与普通对话一致) */}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
@@ -638,7 +610,7 @@ export function CodingLayout() {
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void submitRename();
               }
@@ -848,7 +820,7 @@ export function CodingLayout() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                     e.preventDefault();
                     if (!activeSending) void handleSend();
                   }
@@ -950,11 +922,9 @@ export function CodingLayout() {
               终端{terminal.length > 0 ? ` (${terminal.length})` : ""}
             </WorkTab>
             <div className="ml-auto flex items-center gap-1">
-              {dockerOk === false && (
-                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
-                  未隔离·本机
-                </span>
-              )}
+              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                本地沙盒·进程级隔离
+              </span>
               {/* 顺序:沙盒 → 启动/停止 → 回退。按钮自带图标+文字标签+悬浮态,不再额外加 tooltip */}
               <Button
                 variant="ghost"
@@ -965,11 +935,7 @@ export function CodingLayout() {
                 <Box
                   className={cn(
                     "size-3.5",
-                    dockerOk === false
-                      ? "text-muted-foreground/60"
-                      : sandboxRunning
-                        ? "text-emerald-500"
-                        : "text-amber-500",
+                    sandboxRunning ? "text-emerald-500" : "text-muted-foreground/60",
                   )}
                 />
                 沙盒
@@ -1130,22 +1096,11 @@ export function CodingLayout() {
                 ) : (
                   <div className="flex min-h-0 flex-1">
                     <div className="veltrix-thin-scrollbar w-44 shrink-0 overflow-y-auto border-r p-1.5">
-                      {wsFiles.map((f) => (
-                        <SimpleTooltip key={f} content={f} side="right">
-                          <button
-                            type="button"
-                            onClick={() => setSelectedFile(f)}
-                            className={cn(
-                              "block w-full truncate rounded px-2 py-1 text-left text-xs transition-colors",
-                              shownFile === f
-                                ? "bg-primary/10 font-medium text-primary"
-                                : "text-foreground hover:bg-accent/50",
-                            )}
-                          >
-                            {f}
-                          </button>
-                        </SimpleTooltip>
-                      ))}
+                      <FileTree
+                        files={wsFiles}
+                        selected={shownFile}
+                        onSelect={setSelectedFile}
+                      />
                     </div>
                     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                       {shownFile && (
@@ -1774,61 +1729,64 @@ function StatusBar({
   );
 }
 
-// 把 docker stats 的百分比字符串(如 "12.34%")解析为 0~100 的数值(供进度条宽度;CPU 多核可 >100,夹到 100)。
-function statPct(s?: string): number {
-  if (!s) return 0;
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+// 字节数 → 人类可读(与后端 human_bytes 同口径)
+function fmtBytes(n: number): string {
+  const units = ["B", "KB", "MB", "GB"];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  return u === 0 ? `${n} B` : `${v.toFixed(1)} ${units[u]}`;
 }
 
-// 沙盒资源占用单条:标签 + 数值 + 细进度条(按占用高低变色:绿 / 黄 / 红)。
-function SandboxStatBar({
-  label,
-  value,
-  percent,
-}: {
-  label: string;
-  value: string;
-  percent: number;
-}) {
-  const color =
-    percent >= 85 ? "bg-red-500" : percent >= 60 ? "bg-amber-500" : "bg-emerald-500";
-  return (
-    <div>
-      <div className="flex items-center justify-between text-[11px]">
-        <span className="text-muted-foreground">{label}</span>
-        <span className="tabular-nums text-foreground">{value || "—"}</span>
-      </div>
-      <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
-        <div
-          className={cn("h-full rounded-full transition-all", color)}
-          style={{ width: `${percent}%` }}
-        />
-      </div>
-    </div>
-  );
+// 沙盒命令审计条目(后端 jsonl 一行的形状)
+interface SandboxAuditEntry {
+  ts: number;
+  command: string;
+  exit_code: number | null;
+  duration_ms: number;
+  timeout?: boolean;
 }
 
-// 编程沙盒设置:本机 / Docker(每会话共享容器内独立目录);镜像/容器名 + 启停 + 状态。
+// 本地沙盒状态:工作区路径 + 运行状态 + 资源占用(Job 会计)+ 限额配置 + 审计 +「停止沙盒」。
+// 沙盒随首个编程动作惰性创建,无需启动;停止即 terminate 全部沙盒进程树(工作区文件保留)。
 function SandboxDialog({
   open,
   onOpenChange,
+  conversationId,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
+  conversationId: string | null;
 }) {
   const [cfg, setCfg] = useState<SandboxConfigView | null>(null);
   const [stats, setStats] = useState<SandboxStatsView | null>(null);
-  const [image, setImage] = useState("node:20-bookworm");
-  const [container, setContainer] = useState("veltrix-sandbox");
   const [busy, setBusy] = useState(false);
+  // 内存上限输入(MB,0=不限);失焦即持久化
+  const [memLimit, setMemLimit] = useState("0");
+  // 网络限速输入(KB/s,0=不限);失焦即持久化
+  const [netLimit, setNetLimit] = useState("0");
+  // 空闲回收输入(分钟,0=关闭);失焦即持久化
+  const [idleMin, setIdleMin] = useState("30");
+  // CPU 上限(%,0=不限)/ 进程数上限(0=不限)/ 磁盘 IO 限速(KB/s,0=不限);同款失焦持久化
+  const [cpuLimit, setCpuLimit] = useState("0");
+  const [maxProcs, setMaxProcs] = useState("0");
+  const [ioLimit, setIoLimit] = useState("0");
+  // 当前会话的命令审计(弹窗打开时拉一次,新的在前)
+  const [audit, setAudit] = useState<SandboxAuditEntry[]>([]);
 
   async function refresh() {
     try {
       const c = await api.getSandboxConfig();
       setCfg(c);
-      setImage(c.image);
-      setContainer(c.container);
+      setMemLimit(String(c.memoryLimitMb));
+      setNetLimit(String(c.netLimitKbps));
+      setIdleMin(String(c.idleRecycleMinutes));
+      setCpuLimit(String(c.cpuLimitPercent));
+      setMaxProcs(String(c.maxProcesses));
+      setIoLimit(String(c.ioLimitKbps));
     } catch {
       // 忽略
     }
@@ -1836,7 +1794,7 @@ function SandboxDialog({
   useEffect(() => {
     if (open) void refresh();
   }, [open]);
-  // 资源占用:弹窗打开期间定时采样(docker stats 每次约 1~2s,3s 一轮足够);关闭即停
+  // 资源占用:弹窗打开期间定时采样(Job 会计读取极快,3s 一轮足够);关闭即停
   useEffect(() => {
     if (!open) {
       setStats(null);
@@ -1859,172 +1817,301 @@ function SandboxDialog({
     };
   }, [open]);
 
-  async function withBusy(fn: () => Promise<void>) {
+  async function stopAll() {
     setBusy(true);
     try {
-      await fn();
+      await api.sandboxStop();
+      toast.success("已停止全部沙盒进程");
+      await refresh();
+    } catch (e) {
+      toast.error(`停止失败: ${e}`);
     } finally {
       setBusy(false);
     }
   }
-  // 去掉显式「保存」按钮:镜像 / 容器名改动在失焦及启动 / 重建前自动持久化,确保编辑即时生效。
-  async function persistConfig() {
+  // 持久化全部限额配置(各输入共用一个配置接口,一次全量提交):
+  // 后端会 terminate 现存沙盒,下次编程动作按新配置惰性重建
+  async function persistLimit() {
+    const vals = [memLimit, netLimit, idleMin, cpuLimit, maxProcs, ioLimit].map(Number);
+    if (vals.some((v) => !Number.isFinite(v) || v < 0)) {
+      toast.error("各项限额需为不小于 0 的数字");
+      return;
+    }
     try {
-      await api.setSandboxConfig(image, container);
+      await api.setSandboxConfig({
+        memoryLimitMb: Math.floor(vals[0]),
+        netLimitKbps: Math.floor(vals[1]),
+        idleRecycleMinutes: Math.floor(vals[2]),
+        cpuLimitPercent: Math.min(100, Math.floor(vals[3])),
+        maxProcesses: Math.floor(vals[4]),
+        ioLimitKbps: Math.floor(vals[5]),
+      });
     } catch (e) {
       toast.error(`保存沙盒配置失败: ${e}`);
+    }
+  }
+  // 打开弹窗时拉一次当前会话的命令审计(50 条,新的在前)
+  useEffect(() => {
+    if (!open || !conversationId) {
+      setAudit([]);
+      return;
+    }
+    let alive = true;
+    api
+      .getSandboxAudit(conversationId, 50)
+      .then((lines) => {
+        if (!alive) return;
+        const parsed = lines
+          .map((l) => {
+            try {
+              return JSON.parse(l) as SandboxAuditEntry;
+            } catch {
+              return null;
+            }
+          })
+          .filter((x): x is SandboxAuditEntry => x !== null);
+        setAudit(parsed.reverse());
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [open, conversationId]);
+
+  // 清空当前会话的存储目录(高危:删工作区全部文件;后端有台账 + 根目录护栏)
+  async function clearStorage() {
+    if (!conversationId) return;
+    setBusy(true);
+    try {
+      await api.clearSandboxStorage(conversationId);
+      toast.success("已清空该会话的存储目录");
+      await refresh();
+    } catch (e) {
+      toast.error(`清空存储失败: ${e}`);
+    } finally {
+      setBusy(false);
     }
   }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>运行沙盒(Docker)</DialogTitle>
+          <DialogTitle>本地沙盒</DialogTitle>
           <DialogDescription>
-            命令默认在 Docker 沙盒里跑:每个会话在共享容器内的独立目录,不污染本机,退出时自动停止(文件保留),跨 Win/Mac/Linux。Docker 未安装/未运行时自动回退本机执行(未隔离)。
+            命令在本机的进程级沙盒里运行:每个编程会话一组独立进程(Windows Job Object / macOS 进程组),
+            停止或退出应用时整树杀净、不残留进程。文件读写限定在工作区目录内。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
-          {!cfg?.dockerAvailable && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-600 dark:text-amber-400">
-              未检测到 Docker:命令将临时在本机执行(未隔离)。安装并启动 Docker 后即自动使用沙盒。
+          <div className="rounded-md border bg-muted/20 px-2.5 py-2 text-xs text-muted-foreground">
+            <div className="break-all">
+              工作区:<span className="text-foreground">{cfg?.workspace || "…"}</span>
+            </div>
+            <div className="mt-1">
+              状态:
+              <b className={cfg?.running ? "text-emerald-500" : "text-foreground"}>
+                {cfg?.running ? "运行中" : "空闲"}
+              </b>
+              {" · "}会话沙盒:{cfg?.activeSessions ?? 0} 个
+            </div>
+            {/* 资源占用:Job 会计值(累计 CPU 时间 / 峰值内存 / 存活进程数),非实时百分比 */}
+            <div className="mt-1.5 space-y-1 border-t pt-1.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">CPU 累计</span>
+                <span className="tabular-nums text-foreground">
+                  {stats?.running ? stats.cpuPerc : "—"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">内存峰值</span>
+                <span className="tabular-nums text-foreground">
+                  {stats?.running
+                    ? `${stats.memUsage}${stats.memLimitBytes ? ` / 上限 ${fmtBytes(stats.memLimitBytes)}` : ""}`
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">存活进程</span>
+                <span className="tabular-nums text-foreground">
+                  {stats?.running ? stats.memPerc : "—"}
+                </span>
+              </div>
+              {/* 存储占用:工作区文件持久存在,与是否有进程在跑无关,故不随 running 隐藏 */}
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">存储占用</span>
+                <span className="tabular-nums text-foreground">
+                  {stats ? fmtBytes(stats.storageBytes) : "—"}
+                </span>
+              </div>
+              {/* 出站限速:仅配置了限速时展示(unix 平台不生效,仅 Windows) */}
+              {stats && stats.netLimitKbps > 0 && (
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-muted-foreground">网络限速</span>
+                  <span className="tabular-nums text-foreground">
+                    {stats.netLimitKbps} KB/s
+                  </span>
+                </div>
+              )}
+              {/* CPU / 进程数 / IO 限额回显:仅配置了的项展示(仅 Windows 生效) */}
+              {stats && stats.cpuLimitPercent > 0 && (
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-muted-foreground">CPU 上限</span>
+                  <span className="tabular-nums text-foreground">{stats.cpuLimitPercent}%</span>
+                </div>
+              )}
+              {stats && stats.maxProcesses > 0 && (
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-muted-foreground">进程数上限</span>
+                  <span className="tabular-nums text-foreground">{stats.maxProcesses}</span>
+                </div>
+              )}
+              {stats && stats.ioLimitKbps > 0 && (
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-muted-foreground">IO 限速</span>
+                  <span className="tabular-nums text-foreground">{stats.ioLimitKbps} KB/s</span>
+                </div>
+              )}
+            </div>
+          </div>
+          {/* 内存上限 / 网络限速:0=不限;改动后现存沙盒会被停止,下次编程动作按新配置重建 */}
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">内存上限(MB,0=不限)</span>
+            <Input
+              type="number"
+              min={0}
+              className="h-7 w-28 text-xs"
+              value={memLimit}
+              onChange={(e) => setMemLimit(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="0"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">网络限速(KB/s,0=不限)</span>
+            <Input
+              type="number"
+              min={0}
+              className="h-7 w-28 text-xs"
+              value={netLimit}
+              onChange={(e) => setNetLimit(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="0"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">空闲自动回收(分钟,0=关闭)</span>
+            <Input
+              type="number"
+              min={0}
+              className="h-7 w-28 text-xs"
+              value={idleMin}
+              onChange={(e) => setIdleMin(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="30"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">CPU 上限(%,0=不限)</span>
+            <Input
+              type="number"
+              min={0}
+              max={100}
+              className="h-7 w-28 text-xs"
+              value={cpuLimit}
+              onChange={(e) => setCpuLimit(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="0"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">进程数上限(0=不限)</span>
+            <Input
+              type="number"
+              min={0}
+              className="h-7 w-28 text-xs"
+              value={maxProcs}
+              onChange={(e) => setMaxProcs(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="0"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">磁盘 IO 限速(KB/s,0=不限)</span>
+            <Input
+              type="number"
+              min={0}
+              className="h-7 w-28 text-xs"
+              value={ioLimit}
+              onChange={(e) => setIoLimit(e.target.value)}
+              onBlur={() => void persistLimit()}
+              placeholder="0"
+            />
+          </label>
+          {/* 当前会话最近命令审计(后端 jsonl,新的在前;退出码 null = 长驻进程或超时被杀) */}
+          {conversationId && audit.length > 0 && (
+            <div className="rounded-md border bg-muted/20 px-2.5 py-2">
+              <div className="mb-1 text-xs text-muted-foreground">最近命令(本会话)</div>
+              <div className="max-h-40 space-y-1 overflow-y-auto">
+                {audit.map((a, i) => (
+                  <div key={i} className="flex items-center gap-2 text-[11px]">
+                    <span className="shrink-0 tabular-nums text-muted-foreground">
+                      {new Date(a.ts * 1000).toLocaleTimeString()}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-mono" title={a.command}>
+                      {a.command}
+                    </span>
+                    <span
+                      className={cn(
+                        "shrink-0 tabular-nums",
+                        a.timeout
+                          ? "text-amber-500"
+                          : a.exit_code === null
+                            ? "text-muted-foreground"
+                            : a.exit_code === 0
+                              ? "text-emerald-500"
+                              : "text-red-500",
+                      )}
+                    >
+                      {a.timeout ? "超时" : a.exit_code === null ? "常驻" : `exit ${a.exit_code}`}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
-          <div className="grid gap-2 sm:grid-cols-2">
-            <label className="space-y-1">
-              <span className="text-xs text-muted-foreground">基础镜像</span>
-              <Input
-                value={image}
-                onChange={(e) => setImage(e.target.value)}
-                onBlur={() => void persistConfig()}
-                placeholder="node:20-bookworm"
-              />
-            </label>
-            <label className="space-y-1">
-              <span className="text-xs text-muted-foreground">容器名</span>
-              <Input
-                value={container}
-                onChange={(e) => setContainer(e.target.value)}
-                onBlur={() => void persistConfig()}
-                placeholder="veltrix-sandbox"
-              />
-            </label>
-          </div>
-          <div className="rounded-md border bg-muted/20 px-2.5 py-2 text-xs text-muted-foreground">
-            <div>
-              Docker:
-              <b className={cfg?.dockerAvailable ? "text-emerald-500" : "text-destructive"}>
-                {cfg?.dockerAvailable ? "可用" : "不可用 / 未安装"}
-              </b>
-              {" · "}容器:
-              <b className={cfg?.containerRunning ? "text-emerald-500" : "text-foreground"}>
-                {cfg?.containerRunning ? "运行中" : "未运行"}
-              </b>
-            </div>
-            {/* 资源占用:容器运行中显示 docker stats 实时采样(CPU / 内存各一条细进度条) */}
-            <div className="mt-1.5 space-y-1.5 border-t pt-1.5">
-              <SandboxStatBar
-                label="CPU"
-                value={stats?.running ? stats.cpuPerc : ""}
-                percent={statPct(stats?.running ? stats.cpuPerc : undefined)}
-              />
-              <SandboxStatBar
-                label="内存"
-                value={
-                  stats?.running
-                    ? `${stats.memUsage}${stats.memPerc ? ` · ${stats.memPerc}` : ""}`
-                    : ""
-                }
-                percent={statPct(stats?.running ? stats.memPerc : undefined)}
-              />
-            </div>
-          </div>
           <div className="flex justify-end gap-2">
-            {/* 运行中 → 红色「停止」(二次确认);否则 → 绿色「启动」 */}
-            {cfg?.containerRunning ? (
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1 text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
-                disabled={busy || !cfg?.dockerAvailable}
-                onClick={() =>
-                  toast("停止沙盒容器?运行中的预览 / 命令会中断(工作区文件保留)", {
-                    action: {
-                      label: "停止",
-                      onClick: () =>
-                        void withBusy(async () => {
-                          try {
-                            await api.sandboxStop();
-                            toast.success("已停止沙盒容器");
-                            await refresh();
-                          } catch (e) {
-                            toast.error(`停止失败: ${e}`);
-                          }
-                        }),
-                    },
-                  })
-                }
-              >
-                <Square className="size-3.5" />
-                停止
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1 text-emerald-600 hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-400"
-                disabled={busy || !cfg?.dockerAvailable}
-                onClick={() =>
-                  void withBusy(async () => {
-                    try {
-                      // 启动前先落盘当前镜像 / 容器名,确保用的是最新编辑值(后端按已保存配置拉容器)
-                      await persistConfig();
-                      toast.success(await api.sandboxStart());
-                      await refresh();
-                    } catch (e) {
-                      toast.error(`启动失败: ${e}`);
-                    }
-                  })
-                }
-              >
-                <Play className="size-3.5" />
-                启动
-              </Button>
-            )}
-            {/* 重建:红色 + 二次确认(删容器重建) */}
+            {/* 清空存储:高危(删本会话工作区全部文件),二次确认;无会话时禁用 */}
             <Button
               size="sm"
               variant="outline"
               className="gap-1 text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
-              disabled={busy || !cfg?.dockerAvailable}
+              disabled={busy || !conversationId}
               onClick={() =>
-                toast("重建沙盒容器?将删除现有容器并重新创建(工作区文件保留)", {
-                  action: {
-                    label: "重建",
-                    onClick: () =>
-                      void withBusy(async () => {
-                        try {
-                          // 重建前先落盘当前镜像 / 容器名,确保按最新编辑值重建
-                          await persistConfig();
-                          toast.success(await api.sandboxRecreate());
-                          await refresh();
-                        } catch (e) {
-                          toast.error(`重建失败: ${e}`);
-                        }
-                      }),
-                  },
+                toast("清空存储?该会话工作区内的全部文件将被删除(不可恢复)", {
+                  action: { label: "清空", onClick: () => void clearStorage() },
                 })
               }
             >
-              <RotateCw className="size-3.5" />
-              重建
+              <Trash2 className="size-3.5" />
+              清空存储
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1 text-red-600 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
+              disabled={busy || !cfg?.running}
+              onClick={() =>
+                toast("停止沙盒?全部沙盒进程(含预览服务)会被杀掉,工作区文件保留", {
+                  action: { label: "停止", onClick: () => void stopAll() },
+                })
+              }
+            >
+              <Square className="size-3.5" />
+              停止沙盒
             </Button>
           </div>
           <p className="text-[11px] text-muted-foreground">
-            首次启动会拉取镜像(较慢);需本机已安装并运行 Docker,未安装时自动回退本机执行。
-          </p>
-          <p className="text-[11px] text-amber-600 dark:text-amber-400">
-            若「生成的文件不在沙盒 / 无法预览」:多为旧容器挂载错误,点「重建容器」用正确挂载重建一次即可(文件保留在工作区)。
+            沙盒随首个编程动作自动创建,无需手动启动;停止后下次编程动作会自动重建。
           </p>
         </div>
       </DialogContent>

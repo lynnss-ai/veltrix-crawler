@@ -183,6 +183,8 @@ export interface ChatMessageView {
   attachments?: MessageAttachment[];
   // assistant 思考过程(模型推理内容);仅推理型模型非空,前端折叠展示
   reasoning?: string | null;
+  // 用户反馈(点赞/点踩):like / dislike / null;加载会话时水合到前端点赞态
+  feedback: string | null;
   createdAt: number;
 }
 
@@ -223,20 +225,41 @@ export interface CheckpointDiffView {
   files: CheckpointFileDiff[];
 }
 
-// 编程 Agent:沙盒配置(默认 Docker;Docker 不可用时命令自动回退本机执行)
+// 编程 Agent:本地沙盒状态(进程级隔离;每会话一个 Job / 进程组,首个编程动作惰性创建)
 export interface SandboxConfigView {
-  image: string;
-  container: string;
-  dockerAvailable: boolean; // false → 命令在本机执行(未隔离)
-  containerRunning: boolean;
+  workspace: string; // 工作区根目录(每会话一个子目录)
+  running: boolean; // 是否有沙盒进程在运行
+  activeSessions: number; // 已创建的会话沙盒数\r
+  memoryLimitMb: number; // 内存上限(MB,0=不限)\r
+  netLimitKbps: number; // 出站网络限速(KB/s,0=不限)\r
+  idleRecycleMinutes: number; // 空闲自动回收阈值(分钟,0=关闭)\r
+  cpuLimitPercent: number; // CPU 上限(%,0=不限)\r
+  maxProcesses: number; // 进程数上限(0=不限)\r
+  ioLimitKbps: number; // 磁盘 IO 限速(KB/s,0=不限)
 }
 
-// 沙盒容器实时资源占用(docker stats);容器未运行时 running=false、其余空
+// 沙盒配置写入入参(set_sandbox_config 单对象参数;0=不限/关闭)
+export interface SandboxConfigInput {
+  memoryLimitMb: number;
+  netLimitKbps: number;
+  idleRecycleMinutes: number;
+  cpuLimitPercent: number;
+  maxProcesses: number;
+  ioLimitKbps: number;
+}
+
+// 沙盒资源占用(Job 会计聚合;累计值,非实时百分比);无沙盒进程时 running=false、其余空
 export interface SandboxStatsView {
   running: boolean;
-  cpuPerc: string; // 如 "12.34%"
-  memUsage: string; // 如 "120MiB / 7.5GiB"
-  memPerc: string; // 如 "1.56%"
+  cpuPerc: string; // 累计 CPU 时间,如 "12.3s"
+  memUsage: string; // 峰值内存,如 "45.6 MB"
+  memPerc: string; // 存活进程数,如 "3 进程"\r
+  storageBytes: number; // 全部沙盒存储目录占用合计(字节;与 running 无关)\r
+  memLimitBytes: number | null; // 内存上限(字节,null=不限)\r
+  netLimitKbps: number; // 出站网络限速(KB/s,0=不限)
+  cpuLimitPercent: number; // CPU 上限(%,0=不限)
+  maxProcesses: number; // 进程数上限(0=不限)
+  ioLimitKbps: number; // 磁盘 IO 限速(KB/s,0=不限)
 }
 
 // 记忆分类:身份 / 偏好 / 项目 / 人际 / 习惯 / 其它(与后端 MEM_TYPES 对应)
@@ -343,42 +366,6 @@ export interface KeywordDto {
   id: string;
   industryId: string;
   word: string;
-}
-
-// 内容创作 - 提示词分类目录
-export interface PromptCategoryView {
-  id: string;
-  owner: string;
-  name: string;
-  remark: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface PromptCategoryInput {
-  id: string;
-  name: string;
-  remark: string;
-}
-
-// 内容创作 - 分镜镜头提示词
-export interface ShotPromptView {
-  id: string;
-  owner: string;
-  categoryId: string;
-  name: string;
-  content: string;
-  remark: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ShotPromptInput {
-  id: string;
-  categoryId: string;
-  name: string;
-  content: string;
-  remark: string;
 }
 
 // 采集任务
@@ -577,6 +564,20 @@ export interface AuthorView {
 }
 
 // 作者画像补采结果汇总(对应后端 EnrichSummary)
+// 全量库补采评论结果汇总(对应后端 RecollectCommentsSummary)
+export interface RecollectCommentsSummary {
+  requested: number;
+  // 实际发起评论采集的视频数(排除评论数为 0 / 平台不支持等跳过项)
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  // 本次入库的评论条数(按时间范围 / 单视频上限过滤后)
+  comments: number;
+  // 跳过 / 失败的逐条原因
+  messages: string[];
+}
+
 export interface EnrichSummary {
   requested: number;
   updated: number;

@@ -5,11 +5,11 @@
 // - 列表 tab 显示 pending/running/paused;归档 tab 显示 completed/failed/cancelled
 // - 操作按钮按状态动态:running → 暂停/停止,paused → 启动/停止,pending → 启动/停止
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import { api } from "@/lib/api";
-import type { IndustryView, PlatformConfig, TaskInput, TaskView } from "@/lib/api";
-import { sortLabelOf, timeLabelOf, extraFilterChipsOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime, type TaskContentFilter } from "./collect-meta";
+import type { CollectLogEntry, IndustryView, PlatformConfig, TaskInput, TaskView } from "@/lib/api";
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime, displayKeyword, type TaskContentFilter } from "./collect-meta";
 import type { PageKey } from "@/components/app-sidebar";
 import type { TaskItem, PlatformOption, KeywordState } from "./collect-meta";
 import { TaskDetailPage } from "@/pages/TaskDetailPage";
@@ -26,6 +26,7 @@ import { Progress } from "@/components/ui/progress";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { IndustryFilterItem, IndustryFilterToggle } from "@/components/library-filters";
@@ -34,6 +35,53 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TaskFormSheet } from "./TaskFormSheet";
 
 // ---- 数据模型(沿用后端 TaskView,本地 alias 为 TaskItem 方便引用) ----
+
+// 实时日志行时间:HH:mm:ss(定宽对齐)
+const fmtLogTime = (ts: number) => {
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+
+// 实时日志级别配色(与任务详情页口径一致)
+const LOG_LEVEL_CLASS: Record<CollectLogEntry["level"], string> = {
+  info: "text-foreground",
+  warn: "text-amber-600 dark:text-amber-400",
+  error: "text-red-600 dark:text-red-400",
+};
+
+// 素材日志的类型标签(素材[音频]/素材[图片]/素材[封面])按类型着色
+const MEDIA_TAG_CLASS: Record<string, string> = {
+  音频: "text-sky-600 dark:text-sky-400",
+  图片: "text-violet-600 dark:text-violet-400",
+  封面: "text-amber-600 dark:text-amber-400",
+};
+const MEDIA_TAG_RE = /^素材\[(音频|图片|封面)\]\s*/;
+
+// 渲染一条日志文本:素材类型标签着色,其余按级别配色
+function LogMessage({ log }: { log: CollectLogEntry }) {
+  const m = log.message.match(MEDIA_TAG_RE);
+  if (!m) {
+    return (
+      <span
+        className={`min-w-0 flex-1 break-all ${LOG_LEVEL_CLASS[log.level] ?? "text-foreground"}`}
+      >
+        {log.message}
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`min-w-0 flex-1 break-all ${LOG_LEVEL_CLASS[log.level] ?? "text-foreground"}`}
+    >
+      <span className={`font-medium ${MEDIA_TAG_CLASS[m[1]]}`}>
+        素材[{m[1]}]
+      </span>{" "}
+      {log.message.slice(m[0].length)}
+    </span>
+  );
+}
+
 
 // 采集明细里每个关键词的状态徽标:圆底包裹图标。
 // done=采集成功 / failed=采集失败 / running=采集中(转圈)/ pending=等待
@@ -139,6 +187,44 @@ export function CollectPage({
   const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
   // 停止/终止确认弹窗
   const [stopConfirmTask, setStopConfirmTask] = useState<TaskItem | null>(null);
+  // 实时日志:进行中的任务点状态徽标打开;历史日志先回显,再订阅 collect-log 事件实时追加
+  const [logTask, setLogTask] = useState<TaskItem | null>(null);
+  const [liveLogs, setLiveLogs] = useState<CollectLogEntry[]>([]);
+  const logScrollRef = useRef<HTMLDivElement>(null);
+
+  // 打开实时日志:拉历史 + 订阅该任务的 collect-log 事件(保留最近 1000 条防无限增长)
+  useEffect(() => {
+    if (!logTask) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    setLiveLogs([]);
+    api
+      .listCollectLogs(logTask.id)
+      .then((rows) => {
+        if (!disposed) setLiveLogs(rows);
+      })
+      .catch((e) => console.warn("加载采集日志失败:", e));
+    listen<CollectLogEntry>("collect-log", (e) => {
+      if (e.payload.taskId !== logTask.id) return;
+      setLiveLogs((prev) => [...prev.slice(-999), e.payload]);
+    }).then(
+      (fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      },
+      () => {}, // 浏览器调试(非 Tauri)环境订阅失败,仅看历史日志
+    );
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [logTask]);
+
+  // 新日志到达自动滚到底部
+  useEffect(() => {
+    const el = logScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [liveLogs]);
 
   // 平台 id → 名称,首列任务名前的标签和 toolbar 都用这个查表
   const platformName = (id: string) =>
@@ -483,6 +569,9 @@ export function CollectPage({
         cell: ({ row, table }) => {
           const t = row.original;
           const TriggerIcon = TRIGGER_META[t.trigger].icon;
+          // 定向采集(按链接逐条抓取):表单里不提供排序/时间筛选/返回数量/最低点赞,
+          // 列表同样不展示,保持与表单可选口径一致
+          const isTargeted = (t.targetUrls?.length ?? 0) > 0;
           // 未设过列宽 → auto 自适应(w-max 单行);设过 → fixed 填充列宽并裁剪
           const fixed = Object.keys(table.getState().columnSizing).length > 0;
           return (
@@ -544,25 +633,27 @@ export function CollectPage({
                   </span>
                 )}
               </div>
-              {/* 基础采集策略(排序 / 时间 / 目标数 / 最低赞) */}
-              <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
-                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
-                  {sortLabelOf(t.platform, t.sortMode)}
-                </span>
-                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
-                  {timeLabelOf(t.platform, t.timeRange)}
-                </span>
-                <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
-                  ≤ {t.perKeywordLimit}
-                </span>
-                {t.minLikes > 0 && (
+              {/* 基础采集策略(排序 / 时间 / 目标数 / 最低赞):仅搜索采集展示,定向采集按链接直取不涉及 */}
+              {!isTargeted && (
+                <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                   <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
-                    ≥{t.minLikes}赞
+                    {sortLabelOf(t.platform, t.sortMode)}
                   </span>
-                )}
-              </div>
-              {/* 平台专属额外筛选(小红书 笔记类型/搜索范围/位置距离;抖音 视频时长 等):选了非「不限」才展示 */}
-              {extraFilterChipsOf(t.platform, t.extraFilters).length > 0 && (
+                  <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
+                    {timeLabelOf(t.platform, t.timeRange)}
+                  </span>
+                  <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
+                    ≤ {t.perKeywordLimit}
+                  </span>
+                  {t.minLikes > 0 && (
+                    <span className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5">
+                      ≥{t.minLikes}赞
+                    </span>
+                  )}
+                </div>
+              )}
+              {/* 平台专属额外筛选(小红书 笔记类型/搜索范围/位置距离;抖音 视频时长 等):选了非「不限」才展示(定向采集同表单不提供,不展示) */}
+              {!isTargeted && extraFilterChipsOf(t.platform, t.extraFilters).length > 0 && (
                 <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                   {extraFilterChipsOf(t.platform, t.extraFilters).map((c) => (
                     <span
@@ -663,7 +754,9 @@ export function CollectPage({
                       })
                     }
                     title={
-                      canDrill ? `穿透查看「${keyword}」采集的内容` : undefined
+                      canDrill
+                        ? `穿透查看「${displayKeyword(keyword)}」采集的内容`
+                        : undefined
                     }
                     className={`group flex flex-col gap-0.5 py-1.5 text-left first:pt-0 last:pb-0 ${
                       canDrill ? "cursor-pointer" : "cursor-default"
@@ -684,9 +777,9 @@ export function CollectPage({
                         className={`min-w-0 flex-1 truncate font-medium text-foreground ${
                           canDrill ? "group-hover:text-primary" : ""
                         }`}
-                        title={keyword}
+                        title={displayKeyword(keyword)}
                       >
-                        {keyword}
+                        {displayKeyword(keyword)}
                       </span>
                       {/* 内容 / 评论数:紧跟关键词 */}
                       <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
@@ -724,6 +817,8 @@ export function CollectPage({
         cell: ({ row }) => {
           const t = row.original;
           const meta = STATUS_META[t.status];
+          // 点状态徽标查看日志:进行中看实时日志,已完成回看当次采集日志(同一份历史日志)
+          const canViewLogs = isInProgress(t) || t.status === "completed";
           // 从 dot 类串里取背景色(按 bg- 前缀找,不依赖排列顺序),供 ping 动画用
           const dotColor =
             meta.dot.split(" ").find((cls) => cls.startsWith("bg-")) ?? meta.dot;
@@ -738,7 +833,26 @@ export function CollectPage({
             <div className="flex max-w-[150px] flex-col gap-1 whitespace-normal">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span
-                  className={`inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium ${meta.className}`}
+                  onClick={
+                    canViewLogs
+                      ? (e) => {
+                          e.stopPropagation();
+                          setLogTask(t);
+                        }
+                      : undefined
+                  }
+                  title={
+                    canViewLogs
+                      ? isInProgress(t)
+                        ? "查看实时日志"
+                        : "查看采集日志"
+                      : undefined
+                  }
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium ${meta.className} ${
+                    canViewLogs
+                      ? "cursor-pointer transition-shadow hover:ring-1 hover:ring-primary/50"
+                      : ""
+                  }`}
                 >
                   {isInProgress(t) ? (
                     <span className="relative flex size-2">
@@ -761,7 +875,8 @@ export function CollectPage({
                     </SimpleTooltip>
                   )}
                 </span>
-                {/* 补偿执行:独立于状态徽章,放在状态信息之后 */}
+                {/* 补偿执行:独立于状态徽章,放在状态信息之后;
+                    text-xs + py-0.5 + 透明边框,与状态徽章等高对齐 */}
                 {t.status === "failed" && (
                   <SimpleTooltip content="按采集参数补做缺失步骤(意向 / 素材 / 转写);评论缺失请用「重新运行」">
                     <button
@@ -775,9 +890,9 @@ export function CollectPage({
                           })
                           .catch((e) => toast.error(`补偿失败: ${e}`))
                       }
-                      className="inline-flex cursor-pointer items-center gap-0.5 rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 transition-colors hover:bg-violet-200 dark:bg-violet-950/60 dark:text-violet-300 dark:hover:bg-violet-900/60"
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-transparent bg-violet-100 px-1.5 py-0.5 text-xs font-medium text-violet-700 transition-colors hover:bg-violet-200 dark:bg-violet-950/60 dark:text-violet-300 dark:hover:bg-violet-900/60"
                     >
-                      <Wrench className="size-3" />
+                      <Wrench className="size-3.5" />
                       补偿执行
                     </button>
                   </SimpleTooltip>
@@ -1066,6 +1181,53 @@ export function CollectPage({
         onSubmit={handleSaveTask}
       />
 
+      {/* 采集日志:进行中的任务点状态徽标看实时日志(历史回显 + collect-log 事件实时追加),
+          已完成任务点状态徽标回看当次采集日志(仅历史回显,不会再有新事件) */}
+      <Sheet
+        open={!!logTask}
+        onOpenChange={(open) => {
+          if (!open) setLogTask(null);
+        }}
+      >
+        <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-[min(64rem,94vw)]">
+          <SheetHeader className="border-b">
+            <SheetTitle className="flex flex-wrap items-baseline gap-x-2">
+              {logTask && isInProgress(logTask) ? "实时日志" : "采集日志"}
+              {logTask && (
+                <span className="text-xs font-normal text-muted-foreground">
+                  {logTask.name} ·{" "}
+                  {STATUS_META[logTask.status]?.label ?? logTask.status}
+                </span>
+              )}
+            </SheetTitle>
+          </SheetHeader>
+          <div
+            ref={logScrollRef}
+            className="min-h-0 flex-1 overflow-y-auto p-3 pb-6 font-mono text-xs"
+          >
+            {liveLogs.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-muted-foreground">
+                暂无日志
+              </div>
+            ) : (
+              <div className="space-y-px">
+                {liveLogs.map((log, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 rounded px-1.5 py-0.5 hover:bg-muted/50"
+                  >
+                    <span className="w-[58px] shrink-0 tabular-nums text-muted-foreground">
+                      {fmtLogTime(log.ts)}
+                    </span>
+                    <LogMessage log={log} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
+
       {/* 停止/终止任务确认弹窗:防止误触(归档/删除都有确认,停止也应该有) */}
       <AlertDialog
         open={!!stopConfirmTask}
@@ -1088,6 +1250,9 @@ export function CollectPage({
                 if (!stopConfirmTask) return;
                 const id = stopConfirmTask.id;
                 setPendingActions((prev) => new Set(prev).add(id));
+                // 先登记停止标记:运行中的采集/素材下载/语音转写据此中断;
+                // 仅改 DB 状态停不掉运行体(此前 bug:终止后素材仍在下载)
+                api.stopTask(id).catch((e) => console.warn("登记任务停止标记失败:", e));
                 updateTask(id, {
                   status: "cancelled",
                   finishedAt: Math.floor(Date.now() / 1000),

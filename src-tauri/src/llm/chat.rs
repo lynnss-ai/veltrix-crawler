@@ -4,7 +4,6 @@
 //! 意向分析与语音识别(MiMo 走 input_audio chat)都复用本实现;能力特有字段经 `extra_body` 注入。
 
 use serde_json::{json, Value};
-use std::sync::Arc;
 use veltrix_core::error::{CrawlerError, Result};
 
 use super::http;
@@ -117,12 +116,14 @@ pub struct StreamOutcome {
 ///
 /// 不走 send_with_retry:流式响应需按字节流读取且重试语义复杂,这里单次请求即可。
 ///
-/// `cancel_flag` 为可选的取消标志(AtomicBool);设置后会在下一个 chunk 到达时中断流式读取,
-/// 返回已累积的内容(不报错)。
+/// 流式不设总超时(长生成合法地超过 CHAT 档);存活判死靠 idle 超时
+///(STREAM_IDLE_TIMEOUT_SECS 无新 chunk 报「流停滞超时」)。
+/// `cancel_token` 为可选的取消令牌:cancel 后经 tokio::select! 立即中断读流
+///(drop 响应即断连,不再等下一个 chunk),返回已累积的内容(不报错)。
 pub async fn chat_completion_stream<F>(
     req: ChatRequest<'_>,
     mut on_delta: F,
-    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<StreamOutcome>
 where
     F: FnMut(&str, &str),
@@ -153,7 +154,7 @@ where
         }
     }
 
-    let client = http::shared_client(req.timeout_secs)?;
+    let client = http::streaming_client()?;
     let resp = client
         .post(&endpoint)
         .bearer_auth(req.api_key)
@@ -188,22 +189,32 @@ where
     let mut buf = String::new();
     let mut cancelled = false;
     let mut usage = TokenUsage::default();
+    let idle = std::time::Duration::from_secs(http::STREAM_IDLE_TIMEOUT_SECS);
 
-    // 每处理一批 chunk 后检查取消标志
-    let check_cancel = |flag: &Option<Arc<std::sync::atomic::AtomicBool>>| -> bool {
-        if let Some(f) = flag {
-            f.load(std::sync::atomic::Ordering::Relaxed)
+    // 读流循环:tokio::select! 同时等「下一个 chunk(带 idle 超时)」和「取消令牌」,
+    // 取消立即 break(drop stream 即断连),不再依赖下一个 chunk 到达才发现取消。
+    loop {
+        let next = if let Some(token) = &cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                r = tokio::time::timeout(idle, stream.next()) => r,
+            }
         } else {
-            false
-        }
-    };
-
-    while let Some(chunk) = stream.next().await {
-        // 检查取消标志
-        if check_cancel(&cancel_flag) {
-            cancelled = true;
-            break;
-        }
+            tokio::time::timeout(idle, stream.next()).await
+        };
+        let chunk = match next {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(CrawlerError::Config(format!(
+                    "大模型流停滞超时({} 秒无新数据),已中断",
+                    http::STREAM_IDLE_TIMEOUT_SECS
+                )))
+            }
+        };
         let bytes = chunk.map_err(|e| CrawlerError::Config(format!("读取流失败: {e}")))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // 按行处理 SSE;一行可能跨多个网络包,故只处理含完整换行的部分

@@ -44,6 +44,49 @@ struct RecordingSession {
     output_path: std::path::PathBuf,
     /// 开始时间(Unix 秒),供悬浮窗计时。
     started_at: i64,
+    /// ffmpeg stderr 尾部( draining 线程持续写入,只留最后几 KB),失败时摘进错误信息。
+    stderr_tail: std::sync::Arc<Mutex<String>>,
+}
+
+/// 接管 ffmpeg stderr:后台线程持续排空(防管道写满卡死 ffmpeg),只保留尾部若干 KB 供诊断。
+/// ffmpeg 把进度与错误都打到 stderr,不排空长录制会把管道撑满。
+fn drain_stderr(child: &mut Child) -> std::sync::Arc<Mutex<String>> {
+    use std::io::Read;
+    let tail = std::sync::Arc::new(Mutex::new(String::new()));
+    if let Some(mut stderr) = child.stderr.take() {
+        let tail = std::sync::Arc::clone(&tail);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut t) = tail.lock() {
+                            t.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            let over = t.len().saturating_sub(4096);
+                            if over > 0 {
+                                t.drain(..over);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    tail
+}
+
+/// 从 stderr 尾部摘最后一行非空文本,拼进给用户的错误信息(没有则返回空串)。
+fn stderr_last_line(tail: &Mutex<String>) -> String {
+    tail.lock()
+        .map(|t| {
+            t.lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 /// 录屏全局状态:同一时刻只允许一个录制会话。挂在 AppState 上跨命令共享。
@@ -147,7 +190,7 @@ pub async fn start_screen_recording(
         let _ = main.minimize();
     }
 
-    // 起 ffmpeg(stdin 接管以便后续写 'q' 优雅停止;输出丢弃)
+    // 起 ffmpeg(stdin 接管以便后续写 'q' 优雅停止;stderr 接管排空,留尾部供诊断)
     let program = ffmpeg_path
         .as_deref()
         .map(str::trim)
@@ -159,10 +202,33 @@ pub async fn start_screen_recording(
     let mut cmd = build_ffmpeg_command(&program, &output_path, &watermark_time);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = cmd
+        .stderr(Stdio::piped());
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 ffmpeg 录屏失败: {e}"))?;
+    let stderr_tail = drain_stderr(&mut child);
+
+    // 启动后短暂确认 ffmpeg 存活:滤镜解析失败(如 drawtext 参数)等会让它立即退出,
+    // 不检查就会「假录制」——计时在走、实际无产出,最终视频 0:00。
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    if let Ok(Some(_)) | Err(_) = child.try_wait() {
+        let detail = stderr_last_line(&stderr_tail);
+        let _ = child.kill();
+        let _ = child.wait();
+        restore_main(&app);
+        close_overlay(&app);
+        let msg = if detail.is_empty() {
+            "ffmpeg 启动后立即退出,录屏未开始".to_string()
+        } else {
+            format!("ffmpeg 启动后立即退出: {detail}")
+        };
+        let _ = app.emit_to(
+            MAIN_WINDOW_LABEL,
+            "recording-failed",
+            json!({ "message": msg }),
+        );
+        return Err(msg);
+    }
     let started_at = chrono::Local::now().timestamp();
 
     // 存会话;若期间已被别的调用抢先(竞态),杀掉本次新进程并报错,避免出现两个录制
@@ -182,6 +248,7 @@ pub async fn start_screen_recording(
             child,
             output_path: output_path.clone(),
             started_at,
+            stderr_tail,
         });
     }
 
@@ -221,13 +288,34 @@ pub async fn stop_screen_recording(
     };
 
     let output_path = session.output_path.clone();
-    // 优雅停止 + 阻塞 wait,放 blocking 线程
-    tauri::async_runtime::spawn_blocking(move || finalize_ffmpeg(session))
+    // 优雅停止 + 阻塞 wait,放 blocking 线程;返回 stderr 尾部供失败诊断
+    let stderr_tail = tauri::async_runtime::spawn_blocking(move || finalize_ffmpeg(session))
         .await
         .map_err(|e| format!("停止录屏异常: {e}"))?;
 
     close_overlay(&app);
     restore_main(&app);
+
+    // 校验产物:文件缺失 / 过小说明录制中途已失败(如 ffmpeg 崩溃),不要把坏文件丢给用户
+    let ok = std::fs::metadata(&output_path)
+        .map(|m| m.len() >= 4096)
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&output_path); // 清掉废文件,避免 0:00 视频混入对话
+        let detail = stderr_last_line(&stderr_tail);
+        let msg = if detail.is_empty() {
+            "录屏失败:ffmpeg 未产出有效视频".to_string()
+        } else {
+            format!("录屏失败: {detail}")
+        };
+        tracing::warn!("{msg}");
+        let _ = app.emit_to(
+            MAIN_WINDOW_LABEL,
+            "recording-failed",
+            json!({ "message": msg }),
+        );
+        return Ok(RecordingStatus::idle());
+    }
 
     // 通知主窗口(其 Toaster 才能弹提示并提供「打开所在文件夹」)
     let _ = app.emit_to(
@@ -243,25 +331,40 @@ pub async fn stop_screen_recording(
     })
 }
 
-/// 打开录屏悬浮控制条(**不立即开始录制**):录制由悬浮条上的「开始」按钮手动触发。
+/// 开 / 关录屏悬浮控制条(**不立即开始录制**):录制由悬浮条上的「开始」按钮手动触发。
+/// 开关语义:悬浮窗未开 → 打开;已开且未在录制 → 关闭(再次点击入口 = 收起);录制中 → 只把它带到前面。
 /// 先预检 ffmpeg(主窗口能弹 toast 引导),不可用就不弹悬浮窗。此时不最小化主窗口(按下「开始」才最小化)。
 #[tauri::command]
 pub async fn open_recording_overlay(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> std::result::Result<(), String> {
-    // 先弹出悬浮窗(独立轻量入口,秒开)。可用性走启动时探测的标记,不再每次启子进程探测。
-    open_overlay(&app).map_err(|e| format!("打开录屏悬浮窗失败: {e}"))?;
-    // ffmpeg 不可用:撤掉悬浮窗 + 还原主窗口,并返回错误(主窗口 hook 据此弹 toast 引导)
+    let is_recording = state
+        .recording
+        .inner
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+
+    // 悬浮窗已存在:录制中带前;未录制则关闭(开关的「关」)
+    if let Some(w) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
+        if is_recording {
+            let _ = w.show();
+            let _ = w.set_focus();
+        } else {
+            close_overlay(&app);
+        }
+        return Ok(());
+    }
+
+    // ffmpeg 预检要在开窗之前:不可用直接报错(主窗口 hook 弹 toast 引导),避免「开了又关」的闪烁
     if !state.recording.ffmpeg_available() {
-        close_overlay(&app);
-        restore_main(&app);
         return Err(
             "未检测到 ffmpeg,无法录屏。请先安装 ffmpeg,或在「系统配置」中设置 ffmpeg 路径。"
                 .to_string(),
         );
     }
-    Ok(())
+    open_overlay(&app).map_err(|e| format!("打开录屏悬浮窗失败: {e}"))
 }
 
 /// 取消录屏(尚未开始录制时):关闭悬浮窗并还原主窗口,不产出文件。
@@ -305,6 +408,7 @@ fn build_ffmpeg_command(
     watermark_time: &str,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
+    crate::media::hide_console_window(&mut cmd);
     cmd.arg("-y"); // 覆盖同名输出,避免交互确认卡住
 
     // 视频输入(全屏;不采集音频)
@@ -342,7 +446,9 @@ fn build_ffmpeg_command(
 
 /// 拼视频滤镜:偶数尺寸 + 两行水印(第一行 VeltrixLoop,第二行录制开始时间)。
 /// 需 ffmpeg 带 libfreetype(drawtext);字体用各平台系统自带(水印为 ASCII,无需中文字体)。
-/// Windows 字体路径里的盘符冒号要转义为 `C\:`(filtergraph 的选项分隔符也是冒号)。
+/// 两个 filtergraph 转义坑(实测新版 ffmpeg 会直接解析失败退出,造成「假录制」、视频 0:00):
+/// ① fontfile 的 Windows 盘符路径要用单引号包起来(`'C\:/...'`),不引时 `\:` 转义不生效;
+/// ② 时间文本里的冒号(如 14:00)是选项分隔符,要转义成 `\:`。
 fn build_video_filter(watermark_time: &str) -> String {
     #[cfg(windows)]
     let font = "C\\:/Windows/Fonts/arial.ttf";
@@ -350,10 +456,12 @@ fn build_video_filter(watermark_time: &str) -> String {
     let font = "/System/Library/Fonts/Supplemental/Arial.ttf";
     #[cfg(all(unix, not(target_os = "macos")))]
     let font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    let watermark_time = watermark_time.replace(':', "\\:");
+    // 水印在右下角、淡色半透明,尽量不遮挡录制内容
     format!(
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,\
-         drawtext=fontfile={font}:text='VeltrixLoop':x=24:y=22:fontsize=26:fontcolor=white:borderw=2:bordercolor=black@0.6,\
-         drawtext=fontfile={font}:text='{watermark_time}':x=24:y=58:fontsize=20:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6"
+         drawtext=fontfile='{font}':text='VeltrixLoop':x=w-text_w-24:y=h-text_h-58:fontsize=22:fontcolor=white@0.4:borderw=1:bordercolor=black@0.25,\
+         drawtext=fontfile='{font}':text='{watermark_time}':x=w-text_w-24:y=h-text_h-28:fontsize=16:fontcolor=white@0.35:borderw=1:bordercolor=black@0.25"
     )
 }
 
@@ -371,8 +479,10 @@ fn exclude_overlay_from_capture(overlay: &tauri::WebviewWindow) {
     }
 }
 
-/// 优雅停止 ffmpeg:向 stdin 写 `q` 让其写完 MP4 moov;超时未退则强杀。
-fn finalize_ffmpeg(mut session: RecordingSession) {
+/// 优雅停止 ffmpeg:向 stdin 写 `q` 让其写完 MP4 moov;超时未退则强杀。返回 stderr 尾部供诊断。
+fn finalize_ffmpeg(session: RecordingSession) -> std::sync::Arc<Mutex<String>> {
+    let mut session = session;
+    let stderr_tail = session.stderr_tail.clone();
     // 关键:gdigrab→mp4 必须让 ffmpeg 自己收尾,直接 kill 会留下缺 moov 的废文件
     if let Some(mut stdin) = session.child.stdin.take() {
         let _ = stdin.write_all(b"q");
@@ -397,6 +507,7 @@ fn finalize_ffmpeg(mut session: RecordingSession) {
             }
         }
     }
+    stderr_tail
 }
 
 /// 创建(或显示)录屏悬浮窗:无边框 / 透明 / 不进任务栏 / 置顶,放主显示器顶部居中。

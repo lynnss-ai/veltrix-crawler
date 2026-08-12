@@ -25,9 +25,9 @@ export function TrayPopup() {
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
       {/* 顶部:应用信息 */}
-      <div className="flex items-center gap-3 border-b border-border px-4 py-3.5">
-        <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <Radar className="size-5" />
+      <div className="flex items-center gap-2.5 border-b border-border px-3 py-3">
+        <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+          <Radar className="size-4.5" />
         </div>
         <div className="min-w-0">
           <div className="text-sm font-semibold text-foreground">

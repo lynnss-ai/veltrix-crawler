@@ -6,12 +6,70 @@
 //!
 //! collect 流程:采集前清空缓冲 → RPA 触发搜索/滚动加载 → 取走缓冲里这一轮命中的响应。
 
-use super::InterceptedResponse;
+use super::{CollectControl, InterceptedResponse};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Webview};
+use tauri::{AppHandle, Emitter, Webview};
 
 /// 命中响应的窗口级缓冲。每个采集窗口一份,采集前清空、采集后取走。
 pub type ResponseSink = Arc<Mutex<Vec<InterceptedResponse>>>;
+
+/// 页内信号桥接上下文:页面 → Rust 的「控制信号」走 WebView 原生消息通道
+/// (Windows `chrome.webview.postMessage` / mac `webkit.messageHandlers`),
+/// 不走 Tauri invoke——远程页面(平台站点)的 invoke 会被 ACL 拒绝
+/// ("not allowed. Plugin not found",远程源不允许触达自定义命令)。
+#[derive(Clone)]
+pub struct SignalCtx {
+    pub app: AppHandle,
+    pub control: Arc<CollectControl>,
+}
+
+/// 处理页内信号(信封 `{"__veltrix": kind, ...}`),Win/mac 两通道共用。
+/// - `api_done`:评论/画像直采脚本完成回传(等价 `comment_api_done` 命令)
+/// - `verify`:验证弹窗出现/解除(等价 `report_collect_verify`)
+/// - `stop`:HUD「结束」按钮(等价 `stop_collect`)
+fn handle_signal(ctx: &SignalCtx, text: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let kind = v.get("__veltrix").and_then(|k| k.as_str()).unwrap_or("");
+    if kind.is_empty() {
+        return;
+    }
+    let sid = v.get("sessionId").and_then(|x| x.as_u64());
+    match kind {
+        "api_done" => {
+            if let (Some(sid), Some(result)) = (sid, v.get("result").and_then(|r| r.as_str())) {
+                // 留痕:区分「页内没发」与「桥收到但 poll 侧没取走」(直采回传丢失排查)
+                tracing::info!(session = sid, len = result.len(), "收到 api_done(原生桥)");
+                ctx.control.set_api_done(sid, result.to_string());
+            } else {
+                tracing::warn!("api_done 信号缺 sessionId/result,已丢弃");
+            }
+        }
+        "verify" => {
+            if let Some(sid) = sid {
+                let present = v.get("present").and_then(|x| x.as_bool()).unwrap_or(false);
+                tracing::info!("验证检测(原生桥):session={sid} present={present}");
+                ctx.control.set_verifying(sid, present);
+                let _ = ctx.app.emit(
+                    "collect-verify",
+                    serde_json::json!({ "present": present, "sessionId": sid }),
+                );
+            }
+        }
+        "stop" => {
+            if let Some(sid) = sid {
+                ctx.control.request_stop(sid);
+            }
+            if let Some(tid) = v.get("taskId").and_then(|x| x.as_str()) {
+                if !tid.is_empty() {
+                    ctx.control.request_stop_task(tid);
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 /// 拦截命中后向前端实时推送 `agent-network` 事件的上下文。仅浏览器 Agent 用(采集传 None,
 /// 只写 sink 不推事件)。`emit.is_some()` 同时表示「全量拦截 + sink 限长」的 Agent 模式。
@@ -33,6 +91,7 @@ const SINK_MAX_ENTRIES: usize = 300;
 /// `patterns` 为空 = 全量拦截(仅 content-type 含 json 的响应),用于浏览器 Agent;
 /// 非空 = 仅放行 URL 命中特征的响应(采集行为不变)。`emit` 见 [`EmitCtx`]。
 /// `cap_entries` = 缓冲限长(非采集窗口,如登录/访问平台,长期开着防内存线性膨胀);采集窗口传 false。
+/// `signals` 非空时同时注册页内信号桥(WebMessageReceived),接收 api_done / verify / stop。
 #[cfg(windows)]
 pub fn install(
     webview: &Webview,
@@ -40,14 +99,46 @@ pub fn install(
     sink: ResponseSink,
     emit: Option<EmitCtx>,
     cap_entries: bool,
+    signals: Option<SignalCtx>,
 ) {
     // with_webview 把闭包调度到 WebView 线程执行;失败仅告警,不阻断采集
     if let Err(e) = webview.with_webview(move |pw| {
         // SAFETY: 在 WebView2 自身线程上访问其 COM 接口
-        unsafe { win::install(pw, patterns, sink, emit, cap_entries) }
+        unsafe { win::install(pw, patterns, sink, emit, cap_entries, signals) }
     }) {
         tracing::warn!("安装原生网络拦截失败(退回页面 hook): {e}");
     }
+}
+
+/// 读取站点 Cookie(含 HttpOnly——页内 `document.cookie` 读不到它们)。
+/// 评论直采凭空构造请求时用真实 msToken / 指纹 Cookie(s_v_web_id)补齐公共参数,
+/// 缩小与页面真实请求的差距,降低被风控直接回 HTML 验证页的概率。
+/// 仅 Windows 有实现(WebView2 CookieManager);其他平台返回空,脚本退回 document.cookie。
+#[cfg(windows)]
+pub async fn get_cookies(webview: &Webview, uri: &str, names: &[&str]) -> Vec<(String, String)> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
+    let uri = uri.to_string();
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    if webview
+        .with_webview(move |pw| {
+            // SAFETY: 在 WebView2 自身线程上访问其 COM 接口
+            unsafe { win::get_cookies(pw, &uri, &names, tx) }
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    // 3s 兜底:COM 回调不返回(窗口销毁等)时不能挂住采集流程
+    match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        _ => Vec::new(),
+    }
+}
+
+/// 非 Windows:无 CookieManager 等价物,返回空(脚本退回 document.cookie 现取)。
+#[cfg(not(windows))]
+pub async fn get_cookies(_webview: &Webview, _uri: &str, _names: &[&str]) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 /// macOS:注册 WKScriptMessageHandler,接收注入脚本经 `webkit.messageHandlers` 回传的
@@ -60,10 +151,11 @@ pub fn install(
     sink: ResponseSink,
     _emit: Option<EmitCtx>,
     _cap_entries: bool,
+    signals: Option<SignalCtx>,
 ) {
     if let Err(e) = webview.with_webview(move |pw| {
         // SAFETY: with_webview 在 macOS 主线程回调,可安全访问 WKWebView / UCC 的 AppKit 接口
-        unsafe { mac::install(pw, sink) }
+        unsafe { mac::install(pw, sink, signals) }
     }) {
         tracing::warn!("安装 mac 原生网络拦截失败(退回页面 invoke 兜底): {e}");
     }
@@ -77,24 +169,26 @@ pub fn install(
     _sink: ResponseSink,
     _emit: Option<EmitCtx>,
     _cap_entries: bool,
+    _signals: Option<SignalCtx>,
 ) {
 }
 
 #[cfg(windows)]
 mod win {
-    use super::{EmitCtx, ResponseSink, EMIT_BODY_CAP, SINK_MAX_ENTRIES};
+    use super::{handle_signal, EmitCtx, ResponseSink, SignalCtx, EMIT_BODY_CAP, SINK_MAX_ENTRIES};
     use crate::webview::InterceptedResponse;
     use std::sync::Arc;
     use tauri::webview::PlatformWebview;
     use tauri::Emitter;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2_2, ICoreWebView2WebResourceResponseReceivedEventArgs,
-        ICoreWebView2WebResourceResponseView,
+        ICoreWebView2CookieList, ICoreWebView2WebMessageReceivedEventArgs, ICoreWebView2_2,
+        ICoreWebView2WebResourceResponseReceivedEventArgs, ICoreWebView2WebResourceResponseView,
     };
     use webview2_com::{
+        GetCookiesCompletedHandler, WebMessageReceivedEventHandler,
         WebResourceResponseReceivedEventHandler, WebResourceResponseViewGetContentCompletedHandler,
     };
-    use windows::core::{w, Interface, PWSTR};
+    use windows::core::{w, HSTRING, Interface, PCWSTR, PWSTR};
     use windows::Win32::System::Com::{CoTaskMemFree, IStream};
 
     pub unsafe fn install(
@@ -103,6 +197,7 @@ mod win {
         sink: ResponseSink,
         emit: Option<EmitCtx>,
         cap_entries: bool,
+        signals: Option<SignalCtx>,
     ) {
         let core = match webview.controller().CoreWebView2() {
             Ok(c) => c,
@@ -111,6 +206,24 @@ mod win {
                 return;
             }
         };
+        // 页内信号桥:WebMessageReceived 接收 chrome.webview.postMessage 的控制信号
+        // (api_done / verify / stop),不经 Tauri invoke,规避远程页面 ACL 拒绝
+        if let Some(ctx) = signals {
+            let msg_handler = WebMessageReceivedEventHandler::create(Box::new(
+                move |_core, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut json = PWSTR::null();
+                    args.WebMessageAsJson(&mut json)?;
+                    let text = pwstr_take(json);
+                    handle_signal(&ctx, &text);
+                    Ok(())
+                },
+            ));
+            let mut msg_token: i64 = 0;
+            if let Err(e) = core.add_WebMessageReceived(&msg_handler, &mut msg_token) {
+                tracing::warn!("注册 WebMessageReceived 失败(页内信号桥不可用): {e}");
+            }
+        }
         // WebResourceResponseReceived 定义在 ICoreWebView2_2 上
         let core2: ICoreWebView2_2 = match core.cast() {
             Ok(c) => c,
@@ -145,7 +258,18 @@ mod win {
                     // redcaptcha/v2/getconfig 是小红书每次都预加载的验证码 SDK 配置(良性,非真验证),
                     // 排除掉,避免误报"疑似风控"刷屏。真正的验证挑战会走其它 redcaptcha 接口。
                     let is_benign_preload = path.contains("redcaptcha/v2/getconfig");
+                    // 验证码 SDK 的静态资源(CDN 上的 .js/.html 等,如 rc-verifycenter / rmc-nocaptcha /
+                    // security-secsdk 的 bundle)是每次页面加载的正常预载,并非真触发验证;
+                    // 真风控是接口调用形态(如 verify.zijieapi.com/captcha/verify),path 无扩展名。
+                    // 排除静态资源,避免每次开窗刷屏误报。
+                    let is_static_asset = [
+                        ".js", ".html", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".woff",
+                        ".woff2", ".ttf", ".map",
+                    ]
+                    .iter()
+                    .any(|ext| path.ends_with(ext));
                     if !is_benign_preload
+                        && !is_static_asset
                         && ["captcha", "verifycenter", "vc_captcha", "secsdk", "shark"]
                             .iter()
                             .any(|k| path.contains(k))
@@ -170,8 +294,13 @@ mod win {
                 let emit = emit.clone();
                 let completed = WebResourceResponseViewGetContentCompletedHandler::create(Box::new(
                     move |_result: windows::core::Result<()>, stream: Option<IStream>| {
-                        let Some(stream) = stream else { return Ok(()) };
-                        let body = read_stream(&stream, STREAM_READ_CAP);
+                        let Some(stream) = stream else {
+                            // GetContent 返回空 stream(多为命中缓存无 body / 响应被丢弃):
+                            // 此前静默 return 无任何痕迹,补 warn 便于定位漏采
+                            tracing::warn!(url = %url, "拦截器 GetContent 返回空 stream,漏捕该响应");
+                            return Ok(());
+                        };
+                        let body = read_stream(&stream, STREAM_READ_CAP, &url);
                         if let Ok(mut buf) = sink.lock() {
                             buf.push(InterceptedResponse {
                                 url: url.clone(),
@@ -210,6 +339,88 @@ mod win {
         }
     }
 
+    /// 在 WebView2 线程上经 CookieManager 读取 uri 的站点 Cookie(含 HttpOnly),
+    /// 只挑 names 里列出的项,经 oneshot 送出;任一步失败送空(调用方已按空兜底)。
+    pub unsafe fn get_cookies(
+        webview: PlatformWebview,
+        uri: &str,
+        names: &[String],
+        tx: tokio::sync::oneshot::Sender<Vec<(String, String)>>,
+    ) {
+        let send_empty = |tx: tokio::sync::oneshot::Sender<Vec<(String, String)>>| {
+            let _ = tx.send(Vec::new());
+        };
+        let core = match webview.controller().CoreWebView2() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("读 Cookie 取 CoreWebView2 失败: {e}");
+                return send_empty(tx);
+            }
+        };
+        let core2: ICoreWebView2_2 = match core.cast() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("读 Cookie: ICoreWebView2_2 不可用: {e}");
+                return send_empty(tx);
+            }
+        };
+        let mgr = match core2.CookieManager() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("读 Cookie: CookieManager 不可用: {e}");
+                return send_empty(tx);
+            }
+        };
+        let wanted: Vec<String> = names.to_vec();
+        // 共享 tx:GetCookies 调用本身失败时回调不会触发,需在闭包外主动送空防干等
+        let tx_shared = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let tx_in_handler = tx_shared.clone();
+        let handler = GetCookiesCompletedHandler::create(Box::new(
+            move |result: windows::core::Result<()>, list: Option<ICoreWebView2CookieList>| {
+                let mut out: Vec<(String, String)> = Vec::new();
+                if result.is_ok() {
+                    if let Some(list) = list {
+                        let mut count: u32 = 0;
+                        if list.Count(&mut count).is_ok() {
+                            for i in 0..count {
+                                let Ok(cookie) = list.GetValueAtIndex(i) else {
+                                    continue;
+                                };
+                                let mut n = PWSTR::null();
+                                let mut v = PWSTR::null();
+                                let name = if cookie.Name(&mut n).is_ok() {
+                                    pwstr_take(n)
+                                } else {
+                                    String::new()
+                                };
+                                let value = if cookie.Value(&mut v).is_ok() {
+                                    pwstr_take(v)
+                                } else {
+                                    String::new()
+                                };
+                                if wanted.iter().any(|w| *w == name) {
+                                    out.push((name, value));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tx) = tx_in_handler.lock().ok().and_then(|mut g| g.take()) {
+                    let _ = tx.send(out);
+                }
+                Ok(())
+            },
+        ));
+        let uri_h = HSTRING::from(uri);
+        if let Err(e) = mgr.GetCookies(PCWSTR::from_raw(uri_h.as_ptr()), &handler) {
+            tracing::warn!("读 Cookie: GetCookies 调用失败: {e}");
+            // 调用失败时回调不会触发,主动送空防调用方干等
+            if let Some(tx) = tx_shared.lock().ok().and_then(|mut g| g.take()) {
+                let _ = tx.send(Vec::new());
+            }
+        }
+    }
+
     /// 响应 content-type 是否为 JSON(全量拦截模式下据此过滤掉 html/js/css/图片等噪声)。
     unsafe fn is_json_response(response: &ICoreWebView2WebResourceResponseView) -> bool {
         let Ok(headers) = response.Headers() else {
@@ -238,13 +449,16 @@ mod win {
         s
     }
 
-    /// 采集模式下响应体最大读取字节数(约 2MB),超出截断。
+    /// 采集模式下响应体最大读取字节数(约 16MB),超出截断。
     /// WebView2 GetContent 回调在 UI 线程执行,大响应需限制读取量防卡顿与内存膨胀。
-    const STREAM_READ_CAP: usize = 2 * 1024 * 1024;
+    /// 注意:抖音主页作品接口(/aweme/v1/web/aweme/post/)单页 18 条带完整元数据,
+    /// 实测首页可超 2MB;截断会让整页 JSON 解析失败、整页作品丢失,故上限需明显高于单页体积。
+    const STREAM_READ_CAP: usize = 16 * 1024 * 1024;
 
     /// 把响应内容流读成字符串(UTF-8 lossy);响应体通常是 JSON 文本。
-    /// `cap` 为 0 时不限长;非 0 时超出截断丢弃并打 warn。
-    unsafe fn read_stream(stream: &IStream, cap: usize) -> String {
+    /// `cap` 为 0 时不限长;非 0 时超出截断丢弃并打 warn(带 URL,截断的半个 JSON
+    /// 会在采集侧解析失败,由 `report_profile_collect_audit` 计入「解析失败页数」)。
+    unsafe fn read_stream(stream: &IStream, cap: usize, url: &str) -> String {
         let mut data: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 16384];
         let max = if cap > 0 { cap } else { usize::MAX };
@@ -265,7 +479,7 @@ mod win {
                 break;
             }
             if data.len() >= max {
-                tracing::warn!("响应体超过 {} 字节,已截断", max);
+                tracing::warn!(url = %url, "响应体超过 {} 字节,已截断", max);
                 break;
             }
         }
@@ -278,7 +492,7 @@ mod win {
 /// 不走 Tauri invoke → 不受外部页面 capabilities / 注入时序影响(对应 Windows 原生拦截)。
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::ResponseSink;
+    use super::{handle_signal, ResponseSink, SignalCtx};
     use crate::webview::InterceptedResponse;
     use objc2::rc::Retained;
     use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
@@ -290,12 +504,18 @@ mod mac {
     /// message handler 名,与 `build_native_intercept_init_script_mac` 注入脚本里的一致。
     const HANDLER_NAME: &str = "veltrixNative";
 
+    /// handler 状态:拦截缓冲 + 页内信号桥(可选)。
+    struct MacIvars {
+        sink: ResponseSink,
+        signals: Option<SignalCtx>,
+    }
+
     define_class!(
         // WKScriptMessageHandler 协议要求 MainThreadOnly;ivar 持有窗口级缓冲
         #[unsafe(super(NSObject))]
         #[thread_kind = MainThreadOnly]
         #[name = "VeltrixMsgHandler"]
-        #[ivars = ResponseSink]
+        #[ivars = MacIvars]
         struct MsgHandler;
 
         unsafe impl NSObjectProtocol for MsgHandler {}
@@ -307,18 +527,30 @@ mod mac {
                 _ucc: &WKUserContentController,
                 message: &WKScriptMessage,
             ) {
-                // body 为注入脚本 postMessage 的 JSON 字符串:{"u":url,"b":body}
+                // body 为注入脚本 postMessage 的 JSON 字符串:
+                // 拦截响应 {"u":url,"b":body};控制信号 {"__veltrix":kind,...}
                 let body = unsafe { message.body() };
                 if let Some(text) = body.downcast_ref::<NSString>() {
-                    push_message(self.ivars(), &text.to_string());
+                    let text = text.to_string();
+                    if text.contains("__veltrix") {
+                        if let Some(ctx) = &self.ivars().signals {
+                            handle_signal(ctx, &text);
+                        }
+                    } else {
+                        push_message(&self.ivars().sink, &text);
+                    }
                 }
             }
         }
     );
 
     impl MsgHandler {
-        fn new(mtm: MainThreadMarker, sink: ResponseSink) -> Retained<Self> {
-            let this = Self::alloc(mtm).set_ivars(sink);
+        fn new(
+            mtm: MainThreadMarker,
+            sink: ResponseSink,
+            signals: Option<SignalCtx>,
+        ) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(MacIvars { sink, signals });
             unsafe { msg_send![super(this), init] }
         }
     }
@@ -344,7 +576,7 @@ mod mac {
     }
 
     /// 给 WKWebView 的 userContentController 注册响应回传处理器。
-    pub unsafe fn install(webview: PlatformWebview, sink: ResponseSink) {
+    pub unsafe fn install(webview: PlatformWebview, sink: ResponseSink, signals: Option<SignalCtx>) {
         let Some(mtm) = MainThreadMarker::new() else {
             tracing::warn!("非主线程,mac 原生拦截未安装");
             return;
@@ -356,7 +588,7 @@ mod mac {
             return;
         };
         // UCC 内部会 retain handler,故本地 Retained 随 install 结束释放无碍
-        let handler = MsgHandler::new(mtm, sink);
+        let handler = MsgHandler::new(mtm, sink, signals);
         let name = NSString::from_str(HANDLER_NAME);
         unsafe {
             // 防御:同名 handler 重复注册会抛 NSException;先移除(不存在则 no-op)再注册,

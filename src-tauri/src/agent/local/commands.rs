@@ -104,6 +104,7 @@ pub async fn send_local_message(
         &mut hooks,
         &registry,
         &mut messages,
+        None,
     )
     .await?;
 
@@ -170,6 +171,7 @@ pub async fn run_local_subtask(
     };
     let result = crate::agent::core::react::react_run(
         db, app, conversation_id, provider_ref, config, &mut hooks, &registry, &mut messages,
+        None,
     )
     .await?;
     let _ = veltrix_core::db::entity::model_usage_record::Model::record(

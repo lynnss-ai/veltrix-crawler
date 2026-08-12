@@ -26,7 +26,6 @@ import type { TaskContentFilter } from "@/pages/collect-meta";
 import { AccountsPage } from "@/pages/AccountsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
-import { PromptStudioPage } from "@/pages/PromptStudioPage";
 import { CustomersPage } from "@/pages/CustomersPage";
 import { AuthorLibraryPage } from "@/pages/AuthorLibraryPage";
 import { MemoryCenterPage } from "@/pages/MemoryCenterPage";
@@ -67,13 +66,18 @@ function loadStoredNav(): {
 } | null {
   try {
     const raw = sessionStorage.getItem(NAV_STORAGE_KEY);
-    return raw
-      ? (JSON.parse(raw) as {
-          product: ProductKey;
-          workspace: Workspace;
-          active: PageKey;
-        })
-      : null;
+    if (!raw) return null;
+    const nav = JSON.parse(raw) as {
+      product: ProductKey;
+      workspace: Workspace;
+      active: PageKey;
+    };
+    // 已下线产品(如内容创作)的残留记录:回退到协作平台,避免落在无导航的状态
+    if (nav.product !== "crawler" && nav.product !== "publish") {
+      nav.product = "crawler";
+      nav.active = "dashboard";
+    }
+    return nav;
   } catch {
     return null;
   }
@@ -121,14 +125,14 @@ function renderPage(
       return (
         <PlaceholderPage
           title="工作空间"
-          description="协作模块建设中。后续接入团队共享工作区。"
+          description="创作模块建设中。后续接入团队共享工作区。"
         />
       );
     case "cowork-team":
       return (
         <PlaceholderPage
           title="团队成员"
-          description="协作模块建设中。后续接入成员与权限管理。"
+          description="创作模块建设中。后续接入成员与权限管理。"
         />
       );
     // 三个库共用组件,必须用 key 强制各自独立挂载:
@@ -170,23 +174,6 @@ function renderPage(
       return <CommentLibraryPage />;
     case "assets-author":
       return <AuthorLibraryPage />;
-    // 内容创作产品:仅「创作脚本」已实现,其余为占位页
-    case "creation-home":
-      return (
-        <PlaceholderPage
-          title="创作工作台"
-          description="内容创作工作台建设中,即将上线。"
-        />
-      );
-    case "creation-prompts":
-      return <PromptStudioPage />;
-    case "creation-works":
-      return (
-        <PlaceholderPage
-          title="作品库"
-          description="生成图片 / 视频的统一管理与导出,即将上线。"
-        />
-      );
     default:
       return null;
   }

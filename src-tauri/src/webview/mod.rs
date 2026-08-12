@@ -115,6 +115,19 @@ impl InterceptChannel {
         })
     }
 
+    /// 非破坏性倒查会话内首个 URL 命中 `url_pattern` 的请求 URL(只克隆命中那一条)。
+    /// 供「拿真实请求 URL 当参数模板」场景(如评论 API 直采取 msToken / device 参数)。
+    pub fn find_session_url_rev(&self, session_id: u64, url_pattern: &str) -> Option<String> {
+        self.sessions.lock().ok().and_then(|sessions| {
+            sessions.get(&session_id).and_then(|buf| {
+                buf.iter()
+                    .rev()
+                    .find(|r| r.url.contains(url_pattern))
+                    .map(|r| r.url.clone())
+            })
+        })
+    }
+
     /// 非破坏性查看会话自 `offset` 起的新增响应,返回 (新增响应, 当前总条数) 供调用方推进游标。
     /// 滚动循环每轮调用:会话缓冲只追加,只克隆增量——此前整份 clone 随轮数增长成 O(n²) 热点
     /// (响应体是整页 JSON)。锁异常时返回空增量且总数保持 offset,游标原地不动、下轮重试。
@@ -215,6 +228,9 @@ pub struct CollectControl {
     /// 当前检测到安全验证弹窗的 session_id 集合(采集窗口自检脚本经 `report_collect_verify` 写入)。
     /// 采集循环每轮检查到即暂停滚动,等弹窗消失(用户手动完成)再恢复。
     verifying: Mutex<std::collections::HashSet<u64>>,
+    /// 评论 API 直采的完成结果(session_id → 结果 JSON 字符串),页内 JS 经 `comment_api_done` 写入,
+    /// pool 侧轮询 `take_api_done` 取走。比 eval 回读可靠:mac 上 eval_json 是空实现。
+    api_done: Mutex<std::collections::HashMap<u64, String>>,
 }
 
 impl CollectControl {
@@ -286,6 +302,24 @@ impl CollectControl {
         if let Ok(mut set) = self.verifying.lock() {
             set.remove(&session_id);
         }
+        if let Ok(mut m) = self.api_done.lock() {
+            m.remove(&session_id);
+        }
+    }
+
+    /// 页内评论直采脚本回传完成结果(经 `comment_api_done` 命令)。
+    pub fn set_api_done(&self, session_id: u64, result: String) {
+        if let Ok(mut m) = self.api_done.lock() {
+            m.insert(session_id, result);
+        }
+    }
+
+    /// 取走某会话的直采完成结果(取走即清,不重复消费)。
+    pub fn take_api_done(&self, session_id: u64) -> Option<String> {
+        self.api_done
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&session_id))
     }
 }
 
@@ -306,6 +340,26 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
   window.__veltrixSeen = [];    // 调试:hook 看到的所有请求 URL(不只命中 patterns 的)
   window.__veltrixPushOk = 0;   // 调试:invoke 回传成功次数
   window.__veltrixPushErr = 0;  // 调试:invoke 回传失败次数(>0 且 Ok=0 = 桥被拒)
+
+  // 页内 → Rust 控制信号桥:走 WebView 原生消息,不走 Tauri invoke——
+  // 远程页面(平台站点)的 invoke 会被 ACL 拒("not allowed. Plugin not found")。
+  // Windows: chrome.webview.postMessage(WebMessageReceived);mac: webkit.messageHandlers。
+  // 返回 false = 两桥都不可用,调用方可退回 invoke 兜底。
+  window.__veltrixSignal = function (kind, payload) {{
+    try {{
+      var o = payload || {{}};
+      o.__veltrix = kind;
+      if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {{
+        window.chrome.webview.postMessage(o);
+        return true;
+      }}
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.veltrixNative) {{
+        window.webkit.messageHandlers.veltrixNative.postMessage(JSON.stringify(o));
+        return true;
+      }}
+    }} catch (e) {{}}
+    return false;
+  }};
 
   function matched(url) {{
     if (!url) return false;
@@ -448,6 +502,100 @@ pub fn build_set_session_eval(session_id: u64) -> String {
     format!("window.__veltrixSetSession && window.__veltrixSetSession({session_id});")
 }
 
+/// 首屏 SSR 兜底合成响应的标记 URL 前缀。
+/// 主页定向采集的首屏(约 18-24 条,含置顶)是 SSR 直出,可能根本不发作品列表 XHR
+/// 或命中缓存拿不到 body,导致整页丢失。`build_ssr_first_screen_eval` 从页面 SSR 数据
+/// 提取首屏作品,以该前缀的合成 URL 经 `intercept_push` 回传,随拦截响应一并交适配器解析。
+pub const SSR_FALLBACK_URL_PREFIX: &str = "https://veltrix.local/ssr-first-screen";
+
+/// 构造「首屏 SSR 兜底补采」注入脚本(主页定向采集,导航完成后 eval 一次)。
+///
+/// 提取顺序:`window._ROUTER_DATA` → `#RENDER_DATA`(decodeURIComponent 后 JSON.parse),
+/// 递归找首个「含 aweme_list 且首项带 aweme_id」的对象;找到即以
+/// `{SSR_FALLBACK_URL_PREFIX}{posts_pattern}` 为合成 URL 回传 `{"aweme_list":[...]}`
+/// (URL 含作品接口特征,适配器按正常分页响应解析,下游按 aweme_id 去重合并)。
+/// SSR 数据不可用则退化为扫 DOM 里 `/video/{id}` 链接,回传 `{prefix}/aweme-ids`
+/// + `{"aweme_ids":[...]}`(仅 ID,采集侧记「首屏疑似丢失 N 条」,不逐条补采)。
+/// 全程 try/catch 包裹,任何一步失败静默放弃,不影响页面。
+pub fn build_ssr_first_screen_eval(session_id: u64, posts_pattern: &str) -> String {
+    let items_url = serde_json::to_string(&format!("{SSR_FALLBACK_URL_PREFIX}{posts_pattern}"))
+        .unwrap_or_else(|_| "\"\"".to_string());
+    let ids_url = serde_json::to_string(&format!("{SSR_FALLBACK_URL_PREFIX}/aweme-ids"))
+        .unwrap_or_else(|_| "\"\"".to_string());
+
+    const TEMPLATE: &str = r#"(function () {
+  try {
+    var SID = __SID__;
+    var ITEMS_URL = __ITEMS_URL__;
+    var IDS_URL = __IDS_URL__;
+    function push(url, body) {
+      try {
+        var p = window.__TAURI_INTERNALS__.invoke('intercept_push', { sessionId: SID, url: url, body: body });
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) {}
+    }
+    // 递归找「含 aweme_list 数组且首项带 aweme_id」的对象;限制深度与节点数防失控
+    var budget = 4000;
+    function looksLikeAwemeList(v) {
+      if (!v || typeof v !== 'object') return false;
+      var l = v.aweme_list;
+      if (!Array.isArray(l) || !l.length) return false;
+      for (var i = 0; i < Math.min(l.length, 3); i++) {
+        var it = l[i];
+        var info = (it && typeof it === 'object' && it.aweme_info) ? it.aweme_info : it;
+        if (info && (typeof info.aweme_id === 'string' || typeof info.aweme_id === 'number')) return true;
+      }
+      return false;
+    }
+    function findList(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 8 || budget <= 0) return null;
+      budget--;
+      if (looksLikeAwemeList(node)) return node.aweme_list;
+      var keys = Object.keys(node);
+      for (var i = 0; i < keys.length; i++) {
+        var child;
+        try { child = node[keys[i]]; } catch (e) { continue; }
+        if (child && typeof child === 'object') {
+          var r = findList(child, depth + 1);
+          if (r) return r;
+        }
+      }
+      return null;
+    }
+    var list = null;
+    try { if (window._ROUTER_DATA) list = findList(window._ROUTER_DATA, 0); } catch (e) {}
+    if (!list) {
+      try {
+        var el = document.getElementById('RENDER_DATA');
+        if (el && el.textContent) {
+          budget = 4000;
+          list = findList(JSON.parse(decodeURIComponent(el.textContent)), 0);
+        }
+      } catch (e) {}
+    }
+    if (list && list.length) {
+      push(ITEMS_URL, JSON.stringify({ aweme_list: list }));
+      return;
+    }
+    // SSR 数据不可用:退化为扫 DOM 里 /video/{id} 链接,只回传作品 ID 列表
+    var ids = [], seen = {};
+    try {
+      var as = document.querySelectorAll('a[href*="/video/"]');
+      for (var i = 0; i < as.length; i++) {
+        var m = /\/video\/(\d+)/.exec(as[i].getAttribute('href') || '');
+        if (m && !seen[m[1]]) { seen[m[1]] = 1; ids.push(m[1]); }
+      }
+    } catch (e) {}
+    if (ids.length) push(IDS_URL, JSON.stringify({ aweme_ids: ids }));
+  } catch (e) {}
+})();"#;
+
+    TEMPLATE
+        .replace("__SID__", &session_id.to_string())
+        .replace("__ITEMS_URL__", &items_url)
+        .replace("__IDS_URL__", &ids_url)
+}
+
 /// 验证弹窗上报命令名;与 Rust 端 `#[tauri::command] report_collect_verify` 对应。
 pub const VERIFY_REPORT_COMMAND: &str = "report_collect_verify";
 
@@ -533,11 +681,13 @@ pub fn build_verify_check_eval(
     var p = present();
     if (p !== last) {
       last = p;
-      try {
-        window.__TAURI_INTERNALS__.invoke('report_collect_verify', {
-          sessionId: window.__veltrixVerifySession, present: p
-        });
-      } catch (e) {}
+      // 优先走 WebView 原生消息桥(远程页面 invoke 会被 ACL 拒)
+      var payload = { sessionId: window.__veltrixVerifySession, present: p };
+      if (!(window.__veltrixSignal && window.__veltrixSignal('verify', payload))) {
+        try {
+          window.__TAURI_INTERNALS__.invoke('report_collect_verify', payload);
+        } catch (e) {}
+      }
     }
   }
   setTimeout(tick, 1200);
@@ -759,6 +909,469 @@ pub fn build_detail_eval(template: &str, id: &str, token: &str) -> String {
         "(function () {{ var id = encodeURIComponent('{id_esc}'); \
          var token = encodeURIComponent('{token_esc}'); \
          window.location.assign('{tpl}'.split('{{id}}').join(id).split('{{token}}').join(token)); }})();"
+    )
+}
+
+/// 构造「评论 API 直采」注入脚本(抖音):借页面自己的签名函数(`window.byted_acrawler`,
+/// webmssdk 挂载,跟随抖音改版自动是最新版,无需逆向 a_bogus 算法)对翻页请求签名,
+/// 在页面上下文直接 fetch 评论接口分页拉取。拉到的响应会被页内 fetch hook 按既有特征
+/// 自动回传(与滚动采集同通道,适配器解析 / 入库零改动)。
+/// `template_url` 取本会话已拦截的真实 comment/list 请求:msToken / device 等公共参数全带着,
+/// 脚本只换 cursor 重签。传空串 = 无模板模式:不依赖评论面板是否打开,脚本用标准公共参数
+/// (+ 页面 navigator / cookie 现取 msToken)+ `aweme_id` 凭空构造请求,签名机制不变。
+/// 完成(或失败 / 被中止)后经 `comment_api_done` 命令回传结果 JSON。
+pub fn build_comment_api_collect_eval(
+    session_id: u64,
+    template_url: &str,
+    aweme_id: &str,
+    limit: usize,
+    max_pages: u32,
+    ms_token: &str,
+    fp: &str,
+) -> String {
+    // serde 序列化为 JS 字符串字面量,免手工转义
+    let url_json = serde_json::to_string(template_url).unwrap_or_else(|_| "\"\"".to_string());
+    let aweme_json = serde_json::to_string(aweme_id).unwrap_or_else(|_| "\"\"".to_string());
+    let ms_token_json = serde_json::to_string(ms_token).unwrap_or_else(|_| "\"\"".to_string());
+    let fp_json = serde_json::to_string(fp).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function () {{
+  // 代际接管:新脚本注入即接替,旧脚本发现代际过期后静默退出(finish 里不再回传)。
+  // 不能用 Running 标志挡注入:旧脚本若卡在 5s 重试眠里,新注入会被挡下、整视频白等 90s
+  var GEN = (window.__veltrixCommentApiGen || 0) + 1;
+  window.__veltrixCommentApiGen = GEN;
+  window.__veltrixCommentApiRunning = true;
+  window.__veltrixCommentApiAbort = false;
+  var CFG = {{ sessionId: {session_id}, templateUrl: {url_json}, awemeId: {aweme_json}, limit: {limit}, count: 20, maxPages: {max_pages}, msToken: {ms_token_json}, fp: {fp_json} }};
+
+  function hud(level, msg) {{
+    try {{ if (window.__veltrixHud && window.__veltrixHud.log) window.__veltrixHud.log({{ level: level, message: msg }}); }} catch (e) {{}}
+  }}
+  function sleep(ms) {{ return new Promise(function (r) {{ setTimeout(r, ms); }}); }}
+  function getCookie(name) {{
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }}
+
+  // 无模板模式:标准公共参数 + 页面环境现取(msToken / 屏幕 / UA),业务参数只认 aweme_id。
+  // a_bogus 对整个查询串现签,参数集与页面真实请求等价,无需面板先发出 comment/list。
+  function buildStdUrl() {{
+    var u = new URL('https://www.douyin.com/aweme/v1/web/comment/list/');
+    var sp = u.searchParams;
+    var chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '';
+    sp.set('device_platform', 'webapp');
+    sp.set('aid', '6383');
+    sp.set('channel', 'channel_pc_web');
+    sp.set('aweme_id', CFG.awemeId);
+    sp.set('item_type', '0');
+    sp.set('pc_client_type', '1');
+    sp.set('version_code', '290100');
+    sp.set('version_name', '29.1.0');
+    sp.set('cookie_enabled', 'true');
+    sp.set('screen_width', String(window.screen.width || 1920));
+    sp.set('screen_height', String(window.screen.height || 1080));
+    sp.set('browser_language', navigator.language || 'zh-CN');
+    sp.set('browser_platform', navigator.platform || 'Win32');
+    sp.set('browser_name', 'Chrome');
+    sp.set('browser_version', chromeVer);
+    sp.set('browser_online', 'true');
+    sp.set('engine_name', 'Blink');
+    sp.set('engine_version', chromeVer);
+    sp.set('os_name', 'Windows');
+    sp.set('os_version', '10');
+    sp.set('cpu_core_num', String(navigator.hardwareConcurrency || 8));
+    sp.set('device_memory', String(navigator.deviceMemory || 8));
+    sp.set('platform', 'PC');
+    sp.set('downlink', String((navigator.connection && navigator.connection.downlink) || 10));
+    // msToken 优先用 Rust 侧 CookieManager 读到的值(含 HttpOnly);拿不到再退回
+    // document.cookie 现取。verifyFp/fp(s_v_web_id)同理——页面真实评论请求都带
+    // 这组指纹参数,凭空构造缺它们更容易被风控直接回 HTML 验证页
+    sp.set('msToken', CFG.msToken || getCookie('msToken'));
+    var fpv = CFG.fp || getCookie('s_v_web_id');
+    if (fpv) {{ sp.set('verifyFp', fpv); sp.set('fp', fpv); }}
+    return u;
+  }}
+
+  // 找页面自带的请求签名函数;返回形态兼容字符串(纯签名值)与对象({{ a_bogus: v }} / {{ 'X-Bogus': v }})
+  function findSigner() {{
+    var ac = window.byted_acrawler;
+    if (!ac) return null;
+    var fns = [];
+    if (typeof ac.frontierSign === 'function') fns.push(ac.frontierSign);
+    if (typeof ac.sign === 'function') fns.push(ac.sign);
+    if (!fns.length) return null;
+    return function (url) {{
+      for (var i = 0; i < fns.length; i++) {{
+        try {{
+          var r = fns[i].call(ac, {{ url: url }});
+          if (typeof r === 'string' && r) return {{ str: r }};
+          if (r && typeof r === 'object') return {{ obj: r }};
+        }} catch (e) {{}}
+      }}
+      return null;
+    }};
+  }}
+
+  function finish(r) {{
+    // 代际过期(已被下个视频的脚本接管):静默退出——回传会污染下个视频的完成判定
+    if (window.__veltrixCommentApiGen !== GEN) return;
+    window.__veltrixCommentApiRunning = false;
+    r.awemeId = CFG.awemeId;
+    // 结果同时留在 window 上:Rust 侧每轮 eval 回读兜底——信号桥(postMessage / invoke)
+    // 在部分环境会静默丢失(页内已收尾,Rust 干等 90s 停滞看门狗),回读不依赖任何桥
+    try {{ window.__veltrixCommentApiResult = JSON.stringify(r); }} catch (e) {{}}
+    // 收尾留痕:区分「脚本没结束」与「结束了但 comment_api_done 回传丢失」
+    hud('info', '🏁 直采脚本收尾 · 页数 ' + r.pages + ' · 评论 ' + r.comments + (r.error ? ' · error=' + r.error : ''));
+    // 回传走 WebView 原生消息桥(不受远程页面 ACL 限制);桥不可用才退回 invoke 兜底
+    var sent = window.__veltrixSignal && window.__veltrixSignal('api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }});
+    if (!sent) {{
+      try {{
+        var p = window.__TAURI_INTERNALS__.invoke('comment_api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }});
+        if (p && p.catch) p.catch(function (e) {{ hud('warn', '⚠️ 直采结果回传失败: ' + e); }});
+      }} catch (e) {{ hud('warn', '⚠️ 直采结果回传异常: ' + e); }}
+    }}
+  }}
+
+  // result 提到 main 外:未捕获异常(resp.text() 拒绝、页面冻结等)时兜底回传,
+  // 否则脚本静默死掉,Rust 侧只能死等超时、日志里看不到任何原因
+  var result = {{ used: false, pages: 0, comments: 0, error: null }};
+
+  async function main() {{
+    // signer 最多等 10s:脚本注入时页面 SDK(webmssdk)可能还没挂载完
+    var signer = null;
+    for (var si = 0; si < 20; si++) {{
+      if (window.__veltrixCommentApiAbort || window.__veltrixCommentApiGen !== GEN) {{ result.error = 'aborted'; return finish(result); }}
+      signer = findSigner();
+      if (signer) break;
+      await sleep(500);
+    }}
+    if (!signer) {{ result.error = 'no-signer'; return finish(result); }}
+    // 诊断留痕:确认签名来源 / 窗口所在页面 / msToken、ttwid 是否在——直采被风控时
+    // 第一眼就能区分「签名环境缺失」与「请求被服务端拦」
+    var sigSrc = (window.byted_acrawler && typeof window.byted_acrawler.frontierSign === 'function') ? 'frontierSign' : 'sign';
+    var msTok = CFG.msToken || getCookie('msToken');
+    var fpv = CFG.fp || getCookie('s_v_web_id');
+    hud('info', '🔏 直采签名就绪(' + sigSrc + ')· 页面 ' + location.host + location.pathname +
+      ' · msToken=' + (msTok ? '有' : '无') + ' · fp=' + (fpv ? '有' : '无'));
+    var u;
+    try {{ u = CFG.templateUrl ? new URL(CFG.templateUrl) : buildStdUrl(); }}
+    catch (e) {{ result.error = 'bad-template'; return finish(result); }}
+    var sp = u.searchParams;
+    // 业务参数以当前视频为准:模板可能携带来自其他视频的 aweme_id(同窗口历史拦截),
+    // 必须强制覆盖,否则会把别的视频的评论拉进来
+    sp.set('aweme_id', CFG.awemeId);
+    // 签名参数名跟页面真实请求走(新版 a_bogus / 旧版 X-Bogus),旧值删掉、每页重签
+    var signKey = sp.has('a_bogus') ? 'a_bogus' : (sp.has('X-Bogus') ? 'X-Bogus' : 'a_bogus');
+    sp.delete('a_bogus'); sp.delete('X-Bogus');
+    var cursor = 0;
+    var total = 0;
+    var retries = 0;
+    // 单页连续失败重试上限(5s/次,≈2.5 分钟):覆盖人工解滑块的耗时;
+    // 超限才判定本视频直采失败
+    var MAX_RETRY = 30;
+    for (var page = 0; page < CFG.maxPages; page++) {{
+      if (window.__veltrixCommentApiAbort || window.__veltrixCommentApiGen !== GEN) {{ result.error = 'aborted'; break; }}
+      sp.set('cursor', String(cursor));
+      sp.set('count', String(CFG.count));
+      var unsigned = u.origin + u.pathname + '?' + sp.toString();
+      var sig = signer(unsigned);
+      if (!sig) {{ result.error = 'sign-failed'; break; }}
+      // 首页留痕签名形态:frontierSign/sign 返回的键名随 webmssdk 版本变化,
+      // 若不再是 a_bogus/X-Bogus 而签了别的键,服务端必拒——日志里一眼可辨
+      if (page === 0 && retries === 0) {{
+        hud('info', '🔑 首页签名形态: ' + (sig.str ? 'string(len=' + sig.str.length + ')' : 'obj[' + Object.keys(sig.obj).join(',') + ']'));
+      }}
+      var signed = unsigned + '&' + (sig.str
+        ? signKey + '=' + encodeURIComponent(sig.str)
+        : Object.keys(sig.obj).map(function (k) {{ return k + '=' + encodeURIComponent(sig.obj[k]); }}).join('&'));
+      // 失败重试:风控(滑块 / 静默吞请求)由用户在窗口里手动解除,解除后 5s 重试即恢复,
+      // 不因单次失败放弃整个视频。fetch 加 15s 超时,防止验证挂起请求永不返回
+      var resp = null, text = null, json = null, failReason = null;
+      try {{
+        var ctrl = new AbortController();
+        var timer = setTimeout(function () {{ ctrl.abort(); }}, 15000);
+        // 响应缓慢探针:>5s 未返回即留痕——区分「fetch 被挂起」与「脚本根本没发出请求」
+        var slowTimer = setTimeout(function () {{
+          hud('warn', '⏳ 第 ' + (page + 1) + ' 页响应缓慢(>5s 未返回,可能被风控挂起)…');
+        }}, 5000);
+        try {{ resp = await fetch(signed, {{ credentials: 'include', signal: ctrl.signal }}); }}
+        finally {{ clearTimeout(timer); clearTimeout(slowTimer); }}
+        text = await resp.text();
+        try {{
+          json = JSON.parse(text);
+        }} catch (pe) {{
+          // 非 JSON 响应:风控 / WAF 常直接回 HTML 验证页(HTTP 200、不跳转,
+          // 下面的 blocked-redirect 检不到)。同参数重试必败,判硬拒立即收尾;
+          // 并把状态码 + content-type + 页面标题打进日志,一眼区分滑块页 /
+          // WAF 拦截页 / 网关错误页
+          var head = (text || '').replace(/\s+/g, ' ');
+          if (head.charAt(0) === '<') {{
+            // title 可能在头部 160 字符之外,放大取样范围再匹配
+            var tm = head.slice(0, 4000).match(/<title[^>]*>([^<]*)<\/title>/i);
+            var ct = '';
+            try {{ ct = resp.headers.get('content-type') || ''; }} catch (he) {{}}
+            // 带上重定向标记与最终 URL 路径:区分「WAF 直回验证页」与「被 302 到落地页」
+            var finalPath = '';
+            try {{ finalPath = new URL(resp.url).pathname; }} catch (ue) {{}}
+            failReason = 'blocked-html(http-' + resp.status + (ct ? ' ' + ct : '') +
+              (resp.redirected ? ', redirected→' + finalPath : '') +
+              (tm ? ', title=' + tm[1] : ', ' + head.slice(0, 80)) + ')';
+          }} else {{
+            failReason = 'bad-json(http-' + resp.status + ', ' + head.slice(0, 80) + ')';
+          }}
+        }}
+      }} catch (e) {{
+        failReason = (e && e.name === 'AbortError') ? 'timeout' : String(e);
+      }}
+      // 风控硬拒:被 302 到搜索页/验证页(resp.url 离开接口路径;后台 fetch 不渲染滑块,
+      // 同参数重试必败)——立即收尾交回滚动采集兜底,不占 30×5s 重试空等
+      if (resp && resp.redirected && resp.url.indexOf('/aweme/v1/') === -1) failReason = 'blocked-redirect(http-' + resp.status + ')';
+      if (!failReason && resp && !resp.ok) failReason = 'http-' + resp.status;
+      if (!failReason && !json) failReason = 'bad-json';
+      if (!failReason && json.status_code !== undefined && json.status_code !== 0) {{
+        failReason = 'status-' + json.status_code + (json.status_msg ? ': ' + json.status_msg : '');
+      }}
+      // 首页空评论的区分:接口返回 total=0 = 该视频真的没有评论(或全被平台过滤),
+      // 正常结束、不重试;total>0 或缺省但列表空 = 风控静默吞的概率高,按失败重试。
+      // 后续页空则视为正常到底,不重试
+      if (!failReason && page === 0 && !(json.comments || []).length) {{
+        var declared = (typeof json.total === 'number') ? json.total : -1;
+        if (declared === 0) {{ result.noComments = true; break; }}
+        failReason = 'empty-first-page';
+      }}
+      if (failReason) {{
+        // 风控硬拒不重试:直接收尾(result.used=false → 调用方回退滚动采集)。
+        // blocked-html 同理:服务端已明确回验证/拦截页,同参数重试必败,白等 15×5s
+        if (failReason.indexOf('blocked-redirect') === 0 || failReason.indexOf('blocked-html') === 0) {{ result.error = failReason; break; }}
+        retries++;
+        if (retries > MAX_RETRY) {{ result.error = 'retry-exhausted: ' + failReason; break; }}
+        hud('warn', '⏳ 第 ' + (page + 1) + ' 页请求失败(' + failReason + ')· 5s 后重试 ' + retries + '/' + MAX_RETRY + '(若弹出滑块请在窗口中完成)');
+        await sleep(5000);
+        page--; // 重试同一页
+        continue;
+      }}
+      retries = 0;
+      var items = json.comments || [];
+      total += items.length;
+      result.comments = total;
+      result.pages++;
+      hud('info', '⚡ API 直采 · 第 ' + (page + 1) + ' 页 +' + items.length + ' 条(累计 ' + total + ')');
+      if (items.length === 0) break;
+      if (CFG.limit > 0 && total >= CFG.limit) break;
+      // 不足一页即到底:has_more 不可靠(实测 3 条评论也标 has_more=1,
+      // 再翻页请求会被静默吞掉、白等停滞看门狗)
+      if (items.length < CFG.count) break;
+      if (!json.has_more) break;
+      cursor = (typeof json.cursor === 'number') ? json.cursor : (cursor + items.length);
+      // 拟人翻页间隔:直采特征明显,自觉压风控
+      await sleep(700 + Math.floor(Math.random() * 900));
+    }}
+    result.comments = total;
+    // 成功口径:真采到评论,或接口明确 total=0(真没评论,属正常结果而非失败);
+    // 其余空结果(多半是签名被风控静默吞掉:空 comments + status_code=0)按失败回报
+    result.used = total > 0 || result.noComments === true;
+    if (!result.used && !result.error) result.error = 'empty';
+    finish(result);
+  }}
+  main().catch(function (e) {{
+    result.error = 'exception: ' + (e && e.message ? e.message : String(e));
+    result.used = result.comments > 0;
+    finish(result);
+  }});
+}})();"#,
+        session_id = session_id,
+        url_json = url_json,
+        aweme_json = aweme_json,
+        limit = limit,
+        max_pages = max_pages,
+    )
+}
+
+/// 构造「画像 API 直采」注入脚本(抖音):与评论直采同机制——标准公共参数 +
+/// sec_user_id 构造 profile/other 请求,借页面签名函数(`window.byted_acrawler`)
+/// 签名后在页面上下文直接 fetch,不导航作者主页。响应由页内 fetch hook 按既有特征
+/// (画像接口已并入 intercept_patterns)自动回流本会话,下游解析 / 落库零改动。
+/// 完成/失败经 `comment_api_done` 命令回传(复用评论直采的回传通道,result 只用 used/error)。
+pub fn build_profile_api_eval(session_id: u64, sec_uid: &str) -> String {
+    let uid_json = serde_json::to_string(sec_uid).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function () {{
+  // 代际接管:与评论直采同理,新脚本注入即接替,旧脚本发现代际过期静默退出
+  var GEN = (window.__veltrixProfileApiGen || 0) + 1;
+  window.__veltrixProfileApiGen = GEN;
+  window.__veltrixProfileApiRunning = true;
+  var CFG = {{ sessionId: {session_id}, secUid: {uid_json} }};
+
+  function hud(level, msg) {{
+    try {{ if (window.__veltrixHud && window.__veltrixHud.log) window.__veltrixHud.log({{ level: level, message: msg }}); }} catch (e) {{}}
+  }}
+  function sleep(ms) {{ return new Promise(function (r) {{ setTimeout(r, ms); }}); }}
+  function getCookie(name) {{
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }}
+  function findSigner() {{
+    var ac = window.byted_acrawler;
+    if (!ac) return null;
+    var fns = [];
+    if (typeof ac.frontierSign === 'function') fns.push(ac.frontierSign);
+    if (typeof ac.sign === 'function') fns.push(ac.sign);
+    if (!fns.length) return null;
+    return function (url) {{
+      for (var i = 0; i < fns.length; i++) {{
+        try {{
+          var r = fns[i].call(ac, {{ url: url }});
+          if (typeof r === 'string' && r) return {{ str: r }};
+          if (r && typeof r === 'object') return {{ obj: r }};
+        }} catch (e) {{}}
+      }}
+      return null;
+    }};
+  }}
+  function finish(r) {{
+    // 代际过期(已被下个作者的脚本接管):静默退出,不回传防串号
+    if (window.__veltrixProfileApiGen !== GEN) return;
+    window.__veltrixProfileApiRunning = false;
+    r.secUid = CFG.secUid;
+    // 回传走 WebView 原生消息桥(不受远程页面 ACL 限制);桥不可用才退回 invoke 兜底
+    var sent = window.__veltrixSignal && window.__veltrixSignal('api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }});
+    if (!sent) {{
+      try {{
+        var p = window.__TAURI_INTERNALS__.invoke('comment_api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }});
+        if (p && p.catch) p.catch(function (e) {{ hud('warn', '⚠️ 画像结果回传失败: ' + e); }});
+      }} catch (e) {{ hud('warn', '⚠️ 画像结果回传异常: ' + e); }}
+    }}
+  }}
+
+  async function main() {{
+    var result = {{ used: false, error: null }};
+    var signer = null;
+    for (var si = 0; si < 20; si++) {{
+      if (window.__veltrixCommentApiAbort || window.__veltrixProfileApiGen !== GEN) {{ result.error = 'aborted'; return finish(result); }}
+      signer = findSigner();
+      if (signer) break;
+      await sleep(500);
+    }}
+    if (!signer) {{ result.error = 'no-signer'; return finish(result); }}
+    var u = new URL('https://www.douyin.com/aweme/v1/web/user/profile/other/');
+    var sp = u.searchParams;
+    var chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '';
+    sp.set('device_platform', 'webapp');
+    sp.set('aid', '6383');
+    sp.set('channel', 'channel_pc_web');
+    sp.set('sec_user_id', CFG.secUid);
+    sp.set('pc_client_type', '1');
+    sp.set('version_code', '290100');
+    sp.set('version_name', '29.1.0');
+    sp.set('cookie_enabled', 'true');
+    // 画像接口常见必备项(真实主页请求都带;缺失时抖音可能返回 HTML 错误页而非 JSON)
+    sp.set('publish_video_strategy_type', '2');
+    sp.set('update_version_code', '170400');
+    sp.set('locate_query', 'false');
+    sp.set('show_live_replay_strategy', '1');
+    sp.set('source', 'normal');
+    sp.set('personal_center_strategy', '1');
+    // 设备标识三件套:与 s_v_web_id cookie 同源,画像接口校验比评论接口严,缺了会被
+    // 网关 302 到错误页(fetch 跟随重定向后拿到 HTML)
+    var webid = getCookie('s_v_web_id');
+    if (webid) {{
+      sp.set('webid', webid);
+      sp.set('verifyFp', webid);
+      sp.set('fp', webid);
+    }}
+    var conn = navigator.connection || {{}};
+    sp.set('effective_type', conn.effectiveType || '4g');
+    sp.set('round_trip_time', String(conn.rtt || 50));
+    sp.set('screen_width', String(window.screen.width || 1920));
+    sp.set('screen_height', String(window.screen.height || 1080));
+    sp.set('browser_language', navigator.language || 'zh-CN');
+    sp.set('browser_platform', navigator.platform || 'Win32');
+    sp.set('browser_name', 'Chrome');
+    sp.set('browser_version', chromeVer);
+    sp.set('browser_online', 'true');
+    sp.set('engine_name', 'Blink');
+    sp.set('engine_version', chromeVer);
+    sp.set('os_name', 'Windows');
+    sp.set('os_version', '10');
+    sp.set('cpu_core_num', String(navigator.hardwareConcurrency || 8));
+    sp.set('device_memory', String(navigator.deviceMemory || 8));
+    sp.set('platform', 'PC');
+    sp.set('downlink', String((navigator.connection && navigator.connection.downlink) || 10));
+    sp.set('msToken', getCookie('msToken'));
+    var unsigned = u.origin + u.pathname + '?' + sp.toString();
+    for (var attempt = 0; attempt < 6; attempt++) {{
+      if (window.__veltrixCommentApiAbort || window.__veltrixProfileApiGen !== GEN) {{ result.error = 'aborted'; break; }}
+      var sig = signer(unsigned);
+      if (!sig) {{ result.error = 'sign-failed'; break; }}
+      var signed = unsigned + '&' + (sig.str
+        ? 'a_bogus=' + encodeURIComponent(sig.str)
+        : Object.keys(sig.obj).map(function (k) {{ return k + '=' + encodeURIComponent(sig.obj[k]); }}).join('&'));
+      var resp = null, json = null, failReason = null, bodyText = '';
+      try {{
+        var ctrl = new AbortController();
+        var timer = setTimeout(function () {{ ctrl.abort(); }}, 15000);
+        // Referer 伪装成作者主页:真实 profile/other 请求都从 /user/{sec_uid} 页面发出,
+        // 搜索页上下文直接 fetch 会被网关当异常请求(同源 referrer 是 fetch 规范允许的)
+        try {{ resp = await fetch(signed, {{ credentials: 'include', signal: ctrl.signal, referrer: u.origin + '/user/' + CFG.secUid }}); }}
+        finally {{ clearTimeout(timer); }}
+        bodyText = await resp.text();
+      }} catch (e) {{
+        failReason = (e && e.name === 'AbortError') ? 'timeout' : String(e);
+      }}
+      if (!failReason && resp && !resp.ok) failReason = 'http-' + resp.status;
+      // 风控硬拒:接口请求被 302 到搜索页/验证页(resp.url 已离开接口路径,如
+      // /search/[object Object] 是网关边缘 JS 拼接 bug 的固定跳转)。后台 fetch 不会渲染
+      // 滑块、同参数重试必败——直接判失败,不再空跑 6 轮 × 5s,让 Rust 回退「导航作者主页」
+      if (!failReason && resp && resp.redirected && resp.url.indexOf('/aweme/v1/') === -1) {{
+        var blockedUrl = '';
+        try {{ var bu = new URL(resp.url); blockedUrl = bu.host + bu.pathname; }} catch (e0) {{}}
+        failReason = 'blocked-redirect(http-' + resp.status + (blockedUrl ? ', ' + blockedUrl : '') + ')';
+      }}
+      // 非 JSON(返回 HTML):JSON.parse 会抛 SyntaxError,单独捕获并带上状态码与最终
+      // URL——被重定向到验证中心(风控)时 resp.url 会变成验证页,可直接区分
+      // 「风控拦截」与「参数不齐的错误页」
+      if (!failReason) {{
+        try {{ json = JSON.parse(bodyText); }} catch (e) {{
+          var finalUrl = '';
+          try {{ var fu = new URL(resp.url); finalUrl = fu.host + fu.pathname; }} catch (e2) {{}}
+          failReason = 'non-json(http-' + resp.status + (finalUrl ? ', ' + finalUrl : '') + ')';
+        }}
+      }}
+      if (!failReason && json.status_code !== undefined && json.status_code !== 0) {{
+        failReason = 'status-' + json.status_code + (json.status_msg ? ': ' + json.status_msg : '');
+      }}
+      if (!failReason && !json.user) failReason = 'no-user';
+      if (!failReason) {{ result.used = true; break; }}
+      // 风控硬拒不重试:带错收尾(finish 回传后 Rust 回退导航作者主页采集)
+      if (failReason.indexOf('blocked-redirect') === 0) {{
+        hud('warn', '🚫 画像请求被网关拦截(' + failReason + ')· 转作者主页采集');
+        result.error = failReason;
+        break;
+      }}
+      if (attempt < 5) {{
+        hud('warn', '⏳ 画像请求失败(' + failReason + ')· 5s 后重试 ' + (attempt + 1) + '/5(若弹出滑块请在窗口中完成)');
+        await sleep(5000);
+      }}
+    }}
+    if (!result.used && !result.error) result.error = 'retry-exhausted';
+    finish(result);
+  }}
+  main().catch(function (e) {{
+    result_finish_on_exception(e);
+  }});
+  function result_finish_on_exception(e) {{
+    // 代际过期:静默退出(与 finish 同理,防串号污染)
+    if (window.__veltrixProfileApiGen !== GEN) return;
+    var r = {{ used: false, error: 'exception: ' + (e && e.message ? e.message : String(e)), secUid: CFG.secUid }};
+    var sent = window.__veltrixSignal && window.__veltrixSignal('api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }});
+    if (!sent) {{
+      try {{ window.__TAURI_INTERNALS__.invoke('comment_api_done', {{ sessionId: CFG.sessionId, result: JSON.stringify(r) }}); }} catch (e2) {{}}
+    }}
+    window.__veltrixProfileApiRunning = false;
+  }}
+}})();"#,
+        session_id = session_id,
+        uid_json = uid_json,
     )
 }
 
@@ -1226,11 +1839,13 @@ pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: im
     let _ = app.emit(COLLECT_LOG_EVENT, log);
 }
 
-/// 给指定账号采集窗口的 HUD 追加一条日志;窗口已关 / 不存在则静默忽略。
+/// 给指定采集窗口的 HUD 追加一条日志;窗口已关 / 不存在则静默忽略。
 /// 供 commands 在 pool collect 返回后(入库完成等)向 HUD 补充提示。
-pub fn hud_log(app: &AppHandle, platform: &str, account_id: &str, level: &str, message: &str) {
+/// task_id 非空时按任务级 label 定位(采集窗口按「平台+账号+任务」唯一);
+/// 素材下载阶段窗口已主动关闭,该阶段的 HUD 日志找不到窗口静默丢弃属预期(仍经 emit_collect_log 落库推前端)。
+pub fn hud_log(app: &AppHandle, platform: &str, account_id: &str, task_id: Option<&str>, level: &str, message: &str) {
     use tauri::Manager;
-    if let Some(win) = app.get_webview_window(&pool::window_label(platform, account_id)) {
+    if let Some(win) = app.get_webview_window(&pool::task_window_label(platform, account_id, task_id)) {
         let _ = win.eval(build_hud_log_eval(level, message));
     }
 }
@@ -1414,7 +2029,10 @@ pub fn build_hud_init_script() -> String {
         var payload = {};
         if (sid !== null && sid !== '') payload.sessionId = Number(sid);
         if (tid !== null && tid !== '') payload.taskId = tid;
-        window.__TAURI_INTERNALS__.invoke('stop_collect', payload);
+        // 优先走 WebView 原生消息桥(远程页面 invoke 会被 ACL 拒)
+        if (!(window.__veltrixSignal && window.__veltrixSignal('stop', payload))) {
+          window.__TAURI_INTERNALS__.invoke('stop_collect', payload);
+        }
       } catch (err) { console.error('[veltrix] stop_collect 调用失败', err); }
       stopBtn.textContent = '结束中…';
       stopBtn.style.pointerEvents = 'none';
@@ -1441,7 +2059,7 @@ pub fn build_hud_init_script() -> String {
     root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
     document.body.appendChild(root);
 
-    // HUD 为右下角浮动面板(宽度 1/2、高 1/3),默认收起为图标,不恢复拖动位置
+    // HUD 为右下角浮动面板(宽度 1/2、高 1/3),默认展开,不恢复拖动位置
 
     // 拖动:按住标题栏或收起图标移动浮层(按钮除外),松手把位置存入 sessionStorage。
     // dragMoved 供图标的 click 判断:刚拖动过的那次点击不应触发展开。
@@ -1497,8 +2115,8 @@ pub fn build_hud_init_script() -> String {
   }
 
   function isCollapsed() {
-    // 默认隐藏(收起为右下角图标);用户手动展开后(置 '0')本会话保持展开
-    try { return sessionStorage.getItem(COLLAPSE_KEY) !== '0'; } catch (e) { return true; }
+    // 默认展开;用户手动收起后(置 '1')本会话保持收起
+    try { return sessionStorage.getItem(COLLAPSE_KEY) === '1'; } catch (e) { return false; }
   }
   function applyCollapsed(collapsed) {
     var root = document.getElementById('veltrix-hud');
@@ -1724,7 +2342,10 @@ pub fn build_hud_init_script() -> String {
     },
     log: function (item) {
       item = item || {};
-      item.time = new Date().toLocaleTimeString();
+      // 完整年月日时分秒:采集常跨零点 / 长时间运行,单时分秒看不出是哪一天
+      var dt = new Date();
+      var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+      item.time = dt.getFullYear() + '-' + p2(dt.getMonth() + 1) + '-' + p2(dt.getDate()) + ' ' + p2(dt.getHours()) + ':' + p2(dt.getMinutes()) + ':' + p2(dt.getSeconds());
       item.keyword = item.keyword || currentKeyword || DEFAULT_KW;
       ensureRoot();
       var hadTab = keywordsOf(getLogs()).indexOf(item.keyword) >= 0;

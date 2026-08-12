@@ -25,6 +25,17 @@ export function formatTimestamp(ts?: number | null): string {
 }
 
 /**
+ * 格式化时间戳(Unix 秒 -> 本地完整日期时间字符串)
+ * 始终显示年-月-日 时:分,不省略当天日期
+ */
+export function formatDateTime(ts?: number | null): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
  * 格式化互动数(过万折算)
  */
 export function formatCount(n?: number | null): string {

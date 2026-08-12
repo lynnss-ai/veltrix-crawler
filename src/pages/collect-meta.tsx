@@ -508,6 +508,13 @@ export const TRIGGER_META: Record<
   watching: { label: "持续监听", icon: InfinityIcon },
 };
 
+// 列表展示用关键词:定向采集不展示目标链接,统一显示占位词「定向采集」。
+// (新任务 keywords 已存占位词、链接在 targetUrls;早期任务把链接直接存进 keywords,
+// 这里兼容两种数据,仅影响展示,筛选 / 穿透仍用原始值)
+export function displayKeyword(kw: string): string {
+  return /^https?:\/\//i.test(kw.trim()) ? "定向采集" : kw;
+}
+
 // 采集策略默认值 — 创建采集任务表单初值
 export const DEFAULT_STRATEGY = {
   sortMode: "synthetic" as SortMode,

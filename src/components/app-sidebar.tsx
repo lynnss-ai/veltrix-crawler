@@ -11,18 +11,14 @@ import {
   FolderKanban,
   Grip,
   Images,
-  Library,
-  Lightbulb,
   MessageSquare,
   LayoutDashboard,
   LogOut,
   MoreVertical,
-  Palette,
   Radar,
   Receipt,
   Rocket,
   Settings,
-  Sparkles,
   SquarePen,
   Tags,
   Trash2,
@@ -97,10 +93,7 @@ export type PageKey =
   | "chat-history"
   | "memory-center"
   | "cowork-space"
-  | "cowork-team"
-  | "creation-home"
-  | "creation-prompts"
-  | "creation-works";
+  | "cowork-team";
 
 interface SubItem {
   key: PageKey;
@@ -152,8 +145,8 @@ const MENU_GROUPS: MenuGroup[] = [
 ];
 
 // 顶层产品:同一账号体系下的多个 AI 产品,Logo 旁 Grip 切换。
-// crawler=协作平台(采集) content=内容创作(出图/出视频工作台) publish=发布服务(占位)。
-export type ProductKey = "crawler" | "content" | "publish";
+// crawler=协作平台(采集) publish=发布服务(占位)。
+export type ProductKey = "crawler" | "publish";
 
 interface ProductMeta {
   key: ProductKey;
@@ -165,30 +158,17 @@ interface ProductMeta {
 
 const PRODUCTS: ProductMeta[] = [
   { key: "crawler", name: "协作平台", icon: Radar },
-  { key: "content", name: "内容创作", icon: Palette },
   { key: "publish", name: "发布服务", icon: Rocket, placeholder: true },
 ];
 
-// 内容创作产品的侧栏菜单(扁平一组,无子工作区);本期仅「提示词管理」已实现,其余为占位页。
-const CONTENT_MENU_GROUPS: MenuGroup[] = [
-  {
-    title: "",
-    items: [
-      { key: "creation-home", label: "创作工作台", icon: Sparkles },
-      { key: "creation-works", label: "作品库", icon: Library },
-      { key: "creation-prompts", label: "创作脚本", icon: Lightbulb },
-    ],
-  },
-];
-
-// 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(协作);后两者暂为占位
+// 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(创作);后两者暂为占位
 export type Workspace = "management" | "chat" | "cowork";
 
 // 工作区元数据(标签固定);展示顺序由 useWorkspaceOrder 控制,可在系统配置调整。
 export const WORKSPACES: { key: Workspace; label: string }[] = [
   { key: "management", label: "运营" },
   { key: "chat", label: "对话" },
-  { key: "cowork", label: "协作" },
+  { key: "cowork", label: "创作" },
 ];
 
 // 各工作区的导航菜单;management 沿用现有 MENU_GROUPS,其余先占位
@@ -209,7 +189,7 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
   ],
   cowork: [
     {
-      title: "协作",
+      title: "创作",
       items: [
         { key: "cowork-space", label: "工作空间", icon: FolderKanban },
         { key: "cowork-team", label: "团队成员", icon: Users },
@@ -224,8 +204,7 @@ export function getWorkspaceDefaultPage(workspace: Workspace): PageKey {
 }
 
 // 某产品的默认落地页,切换产品时跳转到此
-export function getProductDefaultPage(product: ProductKey): PageKey {
-  if (product === "content") return CONTENT_MENU_GROUPS[0].items[0].key;
+export function getProductDefaultPage(_product: ProductKey): PageKey {
   return "dashboard";
 }
 
@@ -245,7 +224,7 @@ export function getPageBreadcrumb(key: PageKey): {
   group: string;
   page: string;
 } {
-  for (const groups of [...Object.values(WORKSPACE_MENUS), CONTENT_MENU_GROUPS]) {
+  for (const groups of Object.values(WORKSPACE_MENUS)) {
     for (const group of groups) {
       const item = group.items.find((i) => i.key === key);
       if (item) return { group: group.title, page: item.label };
@@ -549,11 +528,11 @@ export function AppSidebar({
   // 当前产品(用于 Logo 副标题与产品切换高亮)
   const currentProduct = PRODUCTS.find((p) => p.key === product) ?? PRODUCTS[0];
 
-  // 渲染一组菜单分组(运营各工作区 / 内容创作产品共用同一套样式)
+  // 渲染一组菜单分组(各工作区共用同一套样式)
   const renderMenuGroups = (groups: MenuGroup[]) =>
     groups.map((group) => (
       <SidebarGroup key={group.title || group.items[0]?.key}>
-        {/* 标题为空的分组(如内容创作)不渲染一级分组标题,菜单项直接平铺 */}
+        {/* 标题为空的分组不渲染一级分组标题,菜单项直接平铺 */}
         {group.title && <SidebarGroupLabel>{group.title}</SidebarGroupLabel>}
         <SidebarGroupContent>
           <SidebarMenu>
@@ -583,10 +562,8 @@ export function AppSidebar({
     // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
     // 这里按标题栏高度 --titlebar-h 下移并缩高,使其从标题栏下方开始
     <Sidebar
-      // 对话 / 协作工作区:收起即完全隐藏(offcanvas);运营 / 内容创作保持收成图标条(icon)
-      collapsible={
-        product === "content" || workspace === "management" ? "icon" : "offcanvas"
-      }
+      // 对话 / 创作工作区:收起即完全隐藏(offcanvas);运营工作区保持收成图标条(icon)
+      collapsible={workspace === "management" ? "icon" : "offcanvas"}
       className="top-(--titlebar-h)! h-[calc(100svh-var(--titlebar-h))]!"
     >
       <SidebarHeader>
@@ -662,7 +639,7 @@ export function AppSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
 
-        {/* 工作区分类切换:运营 / 对话 / 协作(仅协作平台产品有子工作区;内容创作为扁平菜单,不展示) */}
+        {/* 工作区分类切换:运营 / 对话 / 创作(仅协作平台产品有子工作区) */}
         {product === "crawler" && (
           <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
             {orderedWorkspaces.map((ws) => (
@@ -685,10 +662,8 @@ export function AppSidebar({
       </SidebarHeader>
 
       <SidebarContent className="group-data-[collapsible=icon]:overflow-y-auto">
-        {/* 内容创作产品:扁平创作菜单;协作平台:对话工作区渲染会话列表,其余渲染静态菜单 */}
-        {product === "content" ? (
-          renderMenuGroups(CONTENT_MENU_GROUPS)
-        ) : workspace === "chat" ? (
+        {/* 对话工作区渲染会话列表,其余渲染静态菜单 */}
+        {workspace === "chat" ? (
           <ChatConversationList active={active} onChange={onChange} />
         ) : (
           renderMenuGroups(WORKSPACE_MENUS[workspace])

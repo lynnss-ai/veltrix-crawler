@@ -6728,6 +6728,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -7277,6 +7278,7 @@ dependencies = [
  "futures-util",
  "image",
  "jsonwebtoken",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-web-kit",
@@ -7294,6 +7296,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -7302,6 +7305,7 @@ dependencies = [
  "uuid",
  "veltrix-core",
  "walkdir",
+ "webrtc-vad",
  "webview2-com",
  "windows 0.61.3",
  "xcap",
@@ -7659,6 +7663,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webrtc-vad"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39a1e40fd6ca90be95459152a2537f2ba4286ee1b13073f7ebcaa74fc94e3008"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

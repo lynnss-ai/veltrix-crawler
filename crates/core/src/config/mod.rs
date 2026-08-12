@@ -445,8 +445,13 @@ pub struct MediaConfig {
     /// **已废弃**:视频是否转音频现由任务级 `ai_extract`(AI 文案提取)控制,
     /// 本字段不再被 media::process_content 读取,仅为兼容旧配置文件保留。
     pub enable_audio_extract: bool,
-    /// ffmpeg 可执行文件路径;为空时按 sidecar / 系统 PATH 查找。
+    /// ffmpeg 可执行文件路径;为空时用安装包内置 ffmpeg,其次系统 PATH 的 `ffmpeg`。
     pub ffmpeg_path: Option<String>,
+    /// 运行时标记(不落盘):ffmpeg_path 是否为启动时自动填充的内置路径。
+    /// true 时 save 把 ffmpeg_path 写为 None——自动填充的是本机绝对路径(开发机 target/ 下),
+    /// 落盘后随配置带到其他机器 / 安装环境会变成失效路径,反而屏蔽内置 ffmpeg。
+    #[serde(skip)]
+    pub ffmpeg_path_auto: bool,
     /// 输出音频格式(如 "mp3" / "wav")。
     pub audio_format: String,
     /// 媒体与中间文件输出目录。
@@ -464,6 +469,7 @@ impl Default for MediaConfig {
             // 默认开启视频转音频(下载视频 → ffmpeg 转音频 → 删视频),符合「只留音频」诉求
             enable_audio_extract: true,
             ffmpeg_path: None,
+            ffmpeg_path_auto: false,
             audio_format: "mp3".to_string(),
             output_dir: "media".to_string(),
             // 默认空 = 自动探测本机代理(与加此字段前的行为一致)
@@ -495,7 +501,7 @@ pub const DEFAULT_ASR_PROVIDER: &str = "mimo";
 pub const DEFAULT_ASR_API_URL: &str = "https://api.xiaomimimo.com/v1";
 pub const DEFAULT_ASR_MODEL: &str = "mimo-v2.5-asr";
 /// 语音转写默认并发数:同时在飞的 ASR 请求数,偏保守以降低厂商限流概率。
-pub const DEFAULT_ASR_CONCURRENCY: u32 = 3;
+pub const DEFAULT_ASR_CONCURRENCY: u32 = 5;
 
 fn default_asr_provider() -> String {
     DEFAULT_ASR_PROVIDER.to_string()
@@ -627,7 +633,12 @@ impl AppConfig {
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(config_dir)?;
         let path = config_dir.join(CONFIG_FILE_NAME);
-        let text = serde_json::to_string_pretty(self)?;
+        // 自动填充的内置 ffmpeg 路径不落盘(见 MediaConfig::ffmpeg_path_auto)
+        let mut out = self.clone();
+        if out.media.ffmpeg_path_auto {
+            out.media.ffmpeg_path = None;
+        }
+        let text = serde_json::to_string_pretty(&out)?;
         // 临时文件在同目录,确保 rename 是原子操作(同文件系统)
         let tmp = config_dir.join(format!(".{CONFIG_FILE_NAME}.tmp"));
         std::fs::write(&tmp, &text)?;

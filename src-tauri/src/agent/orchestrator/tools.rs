@@ -1,9 +1,8 @@
 //! 编排器的 4 个委派工具:把 coding/rpa/computer/local 当 tool。每个工具捕获 clonable 句柄,
 //! 在 `run()` 里调对应子智能体的 `run_*_subtask`(同 conversation_id 串行执行),把子智能体最终文本作工具结果回传。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -44,7 +43,8 @@ struct DelegateCoding {
     app: AppHandle,
     exec_ctx: CodingExecCtx,
     config_dir: PathBuf,
-    agent_cancel: Arc<Mutex<HashSet<String>>>,
+    /// 编排器回合的取消令牌:父回合取消时子任务同步中断(步内流式 select! + 迭代间检查)。
+    cancel_token: tokio_util::sync::CancellationToken,
     conversation_id: String,
     owner: String,
     provider_ref: ProviderRef,
@@ -69,7 +69,7 @@ impl Tool for DelegateCoding {
             &self.app,
             &self.exec_ctx,
             &self.config_dir,
-            &self.agent_cancel,
+            &self.cancel_token,
             &self.conversation_id,
             &self.owner,
             &self.provider_ref,
@@ -223,7 +223,7 @@ pub fn build_registry(
     provider_ref: ProviderRef,
     provider_id: String,
     config_dir: PathBuf,
-    agent_cancel: Arc<Mutex<HashSet<String>>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     exec_ctx: CodingExecCtx,
     pool: Arc<WebviewPool>,
     agent_confirm: Arc<AgentConfirmChannel>,
@@ -234,7 +234,7 @@ pub fn build_registry(
         app: app.clone(),
         exec_ctx,
         config_dir: config_dir.clone(),
-        agent_cancel,
+        cancel_token,
         conversation_id: conversation_id.clone(),
         owner: owner.clone(),
         provider_ref: provider_ref.clone(),

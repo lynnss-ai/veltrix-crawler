@@ -9,15 +9,16 @@ mod llm;
 mod media;
 mod model;
 mod obsidian;
+mod sandbox;
 mod webview;
 
-// 复用抽出到独立 crate 的核心模块,保持 config::/db::/api:: 用法不变
-use veltrix_core::{api, config, db};
+// 复用抽出到独立 crate 的核心模块,保持 config::/db:: 用法不变
+use veltrix_core::{config, db};
 
 use commands::AppState;
 use std::sync::Arc;
 use tauri::{
-    tray::{MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -41,25 +42,82 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 // 面板逻辑尺寸(与 WebviewWindowBuilder.inner_size 一致)
-const POPUP_W: f64 = 260.0;
-const POPUP_H: f64 = 300.0;
+const POPUP_W: f64 = 200.0;
+const POPUP_H: f64 = 224.0;
+
+// Windows:托盘面板「点击别处收起」看门狗。透明无边框 + 置顶 + skip_taskbar 组合下,
+// 窗口 Focused 事件不一定可靠送达(面板可能可见却没真正获焦,失焦事件无从产生,
+// 表现为「点别处关不掉」)。改为轮询前台窗口:面板曾是前台、后来不是了 → 收起。
+#[cfg(windows)]
+fn spawn_tray_popup_watcher(app: &tauri::AppHandle) {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) else {
+            return;
+        };
+        let Ok(own) = popup.hwnd() else { return };
+        let mut armed = false;
+        // 上限约 3 分钟,防线程泄漏(正常几秒内就会收起或退出)
+        for _ in 0..900 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) else {
+                return;
+            };
+            if !popup.is_visible().unwrap_or(false) {
+                return;
+            }
+            let fg = unsafe { GetForegroundWindow() };
+            if fg == own {
+                armed = true;
+            } else if armed {
+                let _ = popup.hide();
+                return;
+            }
+        }
+    });
+}
+
+// 点击托盘图标后延迟弹出面板。点击托盘会引发壳层的一轮焦点迁移,若立即 show+set_focus,
+// 随后到达的失焦事件会把面板再度隐藏(「有时点不出」);而若靠吞掉失焦事件硬扛,面板又会
+// 停在「可见但无焦点」状态,点击别处再也无法触发失焦收起(「点了别处关不掉」)。
+// 等 80ms 让焦点迁移落定再显示聚焦,两个坑都避开;随后补一次聚焦兜底。
+fn schedule_tray_popup(app: &tauri::AppHandle, click_pos: tauri::PhysicalPosition<f64>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        show_tray_popup(&app, click_pos);
+        // 聚焦兜底:焦点若仍被壳层占着(面板可见但未聚焦),补一次 set_focus,
+        // 否则面板无焦点、点击别处不产生失焦事件,永远收不起来
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) {
+            let visible = popup.is_visible().unwrap_or(false);
+            let focused = popup.is_focused().unwrap_or(true);
+            if visible && !focused {
+                let _ = popup.set_focus();
+            }
+        }
+    });
+}
 
 // 在托盘图标附近弹出自定义面板:默认放点击点左上方,并夹在点击所在显示器内,避免错位 / 移出屏幕。
 fn show_tray_popup(app: &tauri::AppHandle, click_pos: tauri::PhysicalPosition<f64>) {
     let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) else {
         return;
     };
-    // 隐藏窗口的 outer_size 不可靠,用缩放因子把逻辑尺寸换算成物理像素
-    let scale = popup.scale_factor().unwrap_or(1.0);
-    let w = POPUP_W * scale;
-    let h = POPUP_H * scale;
-
-    // 取点击点所在显示器边界(多屏 / 高 DPI 下定位才正确)
+    // 取点击点所在显示器(多屏 / 高 DPI 下定位才正确)
     let monitor = app
         .monitor_from_point(click_pos.x, click_pos.y)
         .ok()
         .flatten()
         .or_else(|| popup.primary_monitor().ok().flatten());
+    // 用点击点所在显示器的缩放因子把逻辑尺寸换算成物理像素。
+    // 此前用 popup.scale_factor():隐藏中的面板挂在主屏上,副屏 DPI 不同(如主屏 100%、
+    // 副屏 150%)时尺寸算错,面板位置跟着偏——这正是「位置不对」的根因。
+    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let w = POPUP_W * scale;
+    let h = POPUP_H * scale;
+
     let (mx, my, mw, mh) = monitor
         .map(|m| {
             let p = *m.position();
@@ -83,6 +141,9 @@ fn show_tray_popup(app: &tauri::AppHandle, click_pos: tauri::PhysicalPosition<f6
     let _ = popup.set_position(tauri::PhysicalPosition::new(x, y));
     let _ = popup.show();
     let _ = popup.set_focus();
+    // Windows:前台窗口看门狗兜底「点击别处收起」(Focused 事件对该窗口不可靠)
+    #[cfg(windows)]
+    spawn_tray_popup_watcher(app);
 }
 
 // 托盘面板「显示主窗口」:显示主窗口并收起面板
@@ -94,12 +155,12 @@ fn show_main_from_tray(app: tauri::AppHandle) {
     }
 }
 
-// 托盘面板「退出」:真正退出进程。退出前停掉编程沙盒容器(释放资源,工作区文件保留)。
+// 托盘面板「退出」:真正退出进程。退出前 terminate 全部沙盒(整树杀净,工作区文件保留)。
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        let db = state.db.clone();
-        tauri::async_runtime::block_on(agent::coding::commands::stop_sandbox_on_exit(&db));
+        // 同步 Win32 调用,快速不阻塞退出;即便漏杀,进程退出时 Job 句柄关闭(KILL_ON_JOB_CLOSE)也会兜底
+        state.sandbox.terminate_all();
     }
     app.exit(0);
 }
@@ -214,7 +275,7 @@ pub fn run() {
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_dir = config::resolve_config_dir(&base);
-            let cfg = config::AppConfig::load_or_default(&config_dir)?;
+            let mut cfg = config::AppConfig::load_or_default(&config_dir)?;
 
             // 连接数据库(运行时二选一 SQLite / PG)并建表;setup 为同步上下文,阻塞等待完成
             let db = tauri::async_runtime::block_on(db::connect(&config_dir, &cfg.database))?;
@@ -468,26 +529,10 @@ pub fn run() {
                 }
             });
 
-            // 启动对外 HTTP API(复用同一数据库连接);失败仅告警,不阻塞应用
-            let api_db = db.clone();
-            tauri::async_runtime::spawn(async move {
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8787));
-                // 桌面端固定 Desktop 模式:不挂 /pair /devices,不连 Redis
-                if let Err(e) =
-                    api::serve(api_db, addr, api::ServerMode::Desktop, None).await
-                {
-                    tracing::error!("HTTP API 启动失败: {e}");
-                }
-            });
+            // 对外 HTTP API(127.0.0.1:8787)已停用:桌面端数据交互全部走 Tauri commands,
+            // 该服务无消费方,空转且启动时会打 JWT 密钥告警;Cloud 部署走 crates/server 独立装配
 
-            // 编程沙盒:若设为 Docker 模式,启动时后台拉起共享容器(失败仅告警)
-            {
-                let sb_db = db.clone();
-                let sb_dir = config_dir.clone();
-                tauri::async_runtime::spawn(async move {
-                    agent::coding::commands::ensure_sandbox_on_start(&sb_db, &sb_dir).await;
-                });
-            }
+            // 编程沙盒:本地进程沙盒(Job Object / 进程组),首个编程动作时惰性创建,启动不预热
 
             // 云端客户端:启动后自动检查是否已配对,若有 pc_token 直接拉起 WS
             let cloud = Arc::new(cloud::CloudClient::new(config_dir.clone()));
@@ -505,10 +550,41 @@ pub fn run() {
             registry.register(Arc::new(adapter::tiktok::TiktokAdapter::new()));
             registry.register(Arc::new(adapter::youtube::YoutubeAdapter::new()));
 
-            // 启动时探测一次 ffmpeg 可用性,写入录屏状态;后续录屏命令直接读标记,不再每次启子进程探测
+            // 内置 ffmpeg 优先:配置未显式指定路径时,用安装包(开发模式为源码 resources/)自带的,
+            // 免用户安装;仅改内存配置不落盘(save 会跳过 auto 标记的值),用户显式配的有效路径仍优先
+            let configured = cfg
+                .media
+                .ffmpeg_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            // 配置的路径已失效(如旧配置残留了开发机 target/ 下的绝对路径):视为未配置,
+            // 否则它会屏蔽内置 ffmpeg,导致打包安装后「检测不到 ffmpeg」
+            if !configured.is_empty() && !std::path::Path::new(&configured).exists() {
+                tracing::warn!("配置的 ffmpeg 路径不存在,回退内置 ffmpeg: {configured}");
+                cfg.media.ffmpeg_path = None;
+            }
+            if cfg.media.ffmpeg_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                if let Some(p) = crate::media::bundled_ffmpeg_path(app.handle()) {
+                    tracing::info!("使用内置 ffmpeg: {}", p.display());
+                    cfg.media.ffmpeg_path = Some(p.to_string_lossy().into_owned());
+                    cfg.media.ffmpeg_path_auto = true;
+                }
+            }
+
+            // 启动时探测一次 ffmpeg 可用性,写入录屏状态;后续录屏命令直接读标记,不再每次启子进程探测。
+            // 配置路径探测失败再试系统 PATH(与 check_ffmpeg 的兜底口径一致)
             let ffmpeg_available =
-                crate::media::probe_ffmpeg(cfg.media.ffmpeg_path.as_deref()).is_some();
+                crate::media::probe_ffmpeg(cfg.media.ffmpeg_path.as_deref()).is_some()
+                    || crate::media::probe_ffmpeg(None).is_some();
             tracing::info!("ffmpeg 启动探测:可用={ffmpeg_available}");
+
+            // 全局沙盒管理器(审计日志根目录 = config_dir;回收循环与 AppState 共享同一实例)
+            let sandbox_manager = Arc::new(sandbox::SandboxManager::new(config_dir.clone()));
+            // 空闲回收循环用的句柄(db 随后 move 进 AppState,先克隆)
+            let recycle_db = db.clone();
+            let recycle_sandbox = sandbox_manager.clone();
 
             app.manage(AppState {
                 config: std::sync::Mutex::new(cfg),
@@ -530,12 +606,9 @@ pub fn run() {
                 dev_server: Arc::new(std::sync::Mutex::new(
                     agent::coding::commands::DevServer::default(),
                 )),
-                sandbox_ready: std::sync::Arc::new(std::sync::Mutex::new(
-                    agent::coding::commands::SandboxReady::default(),
-                )),
-                app_handle: app.handle().clone(),
-                agent_cancel: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-                chat_cancel_flags: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                sandbox: sandbox_manager.clone(),
+                cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                chat_send_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 agent_confirm: Arc::new(agent::core::shared::AgentConfirmChannel::new()),
                 recording: {
                     let rec = agent::computer::recorder::RecordingState::new();
@@ -556,15 +629,32 @@ pub fn run() {
                 });
             }
 
+            // 沙盒空闲自动回收:每 60s 读一次配置(分钟,0=关闭)执行回收;回收只杀进程摘台账,不动存储
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let v = commands::get_secret(
+                        &recycle_db,
+                        agent::coding::commands::SANDBOX_IDLE_RECYCLE_KEY,
+                    )
+                    .await;
+                    let mins: u64 = v.trim().parse().unwrap_or(30);
+                    if mins == 0 {
+                        continue;
+                    }
+                    recycle_sandbox.recycle_idle(std::time::Duration::from_secs(mins * 60));
+                }
+            });
+
             // 托盘弹出面板窗口:无边框 / 透明 / 不进任务栏 / 置顶,隐藏待用。
-            // 点击托盘图标时由 on_tray_icon_event 定位并显示,替代传统系统右键菜单。
+            // 右键托盘图标时由 on_tray_icon_event 定位并显示,替代传统系统右键菜单。
             let popup = WebviewWindowBuilder::new(
                 app,
                 TRAY_POPUP_LABEL,
                 WebviewUrl::App("index.html".into()),
             )
             .title("Veltrix")
-            .inner_size(260.0, 300.0)
+            .inner_size(200.0, 224.0)
             .decorations(false)
             .transparent(true)
             .skip_taskbar(true)
@@ -587,14 +677,20 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::new()
                 .tooltip("VeltrixLoop")
                 .on_tray_icon_event(|tray, event| {
-                    // 单击(按下抬起)托盘图标弹出自定义面板
-                    if let TrayIconEvent::Click {
-                        button_state: MouseButtonState::Up,
-                        position,
-                        ..
-                    } = event
-                    {
-                        show_tray_popup(tray.app_handle(), position);
+                    match event {
+                        // 双击(左键):直接打开主界面
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } => show_main_window(tray.app_handle()),
+                        // 右键(抬起):展示托盘菜单面板(延迟到壳层焦点迁移落定后再显示)
+                        TrayIconEvent::Click {
+                            button: MouseButton::Right,
+                            button_state: MouseButtonState::Up,
+                            position,
+                            ..
+                        } => schedule_tray_popup(tray.app_handle(), position),
+                        _ => {}
                     }
                 });
 
@@ -702,6 +798,7 @@ pub fn run() {
             commands::login_status_report,
             // 采集:拦截回传与启动
             commands::intercept_push,
+            commands::comment_api_done,
             commands::stop_collect,
             commands::report_collect_verify,
             commands::rpa_done,
@@ -730,6 +827,7 @@ pub fn run() {
             commands::retry_content_media,
             commands::retry_content_transcript,
             commands::retry_failed_transcripts,
+            commands::recollect_comments,
             commands::compensate_task,
             commands::check_ffmpeg,
             commands::set_obsidian_vault,
@@ -786,9 +884,9 @@ pub fn run() {
             agent::coding::commands::get_sandbox_config,
             agent::coding::commands::get_sandbox_stats,
             agent::coding::commands::set_sandbox_config,
-            agent::coding::commands::sandbox_start,
             agent::coding::commands::sandbox_stop,
-            agent::coding::commands::sandbox_recreate,
+            agent::coding::commands::get_sandbox_audit,
+            agent::coding::commands::clear_sandbox_storage,
             // 浏览器 Agent(RPA:内嵌右栏真实 webview + 回读 + 接口拦截)
             agent::rpa::commands::send_browser_message,
             agent::rpa::commands::set_agent_webview_bounds,

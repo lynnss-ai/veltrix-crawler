@@ -337,8 +337,9 @@ pub async fn enrich_authors(
         };
 
         // 用户手动关闭采集窗口 = 终止补采:不再为后续作者重建窗口
-        // (与采集主链路「关窗即终止」语义一致),剩余作者记 Skipped
-        if bridge.is_collect_window_closed(&cfg.id, &account_id) {
+        // (与采集主链路「关窗即终止」语义一致),剩余作者记 Skipped。
+        // 手动补采无任务上下文:窗口按账号级 label(与 ProfileCollectRequest.task_id=None 的开窗口径一致)
+        if bridge.is_collect_window_closed(&cfg.id, &account_id, None) {
             let remaining = authors.len() - idx;
             summary.skipped += remaining;
             summary
@@ -375,8 +376,9 @@ pub async fn enrich_authors(
     // 关窗会触发 Destroyed 把「被手动关闭」标记置位,随即重置该标记,
     // 避免自己关窗留下的标记污染下次补采的首轮检查
     for (platform, account_id) in &opened_windows {
-        bridge.close_collect_window(platform, account_id);
-        bridge.reset_collect_window_closed(platform, account_id);
+        // 手动补采的窗口是账号级 label(task_id=None),按同口径关闭 / 重置标记
+        bridge.close_collect_window(platform, account_id, None);
+        bridge.reset_collect_window_closed(platform, account_id, None);
     }
 
     Ok(summary)

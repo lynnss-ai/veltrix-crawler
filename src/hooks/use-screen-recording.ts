@@ -1,6 +1,6 @@
 // 屏幕录制入口(供「电脑操作」页与对话页输入框加号复用):
-// 加号点击只「打开悬浮控制条」,真正的开始/停止/录音开关都在悬浮条上手动操作。
-// 这里另监听后端「录制已保存」事件,在主窗口弹提示(悬浮窗没有 Toaster)。
+// 加号点击「开 / 关悬浮控制条」(已开且未录制时再次点击 = 收起),真正的开始/停止都在悬浮条上手动操作。
+// 这里另监听后端「录制已保存 / 录制失败」事件,在主窗口弹提示(悬浮窗没有 Toaster)。
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
@@ -14,10 +14,11 @@ export function useScreenRecording(onSaved?: (path: string) => void) {
   onSavedRef.current = onSaved;
 
   // 录屏保存完成(后端停止录制后向主窗口推送):优先交回调,否则弹提示并提供「打开所在文件夹」
+  // 另监听「录制失败」(ffmpeg 启动即退 / 未产出有效视频):后端已还原主窗口,这里弹错误提示
   useEffect(() => {
     let dispose: (() => void) | undefined;
     let disposed = false;
-    listen<{ path: string }>("recording-saved", (e) => {
+    const onSaved = listen<{ path: string }>("recording-saved", (e) => {
       const path = e.payload.path;
       const cb = onSavedRef.current;
       if (cb) {
@@ -32,10 +33,21 @@ export function useScreenRecording(onSaved?: (path: string) => void) {
           },
         },
       });
-    }).then(
-      (fn) => {
-        if (disposed) fn();
-        else dispose = fn;
+    });
+    const onFailed = listen<{ message: string }>("recording-failed", (e) => {
+      toast.error(e.payload.message || "屏幕录制失败");
+    });
+    Promise.all([onSaved, onFailed]).then(
+      ([a, b]) => {
+        if (disposed) {
+          a();
+          b();
+        } else {
+          dispose = () => {
+            a();
+            b();
+          };
+        }
       },
       () => {},
     );

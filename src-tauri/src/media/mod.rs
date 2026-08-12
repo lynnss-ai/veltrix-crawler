@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use veltrix_core::config::MediaConfig;
 use veltrix_core::error::{CrawlerError, Result};
+use webrtc_vad::{SampleRate, Vad, VadMode};
+
+/// Windows 打包(GUI 子系统)后 spawn 控制台子进程(ffmpeg 等)会弹出黑色终端窗口,
+/// 统一加 CREATE_NO_WINDOW 抑制;非 Windows 平台为 no-op。
+pub(crate) fn hide_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
 
 /// 单条内容的素材处理结果。回写到 contents 表,供前端展示与失败重试。
 /// 只反映「主素材」:视频内容 = 视频下载 + 音频提取;图文内容 = 图片下载。
@@ -371,12 +385,15 @@ pub fn extract_audio_from_url(
     referer: Option<&str>,
     cookie: Option<&str>,
     proxy_setting: &str,
+    // 取消标志:任务被手动停止时置位,等待循环 500ms 内感知并强杀 ffmpeg 子进程
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<()> {
     let program = ffmpeg_path
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .unwrap_or("ffmpeg");
     let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
     cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
     // CDN 偶发中途断流:让 ffmpeg 自行重连续传,避免一断就整条失败(须在 -i 之前作为输入选项)
     // -rw_timeout(微秒):单次 I/O 停滞上限,CDN 建立连接后滴流/不返数据时 30s 无数据即报错退出,
@@ -445,6 +462,16 @@ pub fn extract_audio_from_url(
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) => {
+                // 任务手动停止:立即强杀子进程,不让在飞的 ffmpeg 继续拖
+                if cancel
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false)
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CrawlerError::Parse("已手动停止,ffmpeg 已终止".into()));
+                }
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -484,7 +511,9 @@ pub fn split_audio(
     std::fs::create_dir_all(out_dir)
         .map_err(|e| CrawlerError::Parse(format!("创建切片目录失败: {e}")))?;
     let pattern = out_dir.join("chunk_%04d.mp3");
-    let status = std::process::Command::new(program)
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let status = cmd
         .arg("-y") // 覆盖已存在切片,避免交互确认卡住
         .arg("-i")
         .arg(audio)
@@ -523,6 +552,324 @@ pub fn split_audio(
     Ok(chunks)
 }
 
+// ---- 静音点切片(语音转写优化) ----
+
+/// silencedetect 的判定参数:噪声门限 -35dB、最短静音 0.5s。
+/// 口播类音频的常用起点:门限太松会把气口当句子边界,太严会检测不到静音退化为硬切。
+const SILENCE_DETECT_FILTER: &str = "silencedetect=noise=-35dB:d=0.5";
+/// 切点距当前段起点至少 1 秒,避免切出过短的碎片段。
+const MIN_CHUNK_SECS: f64 = 1.0;
+
+/// 一段静音区间(秒,绝对时间轴)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SilenceRange {
+    start: f64,
+    end: f64,
+}
+
+/// 语音间隙优先切片(ASR 用):先 WebRTC VAD 逐帧判定人声,把连续非人声 ≥0.5s 的区间作为
+/// 可切间隙(BGM 不算人声,带背景音乐的视频也能找到句间缝隙);VAD 失败/全程无间隙时降级
+/// silencedetect 能量静音探测,仍无结果回退 `split_audio` 按时长硬切,保证任何音频都有产出。
+/// 切点选在「不超过时长上限的最后一个间隙中点」,避免硬切把句中/词中劈开导致 ASR 边界错字。
+/// 返回切片路径(顺序即时间顺序),目录由调用方清理。
+pub fn split_audio_for_asr(
+    audio: &Path,
+    out_dir: &Path,
+    max_seconds: u32,
+    ffmpeg_path: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg");
+    // 探测 / 时长读取 / 切点规划任一步失败都沿「VAD → 静音 → 硬切」回退,行为不差于原硬切逻辑
+    let fallback = || split_audio(audio, out_dir, max_seconds, ffmpeg_path);
+    let gaps = match detect_speech_gaps(program, audio) {
+        Ok(g) if !g.is_empty() => g,
+        other => {
+            match &other {
+                Ok(_) => tracing::info!("VAD 未检出人声间隙,尝试静音探测"),
+                Err(e) => tracing::warn!("VAD 探测失败({e}),尝试静音探测"),
+            }
+            match detect_silences(program, audio) {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => {
+                    tracing::info!("未检测到静音段,回退按时长硬切");
+                    return fallback();
+                }
+                Err(e) => {
+                    tracing::warn!("静音探测失败({e}),回退按时长硬切");
+                    return fallback();
+                }
+            }
+        }
+    };
+    let duration = match probe_duration(program, audio) {
+        Some(d) if d > 0.0 => d,
+        _ => {
+            tracing::warn!("读取音频时长失败,回退按时长硬切");
+            return fallback();
+        }
+    };
+    let cuts = plan_silence_cuts(duration, f64::from(max_seconds), &gaps);
+    if cuts.is_empty() {
+        return fallback();
+    }
+    cut_audio_at(program, audio, out_dir, &cuts).or_else(|e| {
+        tracing::warn!("按语音间隙切片失败({e}),回退按时长硬切");
+        // 清掉可能已产出的半成品切片,避免与硬切产物混在同一目录被一起收走
+        let _ = std::fs::remove_dir_all(out_dir);
+        fallback()
+    })
+}
+
+/// VAD 帧长:WebRTC VAD 只接受 10/20/30ms 帧,取 30ms(判定次数最少,精度足够)。
+const VAD_FRAME_SECS: f64 = 0.03;
+/// 连续非人声帧达到该时长才算可切的人声间隙:0.5s 覆盖正常句间停顿,更短的视为气口。
+const VAD_MIN_GAP_SECS: f64 = 0.5;
+
+/// VAD 探测人声间隙:ffmpeg 解码为 16kHz 16bit 单声道 PCM(VAD 只接受 8/16/32/48kHz),
+/// 逐 30ms 帧判定人声,连续非人声 ≥ VAD_MIN_GAP_SECS 的区间记为可切间隙(复用 SilenceRange)。
+/// Aggressive 模式把背景音乐更多地判为非人声,适合带 BGM 的短视频。
+fn detect_speech_gaps(program: &str, audio: &Path) -> Result<Vec<SilenceRange>> {
+    let voiced = detect_voiced_frames(program, audio)?;
+    Ok(gaps_from_voiced_frames(&voiced, VAD_FRAME_SECS, VAD_MIN_GAP_SECS))
+}
+
+/// 语音门禁的最低人声量:累计人声 ≥0.3s(10 帧)才算有语音,过滤气口 / 底噪 / 纯静音段。
+const MIN_SPEECH_SECS: f64 = 0.3;
+
+/// 人声门禁(语音输入分段发 ASR 前调用):音频中是否含人声。
+/// 累计人声 ≥ MIN_SPEECH_SECS 判有;解码 / 判定失败保守返回 true(宁可多送一次 ASR,不误杀)。
+pub fn has_human_speech(program: &str, audio: &Path) -> bool {
+    match detect_voiced_frames(program, audio) {
+        Ok(frames) => voiced_duration_secs(&frames, VAD_FRAME_SECS) >= MIN_SPEECH_SECS,
+        Err(e) => {
+            tracing::warn!("人声门禁判定失败({e}),保守放行");
+            true
+        }
+    }
+}
+
+/// 累计人声时长(秒):逐帧判定为 true 的帧数 × 帧长(纯函数,便于单测)。
+fn voiced_duration_secs(frames: &[bool], frame_secs: f64) -> f64 {
+    frames.iter().filter(|&&v| v).count() as f64 * frame_secs
+}
+
+/// ffmpeg 解码为 16kHz 16bit 单声道 PCM,逐 30ms 帧做人声判定(判定失败的帧按人声保守处理)。
+fn detect_voiced_frames(program: &str, audio: &Path) -> Result<Vec<bool>> {
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let output = cmd
+        .arg("-hide_banner")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(audio)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-")
+        .output()
+        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    if !output.status.success() {
+        return Err(CrawlerError::Parse(format!(
+            "ffmpeg 解码 PCM 失败:{}",
+            describe_ffmpeg_exit(output.status.code())
+        )));
+    }
+    // s16le 字节流 → i16 样本(末尾不足 2 字节的尾巴丢弃)
+    let pcm: Vec<i16> = output
+        .stdout
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let frame_len = (16000.0 * VAD_FRAME_SECS) as usize; // 480 样本
+    let mut vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::Aggressive);
+    let mut voiced = Vec::with_capacity(pcm.len() / frame_len);
+    for frame in pcm.chunks_exact(frame_len) {
+        // 判定失败的帧按人声处理(保守:不拿可疑位置当切点)
+        voiced.push(vad.is_voice_segment(frame).unwrap_or(true));
+    }
+    Ok(voiced)
+}
+
+/// 把逐帧人声判定折叠成间隙区间(纯函数,便于单测):
+/// 连续非人声(false)帧数 ≥ 最小间隙帧数才记一段;区间即该段首/尾帧的时间边界。
+fn gaps_from_voiced_frames(frames: &[bool], frame_secs: f64, min_gap_secs: f64) -> Vec<SilenceRange> {
+    let min_frames = (min_gap_secs / frame_secs).ceil() as usize;
+    let mut out = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (i, &v) in frames.iter().enumerate() {
+        if v {
+            if let Some(s) = run_start.take() {
+                if i - s >= min_frames {
+                    out.push(SilenceRange {
+                        start: s as f64 * frame_secs,
+                        end: i as f64 * frame_secs,
+                    });
+                }
+            }
+        } else if run_start.is_none() {
+            run_start = Some(i);
+        }
+    }
+    // 结尾的非人声段同样可记(切点规划只取中点,尾部间隙 midpoint 超死线自然不会被选中)
+    if let Some(s) = run_start {
+        if frames.len() - s >= min_frames {
+            out.push(SilenceRange {
+                start: s as f64 * frame_secs,
+                end: frames.len() as f64 * frame_secs,
+            });
+        }
+    }
+    out
+}
+
+/// 跑 silencedetect 探测静音区间(整段解码一遍,纯音频很快)。
+/// 该命令正常退出码为 0;静音信息在 stderr 的 `silence_start:` / `silence_end:` 行。
+fn detect_silences(program: &str, audio: &Path) -> Result<Vec<SilenceRange>> {
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let output = cmd
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(audio)
+        .arg("-af")
+        .arg(SILENCE_DETECT_FILTER)
+        .arg("-f")
+        .arg("null")
+        .arg("-")
+        .output()
+        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    if !output.status.success() {
+        return Err(CrawlerError::Parse(format!(
+            "ffmpeg 静音探测失败:{}",
+            describe_ffmpeg_exit(output.status.code())
+        )));
+    }
+    Ok(parse_silences(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// 解析 silencedetect stderr 里的静音区间。行形如:
+/// `[silencedetect @ ...] silence_start: 12.34` / `... silence_end: 15.67 | silence_duration: 3.33`
+fn parse_silences(stderr: &str) -> Vec<SilenceRange> {
+    fn number_after(line: &str, key: &str) -> Option<f64> {
+        let pos = line.find(key)?;
+        let num: String = line[pos + key.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        num.parse().ok()
+    }
+    let mut out = Vec::new();
+    let mut pending_start: Option<f64> = None;
+    for line in stderr.lines() {
+        if let Some(s) = number_after(line, "silence_start: ") {
+            pending_start = Some(s);
+        } else if let Some(e) = number_after(line, "silence_end: ") {
+            // 成对出现才登记;孤立的 start(结尾余音未起)丢弃
+            if let Some(s) = pending_start.take() {
+                out.push(SilenceRange { start: s, end: e });
+            }
+        }
+    }
+    out
+}
+
+/// 读音频总时长(秒):`ffmpeg -i` 不产出文件,stderr 头部带 `Duration: HH:MM:SS.cc`。
+/// 无输出文件时 ffmpeg 退出码非 0,属预期,不视为失败;解析不到返回 None 由调用方回退。
+fn probe_duration(program: &str, audio: &Path) -> Option<f64> {
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let output = cmd
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(audio)
+        .output()
+        .ok()?;
+    parse_ffmpeg_duration(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// 解析 ffmpeg stderr 里的 `Duration: 00:03:21.45` 为秒数。
+fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
+    let pos = stderr.find("Duration: ")?;
+    let ts: String = stderr[pos + "Duration: ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ':' || *c == '.')
+        .collect();
+    let mut parts = ts.splitn(3, ':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// 规划切点(纯函数,便于单测):沿时间轴贪心,每段在不超过 max_secs 的前提下
+/// 切在「最后一个可用静音中点」;该区间内无静音则硬切一刀兜底,保证不超上限。
+/// 返回切点绝对时间(升序);总时长不超过上限时返回空(无需切)。
+fn plan_silence_cuts(duration: f64, max_secs: f64, silences: &[SilenceRange]) -> Vec<f64> {
+    let midpoints: Vec<f64> = silences
+        .iter()
+        .map(|s| (s.start + s.end) / 2.0)
+        .collect();
+    let mut cuts = Vec::new();
+    let mut start = 0.0;
+    while duration - start > max_secs {
+        let deadline = start + max_secs;
+        let pick = midpoints
+            .iter()
+            .copied()
+            .filter(|&m| m > start + MIN_CHUNK_SECS && m <= deadline)
+            .last();
+        let cut = pick.unwrap_or(deadline);
+        cuts.push(cut);
+        start = cut;
+    }
+    cuts
+}
+
+/// 按切点逐段出片:`-ss` 前置快速定位 + `-t` 限长,`-c copy` 不重编码。
+/// 切片命名与 `split_audio` 一致(chunk_0001.mp3 起),下游无需区分两种切法。
+fn cut_audio_at(program: &str, audio: &Path, out_dir: &Path, cuts: &[f64]) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| CrawlerError::Parse(format!("创建切片目录失败: {e}")))?;
+    let mut starts: Vec<f64> = Vec::with_capacity(cuts.len() + 1);
+    starts.push(0.0);
+    starts.extend_from_slice(cuts);
+    let mut chunks = Vec::with_capacity(starts.len());
+    for (idx, &seg_start) in starts.iter().enumerate() {
+        let out = out_dir.join(format!("chunk_{:04}.mp3", idx + 1));
+        let mut cmd = std::process::Command::new(program);
+        hide_console_window(&mut cmd);
+        cmd.arg("-y")
+            .arg("-ss")
+            .arg(format!("{seg_start:.3}"))
+            .arg("-i")
+            .arg(audio);
+        // 非末段限长到下一切点;末段跑到文件尾
+        if let Some(&next) = starts.get(idx + 1) {
+            cmd.arg("-t").arg(format!("{:.3}", next - seg_start));
+        }
+        cmd.arg("-c").arg("copy").arg("-threads").arg("1").arg(&out);
+        let status = cmd
+            .status()
+            .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+        if !status.success() {
+            return Err(CrawlerError::Parse(format!(
+                "ffmpeg 音频切片失败:{}",
+                describe_ffmpeg_exit(status.code())
+            )));
+        }
+        chunks.push(out);
+    }
+    Ok(chunks)
+}
+
 /// 探测 ffmpeg 是否可用:用 `<program> -version` 起一次进程,退出码 0 视为可用,
 /// 返回版本信息首行(形如 "ffmpeg version ...")。program 解析口径与 extract_audio 一致:
 /// ffmpeg_path 为空时探测系统 PATH 的 `ffmpeg`。探测失败 / 找不到可执行文件统一返回 None。
@@ -531,7 +878,9 @@ pub fn probe_ffmpeg(ffmpeg_path: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .unwrap_or("ffmpeg");
-    let output = std::process::Command::new(program)
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let output = cmd
         .arg("-version")
         .output()
         .ok()?;    if !output.status.success() {
@@ -543,6 +892,31 @@ pub fn probe_ffmpeg(ffmpeg_path: Option<&str>) -> Option<String> {
         .next()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
+}
+
+/// 随包捆绑的 ffmpeg 路径(存在时优先于系统 PATH,免用户安装)。
+/// 生产:安装目录资源(tauri.conf.json 的 bundle.resources);开发:资源不打进 target,
+/// 直接读源码目录 src-tauri/resources/。两侧都不存在返回 None,调用方退回系统 PATH。
+pub fn bundled_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    let rel = if cfg!(windows) {
+        "resources/ffmpeg.exe"
+    } else {
+        "resources/ffmpeg"
+    };
+    if let Ok(p) = app
+        .path()
+        .resolve(rel, tauri::path::BaseDirectory::Resource)
+    {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    if dev.exists() {
+        return Some(dev);
+    }
+    None
 }
 
 /// 把内容 ID 清洗为合法文件名前缀:替换非法字符为 `_`,限长,空值兜底为 "unknown"。
@@ -570,6 +944,8 @@ pub async fn process_content(
     media: &MediaConfig,
     audio_extract: bool,
     cookie: Option<&str>,
+    // 取消标志:任务手动停止时置位,在飞的 ffmpeg 拉流转码会被强杀(500ms 内感知)
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> MediaOutcome {
     let kind_dir = if content.kind == ContentKind::Video {
         DIR_VIDEO
@@ -664,7 +1040,7 @@ pub async fn process_content(
                     outcome.video_downloaded = Some(false);
                 } else {
                     let video =
-                        process_video(content, &audio_dir, &prefix, video_url, media, cookie).await;
+                        process_video(content, &audio_dir, &prefix, video_url, media, cookie, cancel).await;
                     outcome.ok = video.downloaded;
                     outcome.audio_extracted = video.audio_extracted;
                     outcome.error = video.error;
@@ -721,6 +1097,7 @@ async fn process_video(
     video_url: &str,
     media: &MediaConfig,
     cookie: Option<&str>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> VideoOutcome {
     let audio_format = if media.audio_format.trim().is_empty() {
         "mp3"
@@ -746,6 +1123,19 @@ async fn process_video(
     // 抖音等 CDN 偶发「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_EXTRACT_ATTEMPTS {
+        // 任务已手动停止:不再(重)试,直接以取消收尾
+        if cancel
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            return VideoOutcome {
+                downloaded: false,
+                audio_extracted: Some(false),
+                error: Some("已手动停止".into()),
+                audio_path: None,
+            };
+        }
         // ffmpeg 全局限流:同一时刻最多 MAX_FFMPEG_CONCURRENCY 个子进程在转码。
         // 排队等待比并发打满更稳(CPU / 带宽 / CDN 并发限制),permit 随本次尝试结束释放。
         // 信号量不会关闭,Err 仅理论路径;ok() 拿到 Option 持有 permit,随本次尝试结束释放
@@ -756,6 +1146,7 @@ async fn process_video(
         // cookie / proxy 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
         let cookie_for_task = cookie.map(str::to_string);
         let proxy_for_task = media.proxy.clone();
+        let cancel_for_task = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
             extract_audio_from_url(
                 &url_for_task,
@@ -764,6 +1155,7 @@ async fn process_video(
                 referer,
                 cookie_for_task.as_deref(),
                 &proxy_for_task,
+                cancel_for_task,
             )
         })
         .await;
@@ -797,5 +1189,125 @@ async fn process_video(
         audio_extracted: Some(false),
         error: last_error,
         audio_path: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sil(start: f64, end: f64) -> SilenceRange {
+        SilenceRange { start, end }
+    }
+
+    #[test]
+    fn parse_silences_pairs_start_and_end() {
+        let stderr = r"
+[silencedetect @ 000001] silence_start: 12.34
+[silencedetect @ 000001] silence_end: 15.67 | silence_duration: 3.33
+[silencedetect @ 000001] silence_start: 40
+[silencedetect @ 000001] silence_end: 41.2 | silence_duration: 1.2
+";
+        let v = parse_silences(stderr);
+        assert_eq!(v, vec![sil(12.34, 15.67), sil(40.0, 41.2)]);
+    }
+
+    #[test]
+    fn parse_silences_drops_orphan_start() {
+        // 结尾只有 silence_start(余音未起)不成对,丢弃
+        let stderr = "silence_start: 9.5\n";
+        assert!(parse_silences(stderr).is_empty());
+    }
+
+    #[test]
+    fn parse_duration_hh_mm_ss() {
+        let stderr = "Input #0, mp3, from 'a.mp3':\n  Duration: 01:02:03.50, start: 0.0, bitrate: 96 kb/s\n";
+        let d = parse_ffmpeg_duration(stderr).unwrap();
+        assert!((d - 3723.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_duration_missing() {
+        assert_eq!(parse_ffmpeg_duration("no duration here"), None);
+    }
+
+    #[test]
+    fn plan_cuts_prefers_latest_silence_before_deadline() {
+        // 上限 25s:第一刀切在 24s 的静音中点(而非 10s 或硬切 25s);
+        // 第二段从 24s 起,48.8s 的静音中点 ≤ 49s 死线 → 切 48.8s
+        let cuts = plan_silence_cuts(60.0, 25.0, &[sil(9.5, 10.5), sil(23.5, 24.5), sil(48.6, 49.0)]);
+        assert_eq!(cuts, vec![24.0, 48.8]);
+    }
+
+    #[test]
+    fn plan_cuts_hard_cut_when_no_silence_in_window() {
+        // 0~25s 内无静音 → 25s 硬切;26.5s 的静音可用 → 切 26.5s;之后再无静音 → 51.5s 硬切
+        let cuts = plan_silence_cuts(55.0, 25.0, &[sil(26.2, 26.8)]);
+        assert_eq!(cuts, vec![25.0, 26.5, 51.5]);
+    }
+
+    #[test]
+    fn plan_cuts_skips_silence_too_close_to_start() {
+        // 起点 0.5s 处的静音不满足最小段长,硬切在 25s
+        let cuts = plan_silence_cuts(40.0, 25.0, &[sil(0.4, 0.6)]);
+        assert_eq!(cuts, vec![25.0]);
+    }
+
+    #[test]
+    fn plan_cuts_empty_when_within_limit() {
+        assert!(plan_silence_cuts(20.0, 25.0, &[sil(9.0, 10.0)]).is_empty());
+    }
+
+    // 30ms/帧、最小间隙 0.5s → 连续 ≥17 帧非人声才算间隙
+    fn voiced_frames(spec: &[(usize, bool)]) -> Vec<bool> {
+        let len = spec.iter().map(|(n, _)| n).sum();
+        let mut v = Vec::with_capacity(len);
+        for (n, voiced) in spec {
+            v.extend(std::iter::repeat_n(*voiced, *n));
+        }
+        v
+    }
+
+    #[test]
+    fn vad_gaps_detects_long_gap() {
+        // 10 帧人声 + 20 帧(0.6s)间隙 + 10 帧人声 → 间隙 (0.30, 0.90)
+        let frames = voiced_frames(&[(10, true), (20, false), (10, true)]);
+        let gaps = gaps_from_voiced_frames(&frames, 0.03, 0.5);
+        assert_eq!(gaps.len(), 1);
+        assert!((gaps[0].start - 0.30).abs() < 1e-6);
+        assert!((gaps[0].end - 0.90).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vad_gaps_ignores_short_gap() {
+        // 16 帧(0.48s)不足 0.5s,不记
+        let frames = voiced_frames(&[(10, true), (16, false), (10, true)]);
+        assert!(gaps_from_voiced_frames(&frames, 0.03, 0.5).is_empty());
+    }
+
+    #[test]
+    fn vad_gaps_all_voiced() {
+        let frames = voiced_frames(&[(100, true)]);
+        assert!(gaps_from_voiced_frames(&frames, 0.03, 0.5).is_empty());
+    }
+
+    #[test]
+    fn vad_gaps_trailing_run_counted() {
+        // 结尾 20 帧非人声也记为间隙(0.60 ~ 1.20)
+        let frames = voiced_frames(&[(20, true), (20, false)]);
+        let gaps = gaps_from_voiced_frames(&frames, 0.03, 0.5);
+        assert_eq!(gaps.len(), 1);
+        assert!((gaps[0].start - 0.60).abs() < 1e-6);
+        assert!((gaps[0].end - 1.20).abs() < 1e-6);
+    }
+
+    #[test]
+    fn voiced_duration_counts_only_voiced_frames() {
+        // 10 帧人声(0.3s)+ 90 帧非人声 → 0.3s,恰好达到门禁下限
+        let frames = voiced_frames(&[(10, true), (90, false)]);
+        assert!((voiced_duration_secs(&frames, 0.03) - 0.3).abs() < 1e-6);
+        // 9 帧人声(0.27s)< MIN_SPEECH_SECS:应被门禁拦下
+        let frames = voiced_frames(&[(9, true), (91, false)]);
+        assert!(voiced_duration_secs(&frames, 0.03) < MIN_SPEECH_SECS);
     }
 }

@@ -94,7 +94,7 @@ function CodeBlock({
   }
 
   return (
-    <div className="my-2 overflow-hidden rounded-lg border bg-muted/60">
+    <div className="my-3 overflow-hidden rounded-lg border bg-muted/60">
       <div className="flex items-center justify-between border-b bg-muted/80 px-3 py-1">
         <span className="font-mono text-[11px] text-muted-foreground">
           {lang || "code"}
@@ -216,7 +216,7 @@ function MermaidBlock({ code, plain }: { code: string; plain?: boolean }) {
   const showCode = plain || view === "code";
 
   return (
-    <div className="my-2 overflow-hidden rounded-lg border bg-muted/60">
+    <div className="my-3 overflow-hidden rounded-lg border bg-muted/60">
       <div className="flex items-center justify-between border-b bg-muted/80 px-3 py-1">
         <span className="font-mono text-[11px] text-muted-foreground">
           mermaid
@@ -381,7 +381,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
     body = <MarkdownBody content={content} />;
   }
   return (
-    <div className="text-sm leading-relaxed break-words [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground [&_h1]:my-2 [&_h1]:text-base [&_h1]:font-semibold [&_h2]:my-2 [&_h2]:text-sm [&_h2]:font-semibold [&_h3]:my-1.5 [&_h3]:font-semibold [&_li]:my-0.5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-2 [&_table]:my-2 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:bg-muted [&_th]:px-2 [&_th]:py-1 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5 first:[&>*]:mt-0 last:[&>*]:mb-0">
+    <div className="text-sm leading-relaxed break-words [&_a]:text-primary [&_a]:underline [&_blockquote]:my-3 [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground [&_h1]:my-3 [&_h1]:text-base [&_h1]:font-semibold [&_h2]:my-3 [&_h2]:text-sm [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:font-semibold [&_li]:my-1 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-3 [&_table]:my-3 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:bg-muted [&_th]:px-2 [&_th]:py-1 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-5 first:[&>*]:mt-0 last:[&>*]:mb-0">
       {body}
     </div>
   );

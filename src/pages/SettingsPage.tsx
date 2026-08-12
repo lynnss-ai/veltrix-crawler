@@ -760,7 +760,7 @@ function GeneralSection({
     <>
       <SettingsCard
         title="菜单顺序"
-        description="拖动调整侧边栏顶部工作区(营销 / 对话 / 协作)的排列顺序,松手即时生效。"
+        description="拖动调整侧边栏顶部工作区(营销 / 对话 / 创作)的排列顺序,松手即时生效。"
       >
         <WorkspaceOrderEditor />
       </SettingsCard>
@@ -989,7 +989,7 @@ function GeneralSection({
                 清空业务数据
               </div>
               <div className="text-xs text-muted-foreground">
-                清空采集内容 / 媒体 / 统计,保留平台与账号配置
+                清空采集内容 / 评论 / 作者库 / 媒体素材,保留平台与账号配置
               </div>
             </div>
             <Button

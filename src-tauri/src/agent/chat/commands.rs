@@ -11,8 +11,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 use veltrix_core::db::entity::{chat_conversation as conv, chat_message as msg, provider as provider_entity};
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -362,6 +361,23 @@ async fn fetch_history(
     Ok(rows)
 }
 
+/// live 窗口里仅最近 N 条带图 user 消息真正带图(更早的降级为文字占位):
+/// 历史图片每轮全量重发会反复烧 vision token 并撑大请求体,模型一般也只需最近的图。
+const RECENT_IMAGE_KEEP: usize = 2;
+
+/// 该消息是否为「带可重建图片的 user 消息」(附件里有已落盘图片)。
+fn message_has_images(m: &msg::Model) -> bool {
+    if m.role != "user" {
+        return false;
+    }
+    m.attachments
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<MessageAttachmentView>>(s).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|a| a.mime.starts_with("image/") && !a.path.is_empty())
+}
+
 async fn build_chat_messages(
     db: &sea_orm::DatabaseConnection,
     owner: &str,
@@ -379,8 +395,25 @@ async fn build_chat_messages(
     if let Some(sys) = summary_system_message(summary) {
         arr.push(sys);
     }
+    // 预扫描:带图 user 消息中仅最近 RECENT_IMAGE_KEEP 条保留图片,更早的降级为文字占位
+    let keep_image_ids: std::collections::HashSet<i64> = history
+        .iter()
+        .filter(|m| message_has_images(m))
+        .map(|m| m.id)
+        .rev()
+        .take(RECENT_IMAGE_KEEP)
+        .collect();
     for m in history {
-        arr.push(json!({ "role": m.role, "content": history_content(m).await }));
+        let content = if message_has_images(m) && !keep_image_ids.contains(&m.id) {
+            if m.content.is_empty() {
+                json!("(前文图片,略)")
+            } else {
+                json!(format!("{}\n(前文图片,略)", m.content))
+            }
+        } else {
+            history_content(m).await
+        };
+        arr.push(json!({ "role": m.role, "content": content }));
     }
     arr.push(current_user_content);
     json!(arr)
@@ -427,6 +460,7 @@ async fn insert_assistant_message(
 
 async fn finalize_chat_turn(
     db: &sea_orm::DatabaseConnection,
+    app: &tauri::AppHandle,
     conversation: conv::Model,
     provider: &provider_entity::Model,
     conversation_id: &str,
@@ -439,30 +473,52 @@ async fn finalize_chat_turn(
     spawn_memory_extraction(db, &conversation.owner, fallback_ref.clone(), user_text, reply_text);
     spawn_summary_maintenance(db, conversation_id, fallback_ref.clone());
 
-    let new_title = if had_messages {
-        None
-    } else {
-        let title_ref =
-            crate::commands::resolve_role_provider(db, crate::llm::AgentRole::Summary, fallback_ref)
-                .await;
-        Some(
-            generate_title(
-                &title_ref.api_url,
-                &title_ref.api_key,
-                &title_ref.model,
-                user_text,
-                reply_text,
-            )
-            .await
-            .unwrap_or_else(|| truncate_title(user_text)),
-        )
-    };
+    // updated_at 立即更新(列表排序不等标题)
     let mut am = conversation.into_active_model();
     am.updated_at = Set(Utc::now().timestamp());
-    if let Some(t) = new_title {
-        am.title = Set(t);
-    }
     let _ = am.update(db).await;
+
+    // 首轮标题:后台生成,不阻塞 send 返回;完成后 emit conversation-title 让前端增量更新
+    if !had_messages {
+        spawn_title_generation(db, app, conversation_id, fallback_ref, user_text, reply_text);
+    }
+}
+
+/// 首轮会话标题后台生成:Summary 角色(未配回退会话模型)起名 → 落库 → emit conversation-title。
+/// 生成失败回退首句截断标题;事件 payload camelCase({ conversationId, title }),与前端契约一致。
+fn spawn_title_generation(
+    db: &sea_orm::DatabaseConnection,
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    fallback: crate::agent::core::ProviderRef,
+    user_text: &str,
+    reply_text: &str,
+) {
+    use tauri::Emitter;
+    let db = db.clone();
+    let app = app.clone();
+    let conversation_id = conversation_id.to_string();
+    let user_text = user_text.to_string();
+    let reply_text = reply_text.to_string();
+    tauri::async_runtime::spawn(async move {
+        let p = crate::commands::resolve_role_provider(&db, crate::llm::AgentRole::Summary, fallback)
+            .await;
+        let title = generate_title(&p.api_url, &p.api_key, &p.model, &user_text, &reply_text)
+            .await
+            .unwrap_or_else(|| truncate_title(&user_text));
+        // 落库:会话可能已被删(忽略);用户若已手动改名(不再是占位「新对话」)不覆盖
+        if let Ok(Some(model)) = conv::Entity::find_by_id(conversation_id.clone()).one(&db).await {
+            if model.title == "新对话" {
+                let mut am = model.into_active_model();
+                am.title = Set(title.clone());
+                let _ = am.update(&db).await;
+            }
+        }
+        let _ = app.emit(
+            "conversation-title",
+            json!({ "conversationId": conversation_id, "title": title }),
+        );
+    });
 }
 
 /// 发送一条用户消息并取大模型回复。
@@ -471,6 +527,7 @@ async fn finalize_chat_turn(
 #[tauri::command]
 pub async fn send_chat_message(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     conversation_id: String,
     content: String,
 ) -> Result<MessageView> {
@@ -522,6 +579,7 @@ pub async fn send_chat_message(
 
     finalize_chat_turn(
         &state.db,
+        &app,
         ctx.conversation,
         &ctx.provider,
         &conversation_id,
@@ -560,13 +618,22 @@ pub async fn send_chat_message_stream(
     content: String,
     attachments: Vec<ChatAttachment>,
 ) -> Result<MessageView> {
-    use tauri::Emitter;
-
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(CrawlerError::Config(format!(
             "附件最多 {MAX_ATTACHMENTS} 个"
         )));
     }
+
+    // 同会话发送互斥:并发发送排队串行(不拒绝),持锁到回合结束,防两个回合交错写库 / 互相误取消
+    let send_lock = {
+        let mut map = state
+            .chat_send_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(conversation_id.clone()).or_default().clone()
+    };
+    let _send_guard = send_lock.lock().await;
+
     let ctx = ChatSendContext::prepare(&state, &conversation_id, &content).await?;
     if ctx.text.is_empty() && attachments.is_empty() {
         return Err(CrawlerError::Config("消息内容为空".into()));
@@ -594,20 +661,14 @@ pub async fn send_chat_message_stream(
     // 构建好上下文后再落库当前 user 消息(供历史渲染 + 多轮重建);调模型前落库
     insert_user_message(&state.db, &conversation_id, &ctx.text, attachments_json).await?;
 
-    // 创建取消标志:stop_chat_agent 命令会设置此标志来中断流式输出
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let mut flags = state
-            .chat_cancel_flags
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        flags.insert(conversation_id.clone(), cancel_flag.clone());
-    }
+    // 创建取消令牌:stop_chat_agent 触发 cancel;守卫在回合结束(含错误路径)自动摘除,
+    // 不残留(残留会让下一次 stop 误伤新回合)。
+    let (cancel_token, _cancel_guard) =
+        crate::agent::core::shared::begin_cancel_token(&state.cancel_tokens, &conversation_id);
 
-    // 流式调模型:每段增量 emit chat-stream 事件
-    let app_emit = app.clone();
-    let cid_emit = conversation_id.clone();
-    let cancel_flag_for_stream = cancel_flag.clone();
+    // 流式调模型:增量经合批器按时间窗攒批后 emit chat-stream 事件(格式不变,前端无感)
+    let mut batcher =
+        crate::agent::core::shared::DeltaBatcher::new(app.clone(), conversation_id.clone());
     let reply = crate::llm::chat::chat_completion_stream(
         crate::llm::chat::ChatRequest {
             api_url: &ctx.provider.api_url,
@@ -618,13 +679,8 @@ pub async fn send_chat_message_stream(
             timeout_secs: crate::llm::http::CHAT_TIMEOUT_SECS,
             retry_server_errors: false,
         },
-        move |kind, delta| {
-            let _ = app_emit.emit(
-                "chat-stream",
-                json!({ "conversationId": cid_emit, "kind": kind, "delta": delta }),
-            );
-        },
-        Some(cancel_flag_for_stream),
+        move |kind, delta| batcher.push(kind, delta),
+        Some(cancel_token),
     )
     .await?;
     let reply_text = reply.content;
@@ -642,19 +698,11 @@ pub async fn send_chat_message_stream(
     )
     .await;
 
-    // 清理取消标志
-    {
-        let mut flags = state
-            .chat_cancel_flags
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        flags.remove(&conversation_id);
-    }
-
     let assistant = insert_assistant_message(&state.db, &conversation_id, &reply_text, reply_reasoning).await?;
 
     finalize_chat_turn(
         &state.db,
+        &app,
         ctx.conversation,
         &ctx.provider,
         &conversation_id,
@@ -717,7 +765,8 @@ pub async fn attach_recording_message(
 /// 把本轮对话的记忆提取放到后台 spawn 执行,避免阻塞回复返回。
 /// 入参均 clone 进任务,绕开生命周期约束(provider/conversation 随后会被消费)。
 /// 记忆提取属杂活,优先走 Summary 角色单独配置的便宜模型;未配置则回退会话模型(fallback)。
-fn spawn_memory_extraction(
+/// pub(crate):编排器收尾也复用(orchestrator/commands.rs)。
+pub(crate) fn spawn_memory_extraction(
     db: &sea_orm::DatabaseConnection,
     owner: &str,
     fallback: crate::agent::core::ProviderRef,
@@ -1058,6 +1107,8 @@ pub async fn transcribe_chat_audio(
     use base64::Engine;
 
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
+    // 转码用配置的 ffmpeg(内置优先),不依赖系统 PATH
+    let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
     // 地址/模型已有 MiMo 默认值,真正必填的是 API Key
     let api_key = crate::commands::get_secret(&state.db, "transcription_api_key").await;
     if api_key.trim().is_empty() {
@@ -1089,8 +1140,8 @@ pub async fn transcribe_chat_audio(
         api_key: &api_key,
         model: &transcription_cfg.model,
         audio_path: &tmp,
-        // 语音消息体积小,不切片;万一超大回退系统 PATH 的 ffmpeg
-        ffmpeg_path: None,
+        // 语音消息体积小,不切片;转码走配置(内置)的 ffmpeg
+        ffmpeg_path: ffmpeg_path.as_deref(),
     })
     .await;
     // 转写完删临时文件(失败忽略)
@@ -1252,16 +1303,16 @@ fn local_image_paths(row: &veltrix_core::db::entity::content::Model) -> Vec<Stri
 }
 
 /// 请求停止某会话正在进行的流式对话。
-/// 前端调用后，后端会在下一个增量到达时中断流式输出。
+/// 取消令牌 cancel 后,读流循环经 tokio::select! 立即中断(不等下一个 chunk)。
+/// 幂等:该会话无进行中的回合(无令牌)时安全忽略。
 #[tauri::command]
 pub fn stop_chat_agent(state: State<'_, AppState>, conversation_id: String) -> Result<()> {
-    // 设置取消标志
-    let flags = state
-        .chat_cancel_flags
+    let tokens = state
+        .cancel_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(flag) = flags.get(&conversation_id) {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(token) = tokens.get(&conversation_id) {
+        token.cancel();
     }
     Ok(())
 }
@@ -1339,17 +1390,22 @@ fn spawn_feedback_learning(
     });
 }
 
-/// 实时语音转写:前端定时发送音频片段(base64),后端转写并返回文本。
-/// 支持流式输入，每次调用转写一段音频片段。
+/// 实时语音转写:前端定时发送音频片段(base64),后端流式转写并返回完整文本。
+/// 识别增量经 `asr-stream` 事件实时推送(按前端生成的 request_id 归属,前端只采纳活跃段);
+/// invoke 返回值仍是该段完整文本,供前端 finalize 兜底。
 #[tauri::command]
 pub async fn transcribe_audio_chunk(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     audio_base64: String,
     format: String,
+    request_id: String,
 ) -> Result<String> {
     use base64::Engine;
 
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
+    // 转码用配置的 ffmpeg(内置优先),不依赖系统 PATH
+    let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
     let api_key = crate::commands::get_secret(&state.db, "transcription_api_key").await;
     if api_key.trim().is_empty() {
         return Err(CrawlerError::Config(
@@ -1367,23 +1423,51 @@ pub async fn transcribe_audio_chunk(
         format.trim().to_ascii_lowercase()
     };
     let tmp = std::env::temp_dir().join(format!(
-        "veltrix-chunk-{}.{ext}",
-        Utc::now().timestamp_millis()
+        "veltrix-chunk-{}-{}.{ext}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
     tokio::fs::write(&tmp, &bytes)
         .await
         .map_err(|e| CrawlerError::Config(format!("写临时音频失败: {e}")))?;
 
-    let result = crate::llm::transcribe(crate::llm::TranscribeRequest {
-        provider_code: &transcription_cfg.provider,
-        api_url: &transcription_cfg.api_url,
-        api_key: &api_key,
-        model: &transcription_cfg.model,
-        audio_path: &tmp,
-        // 语音消息体积小,不切片;万一超大回退系统 PATH 的 ffmpeg
-        ffmpeg_path: None,
-    })
+    // 诊断日志:确认流式路径是否被命中(厂商 code / 音频体积)
+    tracing::info!(
+        provider = transcription_cfg.provider.as_str(),
+        bytes = bytes.len(),
+        "语音分段转写开始(流式)"
+    );
+    let delta_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let delta_count2 = delta_count.clone();
+
+    let result = crate::llm::transcribe_stream(
+        crate::llm::TranscribeRequest {
+            provider_code: &transcription_cfg.provider,
+            api_url: &transcription_cfg.api_url,
+            api_key: &api_key,
+            model: &transcription_cfg.model,
+            audio_path: &tmp,
+            // 语音片段体积小,不切片;转码走配置(内置)的 ffmpeg
+            ffmpeg_path: ffmpeg_path.as_deref(),
+        },
+        |delta| {
+            // 识别增量实时推给前端(emit 失败仅说明窗口已关,不影响转写)
+            delta_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.emit(
+                "asr-stream",
+                json!({ "requestId": request_id, "delta": delta }),
+            );
+        },
+    )
     .await;
+    tracing::info!(
+        deltas = delta_count.load(std::sync::atomic::Ordering::Relaxed),
+        "语音分段转写结束(流式增量数;回退非流式时为 1)"
+    );
+    // 错误也落日志:前端 catch 只 console.warn,后端留痕便于排查(4xx 错误体在 message 里)
+    if let Err(e) = &result {
+        tracing::warn!("语音分段转写失败: {e}");
+    }
     // 转写完删临时文件(失败忽略)
     let _ = tokio::fs::remove_file(&tmp).await;
     let outcome = result?;
