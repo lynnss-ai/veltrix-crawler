@@ -4,11 +4,11 @@ import type { ContentView } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { WaterfallCard } from "@/components/WaterfallCard";
 
-const GRID_PAGE_SIZE = 48;
-
+// 服务端分页下 items 即「已加载的全部」(每批 append 进来),不再做渲染侧 slice;
+// hasMore 由服务端总数 total 判定。
 export function ImageWaterfall({
   items,
-  visibleCount,
+  total,
   onLoadMore,
   platformName,
   retrying,
@@ -17,7 +17,8 @@ export function ImageWaterfall({
   onDelete,
 }: {
   items: ContentView[];
-  visibleCount: number;
+  /// 服务端总数(同筛选口径);不传则视为已全部加载
+  total?: number;
   onLoadMore: () => void;
   platformName: (id: string) => string;
   retrying: Set<string>;
@@ -27,7 +28,7 @@ export function ImageWaterfall({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const hasMore = visibleCount < items.length;
+  const hasMore = total !== undefined && items.length < total;
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
@@ -40,7 +41,7 @@ export function ImageWaterfall({
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, visibleCount, items.length, onLoadMore]);
+  }, [hasMore, items.length, onLoadMore]);
 
   if (items.length === 0) {
     return (
@@ -52,7 +53,6 @@ export function ImageWaterfall({
       </div>
     );
   }
-  const visible = items.slice(0, visibleCount);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div
@@ -60,7 +60,7 @@ export function ImageWaterfall({
         className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto pr-1"
       >
         <div className="columns-2 gap-3 sm:columns-3 lg:columns-4 xl:columns-5 [&>*]:mb-3">
-          {visible.map((c) => (
+          {items.map((c) => (
             <WaterfallCard
               key={c.id}
               c={c}
@@ -78,10 +78,10 @@ export function ImageWaterfall({
             className="flex items-center justify-center gap-1.5 py-3 text-xs text-muted-foreground"
           >
             <Loader2 className="size-3.5 animate-spin" />
-            滚动自动加载 · 已显示 {visible.length}/{items.length}
+            滚动自动加载 · 已显示 {items.length}/{total}
           </div>
         ) : (
-          items.length > GRID_PAGE_SIZE && (
+          items.length > 1 && (
             <div className="py-3 text-center text-xs text-muted-foreground">
               已全部加载 · 共 {items.length} 条
             </div>

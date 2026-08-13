@@ -15,9 +15,10 @@ import type { TaskItem, PlatformOption, KeywordState } from "./collect-meta";
 import { TaskDetailPage } from "@/pages/TaskDetailPage";
 import { listen } from "@tauri-apps/api/event";
 import { platformClass, platformChipClass } from "@/lib/platforms";
+import { exportTaskDataExcel } from "@/lib/export-task-excel";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Archive, Check, ChevronDown, ChevronLeft, Clock, Crosshair, Database, Eye, Filter, Loader2, MoreHorizontal, SquarePen, Play, Plus, RotateCcw, Search, Square, Trash2, Wrench, X, type LucideIcon } from "lucide-react";
+import { Archive, Check, ChevronDown, ChevronLeft, Clock, Crosshair, Database, Eye, FileSpreadsheet, Filter, Loader2, MoreHorizontal, SquarePen, Play, Plus, RotateCcw, Search, Square, Trash2, Wrench, X, type LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,6 +34,10 @@ import { IndustryFilterItem, IndustryFilterToggle } from "@/components/library-f
 import { EmptyState } from "@/components/EmptyState";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TaskFormSheet } from "./TaskFormSheet";
+
+// 轮询兜底节奏:进度由 task-progress 事件即时推送,事件静默超过 EVENT_STALE_MS 才补拉一次列表纠偏
+const EVENT_STALE_MS = 10_000;
+const POLL_TICK_MS = 2000;
 
 // ---- 数据模型(沿用后端 TaskView,本地 alias 为 TaskItem 方便引用) ----
 
@@ -232,6 +237,8 @@ export function CollectPage({
 
   // 首次加载标记:区分「加载中」与「真空列表」,避免误导用户(此前直接显示"暂无任务")
   const [initialLoading, setInitialLoading] = useState(true);
+  // 最近一次 task-progress 事件时刻:轮询只在事件静默超过 EVENT_STALE_MS 时兜底补拉
+  const lastEventAt = useRef(0);
   // 加载任务列表;每次 mutate 后重拉(简单粗暴,数据量不大时 OK)
   const reload = (): Promise<void> => {
     return api
@@ -240,7 +247,11 @@ export function CollectPage({
       .catch((e) => { toast.error(`加载任务失败: ${e}`); });
   };
   useEffect(() => {
-    reload().then(() => setInitialLoading(false));
+    reload().then(() => {
+      setInitialLoading(false);
+      // 首载后立即标定「事件新鲜」,否则 lastEventAt 初值 0 会让首个轮询 tick 误触发一次重拉
+      lastEventAt.current = Date.now();
+    });
     api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
     api
       .listPlatforms()
@@ -267,6 +278,11 @@ export function CollectPage({
 
   // 采集 + 素材下载都在后端异步进行,任一处于进行态(running / downloading_media)就轮询刷新进度。
   // 注意 downloading_media 也要纳入,否则采集结束转入素材下载后轮询会停,进度卡住不动。
+  //
+  // 轮询只作兜底:进度由 task-progress 事件即时推送(见下),仅当事件静默超过 EVENT_STALE_MS
+  // 才补拉一次纠偏(此前无条件 2s 全表重拉,活跃任务每次触发后端 per-keyword GROUP BY 聚合)。
+  // 与后端 list_tasks 的 active_ids 口径差异:这里不含 paused——暂停任务不产生事件、统计不变,
+  // 恢复动作自带刷新;后端仍给 paused 算统计(保证任意一次拉取不会把它刷空)。
   const hasActiveTask = tasks.some(
     (t) =>
       t.status === "running" ||
@@ -276,7 +292,13 @@ export function CollectPage({
   );
   useEffect(() => {
     if (!hasActiveTask) return;
-    const timer = setInterval(reload, 2000);
+    const timer = setInterval(() => {
+      if (Date.now() - lastEventAt.current >= EVENT_STALE_MS) {
+        // 兜底触发后立即重置,避免后续每个 tick 都满足条件连拉
+        lastEventAt.current = Date.now();
+        reload();
+      }
+    }, POLL_TICK_MS);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasActiveTask]);
@@ -287,6 +309,7 @@ export function CollectPage({
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     listen<TaskView>("task-progress", (event) => {
+      lastEventAt.current = Date.now();
       const view = event.payload;
       setTasks((prev) =>
         prev.map((t) =>
@@ -925,6 +948,7 @@ export function CollectPage({
           onEdit={onEdit}
           onDetail={onDetail}
           onNavigate={onNavigate}
+          platformName={platformName}
         />
       ),
     });
@@ -1358,6 +1382,7 @@ const TaskActionsCell = memo(function TaskActionsCell({
   onEdit,
   onDetail,
   onNavigate,
+  platformName,
 }: {
   task: TaskItem;
   isArchive: boolean;
@@ -1367,9 +1392,46 @@ const TaskActionsCell = memo(function TaskActionsCell({
   onDetail: (t: TaskItem) => void;
   // 数据穿透:跳全量库按本任务过滤,仅有采集内容时可用
   onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
+  platformName: (id: string) => string;
 }) {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // 导出进行中(防重复点击)
+  const [exporting, setExporting] = useState(false);
+
+  // 导出任务全部采集数据(「文案内容」+「评论」双 sheet,与执行历史导出同格式);
+  // 路径经系统保存对话框选定
+  async function handleExport() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const data = await api.listTaskData(task.id);
+      if (data.contents.length === 0 && data.comments.length === 0) {
+        toast.error("该任务还没有采集到内容或评论,没有可导出的数据");
+        return;
+      }
+      const now = new Date();
+      const p = (n: number) => String(n).padStart(2, "0");
+      const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
+      const safeName = task.name.replace(/[\\/:*?"<>|]/g, "_") || "任务";
+      const saved = await exportTaskDataExcel({
+        contents: data.contents,
+        comments: data.comments,
+        platformName,
+        fileName: `${safeName}-采集数据-${stamp}.xlsx`,
+        kind: "任务导出",
+      });
+      if (saved) {
+        toast.success(
+          `已导出 内容 ${data.contents.length} 条 / 评论 ${data.comments.length} 条`,
+        );
+      }
+    } catch (e) {
+      toast.error(`导出失败: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="flex items-center justify-end gap-1">
@@ -1380,13 +1442,6 @@ const TaskActionsCell = memo(function TaskActionsCell({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-32">
-          <DropdownMenuItem
-            className="cursor-pointer"
-            onClick={() => onDetail(task)}
-          >
-            <Eye className="size-3.5" />
-            详情
-          </DropdownMenuItem>
           {/* 数据穿透:仅当采集到内容(totalContents>0)时显示,跳全量库按本任务过滤 */}
           {onNavigate && task.totalContents > 0 && (
             <DropdownMenuItem
@@ -1402,6 +1457,26 @@ const TaskActionsCell = memo(function TaskActionsCell({
               内容穿透
             </DropdownMenuItem>
           )}
+          <DropdownMenuItem
+            className="cursor-pointer"
+            onClick={() => onDetail(task)}
+          >
+            <Eye className="size-3.5" />
+            详情
+          </DropdownMenuItem>
+          {/* 导出任务全部采集数据(文案 + 评论 双 sheet) */}
+          <DropdownMenuItem
+            className="cursor-pointer"
+            disabled={exporting}
+            onClick={handleExport}
+          >
+            {exporting ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="size-3.5" />
+            )}
+            导出
+          </DropdownMenuItem>
           {!isArchive && (
             <DropdownMenuItem
               className="cursor-pointer"

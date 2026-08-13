@@ -123,6 +123,15 @@ pub fn stop_collect(
     }
 }
 
+/// 全量库「提取文案 / 提取评论」的取消:登记批量提取停止标记,两个批量命令
+/// (retry_failed_transcripts / recollect_comments)在逐条 / 逐批循环里检查,
+/// 命中即优雅收尾——已完成的条目保留,未处理的不再继续(转写在飞请求跑完即弃,
+/// 评论采集在「下一个视频」前停,正在采的当前视频会采完)。
+#[tauri::command]
+pub fn cancel_library_extract(state: State<'_, AppState>) {
+    state.collect_control.request_stop_library_batch();
+}
+
 /// 采集窗口验证弹窗自检回传:页面检测到 / 解除安全验证弹窗时上报。
 /// 采集循环据此暂停 / 恢复滚动;并向前端推送 `collect-verify` 事件,便于主界面提示用户去窗口手动验证。
 #[tauri::command]
@@ -909,6 +918,23 @@ fn is_profile_url(platform: &str, url: &str) -> bool {
     }
 }
 
+/// 从作者主页链接提取平台 uid(画像解析归属用):适配器 parse_profile 以 ctx.keyword
+/// 作作者 uid(如抖音),定向主页链接需先拆出 /user/{uid} 段。
+/// 解析不出返回空串,调用方跳过画像解析(归属不明不落库,由 auto_enrich 兜底)。
+fn profile_uid_from_url(platform: &str, url: &str) -> String {
+    let seg = match platform {
+        "douyin" => url.split("/user/").nth(1),
+        "xhs" => url.split("/user/profile/").nth(1),
+        "kuaishou" => url.split("/profile/").nth(1),
+        "bilibili" => url.split("space.bilibili.com/").nth(1),
+        _ => None,
+    };
+    seg.map(|s| s.split(['?', '#']).next().unwrap_or(s))
+        .map(|s| s.trim_end_matches('/'))
+        .unwrap_or("")
+        .to_string()
+}
+
 /// 定向采集阶段:keywords 里 http(s) 开头的条目是定向链接——内容链接(含前端拼好的视频 ID 链接)
 /// 直接导航详情页等 detail 接口;作者主页链接导航主页后滚动加载作品列表(aweme/post)。
 /// 不拼搜索模板、不跑筛选。落库 / 进度 / 停止(点结束、关窗)语义与 collect_keywords 一致;
@@ -1065,6 +1091,35 @@ async fn collect_direct_urls(
                 format!("⚠️ 链接 {url} 未拦到任何接口响应(页面可能不存在或需登录)"),
             );
         } else {
+            // 定向主页:「主页信息只获取一次」——画像接口随首屏与作品列表一起被拦截,
+            // 顺手解析入库(粉丝/关注/获赞/属地)。后续 auto_enrich 阶段见粉丝数非空
+            // 自然跳过,不再二次打开主页;画像响应缺失时 auto_enrich 照常兜底补采。
+            // 归属:适配器 parse_profile 以 ctx.keyword 作 uid,故从主页 URL 拆出 uid 传入
+            if profile && adapter_arc.supports(&TaskKind::UserProfile) {
+                let uid = profile_uid_from_url(&cfg.id, url);
+                if !uid.is_empty() {
+                    let pctx = FetchContext {
+                        keyword: uid,
+                        responses: responses.clone(),
+                    };
+                    match adapter_arc.parse(&TaskKind::UserProfile, &pctx).await {
+                        Ok(out) if !out.authors.is_empty() => {
+                            let follower = out.authors[0].follower_count.map(|n| n.to_string()).unwrap_or_else(|| "未知".into());
+                            emit_collect_log(
+                                app,
+                                task_id,
+                                "info",
+                                format!("📇 主页画像已入库 · 粉丝 {follower} · 后续不再重复补采"),
+                            );
+                            persist_author_rows(db, owner, &out.authors).await;
+                        }
+                        Ok(_) => { /* 未解析出画像(接口未命中/改版):auto_enrich 兜底 */ }
+                        Err(e) => {
+                            tracing::warn!(url = %url, "定向主页画像解析失败: {e}");
+                        }
+                    }
+                }
+            }
             let ctx = FetchContext {
                 keyword: url.clone(),
                 responses,
@@ -1250,9 +1305,11 @@ async fn collect_comments_phase(
     // 评论采集成功(拿到非空响应)的视频 id:仅这些在阶段末标 comment_collected=true;
     // 采集失败 / 零响应的留 false,下次运行可重采(此前全量标记,失败视频永久失去重采机会)
     let mut comment_done_ids: Vec<String> = Vec::new();
-    for (vidx, (content_id, xsec_token, title, keyword)) in
-        video_ids.iter().enumerate()
-    {
+    // 抖音:两两分组,一批 2 个视频双路并发直采(同账号窗口开不出第二个窗口,
+    // 页内脚本多路 fetch 是唯一并发姿势);其他平台滚动路径按视频串行,批大小恒 1
+    let is_douyin = cfg.id == "douyin";
+    let mut vidx = 0usize;
+    while vidx < video_ids.len() {
         // 与关键词 / 定向阶段一致的提前终止检查:点结束 / 关窗即停,不再为后续视频开新会话
         // (此前漏检:关窗后下一个视频的 ensure_window 会把窗口重新建出来)
         if bridge.is_task_stopping(task_id) {
@@ -1278,36 +1335,47 @@ async fn collect_comments_phase(
         if vidx > 0 {
             tokio::time::sleep(random_comment_video_interval()).await;
         }
-        // 由详情页模板还原视频链接({id}=内容 id,{token}=sec_uid/xsec_token,与导航口径一致),
-        // 打进日志:排查「这条评论属于哪个视频」时可直接点链接核对,不用反查 content_id
-        let video_link = if cfg.collect.detail_url_template.is_empty() {
-            String::new()
+        // 批大小:抖音最多 2(最后一批收尾余数),其他平台 1
+        let batch_size = if is_douyin {
+            (video_ids.len() - vidx).min(2)
         } else {
-            cfg.collect
-                .detail_url_template
-                .replace("{id}", content_id)
-                .replace("{token}", xsec_token)
+            1
         };
-        let link_part = if video_link.is_empty() {
-            String::new()
-        } else {
-            format!(" · {video_link}")
-        };
-        emit_collect_log(app, task_id, "info",
-            format!("💬 [{}/{}] 正在采集「{title}」的评论{link_part}", vidx + 1, total_videos));
-        // HUD 同步一条(HUD 默认只显示逐条评论,看不到当前在采哪个视频)
-        crate::webview::hud_log(
-            app,
-            &cfg.id,
-            account_id,
-            Some(task_id),
-            "info",
-            &format!("💬 [{}/{}] 采集评论「{title}」{link_part}", vidx + 1, total_videos),
-        );
-        match bridge
-            .collect_comments(
+        let group = &video_ids[vidx..vidx + batch_size];
+        // 批内每个视频各打一条「正在采集」日志(含详情页链接,排查评论归属时可点链接核对)
+        for (g, (content_id, xsec_token, title, _keyword)) in group.iter().enumerate() {
+            let video_link = if cfg.collect.detail_url_template.is_empty() {
+                String::new()
+            } else {
+                cfg.collect
+                    .detail_url_template
+                    .replace("{id}", content_id)
+                    .replace("{token}", xsec_token)
+            };
+            let link_part = if video_link.is_empty() {
+                String::new()
+            } else {
+                format!(" · {video_link}")
+            };
+            let abs_idx = vidx + g;
+            emit_collect_log(app, task_id, "info",
+                format!("💬 [{}/{}] 正在采集「{title}」的评论{link_part}", abs_idx + 1, total_videos));
+            // HUD 同步一条(HUD 默认只显示逐条评论,看不到当前在采哪个视频)
+            crate::webview::hud_log(
                 app,
-                CommentCollectRequest {
+                &cfg.id,
+                account_id,
+                Some(task_id),
+                "info",
+                &format!("💬 [{}/{}] 采集评论「{title}」{link_part}", abs_idx + 1, total_videos),
+            );
+        }
+        // 采集:批(抖音 2 路并发)或单视频(其他平台 / 尾批)
+        let (responses, failed_with): (Vec<crate::webview::InterceptedResponse>, Option<String>) = if batch_size > 1 {
+            let reqs: Vec<CommentCollectRequest<'_>> = group
+                .iter()
+                .enumerate()
+                .map(|(g, (content_id, xsec_token, title, keyword))| CommentCollectRequest {
                     account_id,
                     content_id,
                     title,
@@ -1317,18 +1385,66 @@ async fn collect_comments_phase(
                     limit: comment_limit,
                     adapter: adapter.clone(),
                     keyword,
-                    video_index: vidx + 1,
+                    video_index: vidx + g + 1,
                     video_total: total_videos,
-                },
-            )
-            .await
-        {
-            Ok(responses) if !responses.is_empty() => {
+                })
+                .collect();
+            match bridge.collect_comments_batch(app, reqs).await {
+                Ok(r) => (r, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
+        } else {
+            let (content_id, xsec_token, title, keyword) = &group[0];
+            match bridge
+                .collect_comments(
+                    app,
+                    CommentCollectRequest {
+                        account_id,
+                        content_id,
+                        title,
+                        xsec_token,
+                        platform_cfg: cfg,
+                        task_id: Some(task_id),
+                        limit: comment_limit,
+                        adapter: adapter.clone(),
+                        keyword,
+                        video_index: vidx + 1,
+                        video_total: total_videos,
+                    },
+                )
+                .await
+            {
+                Ok(r) => (r, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
+        };
+        // 批内逐视频:拆分响应(批路径按 URL 里的 aweme_id 归属)后各自解析入库,
+        // 与单视频路径完全同口径;某视频零响应不解析、不标记,留 false 供下次重采
+        for (g, (content_id, _xsec_token, title, _keyword)) in group.iter().enumerate() {
+            let abs_idx = vidx + g;
+            let video_responses: Vec<crate::webview::InterceptedResponse> = if batch_size > 1 {
+                responses
+                    .iter()
+                    .filter(|r| r.url.contains(&format!("aweme_id={content_id}")))
+                    .cloned()
+                    .collect()
+            } else {
+                responses.clone()
+            };
+            if let Some(err) = &failed_with {
+                tracing::warn!(content_id = %content_id, "评论采集失败: {err}");
+                emit_collect_log(
+                    app,
+                    task_id,
+                    "warn",
+                    format!("⚠️ 「{title}」评论采集失败 · 原因: {err}"),
+                );
+            } else if !video_responses.is_empty() {
                 // 累计拦截响应数(同采集阶段口径)
-                shared.intercepted_total += responses.len() as i64;
+                shared.intercepted_total += video_responses.len() as i64;
                 let ctx = FetchContext {
                     keyword: content_id.clone(),
-                    responses,
+                    responses: video_responses,
                 };
                 match adapter.parse(&TaskKind::Comments, &ctx).await {
                     Ok(mut output) => {
@@ -1346,7 +1462,7 @@ async fn collect_comments_phase(
                             let likes = cm.like_count.unwrap_or(0);
                             let msg = format!(
                                 "[视频{}/{total_videos} 评论{vseq}] {text} | 点赞:{likes}",
-                                vidx + 1
+                                abs_idx + 1
                             );
                             crate::webview::hud_log(
                                 app, &cfg.id, account_id, Some(task_id), "info", &msg,
@@ -1369,28 +1485,19 @@ async fn collect_comments_phase(
                     }
                 }
             }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(content_id = %content_id, "评论采集失败: {e}");
-                emit_collect_log(
-                    app,
-                    task_id,
-                    "warn",
-                    format!("⚠️ 「{title}」评论采集失败 · 原因: {e}"),
-                );
-            }
+            // 每视频两次 DB 往返(写 + 回读推送),百视频任务即数百次写——
+            // 复用进度节流合并,最后一个视频强制写保证计数不滞后
+            write_task_comment_progress(
+                app,
+                db,
+                task_id,
+                (abs_idx + 1) as i32,
+                shared.seen_comments.len() as i64,
+                abs_idx + 1 == total_videos,
+            )
+            .await;
         }
-        // 每视频两次 DB 往返(写 + 回读推送),百视频任务即数百次写——
-        // 复用进度节流合并,最后一个视频强制写保证计数不滞后
-        write_task_comment_progress(
-            app,
-            db,
-            task_id,
-            (vidx + 1) as i32,
-            shared.seen_comments.len() as i64,
-            vidx + 1 == total_videos,
-        )
-        .await;
+        vidx += batch_size;
     }
     if shared.user_ended || shared.window_closed {
         emit_collect_log(
@@ -1951,6 +2058,45 @@ async fn run_task_body(ctx: RunTaskCtx) {
         let (task_failed, mut to_download) =
             post_collect_prepare(&app, &db, &task_id, &shared).await;
 
+        // 阶段4:直链补取(逐条开详情页,占窗口)。刻意前移到评论采集之前:
+        // ① 补取的详情页导航会激活页面 JS 环境(生成 msToken 等风控 Cookie),
+        //    评论 API 直采(抖音)继承该环境后不再因缺 msToken 被风控回 HTML 验证页;
+        // ② 用户在评论阶段点「结束」时直链已补齐,素材下载不再缺链。
+        // 权衡:评论阶段耗时长会老化补取的签名直链,故仅补「缺直链」的内容(抖音/快手
+        // 初采已含直链会整体跳过,实际只影响小红书等无直链平台);个别过期导致下载失败
+        // 可日后经补偿 / 重试刷新。手动结束 / 关窗后跳过(缺直链按失败落库,可日后重试)。
+        // 需要下载视频(音频提取含 AI 文案提取)才补直链;不下载视频则无需刷新
+        if audio_extract
+            && !to_download.is_empty()
+            && !shared.user_ended
+            && !shared.window_closed
+        {
+            let refresh_aborted = bridge.is_task_stopping(&task_id)
+                || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
+            if refresh_aborted {
+                emit_collect_log(
+                    &app, &task_id, "info",
+                    "ℹ️ 已手动结束 · 跳过直链补取".to_string(),
+                );
+            } else {
+                let stream_params = StreamRefreshParams {
+                    app: &app,
+                    bridge: &bridge,
+                    registry: &registry,
+                    db: &db,
+                    cfg: &cfg,
+                    account_id: &account_id,
+                    task_id: &task_id,
+                };
+                refresh_stream_urls(
+                    &stream_params,
+                    &mut to_download,
+                    false,
+                )
+                .await;
+            }
+        }
+
         // 阶段3:评论采集(占窗口)。与内容采集同一次开窗内做完:此前放在素材下载之后,
         // 窗口关了又开、开了又关,且重开窗口途中弹出的风控滑块用户不易察觉。
         // 现收回窗口占用阶段——一次开窗做完所有需要窗口的事,关窗后只剩纯 HTTP 阶段。
@@ -2003,41 +2149,6 @@ async fn run_task_body(ctx: RunTaskCtx) {
             "comments".to_string(),
             comments_start.elapsed().as_millis() as u64,
         );
-
-        // 阶段4:直链补取(逐条开详情页,占窗口)。刻意排在评论采集之后、关窗之前:
-        // 评论耗时可能很长,先补取再评论会让签名直链在评论期间过期;最后补取保证
-        // 关窗即下载时直链最新。手动结束 / 关窗后跳过(缺直链按失败落库,可日后重试)。
-        // 需要下载视频(音频提取含 AI 文案提取)才补直链;不下载视频则无需刷新
-        if audio_extract
-            && !to_download.is_empty()
-            && !shared.user_ended
-            && !shared.window_closed
-        {
-            let refresh_aborted = bridge.is_task_stopping(&task_id)
-                || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
-            if refresh_aborted {
-                emit_collect_log(
-                    &app, &task_id, "info",
-                    "ℹ️ 已手动结束 · 跳过直链补取".to_string(),
-                );
-            } else {
-                let stream_params = StreamRefreshParams {
-                    app: &app,
-                    bridge: &bridge,
-                    registry: &registry,
-                    db: &db,
-                    cfg: &cfg,
-                    account_id: &account_id,
-                    task_id: &task_id,
-                };
-                refresh_stream_urls(
-                    &stream_params,
-                    &mut to_download,
-                    false,
-                )
-                .await;
-            }
-        }
 
         // WebView 占用阶段(内容采集 + 画像补采 + 评论采集 + 直链补取)结束,释放同账号互斥锁与全局并发名额;
         // 后续素材下载(HTTP)不占窗口,其他任务可立即用该账号 / 名额开采。
@@ -3532,6 +3643,8 @@ pub async fn retry_failed_transcripts(
     }
     let mut query = content_entity::Entity::find()
         .filter(content_entity::Column::Id.is_in(ids))
+        // 只有视频需要语音转写文案:图文/文章类没有语音,即便误传 id 也不处理
+        .filter(content_entity::Column::Kind.eq("video"))
         // 防御:仅处理确有音频的条目(前端口径之外的数据改动不放大)
         .filter(content_entity::Column::AudioPath.is_not_null())
         .filter(content_entity::Column::AudioPath.ne(""));
@@ -3552,6 +3665,8 @@ pub async fn retry_failed_transcripts(
         return Ok(0);
     }
     let total = rows.len() as u32;
+    // 重置取消标记:上一批的「取消」不能影响本批
+    state.collect_control.clear_library_batch();
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
     let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
     // 按 (任务, 平台) 分组:逐组调 transcribe_for_contents,组内并发按配置,组间串行
@@ -3563,19 +3678,34 @@ pub async fn retry_failed_transcripts(
             .or_default()
             .push((r.id.clone(), r.audio_path.clone().unwrap_or_default()));
     }
-    for ((task_id, platform), audios) in by_task {
-        transcribe_for_contents(
-            &app,
-            &state.db,
-            &task_id,
-            &platform,
-            "",
-            &transcription_cfg,
-            ffmpeg_path.clone(),
-            None, // 批量补转写:无任务停止标记可查
-            audios,
-        )
-        .await;
+    // 分批推进 + 批间检查「取消」标记:转写无任务停止标记可查,取消只能靠批间
+    // 检查实现。一批 8 条(并发默认 5 路,一批典型十几秒),取消延迟可接受
+    'outer: for ((task_id, platform), audios) in by_task {
+        for chunk in audios.chunks(8) {
+            if state.collect_control.is_library_batch_stopping() {
+                emit_media_log(
+                    &app,
+                    &task_id,
+                    &platform,
+                    "",
+                    "info",
+                    "🛑 已手动取消 · 剩余条目不再转写(已完成条目保留)".to_string(),
+                );
+                break 'outer;
+            }
+            transcribe_for_contents(
+                &app,
+                &state.db,
+                &task_id,
+                &platform,
+                "",
+                &transcription_cfg,
+                ffmpeg_path.clone(),
+                None, // 批量补转写:无任务停止标记可查
+                chunk.to_vec(),
+            )
+            .await;
+        }
     }
     Ok(total)
 }
@@ -3840,6 +3970,7 @@ pub async fn recollect_comments(
 ) -> Result<RecollectCommentsSummary> {
     use sea_orm::sea_query::Expr;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use tauri::Emitter;
     use veltrix_core::db::entity::content as content_entity;
 
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
@@ -3855,7 +3986,8 @@ pub async fn recollect_comments(
     if ids.is_empty() {
         return Ok(summary);
     }
-
+    // 重置取消标记:上一批的「取消」不能影响本批
+    state.collect_control.clear_library_batch();
     let mut query = content_entity::Entity::find().filter(content_entity::Column::Id.is_in(ids));
     // 数据归属:self 用户只补采自己的内容
     if me.scope == "self" {
@@ -3898,6 +4030,16 @@ pub async fn recollect_comments(
     let mut processed = 0usize;
 
     for (platform, group) in by_platform {
+        // 全量库「取消提取评论」:本平台整组不再开始(已完成条目保留)
+        if state.collect_control.is_library_batch_stopping() {
+            summary.skipped += group.len();
+            summary.messages.push(format!(
+                "已手动取消 · 平台 {} 剩余 {} 条未处理",
+                platform,
+                group.len()
+            ));
+            continue;
+        }
         let cfg = {
             lock_config(&state)
                 .ok()
@@ -3974,6 +4116,13 @@ pub async fn recollect_comments(
                     "采集窗口已被手动关闭 · 终止平台 {} 补采(剩余 {remaining} 条跳过)",
                     cfg.name
                 ));
+                break;
+            }
+            // 全量库「取消提取评论」:剩余内容记跳过;正在采的当前视频采完才停
+            if state.collect_control.is_library_batch_stopping() {
+                let remaining = total - idx;
+                summary.skipped += remaining;
+                summary.messages.push(format!("已手动取消 · 剩余 {remaining} 条未处理"));
                 break;
             }
             // 串行限速:首个不等,之后每个之间随机间隔降频
@@ -4054,6 +4203,7 @@ pub async fn recollect_comments(
                             }
                             // 评论解析不产出内容,清空防误入库(keyword 口径是 content_id,混入会污染)
                             output.contents = Vec::new();
+                            let collected_count = output.comments.len();
                             persist_collected(
                                 &state.db,
                                 &row.task_id,
@@ -4067,6 +4217,15 @@ pub async fn recollect_comments(
                             comment_done_ids.push(row.id.clone());
                             succeeded_task_ids.insert(row.task_id.clone());
                             summary.succeeded += 1;
+                            // 通知前端就地移除该行:全量库「提取评论」进行中
+                            // 成功一条消失一条(与转写的 content-transcript-updated 同模式)
+                            let _ = app.emit(
+                                "content-comments-collected",
+                                serde_json::json!({
+                                    "id": row.id.clone(),
+                                    "comments": collected_count,
+                                }),
+                            );
                         }
                         Err(e) => {
                             summary.failed += 1;
@@ -4493,6 +4652,13 @@ async fn persist_comments(
 /// 才刷新画像(粉丝/获赞/签名等),7 天内不动,避免每次采集都写库。
 /// first_collected_at 与 is_monitored 始终保留。
 async fn persist_authors(db: &DatabaseConnection, owner: &str, contents: &[Content]) {
+    let authors: Vec<Author> = contents.iter().map(|c| c.author.clone()).collect();
+    persist_author_rows(db, owner, &authors).await;
+}
+
+/// persist_authors 的通用版:直接按作者列表 upsert(定向主页采集顺手解析的画像
+/// 也走这里,与内容入库路径同口径的 7 天节流)。
+async fn persist_author_rows(db: &DatabaseConnection, owner: &str, authors: &[Author]) {
     use sea_orm::{ColumnTrait, QueryFilter};
     use veltrix_core::db::entity::author as author_entity;
 
@@ -4500,12 +4666,12 @@ async fn persist_authors(db: &DatabaseConnection, owner: &str, contents: &[Conte
     let now = Utc::now().timestamp();
     // 本批内按作者去重后的 (行主键, 作者引用)
     let mut seen_authors: HashSet<String> = HashSet::new();
-    let candidates: Vec<(String, &Author)> = contents
+    let candidates: Vec<(String, &Author)> = authors
         .iter()
-        .filter(|c| !c.author.uid.is_empty())
-        .filter_map(|c| {
-            let aid = format!("{owner}-{}-{}", c.author.platform, c.author.uid);
-            seen_authors.insert(aid.clone()).then_some((aid, &c.author))
+        .filter(|a| !a.uid.is_empty())
+        .filter_map(|a| {
+            let aid = format!("{owner}-{}-{}", a.platform, a.uid);
+            seen_authors.insert(aid.clone()).then_some((aid, a))
         })
         .collect();
     if candidates.is_empty() {

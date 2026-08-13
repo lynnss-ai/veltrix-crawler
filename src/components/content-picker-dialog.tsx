@@ -1,7 +1,7 @@
 // 资产选择弹窗:从「全量库」已采集内容里挑选,带入 AI 对话。
 // 文案用途:按内容多选(最多 12 篇)。图片用途:按「张」选(全局最多 12 张),
 // 图文相册可内联展开逐张挑选;图源=封面时每条内容按 1 张封面计。
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   ArrowDown,
@@ -22,6 +22,7 @@ import { toast } from "sonner";
 import {
   api,
   type ChatAttachment,
+  type ContentListQuery,
   type ContentView,
   type IndustryView,
 } from "@/lib/api";
@@ -133,11 +134,16 @@ export function ContentPickerDialog({
     Record<string, ChatAttachment[]>
   >({});
   const [galleryLoading, setGalleryLoading] = useState<Set<string>>(new Set());
-  // 当前已渲染数量(分批);滚到底递增
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  // 服务端分页:contents 持有已加载的各批,total 判定是否还有更多
+  const [offset, setOffset] = useState(0);
+  const [total, setTotal] = useState(0);
   const isFirstRender = useRef(true);
+  // 搜索延迟值:输入即时回显,请求延后到空闲帧(与服务端分页配合,避免逐键请求)
+  const deferredKeyword = useDeferredValue(keyword);
+  // 请求序号竞态守卫:筛选快速切换时,慢的旧响应不覆盖新响应
+  const reqSeq = useRef(0);
 
-  // 打开时拉全量库并按父级记忆回填勾选;关闭时清空搜索词与图源
+  // 打开时拉第一页并按父级记忆回填勾选;关闭时清空搜索词与图源
   useEffect(() => {
     if (!open) {
       setKeyword("");
@@ -150,12 +156,6 @@ export function ContentPickerDialog({
     } else {
       setSelectedImages(new Set(initialSelectedIds));
     }
-    setLoading(true);
-    api
-      .listContents()
-      .then(setContents)
-      .catch(() => setContents([]))
-      .finally(() => setLoading(false));
     // 行业下拉数据源(失败按空,降级为「全部行业」)
     api
       .listIndustries()
@@ -175,45 +175,49 @@ export function ContentPickerDialog({
     setExpandedId(null);
   }, [imageSource]);
 
-  // 打开 / 切换筛选条件时,分批渲染回到首屏
+  // 打开 / 切换筛选条件时回到首批
   useEffect(() => {
-    setVisibleCount(PAGE_SIZE);
-  }, [open, keyword, sortBy, imageSource, industryFilter]);
+    setOffset(0);
+  }, [open, deferredKeyword, sortBy, imageSource, industryFilter]);
 
-  // 图片用途按图源限定范围(均要求有本地封面才能定位本地素材):
-  // 图文=图文内容的图片;封面=全部有封面的内容(视频封面也可作图片素材)
-  const pickable = useMemo(() => {
-    if (mode !== "image") return contents;
-    if (imageSource === "image") {
-      return contents.filter((c) => c.kind === "image" && !!c.coverPath);
-    }
-    return contents.filter((c) => !!c.coverPath);
-  }, [contents, mode, imageSource]);
-
-  // 行业 + 关键词过滤(行业按 content.industry 精确匹配;关键词命中标题/描述/命中词/作者/平台)
-  const filtered = useMemo(() => {
-    const kw = keyword.trim().toLowerCase();
-    return pickable.filter((c) => {
-      if (industryFilter !== "__all" && c.industry !== industryFilter) {
-        return false;
-      }
-      if (!kw) return true;
-      return [c.title, c.desc, c.keyword, c.authorNickname, c.platform]
-        .filter(Boolean)
-        .some((field) => field!.toLowerCase().includes(kw));
-    });
-  }, [pickable, keyword, industryFilter]);
-
-  // 排序:按创建时间(collectedAt)或发布时间(publishedAt);发布时间缺失按 0 处理(沉底)
-  const sorted = useMemo(() => {
-    const dir = sortBy.endsWith("-asc") ? 1 : -1;
-    const byPublished = sortBy.startsWith("published");
-    return [...filtered].sort((a, b) => {
-      const av = (byPublished ? a.publishedAt : a.collectedAt) ?? 0;
-      const bv = (byPublished ? b.publishedAt : b.collectedAt) ?? 0;
-      return (av - bv) * dir;
-    });
-  }, [filtered, sortBy]);
+  // 服务端分页拉取:offset=0 替换,否则 append(按 id 去重,防事件删行后重叠)
+  useEffect(() => {
+    if (!open) return;
+    // 图片用途按图源限定范围(均要求本地封面才能定位本地素材):
+    // 图文=图文内容的图片;封面=全部有本地封面的内容(视频封面也可作图片素材)
+    const query: ContentListQuery = {
+      kinds: mode === "image" && imageSource === "image" ? ["image"] : [],
+      imageSource: mode === "image" ? "image" : null,
+      search: deferredKeyword.trim() || null,
+      industry: industryFilter === "__all" ? null : industryFilter,
+      sortBy: sortBy.startsWith("published") ? "publishedAt" : "collectedAt",
+      sortDir: sortBy.endsWith("-asc") ? "asc" : "desc",
+      limit: PAGE_SIZE,
+      offset,
+    };
+    const seq = ++reqSeq.current;
+    setLoading(true);
+    api
+      .listContentsPage(query)
+      .then((res) => {
+        if (seq !== reqSeq.current) return;
+        setContents((prev) => {
+          if (offset === 0) return res.items;
+          const seen = new Set(prev.map((c) => c.id));
+          return [...prev, ...res.items.filter((c) => !seen.has(c.id))];
+        });
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (seq !== reqSeq.current) return;
+        toast.error(`加载内容失败: ${e}`);
+        setContents([]);
+        setTotal(0);
+      })
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
+  }, [open, mode, imageSource, deferredKeyword, industryFilter, sortBy, offset]);
 
   function toggleSort(field: SortField) {
     setSortBy((prev) =>
@@ -283,13 +287,19 @@ export function ContentPickerDialog({
   }
 
   const count = mode === "copy" ? selected.size : selectedImages.size;
-  // 分批渲染:只渲染前 visibleCount 个;滚到底再加载下一批
-  const visible = sorted.slice(0, visibleCount);
-  const hasMore = visibleCount < sorted.length;
+  // 服务端分页:contents 即已加载的全部,滚到底翻下一批
+  const visible = contents;
+  const hasMore = contents.length < total;
+  // 是否有实质筛选(空态文案区分「没有可选的资产」与「无匹配结果」;排序不算筛选)
+  const hasActiveFilter =
+    deferredKeyword.trim() !== "" ||
+    industryFilter !== "__all" ||
+    (mode === "image" && imageSource === "cover");
   function handleListScroll(e: React.UIEvent<HTMLDivElement>) {
     const el = e.currentTarget;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) {
-      setVisibleCount((c) => (c < sorted.length ? c + PAGE_SIZE : c));
+      // loading 守卫防连续滚动连发;hasMore 判定走服务端 total
+      if (!loading && hasMore) setOffset((o) => o + PAGE_SIZE);
     }
   }
 
@@ -298,7 +308,7 @@ export function ContentPickerDialog({
     if (mode === "copy") {
       onPick({
         mode: "copy",
-        contents: pickable.filter((c) => selected.has(c.id)),
+        contents: contents.filter((c) => selected.has(c.id)),
       });
       onOpenChange(false);
       return;
@@ -314,7 +324,7 @@ export function ContentPickerDialog({
     }
     const picks: AssetImagePick[] = [];
     for (const [id, indices] of byContent) {
-      const content = pickable.find((c) => c.id === id);
+      const content = contents.find((c) => c.id === id);
       if (!content) continue;
       picks.push({ content, coverOnly, indices: indices.sort((a, b) => a - b) });
     }
@@ -442,15 +452,15 @@ export function ContentPickerDialog({
           onScroll={handleListScroll}
           className="veltrix-thin-scrollbar -mx-1 min-h-0 flex-1 overflow-y-auto px-1 py-1"
         >
-          {loading ? (
+          {loading && contents.length === 0 ? (
             <div className="flex h-32 items-center justify-center text-muted-foreground">
               <Loader2 className="size-5 animate-spin" />
             </div>
-          ) : filtered.length === 0 ? (
+          ) : contents.length === 0 ? (
             <EmptyState
-              title={pickable.length === 0 ? "没有可选的资产" : "无匹配结果"}
+              title={total === 0 && !hasActiveFilter ? "没有可选的资产" : "无匹配结果"}
               description={
-                pickable.length === 0
+                total === 0 && !hasActiveFilter
                   ? mode === "copy"
                     ? "全量库暂无已采集内容"
                     : "全量库暂无「已下载到本地」的封面/图片,请先到全量库下载素材"
@@ -488,11 +498,11 @@ export function ContentPickerDialog({
             </ul>
           )}
           {/* 分批加载提示:还有更多则提示继续下滑,否则显示总数 */}
-          {!loading && filtered.length > 0 && (
+          {contents.length > 0 && (
             <p className="py-3 text-center text-[11px] text-muted-foreground">
               {hasMore
-                ? `下滑加载更多(已显示 ${visible.length}/${sorted.length})`
-                : `共 ${sorted.length} 条`}
+                ? `下滑加载更多(已显示 ${visible.length}/${total})`
+                : `共 ${total} 条`}
             </p>
           )}
         </div>

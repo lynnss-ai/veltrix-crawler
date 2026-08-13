@@ -6,8 +6,8 @@
 use crate::commands::{current_user, AppState};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -191,8 +191,8 @@ pub struct TaskInput {
 }
 
 /// 单次最多返回 N 行,防止前端 IPC 被几万行数据噎住。
-/// 数据量超出时应改走分页接口(暂留 TODO)。任务穿透视图请用 list_contents 的
-/// task_id 参数服务端过滤,不要靠放大此上限解决单任务可见性。
+/// 全量库/评论库已改走分页接口(list_contents_page / list_comments_page),
+/// 此上限仍约束任务列表 / 详情评论等未分页命令。
 const LIST_HARD_CAP: u64 = 10000;
 
 /// 采集日志单任务返回上限(日志比内容多,放宽);超出只回最近 N 条。
@@ -267,85 +267,62 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
         .collect())
 }
 
-/// 仅对活跃任务聚合 per-keyword 统计(content 表自带 keyword 直接计数;
-/// comment 表无 keyword,先取 content 的 (content_id → keyword) 映射,再把每条内容的评论数归入对应关键词)。
+/// 仅对活跃任务聚合 per-keyword 统计。content 表自带 keyword 直接 GROUP BY 计数;
+/// comment 表无 keyword,内连接 contents 归到关键词。
 /// 仅统计 collected_at >= started_at 的行(collected_at 是实体插入时的 Unix 秒,与任务 started_at 同源)。
+/// 聚合下沉到数据库 GROUP BY:此前全量载入 content/comment 行再在 Rust 侧聚合,
+/// 活跃任务累积到十万行级后每次轮询搬运数十 MB 数据(IPC 与内存双高)。
 /// 查询失败按空处理,不阻断任务列表。
 async fn keyword_stats_for_tasks(
     db: &sea_orm::DatabaseConnection,
     task_started: &HashMap<String, i64>,
 ) -> HashMap<String, HashMap<String, (i64, i64)>> {
     let mut result: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
-    if task_started.is_empty() {
-        return result;
-    }
-    let task_ids: Vec<String> = task_started.keys().cloned().collect();
 
-    #[derive(FromQueryResult)]
-    struct ContentRow {
-        task_id: String,
-        content_id: String,
-        keyword: String,
-        collected_at: i64,
-    }
-    #[derive(FromQueryResult)]
-    struct CommentRow {
-        task_id: String,
-        content_id: String,
-        collected_at: i64,
-    }
+    for (task_id, started) in task_started {
+        let mut by_keyword: HashMap<String, (i64, i64)> = HashMap::new();
 
-    // content:逐条取 (task_id, content_id, keyword, collected_at)。content→keyword 映射全建(供评论归类),
-    // 但仅 collected_at >= 本次 started_at(即最后一次采到)的才计入内容数。
-    let content_rows = content::Entity::find()
-        .select_only()
-        .column(content::Column::TaskId)
-        .column(content::Column::ContentId)
-        .column(content::Column::Keyword)
-        .column(content::Column::CollectedAt)
-        .filter(content::Column::TaskId.is_in(task_ids.clone()))
-        .into_model::<ContentRow>()
-        .all(db)
-        .await
-        .unwrap_or_default();
-    let mut content_keyword: HashMap<(String, String), String> = HashMap::new();
-    for r in content_rows {
-        let started = task_started.get(&r.task_id).copied().unwrap_or(i64::MAX);
-        content_keyword.insert((r.task_id.clone(), r.content_id.clone()), r.keyword.clone());
-        if r.collected_at >= started {
-            result
-                .entry(r.task_id)
-                .or_default()
-                .entry(r.keyword)
-                .or_insert((0, 0))
-                .0 += 1;
+        // 内容:按 keyword 分组计数
+        let content_rows: Vec<(String, i64)> = content::Entity::find()
+            .select_only()
+            .column(content::Column::Keyword)
+            .column_as(content::Column::Id.count(), "cnt")
+            .filter(content::Column::TaskId.eq(task_id.clone()))
+            .filter(content::Column::CollectedAt.gte(*started))
+            .group_by(content::Column::Keyword)
+            .into_tuple()
+            .all(db)
+            .await
+            .unwrap_or_default();
+        for (keyword, cnt) in content_rows {
+            by_keyword.entry(keyword).or_insert((0, 0)).0 = cnt;
         }
-    }
 
-    // comment:逐条取 (task_id, content_id, collected_at);同样只数最后一次采到的,经映射归到对应关键词
-    let comment_rows = comment::Entity::find()
-        .select_only()
-        .column(comment::Column::TaskId)
-        .column(comment::Column::ContentId)
-        .column(comment::Column::CollectedAt)
-        .filter(comment::Column::TaskId.is_in(task_ids.clone()))
-        .into_model::<CommentRow>()
-        .all(db)
-        .await
-        .unwrap_or_default();
-    for r in comment_rows {
-        let started = task_started.get(&r.task_id).copied().unwrap_or(i64::MAX);
-        if r.collected_at < started {
-            continue;
+        // 评论:内连接 contents 按 (task_id, platform, content_id) 归到关键词。
+        // 内容主键是 {task_id}-{platform}-{content_id},同任务内 (platform, content_id) 唯一,不会翻倍;
+        // 内连接等价旧实现「content 映射里找不到的评论不计数」。占位符由 Statement 按后端转换(参数化防注入)。
+        let sql = "SELECT ct.keyword AS kw, COUNT(*) AS cnt FROM comments cm \
+                   JOIN contents ct ON ct.task_id = cm.task_id AND ct.platform = cm.platform \
+                   AND ct.content_id = cm.content_id \
+                   WHERE cm.task_id = ? AND cm.collected_at >= ? \
+                   GROUP BY ct.keyword";
+        let comment_rows = db
+            .query_all(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                sql,
+                [task_id.clone().into(), (*started).into()],
+            ))
+            .await
+            .unwrap_or_default();
+        for row in comment_rows {
+            let keyword: String = row.try_get("", "kw").unwrap_or_default();
+            let cnt: i64 = row.try_get("", "cnt").unwrap_or(0);
+            if !keyword.is_empty() {
+                by_keyword.entry(keyword).or_insert((0, 0)).1 = cnt;
+            }
         }
-        if let Some(keyword) = content_keyword.get(&(r.task_id.clone(), r.content_id.clone())) {
-            result
-                .entry(r.task_id.clone())
-                .or_default()
-                .entry(keyword.clone())
-                .or_insert((0, 0))
-                .1 += 1;
-        }
+
+        result.insert(task_id.clone(), by_keyword);
     }
 
     result
@@ -534,7 +511,7 @@ pub struct ContentView {
     pub id: String,
     pub task_id: String,
     pub platform: String,
-    /// 所属行业:content 表无此列,list_contents 关联 task.industry 填入
+    /// 所属行业:content 表无此列,fill_content_views 关联 task.industry 填入
     pub industry: String,
     pub content_id: String,
     /// 采集时命中的关键词
@@ -584,7 +561,7 @@ pub struct ContentView {
     pub image_done: Option<i32>,
     pub comment_collected: Option<bool>,
     pub intent_analyzed: Option<bool>,
-    /// 当前登录用户是否已把该内容同步到自己的 Obsidian(list_contents 按当前用户回填)
+    /// 当前登录用户是否已把该内容同步到自己的 Obsidian(fill_content_views 按当前用户回填)
     pub synced_by_me: bool,
 }
 
@@ -601,7 +578,7 @@ impl From<content::Model> for ContentView {
             id: m.id,
             task_id: m.task_id,
             platform: m.platform,
-            industry: String::new(), // 由 list_contents 关联 task 后填充
+            industry: String::new(), // 由 fill_content_views 关联 task 后填充
             content_id: m.content_id,
             keyword: m.keyword,
             kind: m.kind,
@@ -636,72 +613,9 @@ impl From<content::Model> for ContentView {
             image_done: m.image_done,
             comment_collected: m.comment_collected,
             intent_analyzed: m.intent_analyzed,
-            synced_by_me: false, // 由 list_contents 按当前用户回填
+            synced_by_me: false, // 由 fill_content_views 按当前用户回填
         }
     }
-}
-
-/// 全量库:列出采集落库的全部内容,按采集时间倒序。dataScope=self 仅看自己。
-#[tauri::command]
-pub async fn list_contents(
-    state: State<'_, AppState>,
-    task_id: Option<String>,
-) -> Result<Vec<ContentView>> {
-    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let mut q = content::Entity::find().order_by_desc(content::Column::CollectedAt);
-    // 任务穿透视图:服务端按任务过滤后再限量,避免全局 LIST_HARD_CAP 按时间倒序
-    // 截断把较旧任务的整条内容挤出返回集(界面上表现为「该任务一条数据都没有」)
-    if let Some(tid) = task_id.filter(|t| !t.is_empty()) {
-        q = q.filter(content::Column::TaskId.eq(tid));
-    }
-    if me.scope == "self" {
-        q = q.filter(content::Column::Owner.eq(me.name.clone()));
-    }
-    let rows = q
-        .limit(LIST_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
-
-    // 关联任务取行业(逻辑外键,无物理 relation):一次性查回相关 task 建 id→industry 表
-    let task_ids: std::collections::HashSet<String> =
-        rows.iter().map(|r| r.task_id.clone()).collect();
-    let industry_map: std::collections::HashMap<String, String> = task::Entity::find()
-        .filter(task::Column::Id.is_in(task_ids))
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询任务行业失败: {e}")))?
-        .into_iter()
-        .map(|t| (t.id, t.industry))
-        .collect();
-
-    // 当前用户已同步到 Obsidian 的内容集合(供前端「已同步」标记)
-    let synced: std::collections::HashSet<String> = {
-        use veltrix_core::db::entity::content_synced_user as csu;
-        let content_ids: std::collections::HashSet<String> =
-            rows.iter().map(|r| r.id.clone()).collect();
-        csu::Entity::find()
-            .filter(csu::Column::SyncedUser.eq(me.name.clone()))
-            .filter(csu::Column::ContentId.is_in(content_ids))
-            .all(&state.db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| r.content_id)
-            .collect()
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(|m| {
-            let industry = industry_map.get(&m.task_id).cloned().unwrap_or_default();
-            let is_synced = synced.contains(&m.id);
-            let mut view: ContentView = m.into();
-            view.industry = industry;
-            view.synced_by_me = is_synced;
-            view
-        })
-        .collect())
 }
 
 /// 内容详情里的作者扩展信息(从 author_json 解析)+ 该作者在库中的聚合统计。
@@ -1368,7 +1282,7 @@ pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Re
 }
 
 /// 级联删除一批内容的评论:按 (task_id, platform, content_id) 三元组精确匹配,
-/// 与评论落库 / list_comments 的关联口径一致。
+/// 与评论落库 / fill_comment_views 的关联口径一致。
 async fn cascade_delete_comments(
     db: &sea_orm::DatabaseConnection,
     keys: &[(&str, &str, &str)],
@@ -1409,7 +1323,7 @@ pub struct CommentView {
     pub author_avatar: Option<String>,
     /// 作者平台号(抖音号 unique_id 等);从 author_json.extra.unique_id 提取
     pub author_unique_id: Option<String>,
-    /// 所属行业:comment 表无此列,list_comments 关联 task.industry 填入
+    /// 所属行业:comment 表无此列,fill_comment_views 关联 task.industry 填入
     pub industry: String,
     pub text: String,
     pub like_count: Option<i64>,
@@ -1421,7 +1335,7 @@ pub struct CommentView {
     pub intent_level: Option<String>,
     /// AI 意向理由;None=未分析
     pub intent_reason: Option<String>,
-    /// 所属内容信息(list_comments 关联 contents 填;内容已删则为 None)
+    /// 所属内容信息(fill_comment_views 关联 contents 填;内容已删则为 None)
     pub content_title: Option<String>,
     pub content_kind: Option<String>,
     pub content_cover_url: Option<String>,
@@ -1458,7 +1372,7 @@ impl From<comment::Model> for CommentView {
             author_nickname: m.author_nickname,
             author_avatar,
             author_unique_id,
-            industry: String::new(), // 由 list_comments 关联 task 后填充
+            industry: String::new(), // 由 fill_comment_views 关联 task 后填充
             text: m.text,
             like_count: m.like_count,
             reply_count: m.reply_count,
@@ -1473,51 +1387,416 @@ impl From<comment::Model> for CommentView {
             content_cover_path: None,
             content_author_nickname: None,
             content_author_avatar: None,
-            keyword: String::new(), // 由 list_comments 关联所属内容后填充
+            keyword: String::new(), // 由 fill_comment_views 关联所属内容后填充
         }
     }
 }
 
-/// 评论库:列出采集落库的评论,按采集时间倒序。task_id 非空时按任务过滤;dataScope=self 仅看自己。
-#[tauri::command]
-pub async fn list_comments(
-    state: State<'_, AppState>,
-    task_id: Option<String>,
-) -> Result<Vec<CommentView>> {
-    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let mut q = comment::Entity::find().order_by_desc(comment::Column::CollectedAt);
-    if me.scope == "self" {
-        q = q.filter(comment::Column::Owner.eq(me.name.clone()));
+// ===================== 分页列表查询(全量库 / 评论库)=====================
+//
+// list_contents / list_comments 此前一次返回最多 LIST_HARD_CAP(10000)行完整对象,
+// 前端再全量过滤/排序:大库下 IPC 传输数百 MB、每键过滤卡顿。分页接口把筛选与排序
+// 下沉 SQL、limit/offset + total 回传,前端三处消费方(内容库 / 评论库 / 内容选择弹窗)逐步迁移。
+
+/// 全量库内容分页查询参数。ids 模式(批量视图)忽略 limit/offset,按 id 集直接取回(上限 10000)。
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContentListQuery {
+    /// 任务穿透:按任务过滤(旧任务内容不被分页截断)
+    pub task_id: Option<String>,
+    /// 任务穿透关键词精确匹配(contents.keyword 全等)
+    pub keyword: Option<String>,
+    /// 任务穿透单次运行窗口(collected_at 闭区间)
+    pub run_start: Option<i64>,
+    pub run_end: Option<i64>,
+    /// 搜索:title / keyword / desc 子串(大小写不敏感)
+    pub search: Option<String>,
+    pub platform: Option<String>,
+    /// 形态多选(video/image/article/unknown);空=不限
+    pub kinds: Vec<String>,
+    /// 行业筛选(经 tasks 逻辑外键)
+    pub industry: Option<String>,
+    /// 采集时间闭区间(Unix 秒)
+    pub created_from: Option<i64>,
+    pub created_to: Option<i64>,
+    /// 发布时间闭区间(Unix 秒)
+    pub published_from: Option<i64>,
+    pub published_to: Option<i64>,
+    /// 图源:image/cover 均附加「有封面」条件;形态限制由 kinds 表达
+    pub image_source: Option<String>,
+    /// 仅展示已转写文案的视频(内容库视频 tab 口径:转写未出的视频无浏览价值)
+    pub require_transcript: Option<bool>,
+    /// 排序字段白名单:collectedAt / publishedAt / mediaStatus;None=collectedAt
+    pub sort_by: Option<String>,
+    /// asc / desc;None=desc
+    pub sort_dir: Option<String>,
+    pub limit: u64,
+    pub offset: u64,
+    /// 批量视图:按 id 集直接取回(不分页)
+    pub ids: Option<Vec<String>>,
+}
+
+/// 评论库分页查询参数。
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommentListQuery {
+    pub task_id: Option<String>,
+    /// 搜索:text / author_nickname 子串(大小写不敏感)
+    pub search: Option<String>,
+    pub platform: Option<String>,
+    /// 评论所属内容形态(EXISTS contents 相关子查询)
+    pub kinds: Vec<String>,
+    /// 行业筛选(经 tasks 逻辑外键)
+    pub industry: Option<String>,
+    /// 意向多选;unanalyzed = intent_level IS NULL
+    pub intent_levels: Vec<String>,
+    /// 评论发表时间闭区间(Unix 秒)
+    pub created_from: Option<i64>,
+    pub created_to: Option<i64>,
+    /// 排序字段白名单:collectedAt / createdAt / likeCount / intent;None=collectedAt
+    pub sort_by: Option<String>,
+    /// asc / desc;None=desc
+    pub sort_dir: Option<String>,
+    pub limit: u64,
+    pub offset: u64,
+}
+
+/// 分页列表返回包:条目 + 同筛选口径的总数(前端 hasMore / 页码推导用)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentListResult {
+    pub items: Vec<ContentView>,
+    pub total: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentListResult {
+    pub items: Vec<CommentView>,
+    pub total: i64,
+}
+
+/// 全量库「待转写 / 待提取评论」计数(与前端 needsTranscript / needsComments 逐条口径一致)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentLibraryStats {
+    pub untranscribed: i64,
+    pub pending_comment: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndustryCount {
+    pub industry: String,
+    pub count: i64,
+}
+
+/// 批量处理种类(对应前端「提取文案 / 提取评论」按钮)
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchKind {
+    Transcript,
+    Comments,
+}
+
+/// WHERE 片段 + 占位符参数(统一用 ?,由 Statement 按后端转换为 $n)
+struct FilterParts {
+    conds: String,
+    values: Vec<sea_orm::Value>,
+}
+
+/// 追加一条 AND 条件(值为占位符参数)
+fn and_cond(
+    conds: &mut String,
+    values: &mut Vec<sea_orm::Value>,
+    frag: &str,
+    v: sea_orm::Value,
+) {
+    conds.push_str(" AND ");
+    conds.push_str(frag);
+    values.push(v);
+}
+
+/// LIKE 通配符转义:前端搜索是无通配子串匹配(JS includes),转义 % _ \ 后语义等价
+fn escape_like(q: &str) -> String {
+    let mut escaped = String::with_capacity(q.len() + 16);
+    for ch in q.chars() {
+        if ch == '\\' || ch == '%' || ch == '_' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
     }
-    if let Some(tid) = task_id {
-        if !tid.is_empty() {
-            q = q.filter(comment::Column::TaskId.eq(tid));
+    escaped
+}
+
+/// 内容列表通用过滤(分页查询 / 计数 / 统计 / 批量取 id 共用同一口径)
+fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> FilterParts {
+    let mut conds = String::new();
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    if self_only {
+        and_cond(&mut conds, &mut values, "owner = ?", owner.to_string().into());
+    }
+    if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
+        and_cond(&mut conds, &mut values, "task_id = ?", tid.to_string().into());
+    }
+    if let Some(kw) = query.keyword.as_deref().filter(|k| !k.is_empty()) {
+        and_cond(&mut conds, &mut values, "keyword = ?", kw.to_string().into());
+    }
+    if let Some(start) = query.run_start {
+        and_cond(&mut conds, &mut values, "collected_at >= ?", start.into());
+    }
+    if let Some(end) = query.run_end {
+        and_cond(&mut conds, &mut values, "collected_at <= ?", end.into());
+    }
+    if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let pattern = format!("%{}%", escape_like(q));
+        // 三个命中列共用同一模式(前端 title / keyword / desc 任一 includes 即命中)
+        and_cond(
+            &mut conds,
+            &mut values,
+            "(lower(title) LIKE lower(?) ESCAPE '\\' OR lower(keyword) LIKE lower(?) ESCAPE '\\' OR lower(desc) LIKE lower(?) ESCAPE '\\')",
+            pattern.clone().into(),
+        );
+        values.push(pattern.clone().into());
+        values.push(pattern.into());
+    }
+    if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
+        and_cond(&mut conds, &mut values, "platform = ?", p.to_string().into());
+    }
+    if !query.kinds.is_empty() {
+        let placeholders = vec!["?"; query.kinds.len()].join(", ");
+        conds.push_str(&format!(" AND kind IN ({placeholders})"));
+        for k in &query.kinds {
+            values.push(k.clone().into());
         }
     }
-    let rows = q
-        .limit(LIST_HARD_CAP)
-        .all(&state.db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
-    // 关联任务取行业(逻辑外键,照 list_contents)
-    let task_ids: std::collections::HashSet<String> =
-        rows.iter().map(|r| r.task_id.clone()).collect();
-    let industry_map: std::collections::HashMap<String, String> = task::Entity::find()
+    if let Some(ind) = query
+        .industry
+        .as_deref()
+        .filter(|i| !i.is_empty() && *i != "__all")
+    {
+        and_cond(
+            &mut conds,
+            &mut values,
+            "task_id IN (SELECT id FROM tasks WHERE industry = ?)",
+            ind.to_string().into(),
+        );
+    }
+    if let Some(from) = query.created_from {
+        and_cond(&mut conds, &mut values, "collected_at >= ?", from.into());
+    }
+    if let Some(to) = query.created_to {
+        and_cond(&mut conds, &mut values, "collected_at <= ?", to.into());
+    }
+    if let Some(from) = query.published_from {
+        and_cond(&mut conds, &mut values, "published_at >= ?", from.into());
+    }
+    if let Some(to) = query.published_to {
+        and_cond(&mut conds, &mut values, "published_at <= ?", to.into());
+    }
+    match query.image_source.as_deref() {
+        // "image":本地封面路径非空(图片素材定位口径,内容选择弹窗用——远程 URL 无法定位本地素材)
+        Some("image") => {
+            conds.push_str(" AND cover_path IS NOT NULL AND cover_path <> ''");
+        }
+        // "cover":本地或远程封面任一存在(内容库封面图源,远程封面也展示)
+        Some("cover") => {
+            conds.push_str(
+                " AND ((cover_path IS NOT NULL AND cover_path <> '') OR (cover_url IS NOT NULL AND cover_url <> ''))",
+            );
+        }
+        _ => {}
+    }
+    if query.require_transcript.unwrap_or(false) {
+        conds.push_str(" AND transcript IS NOT NULL AND trim(transcript) <> ''");
+    }
+    if let Some(ids) = query.ids.as_deref() {
+        if ids.is_empty() {
+            // 空 ids 集:批量为空,恒 false(避免 IN () 语法错误)
+            conds.push_str(" AND 1 = 0");
+        } else {
+            let placeholders = vec!["?"; ids.len().min(10000)].join(", ");
+            conds.push_str(&format!(" AND id IN ({placeholders})"));
+            for id in ids.iter().take(10000) {
+                values.push(id.clone().into());
+            }
+        }
+    }
+    FilterParts { conds, values }
+}
+
+/// 评论列表通用过滤(分页查询 / 计数 / 行业角标共用同一口径)
+fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> FilterParts {
+    let mut conds = String::new();
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    if self_only {
+        and_cond(&mut conds, &mut values, "owner = ?", owner.to_string().into());
+    }
+    if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
+        and_cond(&mut conds, &mut values, "task_id = ?", tid.to_string().into());
+    }
+    if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let pattern = format!("%{}%", escape_like(q));
+        and_cond(
+            &mut conds,
+            &mut values,
+            "(lower(text) LIKE lower(?) ESCAPE '\\' OR lower(author_nickname) LIKE lower(?) ESCAPE '\\')",
+            pattern.clone().into(),
+        );
+        values.push(pattern.into());
+    }
+    if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
+        and_cond(&mut conds, &mut values, "platform = ?", p.to_string().into());
+    }
+    if !query.kinds.is_empty() {
+        // 所属内容形态:相关 EXISTS(评论与内容按任务级三列关联,无物理外键)
+        let placeholders = vec!["?"; query.kinds.len()].join(", ");
+        conds.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM contents ct WHERE ct.task_id = comments.task_id \
+             AND ct.platform = comments.platform AND ct.content_id = comments.content_id \
+             AND ct.kind IN ({placeholders}))"
+        ));
+        for k in &query.kinds {
+            values.push(k.clone().into());
+        }
+    }
+    if let Some(ind) = query
+        .industry
+        .as_deref()
+        .filter(|i| !i.is_empty() && *i != "__all")
+    {
+        and_cond(
+            &mut conds,
+            &mut values,
+            "task_id IN (SELECT id FROM tasks WHERE industry = ?)",
+            ind.to_string().into(),
+        );
+    }
+    if !query.intent_levels.is_empty() {
+        let analyzed: Vec<&String> = query
+            .intent_levels
+            .iter()
+            .filter(|l| l.as_str() != "unanalyzed")
+            .collect();
+        let mut parts: Vec<String> = Vec::new();
+        if !analyzed.is_empty() {
+            let placeholders = vec!["?"; analyzed.len()].join(", ");
+            parts.push(format!("intent_level IN ({placeholders})"));
+            for l in &analyzed {
+                values.push((*l).clone().into());
+            }
+        }
+        if analyzed.len() != query.intent_levels.len() {
+            parts.push("intent_level IS NULL".to_string());
+        }
+        conds.push_str(&format!(" AND ({})", parts.join(" OR ")));
+    }
+    if let Some(from) = query.created_from {
+        and_cond(&mut conds, &mut values, "created_at >= ?", from.into());
+    }
+    if let Some(to) = query.created_to {
+        and_cond(&mut conds, &mut values, "created_at <= ?", to.into());
+    }
+    FilterParts { conds, values }
+}
+
+/// 内容列表排序:白名单字段 + 方向;末尾恒定 id ASC 保证 offset 分页稳定(同值行不漂移)
+fn content_order(query: &ContentListQuery) -> String {
+    let col = match query.sort_by.as_deref() {
+        Some("publishedAt") => "COALESCE(published_at, 0)",
+        Some("mediaStatus") => "COALESCE(media_status, '')",
+        _ => "collected_at",
+    };
+    let dir = match query.sort_dir.as_deref() {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    format!("{col} {dir}, id ASC")
+}
+
+/// 评论列表排序:默认 collected_at DESC + 意向高→低 tiebreak(与前端 sorted 口径一致);
+/// 意向等级 CASE 对所有排序列统一追加,列值相同时保持展示顺序稳定
+fn comment_order(query: &CommentListQuery) -> String {
+    let col = match query.sort_by.as_deref() {
+        Some("createdAt") => "COALESCE(created_at, 0)",
+        Some("likeCount") => "COALESCE(like_count, 0)",
+        Some("intent") => {
+            "CASE intent_level WHEN 'high' THEN 5 WHEN 'medium' THEN 4 WHEN 'low' THEN 3 WHEN 'none' THEN 2 ELSE 1 END"
+        }
+        _ => "collected_at",
+    };
+    let dir = match query.sort_dir.as_deref() {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    format!(
+        "{col} {dir}, CASE intent_level WHEN 'high' THEN 5 WHEN 'medium' THEN 4 WHEN 'low' THEN 3 WHEN 'none' THEN 2 ELSE 1 END DESC, id ASC"
+    )
+}
+
+/// 内容视图回填:行业(逻辑外键)+ 当前用户 Obsidian 已同步标记(照旧 list_contents 口径)
+async fn fill_content_views(
+    db: &sea_orm::DatabaseConnection,
+    me_name: &str,
+    rows: Vec<content::Model>,
+) -> Result<Vec<ContentView>> {
+    let task_ids: HashSet<String> = rows.iter().map(|r| r.task_id.clone()).collect();
+    let industry_map: HashMap<String, String> = task::Entity::find()
         .filter(task::Column::Id.is_in(task_ids))
-        .all(&state.db)
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务行业失败: {e}")))?
+        .into_iter()
+        .map(|t| (t.id, t.industry))
+        .collect();
+    let synced: HashSet<String> = {
+        use veltrix_core::db::entity::content_synced_user as csu;
+        let content_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+        csu::Entity::find()
+            .filter(csu::Column::SyncedUser.eq(me_name.to_string()))
+            .filter(csu::Column::ContentId.is_in(content_ids))
+            .all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.content_id)
+            .collect()
+    };
+    Ok(rows
+        .into_iter()
+        .map(|m| {
+            let industry = industry_map.get(&m.task_id).cloned().unwrap_or_default();
+            let is_synced = synced.contains(&m.id);
+            let mut view: ContentView = m.into();
+            view.industry = industry;
+            view.synced_by_me = is_synced;
+            view
+        })
+        .collect())
+}
+
+/// 评论视图回填:行业 + 所属内容信息(标题/封面/形态/作者/关键词,照旧 list_comments 口径)
+async fn fill_comment_views(
+    db: &sea_orm::DatabaseConnection,
+    rows: Vec<comment::Model>,
+) -> Result<Vec<CommentView>> {
+    let task_ids: HashSet<String> = rows.iter().map(|r| r.task_id.clone()).collect();
+    let industry_map: HashMap<String, String> = task::Entity::find()
+        .filter(task::Column::Id.is_in(task_ids))
+        .all(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询任务行业失败: {e}")))?
         .into_iter()
         .map(|t| (t.id, t.industry))
         .collect();
     // 关联 contents 取所属内容信息(标题/封面/形态 + 内容作者),按 content.id 精确匹配
-    let content_keys: std::collections::HashSet<String> = rows
+    let content_keys: HashSet<String> = rows
         .iter()
         .map(|r| format!("{}-{}-{}", r.task_id, r.platform, r.content_id))
         .collect();
-    let content_map: std::collections::HashMap<String, content::Model> = content::Entity::find()
+    let content_map: HashMap<String, content::Model> = content::Entity::find()
         .filter(content::Column::Id.is_in(content_keys))
-        .all(&state.db)
+        .all(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询所属内容失败: {e}")))?
         .into_iter()
@@ -1560,6 +1839,296 @@ pub async fn list_comments(
                         });
             }
             view
+        })
+        .collect())
+}
+
+/// 按 id 顺序重排模型:raw SQL 只取回 id 列表(保证排序/分页),Model 批量查询不保证顺序
+fn reorder_content_rows(ids: &[String], models: Vec<content::Model>) -> Vec<content::Model> {
+    let by_id: HashMap<String, content::Model> =
+        models.into_iter().map(|m| (m.id.clone(), m)).collect();
+    ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
+}
+
+fn reorder_comment_rows(ids: &[String], models: Vec<comment::Model>) -> Vec<comment::Model> {
+    let by_id: HashMap<String, comment::Model> =
+        models.into_iter().map(|m| (m.id.clone(), m)).collect();
+    ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
+}
+
+/// 全量库分页列表:筛选与排序下沉 SQL,limit/offset + total 回传。
+/// ids 模式(批量视图)忽略分页,按 id 集直接取回(上限 10000),total=返回数。
+#[tauri::command]
+pub async fn list_contents_page(
+    state: State<'_, AppState>,
+    query: ContentListQuery,
+) -> Result<ContentListResult> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let filter = content_filter(&query, me.scope == "self", &me.name);
+    let backend = state.db.get_database_backend();
+    let use_ids = query.ids.as_deref().map(|ids| !ids.is_empty()).unwrap_or(false);
+    let limit = query.limit.clamp(1, 2000);
+    let (page_limit, page_offset) = if use_ids {
+        (10000u64, 0u64)
+    } else {
+        (limit, query.offset)
+    };
+
+    let id_sql = format!(
+        "SELECT id FROM contents WHERE 1=1 {} ORDER BY {} LIMIT {page_limit} OFFSET {page_offset}",
+        filter.conds,
+        content_order(&query),
+    );
+    let id_rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            backend,
+            id_sql,
+            filter.values.clone(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    let ids: Vec<String> = id_rows
+        .iter()
+        .map(|r| r.try_get("", "id").unwrap_or_default())
+        .collect();
+    if ids.is_empty() {
+        return Ok(ContentListResult {
+            items: vec![],
+            total: 0,
+        });
+    }
+    let total = if use_ids {
+        ids.len() as i64
+    } else {
+        let count_sql = format!(
+            "SELECT COUNT(*) AS cnt FROM contents WHERE 1=1 {}",
+            filter.conds
+        );
+        let count_rows = state
+            .db
+            .query_all(Statement::from_sql_and_values(backend, count_sql, filter.values))
+            .await
+            .map_err(|e| CrawlerError::Config(format!("统计内容失败: {e}")))?;
+        count_rows
+            .first()
+            .and_then(|r| r.try_get("", "cnt").ok())
+            .unwrap_or(0)
+    };
+    let models = content::Entity::find()
+        .filter(content::Column::Id.is_in(ids.iter().cloned()))
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    let items = fill_content_views(&state.db, &me.name, reorder_content_rows(&ids, models)).await?;
+    Ok(ContentListResult { items, total })
+}
+
+/// 评论库分页列表(同 list_contents_page 结构)。
+#[tauri::command]
+pub async fn list_comments_page(
+    state: State<'_, AppState>,
+    query: CommentListQuery,
+) -> Result<CommentListResult> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let filter = comment_filter(&query, me.scope == "self", &me.name);
+    let backend = state.db.get_database_backend();
+    let limit = query.limit.clamp(1, 2000);
+
+    let id_sql = format!(
+        "SELECT id FROM comments WHERE 1=1 {} ORDER BY {} LIMIT {limit} OFFSET {}",
+        filter.conds,
+        comment_order(&query),
+        query.offset,
+    );
+    let id_rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            backend,
+            id_sql,
+            filter.values.clone(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
+    let ids: Vec<String> = id_rows
+        .iter()
+        .map(|r| r.try_get("", "id").unwrap_or_default())
+        .collect();
+    if ids.is_empty() {
+        return Ok(CommentListResult {
+            items: vec![],
+            total: 0,
+        });
+    }
+    let count_sql = format!(
+        "SELECT COUNT(*) AS cnt FROM comments WHERE 1=1 {}",
+        filter.conds
+    );
+    let count_rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(backend, count_sql, filter.values))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计评论失败: {e}")))?;
+    let total = count_rows
+        .first()
+        .and_then(|r| r.try_get("", "cnt").ok())
+        .unwrap_or(0);
+    let models = comment::Entity::find()
+        .filter(comment::Column::Id.is_in(ids.iter().cloned()))
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
+    let items = fill_comment_views(&state.db, reorder_comment_rows(&ids, models)).await?;
+    Ok(CommentListResult { items, total })
+}
+
+/// 全量库「待转写 / 待提取评论」计数(与前端 needsTranscript / needsComments 逐条口径一致,
+/// 含任务穿透 / 平台 / 行业 / 时间 / 搜索等全部当前筛选)。
+#[tauri::command]
+pub async fn content_library_stats(
+    state: State<'_, AppState>,
+    query: ContentListQuery,
+) -> Result<ContentLibraryStats> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let filter = content_filter(&query, me.scope == "self", &me.name);
+    let sql = format!(
+        "SELECT \
+         SUM(CASE WHEN kind = 'video' AND (transcript IS NULL OR trim(transcript) = '') \
+             AND audio_path IS NOT NULL AND audio_path <> '' THEN 1 ELSE 0 END) AS untranscribed, \
+         SUM(CASE WHEN comment_collected IS NOT TRUE \
+             AND (comment_count IS NULL OR comment_count != 0) THEN 1 ELSE 0 END) AS pending_comment \
+         FROM contents WHERE 1=1 {}",
+        filter.conds
+    );
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            sql,
+            filter.values,
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计内容处理状态失败: {e}")))?;
+    let first = rows.first();
+    Ok(ContentLibraryStats {
+        untranscribed: first
+            .and_then(|r| r.try_get("", "untranscribed").ok())
+            .unwrap_or(0),
+        pending_comment: first
+            .and_then(|r| r.try_get("", "pending_comment").ok())
+            .unwrap_or(0),
+    })
+}
+
+/// 批量处理的目标内容 id 快照(与当前筛选口径一致;点击瞬间一次性取回,
+/// 之后成功移除不再改变集合——与前端「快照后逐条处理」的旧行为一致)。
+#[tauri::command]
+pub async fn list_batch_content_ids(
+    state: State<'_, AppState>,
+    query: ContentListQuery,
+    batch: BatchKind,
+) -> Result<Vec<String>> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let mut filter = content_filter(&query, me.scope == "self", &me.name);
+    match batch {
+        BatchKind::Transcript => {
+            filter.conds.push_str(
+                " AND kind = 'video' AND (transcript IS NULL OR trim(transcript) = '') \
+                 AND audio_path IS NOT NULL AND audio_path <> ''",
+            );
+        }
+        BatchKind::Comments => {
+            filter.conds.push_str(
+                " AND comment_collected IS NOT TRUE \
+                 AND (comment_count IS NULL OR comment_count != 0)",
+            );
+        }
+    }
+    let sql = format!(
+        "SELECT id FROM contents WHERE 1=1 {} ORDER BY collected_at DESC, id ASC LIMIT 10000",
+        filter.conds
+    );
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            sql,
+            filter.values,
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询批量目标失败: {e}")))?;
+    Ok(rows
+        .iter()
+        .map(|r| r.try_get("", "id").unwrap_or_default())
+        .collect())
+}
+
+/// 全量库各行业内容数(侧栏角标)。忽略行业筛选自身(否则当前行业计数恒 0),其余筛选同列表口径。
+#[tauri::command]
+pub async fn content_industry_counts(
+    state: State<'_, AppState>,
+    query: ContentListQuery,
+) -> Result<Vec<IndustryCount>> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let mut query = query;
+    query.industry = None;
+    let filter = content_filter(&query, me.scope == "self", &me.name);
+    let sql = format!(
+        "SELECT t.industry AS industry, COUNT(*) AS cnt FROM contents \
+         JOIN tasks t ON t.id = contents.task_id \
+         WHERE 1=1 {} AND t.industry IS NOT NULL AND t.industry <> '' \
+         GROUP BY t.industry",
+        filter.conds
+    );
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            sql,
+            filter.values,
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计行业内容失败: {e}")))?;
+    Ok(rows
+        .iter()
+        .map(|r| IndustryCount {
+            industry: r.try_get("", "industry").unwrap_or_default(),
+            count: r.try_get("", "cnt").unwrap_or(0),
+        })
+        .collect())
+}
+
+/// 评论库各行业评论数(侧栏角标,口径同 content_industry_counts)。
+#[tauri::command]
+pub async fn comment_industry_counts(
+    state: State<'_, AppState>,
+    query: CommentListQuery,
+) -> Result<Vec<IndustryCount>> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let mut query = query;
+    query.industry = None;
+    let filter = comment_filter(&query, me.scope == "self", &me.name);
+    let sql = format!(
+        "SELECT t.industry AS industry, COUNT(*) AS cnt FROM comments \
+         JOIN tasks t ON t.id = comments.task_id \
+         WHERE 1=1 {} AND t.industry IS NOT NULL AND t.industry <> '' \
+         GROUP BY t.industry",
+        filter.conds
+    );
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            sql,
+            filter.values,
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计行业评论失败: {e}")))?;
+    Ok(rows
+        .iter()
+        .map(|r| IndustryCount {
+            industry: r.try_get("", "industry").unwrap_or_default(),
+            count: r.try_get("", "cnt").unwrap_or(0),
         })
         .collect())
 }
@@ -1687,3 +2256,199 @@ pub async fn list_run_logs(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+
+/// 单次运行的导出数据视图:该运行时间窗内落库的内容 + 评论。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDataView {
+    pub contents: Vec<ContentView>,
+    pub comments: Vec<CommentView>,
+}
+
+/// 某次运行采集到的内容 + 评论(任务详情「执行历史」导出 Excel 用)。
+/// 时间窗口径与「查看内容」穿透一致:collected_at ∈ [started_at, finished_at ?? 现在]。
+#[tauri::command]
+pub async fn list_run_data(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<RunDataView> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let run = task_run::Entity::find_by_id(run_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询执行记录失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("执行记录不存在".into()))?;
+    if me.scope == "self" && run.owner != me.name {
+        return Err(CrawlerError::Config("无权查看该执行记录".into()));
+    }
+    let end = run.finished_at.unwrap_or_else(|| Utc::now().timestamp());
+
+    // 行业(逻辑外键,照 fill_content_views)
+    let industry = task::Entity::find_by_id(run.task_id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务行业失败: {e}")))?
+        .map(|t| t.industry)
+        .unwrap_or_default();
+
+    collect_task_data_window(
+        &state.db,
+        &run.task_id,
+        industry,
+        Some(run.started_at),
+        Some(end),
+    )
+    .await
+}
+
+/// 任务全部采集数据(任务调度「更多 → 导出」Excel 用):该任务落库的全部内容 + 评论。
+#[tauri::command]
+pub async fn list_task_data(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<RunDataView> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let t = task::Entity::find_by_id(task_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("任务不存在".into()))?;
+    if me.scope == "self" && t.owner != me.name {
+        return Err(CrawlerError::Config("无权查看该任务".into()));
+    }
+    collect_task_data_window(&state.db, &t.id, t.industry, None, None).await
+}
+
+/// 任务级导出数据查询:按任务(+ 可选 collected_at 时间窗)取内容 + 评论并组装视图。
+/// start/end 为 None = 任务全量(「更多 → 导出」);Some = 单次运行窗口(执行历史导出)。
+async fn collect_task_data_window(
+    db: &sea_orm::DatabaseConnection,
+    task_id: &str,
+    industry: String,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> Result<RunDataView> {
+    let mut cq = content::Entity::find().filter(content::Column::TaskId.eq(task_id));
+    if let Some(s) = start {
+        cq = cq.filter(content::Column::CollectedAt.gte(s));
+    }
+    if let Some(e) = end {
+        cq = cq.filter(content::Column::CollectedAt.lte(e));
+    }
+    let contents = cq
+        .order_by_asc(content::Column::CollectedAt)
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    // 评论的「所属内容」关联表(id → Model);内容视图在评论之后统一构建,避免 clone
+    let content_map: HashMap<String, content::Model> = contents
+        .iter()
+        .map(|c| (c.id.clone(), c.clone()))
+        .collect();
+
+    let mut mq = comment::Entity::find().filter(comment::Column::TaskId.eq(task_id));
+    if let Some(s) = start {
+        mq = mq.filter(comment::Column::CollectedAt.gte(s));
+    }
+    if let Some(e) = end {
+        mq = mq.filter(comment::Column::CollectedAt.lte(e));
+    }
+    let comments = mq
+        .order_by_asc(comment::Column::CollectedAt)
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
+    let comment_views: Vec<CommentView> = comments
+        .into_iter()
+        .map(|m| {
+            let cid = format!("{}-{}-{}", m.task_id, m.platform, m.content_id);
+            build_comment_view(m, content_map.get(&cid), &industry)
+        })
+        .collect();
+
+    // 导出用不上「已同步 Obsidian」标记,置 false 省一次 content_synced_users 查询
+    let content_views: Vec<ContentView> = contents
+        .into_iter()
+        .map(|m| {
+            let mut view: ContentView = m.into();
+            view.industry = industry.clone();
+            view.synced_by_me = false;
+            view
+        })
+        .collect();
+
+    Ok(RunDataView {
+        contents: content_views,
+        comments: comment_views,
+    })
+}
+
+/// 评论视图组装:关联所属内容(标题回退 desc 截断,与 fill_comment_views 同口径)。
+/// content 为 None(内容已删 / 跨窗口)时关联字段留默认。
+fn build_comment_view(
+    m: comment::Model,
+    content: Option<&content::Model>,
+    industry: &str,
+) -> CommentView {
+    let mut view: CommentView = m.into();
+    view.industry = industry.to_string();
+    if let Some(c) = content {
+        // 标题缺失时回退 desc 截断(抖音/快手无独立标题),与 fill_comment_views 同口径
+        view.content_title = c
+            .title
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                c.desc.as_deref().filter(|s| !s.trim().is_empty()).map(|d| {
+                    let head: String = d.chars().take(60).collect();
+                    if d.chars().count() > 60 {
+                        format!("{head}…")
+                    } else {
+                        head
+                    }
+                })
+            });
+        view.keyword = c.keyword.clone();
+        view.content_kind = Some(c.kind.clone());
+        view.content_author_nickname = Some(c.author_nickname.clone());
+    }
+    view
+}
+
+/// 单条内容的评论列表(全量库详情右侧评论栏):按内容行精确匹配
+/// (task_id + platform + content_id),按点赞数倒序(热评在前)。
+#[tauri::command]
+pub async fn list_content_comments(
+    state: State<'_, AppState>,
+    content_id: String,
+) -> Result<Vec<CommentView>> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let row = content::Entity::find_by_id(content_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("内容不存在".into()))?;
+    if me.scope == "self" && row.owner != me.name {
+        return Err(CrawlerError::Config("无权查看该内容".into()));
+    }
+    let industry = task::Entity::find_by_id(row.task_id.clone())
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.industry)
+        .unwrap_or_default();
+    let rows = comment::Entity::find()
+        .filter(comment::Column::TaskId.eq(row.task_id.clone()))
+        .filter(comment::Column::Platform.eq(row.platform.clone()))
+        .filter(comment::Column::ContentId.eq(row.content_id.clone()))
+        .order_by_desc(comment::Column::LikeCount)
+        .limit(LIST_HARD_CAP)
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|m| build_comment_view(m, Some(&row), &industry))
+        .collect())
+}

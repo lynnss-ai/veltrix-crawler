@@ -9,10 +9,13 @@ import {
   ArrowLeft,
   CalendarClock,
   Eye,
+  FileSpreadsheet,
   Infinity as InfinityIcon,
+  Loader2,
   Zap,
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
+import { toast } from "sonner";
 
 import { sortLabelOf, timeLabelOf, extraFilterChipsOf, nextRunTs, formatCountdown, isInProgress, displayKeyword, type TaskContentFilter } from "./collect-meta";
 import type { PageKey } from "@/components/app-sidebar";
@@ -40,6 +43,7 @@ import {
   type TaskView,
 } from "@/lib/api";
 import { platformClass } from "@/lib/platforms";
+import { exportTaskDataExcel } from "@/lib/export-task-excel";
 import { formatTimestamp } from "@/lib/utils";
 
 // 采集日志条目类型见 @/lib/api 的 CollectLogEntry(含富条目 entry:头像/昵称/标题/序号)
@@ -219,6 +223,8 @@ export function TaskDetailPage({
   // 查看日志:当前查看的运行 + 其采集日志(右侧抽屉显示)
   const [viewRun, setViewRun] = useState<TaskRunView | null>(null);
   const [runLogs, setRunLogs] = useState<CollectLogEntry[]>([]);
+  // 导出 Excel 进行中的运行 id(防重复点击)
+  const [exportingRunId, setExportingRunId] = useState<string | null>(null);
 
   // 加载执行历史(每次运行一条);任务进行中时 2s 轮询刷新,拿最新运行状态 / 计数
   useEffect(() => {
@@ -255,6 +261,44 @@ export function TaskDetailPage({
       .then(setRunLogs)
       .catch((e) => console.warn("加载运行日志失败:", e));
   }, []);
+
+  // 导出单次运行采集到的内容 + 评论为 Excel(「文案内容」「评论」双 sheet);
+  // 数据由后端按运行时间窗切分,路径经系统保存对话框选定
+  const exportRunExcel = useCallback(
+    async (run: TaskRunView) => {
+      if (exportingRunId) return;
+      setExportingRunId(run.id);
+      try {
+        const data = await api.listRunData(run.id);
+        if (data.contents.length === 0 && data.comments.length === 0) {
+          toast.error("该次运行没有采到内容或评论,没有可导出的数据");
+          return;
+        }
+        // 文件名:任务名(去掉 Windows 文件名非法字符)+ 运行开始时间
+        const d = new Date(run.startedAt * 1000);
+        const p = (n: number) => String(n).padStart(2, "0");
+        const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+        const safeName = task.name.replace(/[\\/:*?"<>|]/g, "_") || "任务";
+        const saved = await exportTaskDataExcel({
+          contents: data.contents,
+          comments: data.comments,
+          platformName,
+          fileName: `${safeName}-运行数据-${stamp}.xlsx`,
+          kind: "运行导出",
+        });
+        if (saved) {
+          toast.success(
+            `已导出 内容 ${data.contents.length} 条 / 评论 ${data.comments.length} 条`,
+          );
+        }
+      } catch (e) {
+        toast.error(`导出失败: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setExportingRunId(null);
+      }
+    },
+    [exportingRunId, task.name, platformName],
+  );
 
   const subTasks = useMemo(() => deriveSubTasks(task), [task]);
 
@@ -453,6 +497,21 @@ export function TaskDetailPage({
         enableSorting: false,
         cell: ({ row }) => (
           <div className="flex justify-end gap-1">
+            {/* 导出本次运行采集的内容 + 评论为 Excel(双 sheet) */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 cursor-pointer px-2"
+              disabled={exportingRunId === row.original.id}
+              onClick={() => exportRunExcel(row.original)}
+            >
+              {exportingRunId === row.original.id ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <FileSpreadsheet />
+              )}
+              导出
+            </Button>
             {/* 单次任务穿透:跳全量库,按本任务 + 该次运行时间范围(collectedAt)过滤,看本次新增内容 */}
             {onNavigate && (
               <Button
@@ -485,7 +544,7 @@ export function TaskDetailPage({
         ),
       },
     ],
-    [openRunLogs, onNavigate, task.id, task.name],
+    [openRunLogs, exportRunExcel, exportingRunId, onNavigate, task.id, task.name],
   );
 
   return (

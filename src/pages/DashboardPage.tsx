@@ -41,8 +41,9 @@ import { AutoScrollList } from "@/components/charts/AutoScrollList";
 import { MultiTrendChart } from "@/components/charts/MultiTrendChart";
 
 // 实时刷新节流间隔:采集中 task-progress / collect-log 事件触发很频繁,
-// 而概览是多表聚合查询较重,最快每 3s 拉一次,事件风暴不会压垮后端
-const REFRESH_THROTTLE_MS = 3000;
+// 而概览是多表聚合查询较重,10s 拉一次即可(此前 3s,采集期间仍会高频全表聚合;
+// 30s 兜底轮询仍在,事件静默也不会漏更新)
+const REFRESH_THROTTLE_MS = 10_000;
 // 兜底轮询间隔:覆盖无事件推送的数据变化(删除内容、其他端写入等)
 const POLL_INTERVAL_MS = 30_000;
 

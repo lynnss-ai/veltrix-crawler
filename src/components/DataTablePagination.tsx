@@ -21,7 +21,8 @@ export function DataTablePagination<TData>({
       pageIndex={pageIndex}
       pageCount={table.getPageCount()}
       onPageChange={(i) => table.setPageIndex(i)}
-      totalCount={table.getFilteredRowModel().rows.length}
+      // 服务端分页模式下用 rowCount(后端 total);客户端模式用当前过滤后行数
+      totalCount={table.options.rowCount ?? table.getFilteredRowModel().rows.length}
       itemLabel={itemLabel}
       pageSize={pageSize}
       pageSizeOptions={pageSizeOptions}

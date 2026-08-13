@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, ContentView, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -407,13 +407,29 @@ export const api = {
   // 终止任务:登记停止标记,运行中的采集滚动 / 素材下载 / 语音转写各阶段据此中断
   // (仅改 DB 状态不会停运行体,必须显式登记;任务未在运行时登记无副作用)
   stopTask: (taskId: string) => invoke<void>("stop_collect", { taskId }),
-  // 全量库:列出采集落库的内容(按采集时间倒序);传 taskId 时服务端按任务过滤
-  // (任务穿透视图专用:不受全局数量上限按时间截断影响,旧任务的内容也能查全)
-  listContents: (taskId?: string) =>
-    invoke<ContentView[]>("list_contents", { taskId: taskId ?? null }),
-  // 评论库:列出采集落库的评论(task_id 可选,按任务过滤)
-  listComments: (taskId?: string) =>
-    invoke<CommentView[]>("list_comments", { taskId: taskId ?? null }),
+  // 取消全量库批量提取(提取文案 / 提取评论):登记停止标记,后端逐条/逐批循环检查,
+  // 已完成条目保留,未处理的不再继续(转写批间生效,评论在「下一个视频」前生效)
+  cancelLibraryExtract: () => invoke<void>("cancel_library_extract"),
+  // 全量库分页列表:筛选/排序下沉 SQL,limit/offset + total
+  listContentsPage: (query: ContentListQuery) =>
+    invoke<ContentListResult>("list_contents_page", { query }),
+  // 评论库分页列表(同上)
+  listCommentsPage: (query: CommentListQuery) =>
+    invoke<CommentListResult>("list_comments_page", { query }),
+  // 全量库「待转写 / 待提取评论」计数(与当前筛选口径一致)
+  contentLibraryStats: (query: ContentListQuery) =>
+    invoke<ContentLibraryStats>("content_library_stats", { query }),
+  // 批量处理的目标内容 id 快照(点击瞬间与当前筛选口径一致)
+  listBatchContentIds: (query: ContentListQuery, batch: "transcript" | "comments") =>
+    invoke<string[]>("list_batch_content_ids", { query, batch }),
+  // 侧栏行业角标计数(忽略行业筛选自身,其余筛选同列表口径)
+  contentIndustryCounts: (query: ContentListQuery) =>
+    invoke<IndustryCount[]>("content_industry_counts", { query }),
+  commentIndustryCounts: (query: CommentListQuery) =>
+    invoke<IndustryCount[]>("comment_industry_counts", { query }),
+  // 单条内容的评论列表(全量库详情右侧评论栏,按点赞倒序)
+  listContentComments: (contentId: string) =>
+    invoke<CommentView[]>("list_content_comments", { contentId }),
   // 采集日志:加载某任务的历史日志(任务详情页打开时回显,再接实时事件)
   listCollectLogs: (taskId: string) =>
     invoke<CollectLogEntry[]>("list_collect_logs", { taskId }),
@@ -422,6 +438,12 @@ export const api = {
     invoke<TaskRunView[]>("list_task_runs", { taskId }),
   listRunLogs: (runId: string) =>
     invoke<CollectLogEntry[]>("list_run_logs", { runId }),
+  // 单次运行采集到的内容 + 评论(执行历史导出 Excel 用,按运行时间窗切分)
+  listRunData: (runId: string) =>
+    invoke<RunDataView>("list_run_data", { runId }),
+  // 任务全部采集内容 + 评论(任务调度「更多 → 导出」Excel 用)
+  listTaskData: (taskId: string) =>
+    invoke<RunDataView>("list_task_data", { taskId }),
   // 数据概览(首页):全量库/评论库/意向客资 + 多平台采集趋势(start/end 为 Unix 秒区间,可选)
   dashboardOverview: (start?: number, end?: number) =>
     invoke<DashboardOverview>("dashboard_overview", {

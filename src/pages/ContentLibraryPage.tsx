@@ -1,7 +1,7 @@
 // 资产库:展示采集落库的内容(contents 表)。全量库/内容库/图片库共用本组件。
 // 筛选:左侧栏(行业 + 创建时间 + 发布时间)+ 顶部(平台 chip + 关键字搜索)。
 // 关键字匹配 标题 / 采集关键词 / 文案;时间为预设范围。
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowLeft,
@@ -24,7 +24,7 @@ import * as XLSX from "xlsx";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 
-import { DataTable } from "@/components/DataTable";
+import { DataTable, type ServerTableState } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { FacetedFilter } from "@/components/FacetedFilter";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
@@ -66,6 +66,8 @@ import {
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import {
   api,
+  type ContentLibraryStats,
+  type ContentListQuery,
   type ContentView,
   type IndustryView,
   type PlatformConfig,
@@ -85,26 +87,18 @@ import {
   FilterSidebar,
   IndustryFilterToggle,
   DateRangeFilter,
-  inDateRange,
 } from "@/components/library-filters";
 import { ImageWaterfall } from "@/components/ImageWaterfall";
 import { ContentCard } from "@/components/ContentCard";
 import { MediaStatusBadge } from "@/components/MediaStatusBadge";
 
-// 瀑布流每次渲染/加载的卡片数:首屏与「加载更多」步长一致,避免一次性挂载海量图片
+// 瀑布流每次加载的卡片数:与后端 offset 步进一致,避免一次性挂载海量图片
 const GRID_PAGE_SIZE = 48;
 
-// 有音频但无文案(待转写):含转写失败与从未转写(如当时缺 API Key 被跳过)两类,
-// 与后端批量转写的筛选口径一致
-function needsTranscript(c: ContentView): boolean {
-  return !(c.transcript ?? "").trim() && !!c.audioPath;
-}
-
-// 待提取评论:未采过评论且接口统计评论数非 0(0 条采了也是空跑;数量未知的保留),
-// 与后端补采评论的跳过口径一致
-function needsComments(c: ContentView): boolean {
-  return c.commentCollected !== true && c.commentCount !== 0;
-}
+// 表格列 id → 后端排序字段(白名单;本页仅「素材」列可排序)
+const CONTENT_SORT_BY_MAP: Record<string, ContentListQuery["sortBy"]> = {
+  media: "mediaStatus",
+};
 
 // 图片库/内容库视图模式(瀑布流/表格)的 localStorage 持久化键(按库区分)
 function viewModeStorageKey(kind: string): string {
@@ -127,7 +121,18 @@ export function ContentLibraryPage({
 }) {
   // 任务穿透过滤开关:进来默认开;用户点"清除"后看全部
   const [taskFilterOn, setTaskFilterOn] = useState(true);
+  // 服务端分页:contents 持有「当前已加载页/批」(表格=当前页,瀑布流=已 append 的各批)
   const [contents, setContents] = useState<ContentView[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  // 表格视图的服务端分页/排序状态
+  const [serverState, setServerState] = useState<ServerTableState>({
+    pageIndex: 0,
+    pageSize: 50,
+    sorting: [],
+  });
+  // 瀑布流已加载偏移(批起点;append 式,事件删行后不能从 contents.length 推导)
+  const [gridOffset, setGridOffset] = useState(0);
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [search, setSearch] = useState("");
@@ -136,6 +141,8 @@ export function ContentLibraryPage({
   const [industryFilter, setIndustryFilter] = useState("__all");
   const [createdRange, setCreatedRange] = useState<DateRange | undefined>();
   const [publishedRange, setPublishedRange] = useState<DateRange | undefined>();
+  // 请求序号竞态守卫:筛选快速切换时,慢的旧响应不覆盖新响应
+  const reqSeq = useRef(0);
   // 内容详情弹窗:当前打开的内容 id(null=关闭)
   const [detailId, setDetailId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
@@ -162,6 +169,18 @@ export function ContentLibraryPage({
   const [cmIntent, setCmIntent] = useState(false);
   // 补采评论进行中(防重复点击;逐视频开详情页采集,耗时较长)
   const [collectingComments, setCollectingComments] = useState(false);
+  // 提取文案/评论进行中:列表只显示本批待处理条目,成功一条移除一条;null=未在提取
+  const [processing, setProcessing] = useState<{
+    kind: "transcript" | "comments";
+    ids: Set<string>;
+  } | null>(null);
+  // 事件监听回调里读最新 processing(监听器只注册一次,不能闭包旧值)
+  const processingRef = useRef<typeof processing>(null);
+  useEffect(() => {
+    processingRef.current = processing;
+  }, [processing]);
+  // 取消请求已发出、等后端在批间/下一条生效(防重复点击)
+  const [cancelling, setCancelling] = useState(false);
   // 待确认的批量删除:ids + 确认后清空表格选择的回调;null=未弹确认框
   const [pendingDelete, setPendingDelete] = useState<{
     ids: string[];
@@ -192,15 +211,8 @@ export function ContentLibraryPage({
   };
   // 图片库图源:image=图文内容的图片(默认)/ cover=全量库全部内容的封面
   const [imageSource, setImageSource] = useState<"image" | "cover">("image");
-  // 瀑布流增量加载:当前可见卡片数,筛选/视图变化时重置回首屏
-  const [visibleCount, setVisibleCount] = useState(GRID_PAGE_SIZE);
   // 搜索词延迟值:输入即时回显,筛选/大列表重渲染延后到空闲帧,避免逐键卡顿
   const deferredSearch = useDeferredValue(search);
-  // 瀑布流「加载更多」:稳定引用,配合 WaterfallCard 的 memo 避免整列无效重渲染
-  const handleLoadMore = useCallback(
-    () => setVisibleCount((prev) => prev + GRID_PAGE_SIZE),
-    [],
-  );
 
   const platformName = useCallback((id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
@@ -208,12 +220,139 @@ export function ContentLibraryPage({
   // 任务穿透时按任务拉取(服务端过滤,旧任务内容不被全量上限截断);开关/目标任务变化时重取
   const penetratedTaskId =
     taskFilter && taskFilterOn ? taskFilter.taskId : undefined;
+
+  // 日期区间 → Unix 秒闭区间(与旧 inDateRange 的本地日 00:00:00 ~ 23:59:59.999 口径一致)
+  const toDayStart = (d: Date) =>
+    Math.floor(new Date(d).setHours(0, 0, 0, 0) / 1000);
+  const toDayEnd = (d: Date) =>
+    Math.floor(new Date(d).setHours(23, 59, 59, 999) / 1000);
+
+  // 由当前筛选 + 分页/排序构造后端查询参数(统计 / 批量快照 / 导出复用同一口径)
+  const buildQuery = useCallback(
+    (opts: {
+      sorting?: ServerTableState["sorting"];
+      limit: number;
+      offset: number;
+    }): ContentListQuery => {
+      const sort = opts.sorting?.[0];
+      return {
+        taskId: penetratedTaskId ?? null,
+        keyword: penetratedTaskId ? (taskFilter?.keyword ?? null) : null,
+        runStart: penetratedTaskId ? (taskFilter?.runStart ?? null) : null,
+        runEnd: penetratedTaskId ? (taskFilter?.runEnd ?? null) : null,
+        search: deferredSearch.trim() || null,
+        platform: platformFilter || null,
+        // kindFilter(库级形态)与 kindSearch(全量库内多选)UI 互斥
+        kinds: kindFilter ? [kindFilter] : kindSearch,
+        industry: industryFilter === "__all" ? null : industryFilter,
+        createdFrom: createdRange?.from ? toDayStart(createdRange.from) : null,
+        createdTo: createdRange?.from
+          ? toDayEnd(createdRange.to ?? createdRange.from)
+          : null,
+        publishedFrom: publishedRange?.from
+          ? toDayStart(publishedRange.from)
+          : null,
+        publishedTo: publishedRange?.from
+          ? toDayEnd(publishedRange.to ?? publishedRange.from)
+          : null,
+        // 图源仅图片库传:「封面」要全形态 + 有封面;「图文」不加封面条件(旧 base 口径)
+        imageSource: isImageLibrary && imageSource === "cover" ? "cover" : null,
+        // 内容库(视频 tab)只展示已转写文案的视频
+        requireTranscript: kindFilter === "video" || null,
+        sortBy: sort ? (CONTENT_SORT_BY_MAP[sort.id] ?? null) : null,
+        sortDir: sort ? (sort.desc ? "desc" : "asc") : null,
+        limit: opts.limit,
+        offset: opts.offset,
+        // 提取文案/评论进行中:ids 模式不分页一次取回本批(「列表只剩本批」视图)
+        ids: processing ? [...processing.ids] : null,
+      };
+    },
+    [
+      penetratedTaskId,
+      taskFilter,
+      deferredSearch,
+      platformFilter,
+      kindFilter,
+      kindSearch,
+      industryFilter,
+      createdRange,
+      publishedRange,
+      isImageLibrary,
+      imageSource,
+      processing,
+    ],
+  );
+
+  // 筛选/视图/库形态变化:表格回第一页、瀑布流回首批(offset 页在列表变化后会漂移)
   useEffect(() => {
+    setServerState((s) => (s.pageIndex === 0 ? s : { ...s, pageIndex: 0 }));
+    setGridOffset((o) => (o === 0 ? o : 0));
+  }, [
+    viewMode,
+    deferredSearch,
+    platformFilter,
+    kindSearch,
+    industryFilter,
+    createdRange,
+    publishedRange,
+    kindFilter,
+    imageSource,
+    taskFilter,
+    taskFilterOn,
+  ]);
+
+  // 表格视图:服务端分页替换式拉取
+  useEffect(() => {
+    if (supportsWaterfall && viewMode === "grid") return;
+    const query = buildQuery({
+      sorting: serverState.sorting,
+      limit: serverState.pageSize,
+      offset: serverState.pageIndex * serverState.pageSize,
+    });
+    const seq = ++reqSeq.current;
+    setLoading(true);
     api
-      .listContents(penetratedTaskId)
-      .then(setContents)
-      .catch((e) => toast.error(`加载内容失败: ${e}`));
-  }, [penetratedTaskId]);
+      .listContentsPage(query)
+      .then((res) => {
+        if (seq !== reqSeq.current) return;
+        setContents(res.items);
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (seq !== reqSeq.current) return;
+        toast.error(`加载内容失败: ${e}`);
+      })
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
+  }, [viewMode, supportsWaterfall, serverState, buildQuery]);
+
+  // 瀑布流视图:offset 步进 append(加载更多);offset=0 时替换为首屏
+  useEffect(() => {
+    if (!(supportsWaterfall && viewMode === "grid")) return;
+    const query = buildQuery({ limit: GRID_PAGE_SIZE, offset: gridOffset });
+    const seq = ++reqSeq.current;
+    setLoading(true);
+    api
+      .listContentsPage(query)
+      .then((res) => {
+        if (seq !== reqSeq.current) return;
+        setContents((prev) => {
+          if (gridOffset === 0) return res.items;
+          // 事件删行后 append 可能重叠,按 id 去重
+          const seen = new Set(prev.map((c) => c.id));
+          return [...prev, ...res.items.filter((c) => !seen.has(c.id))];
+        });
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (seq !== reqSeq.current) return;
+        toast.error(`加载内容失败: ${e}`);
+      })
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
+  }, [viewMode, supportsWaterfall, gridOffset, buildQuery]);
 
   useEffect(() => {
     api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
@@ -237,12 +376,23 @@ export function ContentLibraryPage({
       if (pending.size === 0) return;
       const batch = new Map(pending);
       pending.clear();
+      const proc = processingRef.current;
       setContents((prev) =>
-        prev.map((x) => {
+        prev.flatMap((x) => {
           const p = batch.get(x.id);
-          return p
-            ? { ...x, transcript: p.transcript, transcriptError: p.transcriptError }
-            : x;
+          if (!p) return [x];
+          // 提取文案进行中且本条转写成功:从列表移除(「成功一条消失一条」的渐进效果);
+          // 失败的保留在列表里,转写错误就地显示
+          if (
+            proc?.kind === "transcript" &&
+            proc.ids.has(x.id) &&
+            (p.transcript ?? "").trim()
+          ) {
+            return [];
+          }
+          return [
+            { ...x, transcript: p.transcript, transcriptError: p.transcriptError },
+          ];
         }),
       );
     };
@@ -256,109 +406,69 @@ export function ContentLibraryPage({
     };
   }, []);
 
-  // 按内容形态过滤:图片库=图文 / 内容库=视频 / 全量库=全部。
-  // 图片库切到「封面」图源时改为:全量库全部内容里有封面的(视频封面也作为图片素材浏览)
-  const base = useMemo(() => {
-    if (isImageLibrary && imageSource === "cover") {
-      return contents.filter((c) => !!(c.coverPath || c.coverUrl));
-    }
-    let list = kindFilter
-      ? contents.filter((c) => c.kind === kindFilter)
-      : contents;
-    // 内容库(视频库)只展示已转写出文案的视频:转写(transcript)还没出来的视频
-    // 在卡片里只能显示「示例文案 · 转写完成后自动替换」占位,无浏览价值,故不展示。
-    //(全量库 / 图片库不受影响)
-    if (kindFilter === "video") {
-      list = list.filter((c) => (c.transcript ?? "").trim() !== "");
-    }
-    // 数据穿透:按任务过滤;带运行时间范围则进一步按 collectedAt 落在该次运行内(单次任务穿透)
-    if (taskFilter && taskFilterOn) {
-      list = list.filter((c) => c.taskId === taskFilter.taskId);
-      if (taskFilter.keyword) {
-        list = list.filter((c) => c.keyword === taskFilter.keyword);
-      }
-      if (taskFilter.runStart != null && taskFilter.runEnd != null) {
-        list = list.filter(
-          (c) =>
-            c.collectedAt >= taskFilter.runStart! &&
-            c.collectedAt <= taskFilter.runEnd!,
-        );
-      }
-    }
-    return list;
-  }, [contents, kindFilter, isImageLibrary, imageSource, taskFilter, taskFilterOn]);
+  // 评论补采成功实时移除:后端每采成功一条内容发事件,提取评论进行中
+  // 对应行从列表消失(与转写同一套「成功一条移除一条」交互);失败的保留
+  useEffect(() => {
+    const unlisten = listen<{ id: string; comments: number }>(
+      "content-comments-collected",
+      (e) => {
+        const proc = processingRef.current;
+        if (proc?.kind !== "comments" || !proc.ids.has(e.payload.id)) return;
+        setContents((prev) => prev.filter((x) => x.id !== e.payload.id));
+      },
+    );
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
   // 平台筛选列出全部平台(与行业侧栏一致),不只展示已有数据的平台
   const platformOptions = useMemo(() => platforms.map((p) => p.id), [platforms]);
 
-  // 各行业内容数(侧栏角标),只统计当前库(base)
-  const industryCounts = useMemo(() => {
-    const map: Record<string, number> = { __all: base.length };
-    for (const c of base) {
-      if (c.industry) map[c.industry] = (map[c.industry] ?? 0) + 1;
-    }
-    return map;
-  }, [base]);
-
-  const filtered = useMemo(() => {
-    return base.filter((c) => {
-      if (platformFilter && c.platform !== platformFilter) return false;
-      if (kindSearch.length > 0 && !kindSearch.includes(c.kind)) return false;
-      if (industryFilter !== "__all" && c.industry !== industryFilter)
-        return false;
-      if (!inDateRange(c.collectedAt, createdRange)) return false;
-      if (!inDateRange(c.publishedAt, publishedRange)) return false;
-      if (deferredSearch) {
-        const q = deferredSearch.toLowerCase();
-        return (
-          (c.title ?? "").toLowerCase().includes(q) ||
-          c.keyword.toLowerCase().includes(q) ||
-          (c.desc ?? "").toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [
-    base,
-    platformFilter,
-    kindSearch,
-    industryFilter,
-    createdRange,
-    publishedRange,
-    deferredSearch,
-  ]);
-
-  // 筛选条件或视图模式变化时,瀑布流回到首屏(避免停留在已加载更多的页码)。
-  // 依赖刻意取「筛选条件」而非 filtered 结果:批量转写期间 contents 每 300ms 就地更新,
-  // 若依赖 filtered,visibleCount 会被反复重置,用户滚动位置被顶回首屏
+  // 各行业内容数(侧栏角标):走后端聚合,跟随当前筛选(除行业自身——与列表口径一致)。
+  // 「全部」角标用列表 total,渲染时合并传入
+  const [industryCounts, setIndustryCounts] = useState<Record<string, number>>({});
+  const countsSeq = useRef(0);
   useEffect(() => {
-    setVisibleCount(GRID_PAGE_SIZE);
-  }, [
-    viewMode,
-    platformFilter,
-    kindSearch,
-    industryFilter,
-    createdRange,
-    publishedRange,
-    deferredSearch,
-    kindFilter,
-    imageSource,
-    taskFilter,
-    taskFilterOn,
-  ]);
+    const query = buildQuery({ limit: 1, offset: 0 });
+    const seq = ++countsSeq.current;
+    api
+      .contentIndustryCounts(query)
+      .then((list) => {
+        if (seq !== countsSeq.current) return; // 过期响应丢弃
+        const map: Record<string, number> = {};
+        for (const it of list) map[it.industry] = it.count;
+        setIndustryCounts(map);
+      })
+      .catch((e) => console.warn("加载行业角标失败:", e));
+  }, [buildQuery]);
 
-  // 待转写(有音频无文案):按当前列表口径统计(含任务穿透 / 平台 / 行业 / 时间 / 搜索筛选),
-  // 全量库据此显示批量转写按钮,点击也只处理这批
-  const untranscribedItems = useMemo(
-    () => filtered.filter(needsTranscript),
-    [filtered],
-  );
+  // 待转写 / 待提取评论计数(按钮显示 + 批量目标判定):走后端统计,与当前筛选口径一致。
+  // buildQuery 含 processing,批量进行中(ids 模式)统计即本批剩余
+  const [libStats, setLibStats] = useState<ContentLibraryStats>({
+    untranscribed: 0,
+    pendingComment: 0,
+  });
+  const statsSeq = useRef(0);
+  useEffect(() => {
+    const query = buildQuery({ limit: 1, offset: 0 });
+    const seq = ++statsSeq.current;
+    api
+      .contentLibraryStats(query)
+      .then((s) => {
+        if (seq !== statsSeq.current) return;
+        setLibStats(s);
+      })
+      .catch((e) => console.warn("加载处理状态统计失败:", e));
+  }, [buildQuery]);
 
-  // 待提取评论(未采过评论且评论数非 0):与待转写同口径,按当前列表统计,
-  // 全量库「提取评论」按钮点击也只处理这批
-  const pendingCommentItems = useMemo(
-    () => filtered.filter(needsComments),
-    [filtered],
+  // 提取进行中剩余待处理条数:成功条目已从 contents 移除,直接数这批还剩多少
+  const processingRemaining = useMemo(
+    () =>
+      processing
+        ? contents.filter((c) => processing.ids.has(c.id)).length
+        : 0,
+    [processing, contents],
   );
 
   // 是否有任意筛选生效(决定显示「重置」)
@@ -592,18 +702,40 @@ export function ContentLibraryPage({
     }
   }
 
-  // 批量转写:后端对当前列表中「有音频无文案」的条目按任务分组重跑语音转写
-  // (并发遵循系统设置「语音转写」),完成后整表刷新,用处理数与这批剩余待转写数算出成功数
+  // 取消批量提取:登记后端停止标记;转写在批间、评论在「下一个视频」前生效,
+  // 运行中的 invoke 收尾后 handler 的 finally 会退出处理视图并刷新列表
+  async function handleCancelProcessing() {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await api.cancelLibraryExtract();
+      toast.info("已请求取消 · 当前条目完成后停止");
+    } catch (e) {
+      toast.error(`取消失败: ${e}`);
+      setCancelling(false);
+    }
+  }
+
+  // 批量转写:后端对当前筛选中「有音频无文案」的条目按任务分组重跑语音转写
+  // (并发遵循系统设置「语音转写」)。点击后列表先筛出本批,转写成功一条移除一条;
+  // 完成后清 processing(列表自动回到当前页视图),成功数用服务端剩余待转写统计倒推
   async function handleBatchRetryTranscripts() {
-    if (batchRetryingTranscripts || untranscribedItems.length === 0) return;
+    if (batchRetryingTranscripts || libStats.untranscribed === 0) return;
     setBatchRetryingTranscripts(true);
     try {
-      const ids = untranscribedItems.map((c) => c.id);
+      // 点击瞬间按当前筛选口径取目标快照(后续成功移除不改变集合)
+      const ids = await api.listBatchContentIds(
+        buildQuery({ limit: 1, offset: 0 }),
+        "transcript",
+      );
+      if (ids.length === 0) return;
+      setProcessing({ kind: "transcript", ids: new Set(ids) });
       const retried = await api.retryFailedTranscripts(ids);
-      const list = await api.listContents(penetratedTaskId);
-      setContents(list);
-      const idSet = new Set(ids);
-      const remain = list.filter((c) => idSet.has(c.id) && needsTranscript(c)).length;
+      // 不再整表重拉:本批剩余 = 同口径服务端待转写数(等价旧「重拉后过滤本批」)
+      const stats = await api.contentLibraryStats(
+        buildQuery({ limit: 1, offset: 0 }),
+      );
+      const remain = stats.untranscribed;
       const ok = Math.max(0, retried - remain);
       toast.success(
         remain > 0
@@ -613,20 +745,28 @@ export function ContentLibraryPage({
     } catch (e) {
       toast.error(`批量转写失败: ${e}`);
     } finally {
+      setProcessing(null);
+      setCancelling(false);
       setBatchRetryingTranscripts(false);
     }
   }
 
-  // 补采评论:对选中内容按弹窗参数重采一级评论(后端逐视频开详情页采集,耗时较长),
-  // 完成后刷新列表并清空选择;跳过/失败明细量多,toast 只给汇总,逐条打控制台
+  // 补采评论:对选中内容按弹窗参数重采一级评论(后端逐视频开详情页采集,耗时较长)。
+  // 点击后先关弹窗、列表筛出本批,采成功一条移除一条;完成后退出筛选(列表自动回当前页视图)。
+  // 跳过/失败明细量多,toast 只给汇总,逐条打控制台
   async function handleRecollectComments() {
     if (!commentDialog || collectingComments) return;
     setCollectingComments(true);
+    const { ids, reset } = commentDialog;
+    // 立即关弹窗并清空选择:列表进入「仅本批」视图,成功条目会渐进消失
+    setCommentDialog(null);
+    reset();
+    setProcessing({ kind: "comments", ids: new Set(ids) });
     const toastId = toast.loading(
-      `正在提取 ${commentDialog.ids.length} 条内容的评论 · 会逐个打开详情页,请稍候…`,
+      `正在提取 ${ids.length} 条内容的评论 · 会逐个打开详情页,请稍候…`,
     );
     try {
-      const s = await api.recollectComments(commentDialog.ids, {
+      const s = await api.recollectComments(ids, {
         commentTimeRange: cmTimeRange,
         commentLimit: Number(cmLimit) || 0,
         analyzeIntent: cmIntent,
@@ -638,13 +778,11 @@ export function ContentLibraryPage({
         { id: toastId },
       );
       if (s.messages.length) console.warn("提取评论明细:", s.messages);
-      commentDialog.reset();
-      setCommentDialog(null);
-      const list = await api.listContents(penetratedTaskId);
-      setContents(list);
     } catch (e) {
       toast.error(`提取评论失败: ${e}`, { id: toastId });
     } finally {
+      setProcessing(null);
+      setCancelling(false);
       setCollectingComments(false);
     }
   }
@@ -786,7 +924,7 @@ export function ContentLibraryPage({
               "采集的全部内容"
             )}
             <span className="ml-1 text-muted-foreground">
-              · 共 {filtered.length} 条
+              · 共 {total} 条
             </span>
           </span>
           <div className="flex shrink-0 items-center gap-1">
@@ -819,7 +957,7 @@ export function ContentLibraryPage({
         {!sidebarCollapsed && (
           <FilterSidebar
             industries={industries}
-            industryCounts={industryCounts}
+            industryCounts={{ ...industryCounts, __all: total }}
             industryFilter={industryFilter}
             onIndustry={setIndustryFilter}
             onCollapse={() => setSidebarCollapsed(true)}
@@ -937,33 +1075,39 @@ export function ContentLibraryPage({
             ))}
             {/* 全量库批量提取入口:与平台行同排靠右(不与上方筛选行对齐)。
                 提取评论:待提计数 + 弹窗设评论参数,无选择上下文 reset 传空操作 */}
-            {!kindFilter && pendingCommentItems.length > 0 && (
+            {!kindFilter && libStats.pendingComment > 0 && (
               <Button
                 variant="outline"
                 className="ml-auto h-7 cursor-pointer border-violet-500/40 px-3 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
                 disabled={collectingComments}
-                onClick={() =>
-                  setCommentDialog({
-                    ids: pendingCommentItems.map((c) => c.id),
-                    reset: () => {},
-                  })
-                }
+                onClick={async () => {
+                  // 点击瞬间按当前筛选口径取目标快照(与「提取文案」一致)
+                  const ids = await api.listBatchContentIds(
+                    buildQuery({ limit: 1, offset: 0 }),
+                    "comments",
+                  );
+                  if (ids.length === 0) {
+                    toast.info("当前没有待提取评论的内容");
+                    return;
+                  }
+                  setCommentDialog({ ids, reset: () => {} });
+                }}
               >
                 {collectingComments ? (
                   <Loader2 className="animate-spin" />
                 ) : (
                   <MessagesSquare />
                 )}
-                提取评论 · {pendingCommentItems.length} 条
+                提取评论 · {libStats.pendingComment} 条
               </Button>
             )}
             {/* 提取文案:待提(有音频无文案)计数 + 一键批量提取;
                 评论按钮不在(已提完)时用 ml-auto 保持靠右 */}
-            {!kindFilter && untranscribedItems.length > 0 && (
+            {!kindFilter && libStats.untranscribed > 0 && (
               <Button
                 variant="outline"
                 className={`h-7 cursor-pointer border-amber-500/40 px-3 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400 ${
-                  pendingCommentItems.length > 0 ? "" : "ml-auto"
+                  libStats.pendingComment > 0 ? "" : "ml-auto"
                 }`}
                 disabled={batchRetryingTranscripts}
                 onClick={handleBatchRetryTranscripts}
@@ -973,16 +1117,44 @@ export function ContentLibraryPage({
                 ) : (
                   <RefreshCw />
                 )}
-                提取文案 · {untranscribedItems.length} 条
+                提取文案 · {libStats.untranscribed} 条
               </Button>
             )}
           </div>
 
+          {/* 提取文案/评论进行中:仅显示本批,成功一条移除一条;提示条给剩余计数 + 取消 */}
+          {processing && (
+            <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-1.5 text-xs">
+              <Loader2 className="size-3.5 animate-spin text-primary" />
+              <span>
+                {processing.kind === "transcript"
+                  ? "正在提取文案"
+                  : "正在提取评论"}{" "}
+                · 剩余{" "}
+                <span className="font-mono font-medium">
+                  {processingRemaining}
+                </span>{" "}
+                条(成功一条自动移除一条)
+              </span>
+              {/* 取消:转写在批间、评论在「下一个视频」前生效,已完成条目保留 */}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto h-6 cursor-pointer px-2 text-xs"
+                disabled={cancelling}
+                onClick={handleCancelProcessing}
+              >
+                {cancelling ? <Loader2 className="animate-spin" /> : <X />}
+                {cancelling ? "取消中…" : "取消"}
+              </Button>
+            </div>
+          )}
+
           {supportsWaterfall && viewMode === "grid" ? (
             <ImageWaterfall
-              items={filtered}
-              visibleCount={visibleCount}
-              onLoadMore={handleLoadMore}
+              items={contents}
+              total={total}
+              onLoadMore={() => setGridOffset((o) => o + GRID_PAGE_SIZE)}
               platformName={platformName}
               retrying={retrying}
               onOpenDetail={setDetailId}
@@ -992,11 +1164,17 @@ export function ContentLibraryPage({
           ) : (
             <DataTable
               columns={columns}
-              data={filtered}
+              data={contents}
               itemLabel="内容"
               getRowId={(c) => c.id}
               defaultPageSize={50}
               pageSizeOptions={[50, 100, 200, 500, 1000]}
+              serverControl={{
+                total,
+                state: serverState,
+                onStateChange: setServerState,
+                loading,
+              }}
               renderToolbar={(table) => {
                 const ids = table
                   .getSelectedRowModel()
@@ -1043,16 +1221,6 @@ export function ContentLibraryPage({
                       )}
                       导出 Excel
                     </Button>
-                    {/* 提取评论:弹窗设置评论参数(与新建任务表单的评论采集项一致)后逐视频采集 */}
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="cursor-pointer"
-                      onClick={() => setCommentDialog({ ids, reset })}
-                    >
-                      <MessagesSquare />
-                      提取评论
-                    </Button>
                     <Button
                       variant="destructive"
                       size="sm"
@@ -1084,12 +1252,12 @@ export function ContentLibraryPage({
         </div>
       </div>
       <ContentDetailDialog
-        items={filtered}
+        items={contents}
         activeId={detailId}
         onActiveIdChange={setDetailId}
       />
       {/* 提取评论参数弹窗:三项与新建任务表单的评论采集项一致(评论时间 / 单视频上限 / 意图分析);
-          两个入口共用:顶部「提取评论」(当前筛选待提批)与选中行工具栏(勾选批) */}
+          仅顶部「提取评论」一个入口(当前筛选待提批) */}
       <Dialog
         open={!!commentDialog}
         onOpenChange={(o) => {

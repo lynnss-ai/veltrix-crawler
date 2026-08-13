@@ -1,5 +1,7 @@
-// 全屏内容详情弹窗:左侧展示素材(图文=瀑布流全图、视频=大封面+播放跳转;点开看大图、
-// 方向键浏览,看完可续看下一个),右侧作者卡(画像 + 聚合 + 监控)+ 内容卡 + 转写文案。
+// 全屏内容详情弹窗:顶部通栏(翻篇 + 页面切换 + 链接操作),正文两页:
+// 「概览」= 素材区(图文瀑布全图 / 视频封面+音频)+ 作者卡 + 内容卡;
+// 「文案与评论」= 通栏双栏,左转写文案、右该内容评论列表(点赞倒序)。
+// 素材点开看大图、方向键浏览,看完可续看下一个。
 // 键盘:大图未开时 ←/→ 切上一篇/下一篇;大图打开时 ←/→ 翻图(可跨内容续看)。
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -12,8 +14,12 @@ import {
   Clock,
   Copy,
   ExternalLink,
+  FileText,
   ImageOff,
+  LayoutGrid,
   Loader2,
+  MessagesSquare,
+  ThumbsUp,
   User,
   X,
   XCircle,
@@ -25,7 +31,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
-import { api, type ContentDetailView, type ContentView } from "@/lib/api";
+import { api, type CommentView, type ContentDetailView, type ContentView } from "@/lib/api";
 import {
   authorProfileUrl,
   contentDetailUrl,
@@ -62,6 +68,13 @@ const KIND_LABEL: Record<string, string> = {
   image: "图文",
   article: "文章",
   unknown: "未知",
+};
+
+// 评论意向等级文案(与评论库 INTENT_META 口径一致);none/未分析不展示
+const INTENT_LABEL: Record<string, string> = {
+  high: "高意向",
+  medium: "中意向",
+  low: "低意向",
 };
 
 // 一张图的显示源:src 主源 + 可选 fallback(本地缺失时回退外链)
@@ -213,9 +226,36 @@ function StateBadge({
   );
 }
 
-// 统计格:边框卡片,上 label 下 value
-function StatCell({
+// 正文分页切换按钮(样式与全量库视图切换一致:选中=主色填充)
+function PageButton({
+  active,
   label,
+  icon: Icon,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  icon: typeof LayoutGrid;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex h-full cursor-pointer items-center gap-1 rounded px-2.5 text-xs font-medium transition-colors ${
+        active
+          ? "bg-primary text-primary-foreground"
+          : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <Icon className="size-3.5" />
+      {label}
+    </button>
+  );
+}
+
+// 统计格:边框卡片,上 label 下 value
+function StatCell({  label,
   value,
   accent,
 }: {
@@ -252,6 +292,12 @@ export function ContentDetailDialog({
   const [detail, setDetail] = useState<ContentDetailView | null>(null);
   const [loading, setLoading] = useState(false);
   const [monitoring, setMonitoring] = useState(false);
+  // 右侧评论栏:当前内容的评论列表(点赞倒序)
+  const [comments, setComments] = useState<CommentView[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  // 正文分页:overview=素材 + 作者/内容卡;text=文案与评论通栏双栏。
+  // 切上一篇/下一篇时保持当前页,连续看文案不用来回切
+  const [page, setPage] = useState<"overview" | "text">("overview");
   // 大图浏览态:定位到某条内容的第几张图(null=未打开大图)
   const [lightbox, setLightbox] = useState<{
     itemIndex: number;
@@ -264,6 +310,7 @@ export function ContentDetailDialog({
   useEffect(() => {
     if (!activeId) {
       setDetail(null);
+      setPage("overview"); // 关闭后复位,下次打开回到概览页
       return;
     }
     setLoading(true);
@@ -272,6 +319,23 @@ export function ContentDetailDialog({
       .then(setDetail)
       .catch((e) => toast.error(`加载详情失败: ${e}`))
       .finally(() => setLoading(false));
+  }, [activeId]);
+
+  // 评论栏:随内容切换加载该内容的评论(与详情并行,互不阻塞)
+  useEffect(() => {
+    if (!activeId) {
+      setComments([]);
+      return;
+    }
+    setCommentsLoading(true);
+    api
+      .listContentComments(activeId)
+      .then(setComments)
+      .catch((e) => {
+        console.warn("加载评论失败:", e);
+        setComments([]);
+      })
+      .finally(() => setCommentsLoading(false));
   }, [activeId]);
 
   const content = detail?.content;
@@ -392,64 +456,112 @@ export function ContentDetailDialog({
           }
         }}
       >
-        <DialogContent className="flex h-[92vh] w-[96vw] max-w-[96vw] gap-0 overflow-hidden p-0 sm:max-w-[96vw]">
+        <DialogContent className="flex h-[92vh] w-[96vw] max-w-[96vw] flex-col gap-0 overflow-hidden p-0 sm:max-w-[96vw]">
           <DialogTitle className="sr-only">内容详情</DialogTitle>
 
-          {/* 左栏:图文=瀑布流全图(点开看大图);
-              视频=封面预览 + 本地音频播放 + 文案主体(视频详情以文案/音频为核心) */}
-          <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto bg-muted/20 p-4">
-            {content?.kind === "video" ? (
-              // 视频详情:不放封面,文案主体在上、音频播放在下(看原视频走导航条「打开原文」)
-              <div className="mx-auto flex h-full max-w-3xl flex-col gap-4">
-                {/* 文案主体:视频详情的核心内容,占满剩余空间可滚动 */}
-                <div className="flex min-h-0 flex-1 flex-col rounded-lg border bg-card shadow-sm">
-                  <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
-                    <AudioLines className="size-4" />
-                    视频文案
-                    {content.transcript && (
-                      <SimpleTooltip content="复制全文">
-                        <button
-                          type="button"
-                          className="ml-auto cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
-                          onClick={() => {
-                            navigator.clipboard
-                              ?.writeText(content.transcript ?? "")
-                              .then(() => toast.success("已复制视频文案"))
-                              .catch(() => toast.error("复制失败"));
-                          }}
-                        >
-                          <Copy className="size-4" />
-                        </button>
-                      </SimpleTooltip>
-                    )}
-                  </div>
-                  <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap p-4 text-sm leading-relaxed">
-                    {content.transcript ? (
-                      content.transcript
-                    ) : (
-                      <span className="text-muted-foreground">
-                        {content.transcriptError
-                          ? `转写失败:${content.transcriptError}`
-                          : "暂无文案(未开启 AI 文案提取,或转写尚未完成)"}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                {/* 本地音频:放在文案下方;asset 协议播放转出的 mp3,旧数据未记录路径时给出指引 */}
-                {content.audioPath ? (
-                  <audio
-                    controls
-                    preload="metadata"
-                    src={convertFileSrc(content.audioPath)}
-                    className="w-full shrink-0"
+          {/* 顶部通栏:上一篇/下一篇 + 页面切换 + 链接操作(右上留白给关闭按钮) */}
+          <div className="flex items-center gap-2 border-b px-4 py-2.5 pr-12">
+            <SimpleTooltip content="上一篇">
+              <Button
+                variant="outline"
+                size="icon-sm"
+                className="cursor-pointer"
+                disabled={!hasPrev}
+                onClick={goPrev}
+              >
+                <ChevronLeft />
+              </Button>
+            </SimpleTooltip>
+            <SimpleTooltip content="下一篇">
+              <Button
+                variant="outline"
+                size="icon-sm"
+                className="cursor-pointer"
+                disabled={!hasNext}
+                onClick={goNext}
+              >
+                <ChevronRight />
+              </Button>
+            </SimpleTooltip>
+            {currentIndex >= 0 && (
+              <span className="text-xs text-muted-foreground">
+                第 {currentIndex + 1} / {items.length} 篇
+              </span>
+            )}
+            {/* 切换中:保留上一条内容展示,仅以小菊花提示在刷新,避免整屏闪空 */}
+            {loading && detail && (
+              <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+            )}
+            {/* 页面切换:概览(素材+作者/内容卡)/ 文案与评论(通栏双栏) */}
+            <div className="mx-auto inline-flex h-8 items-center rounded-md border p-0.5">
+              <PageButton
+                active={page === "overview"}
+                label="概览"
+                icon={LayoutGrid}
+                onClick={() => setPage("overview")}
+              />
+              <PageButton
+                active={page === "text"}
+                label="文案与评论"
+                icon={FileText}
+                onClick={() => setPage("text")}
+              />
+            </div>
+            <span className="ml-auto inline-flex items-center gap-1">
+              <SimpleTooltip content="复制原文链接">
+                <Button
+                  variant="outline"
+                  size="icon-sm"
+                  className="cursor-pointer"
+                  disabled={!originUrl}
+                  onClick={() => {
+                    if (!originUrl) return;
+                    navigator.clipboard
+                      ?.writeText(originUrl)
+                      .then(() => toast.success("已复制原文链接"))
+                      .catch(() => toast.error("复制失败"));
+                  }}
+                >
+                  <Copy />
+                </Button>
+              </SimpleTooltip>
+              <SimpleTooltip content="打开原文">
+                <Button
+                  variant="outline"
+                  size="icon-sm"
+                  className="cursor-pointer"
+                  disabled={!originUrl}
+                  onClick={() => {
+                    if (!originUrl) return;
+                    openUrl(originUrl).catch((e) =>
+                      toast.error(`打开失败: ${e}`),
+                    );
+                  }}
+                >
+                  <ExternalLink />
+                </Button>
+              </SimpleTooltip>
+            </span>
+          </div>
+
+          {page === "overview" ? (
+          <div className="flex min-h-0 flex-1">
+          {/* 素材区:图文=瀑布流全图(点开看大图);视频=封面 + 底部音频播放
+              (视频文案挪到「文案与评论」页) */}
+          <div className="flex min-h-0 flex-1 flex-col bg-muted/20">
+          <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-4">
+            {entries.length > 0 ? (
+              content?.kind === "video" ? (
+                // 视频:封面单张居中(点开看大图);转写文案在「文案与评论」页
+                <div className="mx-auto max-w-xl">
+                  <FallbackImage
+                    src={entries[0].src}
+                    fallback={entries[0].fallback}
+                    onClick={() => openLightbox(0)}
+                    className="w-full cursor-zoom-in rounded-lg border bg-card shadow-sm transition hover:opacity-95"
                   />
-                ) : content.audioExtracted ? (
-                  <div className="shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                    音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
-                  </div>
-                ) : null}
-              </div>
-            ) : entries.length > 0 ? (
+                </div>
+              ) : (
               // 瀑布流:按图片原始比例错落排列,break-inside-avoid 防跨列断裂
               <div className="columns-2 gap-3 sm:columns-3 xl:columns-4 [&>*]:mb-3">
                 {entries.map((it, i) => (
@@ -468,6 +580,7 @@ export function ContentDetailDialog({
                   </div>
                 ))}
               </div>
+              )
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
                 <div className="text-center">
@@ -477,79 +590,26 @@ export function ContentDetailDialog({
               </div>
             )}
           </div>
+          {/* 本地音频(仅视频):钉在素材区底部;旧数据未记录路径时给出指引 */}
+          {content?.kind === "video" &&
+            (content.audioPath ? (
+              <div className="shrink-0 px-4 pb-4">
+                <audio
+                  controls
+                  preload="metadata"
+                  src={convertFileSrc(content.audioPath)}
+                  className="w-full"
+                />
+              </div>
+            ) : content.audioExtracted ? (
+              <div className="mx-4 mb-4 shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
+              </div>
+            ) : null)}
+          </div>
 
-          {/* 右栏:导航 + 作者卡 + 内容卡 + 转写 */}
+          {/* 右栏:作者卡 + 内容卡(导航通栏已上移至对话框顶部) */}
           <div className="flex w-[520px] shrink-0 flex-col border-l">
-            {/* 顶部导航条:上一篇/下一篇 + 序号(右上留白给关闭按钮) */}
-            <div className="flex items-center gap-2 border-b px-4 py-2.5 pr-12">
-              <SimpleTooltip content="上一篇">
-                <Button
-                  variant="outline"
-                  size="icon-sm"
-                  className="cursor-pointer"
-                  disabled={!hasPrev}
-                  onClick={goPrev}
-                >
-                  <ChevronLeft />
-                </Button>
-              </SimpleTooltip>
-              <SimpleTooltip content="下一篇">
-                <Button
-                  variant="outline"
-                  size="icon-sm"
-                  className="cursor-pointer"
-                  disabled={!hasNext}
-                  onClick={goNext}
-                >
-                  <ChevronRight />
-                </Button>
-              </SimpleTooltip>
-              {currentIndex >= 0 && (
-                <span className="text-xs text-muted-foreground">
-                  第 {currentIndex + 1} / {items.length} 篇
-                </span>
-              )}
-              {/* 切换中:保留上一条内容展示,仅以小菊花提示在刷新,避免整屏闪空 */}
-              {loading && detail && (
-                <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-              )}
-              <span className="ml-auto inline-flex items-center gap-1">
-                <SimpleTooltip content="复制原文链接">
-                  <Button
-                    variant="outline"
-                    size="icon-sm"
-                    className="cursor-pointer"
-                    disabled={!originUrl}
-                    onClick={() => {
-                      if (!originUrl) return;
-                      navigator.clipboard
-                        ?.writeText(originUrl)
-                        .then(() => toast.success("已复制原文链接"))
-                        .catch(() => toast.error("复制失败"));
-                    }}
-                  >
-                    <Copy />
-                  </Button>
-                </SimpleTooltip>
-                <SimpleTooltip content="打开原文">
-                  <Button
-                    variant="outline"
-                    size="icon-sm"
-                    className="cursor-pointer"
-                    disabled={!originUrl}
-                    onClick={() => {
-                      if (!originUrl) return;
-                      openUrl(originUrl).catch((e) =>
-                        toast.error(`打开失败: ${e}`),
-                      );
-                    }}
-                  >
-                    <ExternalLink />
-                  </Button>
-                </SimpleTooltip>
-              </span>
-            </div>
-
             <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-5">
               {loading && !detail ? (
                 <div className="py-16 text-center text-sm text-muted-foreground">
@@ -833,6 +893,114 @@ export function ContentDetailDialog({
               )}
             </div>
           </div>
+          </div>
+          ) : (
+          /* 文案与评论页:通栏双栏,左转写文案、右该内容评论列表(点赞倒序) */
+          <div className="flex min-h-0 flex-1">
+            {/* 文案:通栏宽,长文不再挤窄列 */}
+            <div className="flex min-h-0 flex-1 flex-col bg-muted/20 p-4">
+              <div className="mx-auto flex h-full w-full max-w-4xl flex-col rounded-lg border bg-card shadow-sm">
+                <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
+                  <AudioLines className="size-4" />
+                  {content?.kind === "video" ? "视频文案" : "文案"}
+                  {content?.transcript && (
+                    <SimpleTooltip content="复制全文">
+                      <button
+                        type="button"
+                        className="ml-auto cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
+                        onClick={() => {
+                          navigator.clipboard
+                            ?.writeText(content.transcript ?? "")
+                            .then(() => toast.success("已复制视频文案"))
+                            .catch(() => toast.error("复制失败"));
+                        }}
+                      >
+                        <Copy className="size-4" />
+                      </button>
+                    </SimpleTooltip>
+                  )}
+                </div>
+                <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap p-4 text-sm leading-relaxed">
+                  {content?.transcript ? (
+                    content.transcript
+                  ) : (
+                    <span className="text-muted-foreground">
+                      {content?.transcriptError
+                        ? `转写失败:${content.transcriptError}`
+                        : content?.kind === "video"
+                          ? "暂无文案(未开启 AI 文案提取,或转写尚未完成)"
+                          : "该内容形式没有语音文案"}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+            {/* 评论:该内容的评论列表(点赞倒序,热评在前) */}
+            <div className="flex w-[480px] shrink-0 flex-col border-l">
+              <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
+                <MessagesSquare className="size-4" />
+                评论 · {comments.length}
+                {commentsLoading && (
+                  <Loader2 className="size-3.5 animate-spin" />
+                )}
+              </div>
+              <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto">
+                {comments.length === 0 && !commentsLoading ? (
+                  <div className="flex h-full items-center justify-center p-4 text-center text-xs text-muted-foreground">
+                    暂无评论(未采集评论,或该内容没有评论)
+                  </div>
+                ) : (
+                  comments.map((cm) => (
+                    <div
+                      key={cm.id}
+                      className="flex gap-2 border-b px-3 py-2.5 last:border-0"
+                    >
+                      {cm.authorAvatar ? (
+                        <img
+                          src={cm.authorAvatar}
+                          alt=""
+                          loading="lazy"
+                          referrerPolicy="no-referrer"
+                          className="size-7 shrink-0 rounded-full border object-cover"
+                          onError={(e) => {
+                            (e.currentTarget as HTMLImageElement).style.display =
+                              "none";
+                          }}
+                        />
+                      ) : (
+                        <div className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-muted-foreground">
+                          <User className="size-3.5" />
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 text-xs">
+                          <span className="truncate font-medium">
+                            {cm.authorNickname || "匿名"}
+                          </span>
+                          {cm.intentLevel && INTENT_LABEL[cm.intentLevel] && (
+                            <span className="shrink-0 rounded bg-fuchsia-500/10 px-1 text-[10px] text-fuchsia-600 dark:text-fuchsia-400">
+                              {INTENT_LABEL[cm.intentLevel]}
+                            </span>
+                          )}
+                          <span className="ml-auto shrink-0 text-muted-foreground">
+                            {fmtDate(cm.createdAt)}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm leading-snug">
+                          {cm.text}
+                        </p>
+                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
+                          <ThumbsUp className="size-3" />
+                          {fmtCount(cm.likeCount)}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+          )}
         </DialogContent>
       </Dialog>
 

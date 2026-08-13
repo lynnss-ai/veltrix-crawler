@@ -20,7 +20,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { GripVertical, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { GripVertical, Loader2, RotateCcw, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
@@ -71,6 +71,9 @@ function loadCustomize(key?: string): TableCustomizeState | null {
 
 // 通用数据表(基于 TanStack Table):整页高度适配 + 表头吸顶 + 排序/筛选/行选择/分页。
 // 工具栏通过 renderToolbar 拿到 table 实例,自行渲染搜索/筛选/操作。
+//
+// serverControl 存在时切换为服务端分页模式:data 即当前页行,排序/分页状态受控在页面组件,
+// 由后端返回 total 推导页数。未传时保持纯客户端行为(排序/筛选/分页全在组件内)。
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
@@ -86,6 +89,21 @@ interface DataTableProps<TData, TValue> {
   // 列自定义(显隐 / 列序 / 列宽)+ localStorage 持久化:传入唯一 key 才启用,仅个别列表用。
   // 启用后表头右上出现「列设置」,并支持拖拽表头边缘调宽(软调:auto 布局下作宽度提示)。
   customizeKey?: string;
+  // 服务端分页模式(可选):排序/分页下沉后端,页面组件持有受控状态
+  serverControl?: {
+    total: number;
+    state: ServerTableState;
+    onStateChange: (next: ServerTableState) => void;
+    /// 取数中(页码区显示轻量加载提示)
+    loading?: boolean;
+  };
+}
+
+// 服务端分页模式的状态(页面组件持有):页码 / 页大小 / 排序
+export interface ServerTableState {
+  pageIndex: number;
+  pageSize: number;
+  sorting: SortingState;
 }
 
 export function DataTable<TData, TValue>({
@@ -99,6 +117,7 @@ export function DataTable<TData, TValue>({
   defaultPageSize = 50,
   pageSizeOptions,
   customizeKey,
+  serverControl,
 }: DataTableProps<TData, TValue>) {
   const customizable = !!customizeKey;
   const [sorting, setSorting] = useState<SortingState>([]);
@@ -137,7 +156,16 @@ export function DataTable<TData, TValue>({
     data,
     columns,
     state: {
-      sorting,
+      // 服务端模式:排序/分页受控于页面组件;客户端模式:内部 state
+      ...(serverControl
+        ? {
+            sorting: serverControl.state.sorting,
+            pagination: {
+              pageIndex: serverControl.state.pageIndex,
+              pageSize: serverControl.state.pageSize,
+            },
+          }
+        : { sorting }),
       columnFilters,
       globalFilter,
       rowSelection,
@@ -152,20 +180,52 @@ export function DataTable<TData, TValue>({
     columnResizeMode: "onChange",
     // 列宽下限,避免拖到 0;表头/单元格按 getSize() 取宽(fixed 布局下权威生效)
     defaultColumn: { minSize: 48 },
-    onSortingChange: setSorting,
+    onSortingChange: serverControl
+      ? (updater) => {
+          // TanStack 传的是 updater(值或函数),按当前受控 state 求值后整体回传
+          const next =
+            typeof updater === "function"
+              ? updater(serverControl.state.sorting)
+              : updater;
+          serverControl.onStateChange({
+            ...serverControl.state,
+            sorting: next,
+          });
+        }
+      : setSorting,
+    onPaginationChange: serverControl
+      ? (updater) => {
+          const prev = {
+            pageIndex: serverControl.state.pageIndex,
+            pageSize: serverControl.state.pageSize,
+          };
+          const next = typeof updater === "function" ? updater(prev) : updater;
+          serverControl.onStateChange({
+            ...serverControl.state,
+            pageIndex: next.pageIndex,
+            pageSize: next.pageSize,
+          });
+        }
+      : undefined,
     onColumnFiltersChange: setColumnFilters,
     onGlobalFilterChange: setGlobalFilter,
     onRowSelectionChange: setRowSelection,
     onColumnVisibilityChange: setColumnVisibility,
     onColumnOrderChange: setColumnOrder,
     onColumnSizingChange: setColumnSizing,
+    // 服务端模式:排序/分页由后端完成,data 即当前页(manual 下对应 row model 自动旁路)
+    manualPagination: !!serverControl,
+    manualSorting: !!serverControl,
+    rowCount: serverControl?.total,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
-    initialState: { pagination: { pageSize: defaultPageSize } },
+    initialState: serverControl
+      ? undefined
+      : { pagination: { pageSize: defaultPageSize } },
   });
 
   // 未做过列宽设置时保持 auto 布局(列宽随内容自适应,即默认观感);
@@ -341,7 +401,10 @@ export function DataTable<TData, TValue>({
             </TableBody>
           </Table>
         </CardContent>
-        <CardFooter className="border-t py-3">
+        <CardFooter className="flex items-center gap-2 border-t py-3">
+          {serverControl?.loading && (
+            <Loader2 className="size-4 shrink-0 animate-spin text-muted-foreground" />
+          )}
           <DataTablePagination
             table={table}
             itemLabel={itemLabel}

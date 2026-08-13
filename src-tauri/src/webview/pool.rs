@@ -550,8 +550,14 @@ const COMMENT_API_MAX_WAIT_SECS: u64 = 300;
 /// 评论 API 直采:停滞上限(秒)。评论响应数长时间不增长 = 页内脚本大概率已死
 /// (页面冻结 / 导航 / 风控静默),主动结束而不是死等整体超时。
 const COMMENT_API_STALL_SECS: u64 = 90;
+/// 评论 API 直采:导航详情页后等 msToken 生成的超时(毫秒)。实测(2026-08-13)本环境
+/// 主页模态加载后 20s 内 msToken 从不生成,而详情页导航后无 msToken 的直采也已成功——
+/// 恢复的关键是详情页环境而非 msToken 本身。msToken 是环境级令牌,一个值服务整个评论
+/// 会话,只需等一次;2s 仅覆盖「生成得慢」的极小概率,阶段内其余视频不再等待。
+const MS_TOKEN_GEN_WAIT_MS: u64 = 2000;
 
 /// 评论 API 直采(抖音)的尝试结果。
+#[derive(Debug)]
 enum CommentApiOutcome {
     /// 直采完成:评论响应已进会话缓冲(与滚动路径同轨),调用方直接收尾。
     Done,
@@ -560,6 +566,10 @@ enum CommentApiOutcome {
     /// 直采不可用(无签名函数 / 接口异常 / 超时等):调用方回退滚动采集。
     Fallback,
 }
+
+/// 画像补采(抖音):主页导航后等画像接口响应的轮询上限(秒)。画像接口加载即发、
+/// 快网秒回;超时说明接口路径特征过时或页面没发请求(留痕见 run_profile_dwell)。
+const PROFILE_DWELL_MAX_SECS: u64 = 8;
 
 /// WebView 窗口标签拼装规则。统一前缀便于在 Tauri 端区分管理类窗口。
 pub(crate) fn window_label(platform: &str, account_id: &str) -> String {
@@ -670,17 +680,33 @@ fn wipe_account_data_store(app: &AppHandle, store_id: [u8; 16]) -> Result<()> {
     Ok(())
 }
 
-/// 把已存在的窗口显示并置于前台。复用窗口可能处于隐藏 / 后台,采集 / 登录时需弹到前台。
-/// show / set_focus 失败不致命,仅告警不阻断流程。
+/// 把已存在的窗口显示出来(**不抢焦点**)。复用窗口可能处于隐藏 / 后台,采集时需可见;
+/// 但 set_focus / show 激活会夺走用户当前的鼠标/键盘焦点——评论采集每批复用一次窗口
+/// 就抢一次,用户干别的事时焦点被反复夺走。故窗口已可见且未最小化时**完全不碰**;
+/// 隐藏 / 最小化才恢复显示。需要用户交互(风控验证滑块)时由调用方显式调
+/// focus_collect_window。
 /// 不在此处 maximize:窗口创建时已由 builder `.maximized(true)` 默认最大化;此后若用户
 /// 手动改过窗口大小,复用时再强制 maximize 会把用户尺寸还原成最大化(每个关键词复用一次
-/// 就还原一次,表现为"过一会儿又自己最大化")。故复用只显示+聚焦,保留用户调整后的尺寸。
+/// 就还原一次,表现为"过一会儿又自己最大化")。故复用只显示,保留用户调整后的尺寸。
 fn bring_to_front(window: &WebviewWindow) {
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    if visible && !minimized {
+        return;
+    }
     if let Err(e) = window.show() {
         tracing::warn!("显示复用窗口失败: {e}");
     }
+    if let Err(e) = window.unminimize() {
+        tracing::warn!("还原复用窗口失败: {e}");
+    }
+}
+
+/// 聚焦采集窗口——仅风控验证需要人工操作时调用:滑块必须用户在窗口里完成,
+/// 此时抢焦点是合理行为(窗口藏在后台用户看不到验证会白等)。
+fn focus_collect_window(window: &WebviewWindow) {
     if let Err(e) = window.set_focus() {
-        tracing::warn!("聚焦复用窗口失败: {e}");
+        tracing::warn!("聚焦采集窗口失败: {e}");
     }
 }
 
@@ -2326,6 +2352,8 @@ impl CollectBridge {
             "warn",
             "检测到安全验证 · 已暂停采集 · 请在本窗口手动完成验证,完成后自动恢复",
         ));
+        // 验证需要人工操作,把窗口带到前台(复用窗口平时不抢焦点,见 bring_to_front)
+        focus_collect_window(&window);
         let start = std::time::Instant::now();
         let mut last_hint: u64 = 0;
         // 是否曾观察到窗口处于验证页(用于跳转式验证的「离开即解除」判定)
@@ -3086,6 +3114,127 @@ impl CollectBridge {
         Ok(responses)
     }
 
+    /// 评论采集批处理(抖音专用,1~2 个视频双路并发直采):setup 一次 → 预检导航(批内
+    /// 第一个视频,msToken / 详情页环境策略与单视频一致)→ 注入双路直采脚本 → 取走
+    /// 全部响应。响应混批返回,调用方按 URL 里的 aweme_id 拆回各视频解析。
+    /// 非抖音平台不并发(滚动路径按视频串行),防御性退回单视频接口。
+    pub async fn collect_comments_batch(
+        &self,
+        app: &AppHandle,
+        reqs: Vec<CommentCollectRequest<'_>>,
+    ) -> Result<Vec<InterceptedResponse>> {
+        let Some(first) = reqs.first() else {
+            return Ok(Vec::new());
+        };
+        let cfg = first.platform_cfg;
+        if cfg.id != "douyin" || reqs.len() < 2 {
+            let req = reqs.into_iter().next().expect("reqs 非空");
+            return self.collect_comments(app, req).await;
+        }
+        let batch: Vec<(&str, &str)> = reqs.iter().map(|r| (r.content_id, r.xsec_token)).collect();
+        let (nav_id, nav_token) = batch[0];
+        // 评论日志归到该内容所属关键词的 HUD tab(评论不单独成 tab,与内容采集同档)。
+        // 空关键词时用"评论"作 tab 名,避免空字符串导致 tab 异常。
+        let kw_tab = if first.keyword.is_empty() {
+            "评论"
+        } else {
+            first.keyword
+        };
+        let (window, session_id, sink) =
+            self.setup_collect_session(app, cfg, first.account_id, first.account_id, first.task_id, kw_tab)?;
+
+        let progress = format!(
+            "第 {}-{}/{} 个视频",
+            first.video_index,
+            first.video_index + reqs.len() - 1,
+            first.video_total
+        );
+        let _ = window.eval(build_hud_status_eval(
+            &format!("评论采集 · {} · 双路并发", progress),
+            true,
+        ));
+        self.log_step(
+            app,
+            &window,
+            first.task_id,
+            "info",
+            &format!(
+                "采集评论 · {} ·「{}」等 {} 个 · 平台 {} · 上限 {} 条",
+                progress,
+                first.title,
+                reqs.len(),
+                cfg.name,
+                first.limit
+            ),
+        );
+
+        // 预检导航:与 run_comment_scroll 抖音分支同口径——msToken 是环境级令牌,阶段内
+        // 只导航一次建立详情页环境;已持令牌或窗口已在详情页模态即免导航
+        let has_ms = !self.peek_ms_token(&window).await.is_empty();
+        let navigated = if !has_ms
+            && !self.window_on_detail(&window).await
+            && !cfg.collect.detail_url_template.is_empty()
+        {
+            window
+                .eval(build_detail_eval(
+                    &cfg.collect.detail_url_template,
+                    nav_id,
+                    nav_token,
+                ))
+                .is_ok()
+        } else {
+            false
+        };
+        let page_ready = self.wait_page_ready(&window, session_id).await;
+        if !page_ready {
+            let _ = window.eval(build_hud_log_eval(
+                "warn",
+                "⏳ 页面未就绪(签名函数未加载)· 仍将尝试直采",
+            ));
+        } else if navigated {
+            let regen = self.wait_ms_token(&window, session_id).await;
+            if regen.is_empty() {
+                tracing::debug!("评论直采 session={session_id} 详情页未生成 msToken(按详情页环境继续直采)");
+            }
+        }
+        if let Err(e) = window.eval(build_set_session_eval(session_id)) {
+            let _ = self.take_collected_responses(session_id, sink.as_ref());
+            self.control.clear(session_id);
+            return Err(CrawlerError::Config(format!("注入采集会话失败: {e}")));
+        }
+        let verify_eval = crate::webview::build_verify_check_eval(
+            session_id,
+            &cfg.collect.verify_selectors,
+            &cfg.collect.verify_texts,
+            &cfg.collect.verify_url_patterns,
+        );
+        if !verify_eval.is_empty() {
+            let _ = window.eval(&verify_eval);
+        }
+        let outcome = self
+            .run_comment_api_collect(&window, cfg, session_id, sink.as_ref(), &batch, first.limit)
+            .await;
+        if matches!(outcome, CommentApiOutcome::Fallback) {
+            let _ = window.eval(build_hud_log_eval(
+                "warn",
+                "⚠️ API 直采不可用 · 本批评论采集结束",
+            ));
+        }
+
+        let responses = self.take_collected_responses(session_id, sink.as_ref());
+        let was_stopped = self.control.is_stopping(session_id);
+        let _ = window.eval(build_hud_status_eval(
+            &format!(
+                "{}:{}",
+                if was_stopped { "已手动结束" } else { "本批评论完成" },
+                first.title
+            ),
+            false,
+        ));
+        self.control.clear(session_id);
+        Ok(responses)
+    }
+
     /// 在某账号的 WebView 内导航到内容详情页,取走详情/feed 接口响应(供补取/刷新视频直链)。
     ///
     /// 与评论采集不同:**不滚动**,只导航详情页 → 注入会话回放首屏 → 等详情接口返回 → 取走响应。
@@ -3151,6 +3300,28 @@ impl CollectBridge {
         // aweme_id 构造请求、借页面签名函数翻页——窗口停在哪个抖音页面都行,
         // 它的意义是提供登录态 / 签名环境,以及触发风控时人工解除。
         if cfg.id == "douyin" {
+            // msToken 是环境级令牌:同一窗口会话内所有视频共用一个,阶段内只需导航一次
+            // 建立详情页环境,后续视频复用、不再逐个导航。
+            // 预检:已持有 msToken 或窗口已在详情页模态(URL 含 modal_id,上一视频导航的
+            // 环境还在)即免导航;否则导航本视频详情页(主页模态)——导航的真正价值是让
+            // 窗口离开搜索页环境(实测详情页下无 msToken 直采也成功,服务端按页面上下文
+            // 放行),同时页面自然发出 comment/list 首屏请求(响应进缓冲白赚一页真实评论,
+            // 其 URL 供直采当签名模板)。
+            let has_ms = !self.peek_ms_token(window).await.is_empty();
+            let navigated = if !has_ms
+                && !self.window_on_detail(window).await
+                && !cfg.collect.detail_url_template.is_empty()
+            {
+                window
+                    .eval(build_detail_eval(
+                        &cfg.collect.detail_url_template,
+                        content_id,
+                        xsec_token,
+                    ))
+                    .is_ok()
+            } else {
+                false
+            };
             // 等页面就绪再注入:评论窗口可能是刚新建的,页面还在加载——此时 eval 的脚本
             // 会随导航提交被整页冲掉(或 signer 尚未挂载),脚本静默丢失、无任何回传,
             // 只能等停滞看门狗兜底。
@@ -3160,6 +3331,14 @@ impl CollectBridge {
                     "warn",
                     "⏳ 页面未就绪(签名函数未加载)· 仍将尝试直采",
                 ));
+            } else if navigated {
+                // 导航后等 msToken 生成;等不到降级继续直采——实测详情页环境下
+                // 无 msToken 直采也能成功,恢复关键在详情页环境而非令牌本身,
+                // 这里只留 trace 不打扰 HUD(每视频都打 warn 是噪声)
+                let regen = self.wait_ms_token(window, session_id).await;
+                if regen.is_empty() {
+                    tracing::debug!("评论直采 session={session_id} 详情页未生成 msToken(按详情页环境继续直采)");
+                }
             }
             window
                 .eval(build_set_session_eval(session_id))
@@ -3173,10 +3352,10 @@ impl CollectBridge {
             if !verify_eval.is_empty() {
                 let _ = window.eval(&verify_eval);
             }
-            // 无模板构造直采(标准参数 + aweme_id);签名函数缺失 / 接口异常 /
-            // 停滞 / 超时结束本视频采集
+            // 无模板构造直采(标准参数 + aweme_id;有真实首屏模板时借模板重签);
+            // 签名函数缺失 / 接口异常 / 停滞 / 超时结束本视频采集
             match self
-                .run_comment_api_collect(window, cfg, session_id, sink, content_id, limit)
+                .run_comment_api_collect(window, cfg, session_id, sink, &[(content_id, xsec_token)], limit)
                 .await
             {
                 CommentApiOutcome::Done | CommentApiOutcome::Aborted => return Ok(()),
@@ -3493,58 +3672,133 @@ impl CollectBridge {
         false
     }
 
+    /// 读窗口 CookieManager 里的 msToken(抖音评论直采必需的风控 Cookie)。
+    /// msToken 由详情页 JS 环境(webmssdk)生成并写入 Cookie,窗口停留在搜索页时
+    /// 通常没有——直采凭空构造的请求缺它必被服务端回 HTML 验证页(blocked-html)。
+    async fn peek_ms_token(&self, window: &WebviewWindow) -> String {
+        let cookies =
+            native_intercept::get_cookies(window.as_ref(), "https://www.douyin.com/", &["msToken"])
+                .await;
+        cookies
+            .iter()
+            .find(|(n, _)| n == "msToken")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// 窗口当前是否已停在抖音详情页模态(URL 含 modal_id)。
+    /// msToken 是环境级令牌、详情页环境一次建立后整阶段复用:阶段内第一个视频导航
+    /// 成功后,后续视频无需再导航(直接复用详情页上下文直采,实测无 msToken 也可行)。
+    /// eval 读不到(mac 无实现 / 页面未加载)按 false 处理,走导航兜底。
+    async fn window_on_detail(&self, window: &WebviewWindow) -> bool {
+        crate::webview::script_eval::eval_json(
+            window.as_ref(),
+            "(function(){ return window.location.href.indexOf('modal_id') >= 0; })()",
+        )
+        .await
+        .map(|s| s.contains("true"))
+        .unwrap_or(false)
+    }
+
+    /// 等详情页 JS 环境生成 msToken(轮询 CookieManager,最长 MS_TOKEN_GEN_WAIT_MS)。
+    /// 等不到返回空串:调用方降级继续直采,由补发重试路径再导航一次兜底。
+    async fn wait_ms_token(&self, window: &WebviewWindow, session_id: u64) -> String {
+        let rounds = MS_TOKEN_GEN_WAIT_MS / COMMENT_API_POLL_MS;
+        for _ in 0..rounds {
+            if self.control.is_stopping(session_id) {
+                break;
+            }
+            let token = self.peek_ms_token(window).await;
+            if !token.is_empty() {
+                return token;
+            }
+            tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+        }
+        String::new()
+    }
+
     /// 处理评论直采完成回传(原生信号桥 / invoke / eval 回读三通道共用):
-    /// 校验归属(防跨视频串号)、判定成败并打日志。
-    /// 返回 Some(outcome) = 本视频已有结论;None = 残留的串号结果,丢弃继续等。
+    /// 校验归属(防跨视频串号)、判定成败并打日志;附带回传 error 文本(供风控补发重试判定)。
+    /// 返回 Some((outcome, error)) = 本视频已有结论;None = 残留的串号结果,丢弃继续等。
     fn handle_comment_api_result(
         &self,
         window: &WebviewWindow,
-        content_id: &str,
+        batch: &[(&str, &str)],
         result: &str,
-    ) -> Option<CommentApiOutcome> {
+    ) -> Option<(CommentApiOutcome, String)> {
         let v: serde_json::Value = serde_json::from_str(result).unwrap_or_default();
-        // 跨视频串号防护:上个视频的脚本被中止后仍可能延迟回传,awemeId 对不上
-        // 说明是残留结果,丢弃后继续等本视频的(不能误判为本视频失败)
-        let belongs = v.get("awemeId").and_then(|x| x.as_str()).unwrap_or("");
-        if !belongs.is_empty() && belongs != content_id {
-            return None;
+        let Some(jobs) = v.get("jobs").and_then(|j| j.as_array()) else {
+            // 无 jobs 数组(异常 / 旧格式残留):按整包失败处理
+            let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("bad-result");
+            tracing::warn!("评论直采回传格式异常(无 jobs 数组) session 结果: {result}");
+            return Some((CommentApiOutcome::Fallback, error.to_string()));
+        };
+        // 跨批串号防护:上一批的脚本被中止后仍可能延迟回传,任一 awemeId 不在本批
+        // 即残留结果,整包丢弃继续等(不能误判为本批失败)
+        let known: std::collections::HashSet<&str> = batch.iter().map(|(id, _)| *id).collect();
+        for job in jobs {
+            if let Some(id) = job.get("awemeId").and_then(|x| x.as_str()) {
+                if !known.contains(id) {
+                    tracing::debug!("评论直采回传串号丢弃: {id} 不在本批");
+                    return None;
+                }
+            }
         }
-        let used = v.get("used").and_then(|x| x.as_bool()).unwrap_or(false);
-        let pages = v.get("pages").and_then(|x| x.as_i64()).unwrap_or(0);
-        let comments = v.get("comments").and_then(|x| x.as_i64()).unwrap_or(0);
-        let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
-        let no_comments = v.get("noComments").and_then(|x| x.as_bool()).unwrap_or(false);
-        if used {
-            let msg = if no_comments {
-                "✅ API 直采完成 · 该视频无评论(接口确认 total=0)".to_string()
-            } else {
-                format!("✅ API 直采完成 · {pages} 页共 {comments} 条评论")
-            };
-            let _ = window.eval(build_hud_log_eval("info", &msg));
-            return Some(CommentApiOutcome::Done);
+        // 逐视频留痕(成功/失败都打):排查「时好时坏」时对比各视频签名环境与服务端响应;
+        // 整体口径 = 至少一路成功即 Done(失败的那路无响应入库,下次任务可重采)
+        let mut any_used = false;
+        let mut first_err = String::new();
+        for job in jobs {
+            let id = job.get("awemeId").and_then(|x| x.as_str()).unwrap_or("");
+            let used = job.get("used").and_then(|x| x.as_bool()).unwrap_or(false);
+            let pages = job.get("pages").and_then(|x| x.as_i64()).unwrap_or(0);
+            let comments = job.get("comments").and_then(|x| x.as_i64()).unwrap_or(0);
+            let error = job.get("error").and_then(|x| x.as_str()).unwrap_or("");
+            let no_comments = job.get("noComments").and_then(|x| x.as_bool()).unwrap_or(false);
+            tracing::info!(
+                "评论直采回传 aweme_id={id} used={used} pages={pages} comments={comments} noComments={no_comments} error={error}"
+            );
+            if used {
+                any_used = true;
+                let msg = if no_comments {
+                    "✅ 直采完成 · 该视频无评论(接口确认 total=0)".to_string()
+                } else {
+                    format!("✅ 直采完成 · {pages} 页 {comments} 条评论")
+                };
+                let _ = window.eval(build_hud_log_eval("info", &msg));
+            } else if first_err.is_empty() {
+                first_err = error.to_string();
+            }
         }
+        if any_used {
+            return Some((CommentApiOutcome::Done, String::new()));
+        }
+        let err = if first_err.is_empty() { "empty".to_string() } else { first_err };
         let _ = window.eval(build_hud_log_eval(
             "warn",
             &format!(
-                "⚠️ API 直采不可用({}) · 跳过本视频评论采集",
-                if error.is_empty() { "未知原因" } else { error }
+                "⚠️ API 直采不可用({}) · 跳过本批评论采集",
+                if err.is_empty() { "未知原因" } else { &err }
             ),
         ));
-        Some(CommentApiOutcome::Fallback)
+        Some((CommentApiOutcome::Fallback, err))
     }
 
-    /// 抖音评论「API 直采」:标准公共参数 + 页面环境现取 msToken,用 aweme_id 凭空构造
-    /// comment/list 请求,注入脚本借页面签名函数翻页直拉评论接口。响应由页内 fetch hook
-    /// 按既有特征自动回流本会话,与滚动采集同通道,下游解析 / 入库零改动。
-    /// 抖音评论只走此路径:不可用 / 失败返回 Fallback,由调用方结束本视频评论采集
-    /// (不再回退滚动)。
+    /// 抖音评论「API 直采」(批处理,1~2 个视频双路并发):标准公共参数 + 页面环境现取
+    /// msToken,用 aweme_id 凭空构造 comment/list 请求,注入脚本借页面签名函数双路交错
+    /// 翻页直拉评论接口。响应由页内 fetch hook 按既有特征自动回流本会话,与滚动采集
+    /// 同通道,下游解析 / 入库零改动。
+    /// 会话内若有真实 comment/list 请求(详情页首屏自然发出)则取其 URL 当模板重签,
+    /// 公共参数 / 指纹全带着,比凭空构造更抗风控;无模板退回无模板模式。
+    /// 抖音评论只走此路径:不可用 / 失败返回 Fallback,由调用方结束本批评论采集
+    /// (不再回退滚动)。batch 为 (content_id, xsec_token),导航只用第一个视频。
     async fn run_comment_api_collect(
         &self,
         window: &WebviewWindow,
         cfg: &PlatformConfig,
         session_id: u64,
         sink: Option<&Arc<Mutex<Vec<InterceptedResponse>>>>,
-        content_id: &str,
+        batch: &[(&str, &str)],
         limit: usize,
     ) -> CommentApiOutcome {
         // 一级评论接口特征(排除二级回复 reply)
@@ -3559,6 +3813,14 @@ impl CollectBridge {
         };
         // 页数上限:限量按 20 条/页折算(+2 页余量);不限量给安全封顶(防死循环,万条级)
         let max_pages = if limit > 0 { (limit / 20 + 2) as u32 } else { 500 };
+        // 直采链路排查埋点(成功/失败全打,日志文件里逐视频对比):
+        let ids: Vec<&str> = batch.iter().map(|(id, _)| *id).collect();
+        tracing::info!(
+            "评论直采开始 session={session_id} 并发={} aweme_ids=[{}] limit={limit} max_pages={max_pages} window={}",
+            batch.len(),
+            ids.join(","),
+            window.label()
+        );
         let _ = window.eval(build_hud_log_eval(
             "info",
             "⚡ 尝试 API 直采评论(借页面签名翻页)",
@@ -3570,22 +3832,74 @@ impl CollectBridge {
         let cookies = native_intercept::get_cookies(
             window.as_ref(),
             "https://www.douyin.com/",
-            &["msToken", "s_v_web_id"],
+            &["msToken", "s_v_web_id", "ttwid", "sessionid"],
         )
         .await;
-        let find_cookie = |name: &str| -> String {
+        let find_cookie = |cookies: &[(String, String)], name: &str| -> String {
             cookies
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
-        let ms_token = find_cookie("msToken");
-        let fp = find_cookie("s_v_web_id");
+        let mut ms_token = find_cookie(&cookies, "msToken");
+        let mut fp = find_cookie(&cookies, "s_v_web_id");
+        // 诊断留痕:直采被风控时,日志里第一眼区分「CookieManager 没读到令牌」
+        // 与「令牌在但页面环境被服务端拒」;ttwid/sessionid 反映设备注册与登录态。
+        // 只打有/无与长度,不落令牌值本身
+        tracing::info!(
+            "评论直采 Cookie 探测 session={session_id} msToken={}(len={}) s_v_web_id={} ttwid={} sessionid={}",
+            if ms_token.is_empty() { "无" } else { "有" },
+            ms_token.len(),
+            if fp.is_empty() { "无" } else { "有" },
+            if find_cookie(&cookies, "ttwid").is_empty() { "无" } else { "有" },
+            if find_cookie(&cookies, "sessionid").is_empty() { "无(未登录)" } else { "有(已登录)" },
+        );
+        // 风控补发重试:blocked-html(服务端回 HTML 验证/拦截页)时,验证页响应往往
+        // Set-Cookie 补发了 msToken——重读 Cookie 拿到新令牌后重签再试一次(仅一次,防死循环)。
+        // 重读仍无则导航详情页让页面 JS 重新生成 msToken 后再试一次(见收尾段)。
+        let mut refreshed = false;
+        'retry: loop {
+        // 每视频的模板各自现找:兜底导航后 sink 里才有真实 comment/list 首屏 URL;
+        // 重试轮次 sink 也可能已更新(导航重生成 msToken 时页面又发了一轮首屏请求)。
+        // 批内未导航过的视频通常无模板,走无模板模式(实测详情页环境下可行)
+        let job_specs: Vec<(String, String)> = batch
+            .iter()
+            .map(|(id, _)| {
+                let tpl = match sink {
+                    Some(s) => match s.lock() {
+                        Ok(buf) => buf
+                            .iter()
+                            .rev()
+                            .find(|r| {
+                                r.url.contains("comment/list")
+                                    && !r.url.contains("reply")
+                                    && r.url.contains(&format!("aweme_id={id}"))
+                            })
+                            .map(|r| r.url.clone())
+                            .unwrap_or_default(),
+                        Err(_) => String::new(),
+                    },
+                    None => String::new(),
+                };
+                (id.to_string(), tpl)
+            })
+            .collect();
+        tracing::info!(
+            "评论直采注入 session={session_id} attempt={} aweme_ids=[{}] msToken={} fp={} template={}",
+            if refreshed { 2 } else { 1 },
+            ids.join(","),
+            if ms_token.is_empty() { "无" } else { "有" },
+            if fp.is_empty() { "无" } else { "有" },
+            if job_specs.iter().any(|(_, t)| !t.is_empty()) { "有" } else { "无" },
+        );
+        let job_refs: Vec<(&str, &str)> = job_specs
+            .iter()
+            .map(|(id, tpl)| (id.as_str(), tpl.as_str()))
+            .collect();
         if let Err(e) = window.eval(crate::webview::build_comment_api_collect_eval(
             session_id,
-            "",
-            content_id,
+            &job_refs,
             limit,
             max_pages,
             &ms_token,
@@ -3607,7 +3921,7 @@ impl CollectBridge {
         let mut verify_logged = false;
         // 回读兜底的分频计数:每 4 轮(≈2s)eval 一次 __veltrixCommentApiResult
         let mut poll_tick: u32 = 0;
-        loop {
+        let wait_outcome: (CommentApiOutcome, String) = loop {
             if self.control.is_stopping(session_id) {
                 let _ = window.eval("window.__veltrixCommentApiAbort = true;");
                 // 给页内脚本收尾时间(已采部分经 hook 回流后正常 finish)
@@ -3619,6 +3933,8 @@ impl CollectBridge {
             if self.control.is_verifying(session_id) {
                 if !verify_logged {
                     verify_logged = true;
+                    // 验证需要人工操作,把窗口带到前台(复用窗口平时不抢焦点,见 bring_to_front)
+                    focus_collect_window(window);
                     let _ = window.eval(build_hud_log_eval(
                         "warn",
                         "🛡️ 检测到安全验证(滑块)· 请在采集窗口中完成,完成后自动继续",
@@ -3635,9 +3951,9 @@ impl CollectBridge {
                 let _ = window.eval(build_hud_log_eval("info", "✅ 安全验证已通过 · 继续直采"));
             }
             if let Some(result) = self.control.take_api_done(session_id) {
-                match self.handle_comment_api_result(window, content_id, &result) {
-                    Some(outcome) => return outcome,
-                    // 串号残留:丢弃,继续等本视频的回传
+                match self.handle_comment_api_result(window, batch, &result) {
+                    Some(outcome) => break outcome,
+                    // 串号残留:丢弃,继续等本批的回传
                     None => {
                         tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
                         continue;
@@ -3659,9 +3975,9 @@ impl CollectBridge {
                     let unwrapped = serde_json::from_str::<String>(&raw).unwrap_or_default();
                     if !unwrapped.is_empty() {
                         if let Some(outcome) =
-                            self.handle_comment_api_result(window, content_id, &unwrapped)
+                            self.handle_comment_api_result(window, batch, &unwrapped)
                         {
-                            return outcome;
+                            break outcome;
                         }
                     }
                 }
@@ -3671,14 +3987,13 @@ impl CollectBridge {
                 let _ = window.eval("window.__veltrixCommentApiAbort = true;");
                 let _ = window.eval(build_hud_log_eval(
                     "warn",
-                    "⚠️ API 直采超时 · 跳过本视频评论采集",
+                    "⚠️ API 直采超时 · 跳过本批评论采集",
                 ));
-                return CommentApiOutcome::Fallback;
+                break (CommentApiOutcome::Fallback, "timeout".to_string());
             }
             if let Some(s) = sink {
-                // 只数本视频的响应(URL 带当前 aweme_id):sink 是全会话累积的,
-                // 跨视频混数会让停滞/终态判定失真
-                let idq = format!("aweme_id={content_id}");
+                // 只数本批视频的响应:sink 是全会话累积的,跨批混数会让停滞/终态判定失真。
+                // 停滞看「任一路增长」:批内任一视频出新响应即重置看门狗
                 let probe = s
                     .lock()
                     .map(|b| {
@@ -3686,7 +4001,7 @@ impl CollectBridge {
                             .filter(|r| {
                                 r.url.contains(pattern)
                                     && !r.url.contains("reply")
-                                    && r.url.contains(&idq)
+                                    && ids.iter().any(|id| r.url.contains(&format!("aweme_id={id}")))
                             })
                             .count()
                     })
@@ -3699,51 +4014,57 @@ impl CollectBridge {
                         self.control.set_verifying(session_id, false);
                     }
                     // 完成信号备用通道:页内 comment_api_done 回传可能丢失(Tauri IPC
-                    // 对远程页面不稳定),按「响应终态」直接判定——出现不足一页 /
-                    // has_more=0 / total=0 的响应,或累计达限量,即本视频已采完。
+                    // 对远程页面不稳定),按「响应终态」直接判定——批内**每个**视频都出现
+                    // 不足一页 / has_more=0 / total=0 的响应,或累计达限量,才判整批采完。
                     // 与页内脚本的到底条件保持同口径(不足一页即到底,has_more 不可靠)
-                    let terminal = s
-                        .lock()
-                        .map(|b| {
-                            let mut total = 0usize;
-                            let mut terminal = false;
-                            for r in b.iter().filter(|r| {
-                                r.url.contains(pattern)
-                                    && !r.url.contains("reply")
-                                    && r.url.contains(&idq)
-                            }) {
-                                let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body)
-                                else {
-                                    continue;
-                                };
-                                let Some(arr) =
-                                    v.get("comments").and_then(|c| c.as_array())
-                                else {
-                                    continue;
-                                };
-                                let n = arr.len();
-                                total += n;
-                                let has_more = v
-                                    .get("has_more")
-                                    .and_then(|x| x.as_bool())
-                                    .unwrap_or(true);
-                                let declared_empty =
-                                    v.get("total").and_then(|x| x.as_i64()) == Some(0);
-                                if (n > 0 && n < 20) || (n == 0 && declared_empty) || !has_more {
+                    let all_terminal = ids.iter().all(|id| {
+                        s.lock()
+                            .map(|b| {
+                                let mut total = 0usize;
+                                let mut terminal = false;
+                                for r in b.iter().filter(|r| {
+                                    r.url.contains(pattern)
+                                        && !r.url.contains("reply")
+                                        && r.url.contains(&format!("aweme_id={id}"))
+                                }) {
+                                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(arr) =
+                                        v.get("comments").and_then(|c| c.as_array())
+                                    else {
+                                        continue;
+                                    };
+                                    let n = arr.len();
+                                    total += n;
+                                    let has_more = v
+                                        .get("has_more")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(true);
+                                    let declared_empty =
+                                        v.get("total").and_then(|x| x.as_i64()) == Some(0);
+                                    if (n > 0 && n < 20) || (n == 0 && declared_empty) || !has_more {
+                                        terminal = true;
+                                    }
+                                }
+                                if limit > 0 && total >= limit {
                                     terminal = true;
                                 }
-                            }
-                            if limit > 0 && total >= limit {
-                                terminal = true;
-                            }
-                            terminal
-                        })
-                        .unwrap_or(false);
-                    if terminal {
+                                terminal
+                            })
+                            .unwrap_or(false)
+                    });
+                    if all_terminal {
                         // 页内脚本理论上已收尾(或正卡在重试眠里),中止它并取走残留
-                        // 回传,避免污染下个视频的判定
+                        // 回传,避免污染下批的判定
                         let _ = window.eval("window.__veltrixCommentApiAbort = true;");
                         let _ = self.control.take_api_done(session_id);
+                        // 留痕:此路径不经 handle_comment_api_result,不回传不打日志,
+                        // 排查「某批直采无回传记录」时这里就是答案
+                        tracing::info!(
+                            "评论直采 session={session_id} 按响应终态判定完成 probe={probe} 页"
+                        );
                         let _ = window.eval(build_hud_log_eval(
                             "info",
                             &format!("✅ API 直采完成 · {probe} 页(按响应终态判定)"),
@@ -3755,13 +4076,85 @@ impl CollectBridge {
                     let _ = window.eval(build_hud_log_eval(
                         "warn",
                         &format!(
-                            "⚠️ API 直采停滞({COMMENT_API_STALL_SECS} 秒无新响应)· 结束本视频评论采集(已采部分保留)"
+                            "⚠️ API 直采停滞({COMMENT_API_STALL_SECS} 秒无新响应)· 结束本批评论采集(已采部分保留)"
                         ),
                     ));
-                    return CommentApiOutcome::Fallback;
+                    break (CommentApiOutcome::Fallback, "stall".to_string());
                 }
             }
             tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+        };
+        // 风控补发重试判定:blocked-html(服务端回 HTML 验证/拦截页)时重读 Cookie——
+        // 验证页响应通常 Set-Cookie 补发 msToken,拿到就重签再试一次(仅一次,防死循环)。
+        // 重读仍无(msToken 被风控清掉/从未生成):导航本视频详情页让页面 JS 重新生成
+        // msToken 后再试一次——凭空构造的请求缺 msToken 必被拒,导航是唯一环境修复手段。
+        let (outcome, err) = wait_outcome;
+        tracing::info!("评论直采收尾 session={session_id} outcome={outcome:?} error={err}");
+        if !refreshed
+            && matches!(outcome, CommentApiOutcome::Fallback)
+            && err.starts_with("blocked-html")
+        {
+            refreshed = true;
+            let cookies2 = native_intercept::get_cookies(
+                window.as_ref(),
+                "https://www.douyin.com/",
+                &["msToken", "s_v_web_id"],
+            )
+            .await;
+            let fresh = find_cookie(&cookies2, "msToken");
+            if !fresh.is_empty() {
+                ms_token = fresh;
+                let fp2 = find_cookie(&cookies2, "s_v_web_id");
+                if !fp2.is_empty() {
+                    fp = fp2;
+                }
+                tracing::info!("评论直采 session={session_id} 验证页响应已补发 msToken,重签重试一次");
+                let _ = window.eval(build_hud_log_eval(
+                    "info",
+                    "🔄 风控响应已补发 msToken · 用新令牌重试直采",
+                ));
+                continue 'retry;
+            }
+            // 重读仍无:导航批内第一个视频的详情页重新生成 msToken 后重试最后一次。
+            // 导航整页重载,页内会话与验证检测一并重注(与 run_comment_scroll 预检导航同口径)
+            let (nav_id, nav_token) = (batch[0].0, batch[0].1);
+            if !cfg.collect.detail_url_template.is_empty()
+                && window
+                    .eval(build_detail_eval(
+                        &cfg.collect.detail_url_template,
+                        nav_id,
+                        nav_token,
+                    ))
+                    .is_ok()
+            {
+                tracing::info!("评论直采 session={session_id} blocked-html 且无 msToken,导航详情页重生成后重试");
+                let _ = window.eval(build_hud_log_eval(
+                    "info",
+                    "🔄 风控拦截(无 msToken)· 导航详情页恢复页面环境后重试直采",
+                ));
+                self.wait_page_ready(window, session_id).await;
+                let _ = window.eval(build_set_session_eval(session_id));
+                let verify_eval = crate::webview::build_verify_check_eval(
+                    session_id,
+                    &cfg.collect.verify_selectors,
+                    &cfg.collect.verify_texts,
+                    &cfg.collect.verify_url_patterns,
+                );
+                if !verify_eval.is_empty() {
+                    let _ = window.eval(&verify_eval);
+                }
+                let regen = self.wait_ms_token(window, session_id).await;
+                if !regen.is_empty() {
+                    ms_token = regen;
+                    tracing::info!("评论直采 session={session_id} 导航后 msToken 已重新生成,重签重试");
+                    continue 'retry;
+                }
+                tracing::info!("评论直采 session={session_id} 导航后仍无 msToken,放弃重试");
+            } else {
+                tracing::info!("评论直采 session={session_id} blocked-html 后仍无 msToken,放弃重试");
+            }
+        }
+        return outcome;
         }
     }
 
@@ -3823,11 +4216,10 @@ impl CollectBridge {
         Ok(responses)
     }
 
-    /// 主页停留:导航 → 注入会话 → 短滚动几轮触发懒加载并等画像接口返回。
-    /// 画像接口多在加载即发,拦到响应即提前结束;固定上限兜底避免空等。
-    /// 抖音优先「API 直采」——sec_user_id + 标准参数构造 profile/other 请求,借页面
-    /// 签名函数直接 fetch(与评论直采同机制,秒级完成);直采不可用(网关拦截 / 签名
-    /// 失效)时回退下方的导航停留路径——页面自发 profile/other 请求,慢但可靠。
+    /// 主页停留:导航 → 注入会话 → 等画像接口返回(抖音轮询画像响应即停;
+    /// 其他平台短滚动几轮辅助懒加载)。固定上限兜底避免空等。
+    /// 抖音不再走 API 直采(实测凭空构造的 profile/other 请求被边缘甩 /search/[object Object],
+    /// 页面环境又不生成 msToken)——统一导航作者主页,页面自发请求带齐风控要素,慢但可靠。
     async fn run_profile_dwell(
         &self,
         window: &WebviewWindow,
@@ -3837,94 +4229,6 @@ impl CollectBridge {
         session_id: u64,
         sink: Option<&ResponseSink>,
     ) -> Result<()> {
-        if cfg.id == "douyin" {
-            if !self.wait_page_ready(window, session_id).await {
-                let _ = window.eval(build_hud_log_eval(
-                    "warn",
-                    "⏳ 页面未就绪(签名函数未加载)· 仍将尝试画像直采",
-                ));
-            }
-            window
-                .eval(build_set_session_eval(session_id))
-                .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
-            window
-                .eval(crate::webview::build_profile_api_eval(session_id, uid))
-                .map_err(|e| CrawlerError::Config(format!("注入画像直采脚本失败: {e}")))?;
-            // 直采等待 45s 封顶:脚本 6 次重试典型耗时 ~36s;超时即回退导航主页,
-            // 不在直采上死等(成功靠下方「响应到达」判定,秒级结束)
-            let deadline = std::time::Instant::now() + Duration::from_secs(45);
-            let mut direct_ok = false;
-            loop {
-                if self.control.is_stopping(session_id) {
-                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                    return Ok(());
-                }
-                if let Some(result) = self.control.take_api_done(session_id) {
-                    let v: serde_json::Value =
-                        serde_json::from_str(&result).unwrap_or_default();
-                    // 跨作者串号防护:上个作者脚本的残留回传直接丢弃
-                    let belongs = v.get("secUid").and_then(|x| x.as_str()).unwrap_or("");
-                    if !belongs.is_empty() && belongs != uid {
-                        tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
-                        continue;
-                    }
-                    let used = v.get("used").and_then(|x| x.as_bool()).unwrap_or(false);
-                    let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
-                    let _ = window.eval(build_hud_log_eval(
-                        if used { "info" } else { "warn" },
-                        &if used {
-                            "✅ 画像直采完成".to_string()
-                        } else {
-                            format!(
-                                "⚠️ 画像直采失败({})",
-                                if error.is_empty() { "未知原因" } else { error }
-                            )
-                        },
-                    ));
-                    direct_ok = used;
-                    break;
-                }
-                // 完成信号备用通道:回传可能丢失,画像响应到达(URL 带本作者 sec_uid
-                // 且 body 含 user 对象)即判定成功——与评论直采的终态判定同思路
-                let got_profile = sink
-                    .and_then(|s| {
-                        s.lock().ok().map(|b| {
-                            b.iter().any(|r| {
-                                r.url.contains("profile/other")
-                                    && r.url.contains(uid)
-                                    && serde_json::from_str::<serde_json::Value>(&r.body)
-                                        .ok()
-                                        .and_then(|v| v.get("user").cloned())
-                                        .is_some()
-                            })
-                        })
-                    })
-                    .unwrap_or(false);
-                if got_profile {
-                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                    let _ = self.control.take_api_done(session_id);
-                    let _ = window.eval(build_hud_log_eval("info", "✅ 画像直采完成(按响应判定)"));
-                    direct_ok = true;
-                    break;
-                }
-                if std::time::Instant::now() > deadline {
-                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                    let _ = window.eval(build_hud_log_eval("warn", "⚠️ 画像直采超时"));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
-            }
-            if direct_ok {
-                return Ok(());
-            }
-            // 直采不可用:回退「打开作者主页」原始路径——导航后页面自发 profile/other
-            // 请求,经拦截通道采回(拦截特征已含画像接口,解析 / 落库零改动)
-            let _ = window.eval(build_hud_log_eval(
-                "info",
-                "↩️ 回退打开作者主页采集画像(页面自发请求,稍慢)",
-            ));
-        }
-
         // 复用详情页导航脚本:模板 {id}=uid,{token}=xsec_token(无 token 占位的平台传空无害)
         window
             .eval(build_detail_eval(
@@ -3943,7 +4247,53 @@ impl CollectBridge {
             .eval(build_set_session_eval(session_id))
             .map_err(|e| CrawlerError::Config(format!("注入采集会话失败: {e}")))?;
 
-        // 主页画像接口通常加载即发;滚动几轮辅助懒加载(YouTube/快手),拦到即停
+        if cfg.id == "douyin" {
+            // 抖音:主页画像接口加载即发,轮询拦截缓冲等画像响应到达即收尾,不滚动
+            // (主页无懒加载依赖,固定滚动只会拖慢);超时打日志列出本会话实际拦到的
+            // 响应 URL,供核对画像接口真实路径(配置特征过时时一眼可辨)
+            let deadline =
+                std::time::Instant::now() + Duration::from_secs(PROFILE_DWELL_MAX_SECS);
+            loop {
+                if self.control.is_stopping(session_id) {
+                    break;
+                }
+                let got_profile = sink
+                    .and_then(|s| {
+                        s.lock().ok().map(|b| {
+                            b.iter().any(|r| r.url.contains("profile/other"))
+                        })
+                    })
+                    .unwrap_or(false)
+                    || !self.channel.peek_session(session_id).is_empty();
+                if got_profile {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    // 留痕:画像响应没等到时列出实际拦截到的 URL(前 5 条),判断是
+                    // 「接口路径特征过时」还是「页面根本没发画像请求」
+                    let urls: Vec<String> = sink
+                        .and_then(|s| {
+                            s.lock().ok().map(|b| {
+                                b.iter()
+                                    .take(5)
+                                    .map(|r| r.url.clone())
+                                    .collect()
+                            })
+                        })
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        uid = %uid,
+                        urls = ?urls,
+                        "画像补采超时未拦到画像响应"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+            }
+            return Ok(());
+        }
+
+        // 其他平台:主页画像接口通常加载即发;滚动几轮辅助懒加载(YouTube/快手),拦到即停
         const PROFILE_ROUNDS: u32 = 4;
         for round in 0..PROFILE_ROUNDS {
             if self.control.is_stopping(session_id) {

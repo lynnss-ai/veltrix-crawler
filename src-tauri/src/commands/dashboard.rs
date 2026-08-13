@@ -4,9 +4,10 @@
 //! 自成一类、与任务 / 内容 CRUD 解耦,便于单独演进。
 
 use crate::commands::{current_user, AppState};
-use chrono::{Local, Utc};
+use chrono::{Local, Offset, Utc};
 use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement,
 };
 use serde::Serialize;
 use tauri::State;
@@ -314,50 +315,46 @@ async fn content_kind_counts(
 
 /// 评论所属内容的形态统计:返回 (视频内容评论数, 图文内容评论数)。
 /// high_only=true 时只统计高意向评论(用于意向客资)。
+///
+/// 下沉为一条 JOIN 聚合:此前两次全列载入(content 形态映射 + 评论行)后在 Rust 侧归并,
+/// 采集期间每 ~3s 触发一轮全表搬运;SQL 化后 DB 侧完成归并,仅返回分组计数。
 async fn comment_kind_counts(
     db: &sea_orm::DatabaseConnection,
     self_only: bool,
     owner: &str,
     high_only: bool,
 ) -> Result<(i64, i64)> {
-    // content 的 (platform, content_id) → kind 映射(kind 客观,不按 owner 过滤)
-    let content_rows: Vec<(String, String, String)> = content::Entity::find()
-        .select_only()
-        .column(content::Column::Platform)
-        .column(content::Column::ContentId)
-        .column(content::Column::Kind)
-        .into_tuple()
-        .all(db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("查询内容形态失败: {e}")))?;
-    let mut kind_map: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for (platform, content_id, kind) in content_rows {
-        kind_map.entry((platform, content_id)).or_insert(kind);
-    }
-
-    // 评论按所属内容形态归类
-    let mut cq = comment::Entity::find();
+    // ⚠️ 子表必须 DISTINCT:contents.id 是任务级复合键,同一 (platform, content_id) 可被多个任务
+    // 重复入库,直连 JOIN 会让一条评论匹配多行内容而翻倍。kind 客观一致,去重不改变归并结果。
+    // content 侧不按 owner 过滤(kind 客观)、comment 侧按 owner——与旧 Rust 实现逐条等价。
+    let mut conds = String::new();
     if high_only {
-        cq = cq.filter(comment::Column::IntentLevel.eq("high"));
+        conds.push_str(" AND c.intent_level = 'high'");
     }
     if self_only {
-        cq = cq.filter(comment::Column::Owner.eq(owner.to_string()));
+        conds.push_str(&format!(
+            " AND c.owner = '{}'",
+            owner.replace('\'', "''")
+        ));
     }
-    let comment_rows: Vec<(String, String)> = cq
-        .select_only()
-        .column(comment::Column::Platform)
-        .column(comment::Column::ContentId)
-        .into_tuple()
-        .all(db)
+    let sql = format!(
+        "SELECT ct.kind AS kind, COUNT(*) AS cnt FROM comments c \
+         JOIN (SELECT DISTINCT platform, content_id, kind FROM contents) ct \
+         ON ct.platform = c.platform AND ct.content_id = c.content_id \
+         WHERE 1=1 {conds} GROUP BY ct.kind"
+    );
+    let rows = db
+        .query_all(Statement::from_string(db.get_database_backend(), sql))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询评论形态失败: {e}")))?;
     let mut video = 0i64;
     let mut image = 0i64;
-    for (platform, content_id) in comment_rows {
-        match kind_map.get(&(platform, content_id)).map(String::as_str) {
-            Some("video") => video += 1,
-            Some("image") => image += 1,
+    for r in rows {
+        let kind: String = r.try_get("", "kind").unwrap_or_default();
+        let cnt: i64 = r.try_get("", "cnt").unwrap_or(0);
+        match kind.as_str() {
+            "video" => video += cnt,
+            "image" => image += cnt,
             _ => {}
         }
     }
@@ -418,7 +415,7 @@ async fn comment_platform_counts(
 }
 
 /// 区间内每平台每天的采集量(内容 + 评论合计)。未指定区间默认近 TREND_DAYS 天。
-/// 返回 (日期轴, 每平台序列)。日期按 UTC 日历日归并。
+/// 返回 (日期轴, 每平台序列)。日期按本地日历日归并。
 async fn dashboard_trend(
     db: &sea_orm::DatabaseConnection,
     self_only: bool,
@@ -450,39 +447,41 @@ async fn dashboard_trend(
         d += chrono::Duration::days(1);
     }
 
-    let day_of = |ts: i64| -> Option<String> {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.with_timezone(&Local).format("%m-%d").to_string())
+    // 按天归桶下沉到 SQL GROUP BY:此前取区间内全部 (platform, collected_at) 行在 Rust 侧逐行
+    // 归日,采集期间每 ~3s 全量搬运一次;分组后仅返回 平台数 × 天数 行。
+    // 方言差异:SQLite strftime(localtime) 即本地日历日;PG 的 to_timestamp 按服务器时区解释,
+    // 注入本机 UTC 偏移使其与 Rust 本地归日一致(固定偏移时区精确等价;DST 跨越的边界日
+    // 可能 ±1 小时归桶偏差,与 billing.rs 的趋势查询同级,可接受)。
+    let date_expr = match db.get_database_backend() {
+        DatabaseBackend::Sqlite => {
+            "strftime('%m-%d', collected_at, 'unixepoch', 'localtime')".to_string()
+        }
+        _ => format!(
+            "to_char(to_timestamp(collected_at + {}), 'MM-DD')",
+            Local::now().offset().fix().local_minus_utc()
+        ),
     };
-
-    // 取 (platform, collected_at):内容 + 评论
-    let mut cq = content::Entity::find()
-        .filter(content::Column::CollectedAt.gte(start_ts))
-        .filter(content::Column::CollectedAt.lte(end_ts));
-    if self_only {
-        cq = cq.filter(content::Column::Owner.eq(owner.to_string()));
-    }
-    let content_rows: Vec<(String, i64)> = cq
-        .select_only()
-        .column(content::Column::Platform)
-        .column(content::Column::CollectedAt)
-        .into_tuple()
-        .all(db)
+    let owner_filter = if self_only {
+        format!("AND owner = '{}'", owner.replace('\'', "''"))
+    } else {
+        String::new()
+    };
+    let content_sql = format!(
+        "SELECT platform, {date_expr} AS day, COUNT(*) AS cnt FROM contents \
+         WHERE collected_at >= {start_ts} AND collected_at <= {end_ts} {owner_filter} \
+         GROUP BY platform, day"
+    );
+    let comment_sql = format!(
+        "SELECT platform, {date_expr} AS day, COUNT(*) AS cnt FROM comments \
+         WHERE collected_at >= {start_ts} AND collected_at <= {end_ts} {owner_filter} \
+         GROUP BY platform, day"
+    );
+    let content_rows = db
+        .query_all(Statement::from_string(db.get_database_backend(), content_sql))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询采集趋势失败: {e}")))?;
-
-    let mut mq = comment::Entity::find()
-        .filter(comment::Column::CollectedAt.gte(start_ts))
-        .filter(comment::Column::CollectedAt.lte(end_ts));
-    if self_only {
-        mq = mq.filter(comment::Column::Owner.eq(owner.to_string()));
-    }
-    let comment_rows: Vec<(String, i64)> = mq
-        .select_only()
-        .column(comment::Column::Platform)
-        .column(comment::Column::CollectedAt)
-        .into_tuple()
-        .all(db)
+    let comment_rows = db
+        .query_all(Statement::from_string(db.get_database_backend(), comment_sql))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询评论趋势失败: {e}")))?;
 
@@ -497,18 +496,24 @@ async fn dashboard_trend(
         .iter()
         .map(|p| (p.clone(), vec![0i64; dlen]))
         .collect();
-    for (platform, ts) in content_rows {
-        if let Some(di) = day_of(ts).and_then(|s| date_idx.get(&s).copied()) {
+    for r in content_rows {
+        let platform: String = r.try_get("", "platform").unwrap_or_default();
+        let day: String = r.try_get("", "day").unwrap_or_default();
+        let cnt: i64 = r.try_get("", "cnt").unwrap_or(0);
+        if let Some(di) = date_idx.get(&day).copied() {
             content_map
                 .entry(platform)
-                .or_insert_with(|| vec![0i64; dlen])[di] += 1;
+                .or_insert_with(|| vec![0i64; dlen])[di] += cnt;
         }
     }
-    for (platform, ts) in comment_rows {
-        if let Some(di) = day_of(ts).and_then(|s| date_idx.get(&s).copied()) {
+    for r in comment_rows {
+        let platform: String = r.try_get("", "platform").unwrap_or_default();
+        let day: String = r.try_get("", "day").unwrap_or_default();
+        let cnt: i64 = r.try_get("", "cnt").unwrap_or(0);
+        if let Some(di) = date_idx.get(&day).copied() {
             comment_map
                 .entry(platform)
-                .or_insert_with(|| vec![0i64; dlen])[di] += 1;
+                .or_insert_with(|| vec![0i64; dlen])[di] += cnt;
         }
     }
 

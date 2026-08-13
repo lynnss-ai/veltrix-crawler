@@ -471,6 +471,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_shot_prompts_category ON shot_prompts(category_id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)",
         "CREATE INDEX IF NOT EXISTS idx_contents_task ON contents(task_id)",
+        // 关键词统计的评论归因 JOIN(comments ⋈ contents 按 task_id+platform+content_id)探测 contents 用
+        "CREATE INDEX IF NOT EXISTS idx_contents_task_platform_content ON contents(task_id, platform, content_id)",
         "CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_comments_content ON comments(content_id)",
         "CREATE INDEX IF NOT EXISTS idx_collect_logs_task ON collect_logs(task_id, ts)",
@@ -485,6 +487,10 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         // 大库(十万行级)下这些查询无索引会退化为全表扫描 + 文件排序。
         "CREATE INDEX IF NOT EXISTS idx_contents_owner_collected ON contents(owner, collected_at)",
         "CREATE INDEX IF NOT EXISTS idx_contents_collected ON contents(collected_at)",
+        // 首页热门内容按 like_count 倒序 top-50(无索引时全表排序);(platform, content_id) 服务
+        // 评论形态 JOIN 的 DISTINCT 子表与评论库内容形态筛选的 EXISTS 探测
+        "CREATE INDEX IF NOT EXISTS idx_contents_like_count ON contents(like_count)",
+        "CREATE INDEX IF NOT EXISTS idx_contents_platform_content ON contents(platform, content_id)",
         "CREATE INDEX IF NOT EXISTS idx_contents_owner_platform_author ON contents(owner, platform, author_uid)",
         "CREATE INDEX IF NOT EXISTS idx_comments_owner_collected ON comments(owner, collected_at)",
         "CREATE INDEX IF NOT EXISTS idx_comments_collected ON comments(collected_at)",

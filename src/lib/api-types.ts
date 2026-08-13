@@ -659,6 +659,67 @@ export interface CommentView {
   keyword: string;
 }
 
+// 全量库内容分页查询参数(对应后端 ContentListQuery)。ids 模式(批量视图)忽略 limit/offset/sort。
+export interface ContentListQuery {
+  taskId?: string | null;
+  keyword?: string | null;
+  runStart?: number | null;
+  runEnd?: number | null;
+  search?: string | null;
+  platform?: string | null;
+  kinds?: string[];
+  industry?: string | null;
+  createdFrom?: number | null;
+  createdTo?: number | null;
+  publishedFrom?: number | null;
+  publishedTo?: number | null;
+  // image=本地封面路径非空(选择器口径);cover=本地/远程封面任一(内容库封面图源)
+  imageSource?: "image" | "cover" | null;
+  requireTranscript?: boolean | null;
+  sortBy?: "collectedAt" | "publishedAt" | "mediaStatus" | null;
+  sortDir?: "asc" | "desc" | null;
+  limit: number;
+  offset: number;
+  ids?: string[] | null;
+}
+
+// 评论库分页查询参数(对应后端 CommentListQuery)
+export interface CommentListQuery {
+  taskId?: string | null;
+  search?: string | null;
+  platform?: string | null;
+  kinds?: string[];
+  industry?: string | null;
+  intentLevels?: Array<"high" | "medium" | "low" | "none" | "unanalyzed">;
+  createdFrom?: number | null;
+  createdTo?: number | null;
+  sortBy?: "collectedAt" | "createdAt" | "likeCount" | "intent" | null;
+  sortDir?: "asc" | "desc" | null;
+  limit: number;
+  offset: number;
+}
+
+// 分页列表返回包:条目 + 同筛选口径总数
+export interface ContentListResult {
+  items: ContentView[];
+  total: number;
+}
+export interface CommentListResult {
+  items: CommentView[];
+  total: number;
+}
+
+// 全量库「待转写 / 待提取评论」计数
+export interface ContentLibraryStats {
+  untranscribed: number;
+  pendingComment: number;
+}
+
+export interface IndustryCount {
+  industry: string;
+  count: number;
+}
+
 // 采集日志条目(对应后端 collect-log 事件 / list_collect_logs)
 export interface TaskRunView {
   id: string;
@@ -670,6 +731,12 @@ export interface TaskRunView {
   contentDelta: number;
   commentDelta: number;
   errorMessage: string | null;
+}
+
+// 单次运行导出数据(对应后端 list_run_data):运行时间窗内落库的内容 + 评论
+export interface RunDataView {
+  contents: ContentView[];
+  comments: CommentView[];
 }
 
 export interface CollectLogEntry {

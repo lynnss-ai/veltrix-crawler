@@ -1,12 +1,13 @@
 // 评论库:展示采集落库的评论(comments 表)+ AI 意向标记。
 // 筛选:左侧栏(行业 + 角标)+ 顶部(意向 / 平台 chip + 评论日期 + 关键字)。
-import { useCallback, useEffect, useMemo, useState } from "react";
+// 数据走后端分页(list_comments_page):筛选/排序下沉 SQL,客户端只持有当前页。
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Download, Heart, MessageCircle, Search, X } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
 
-import { DataTable } from "@/components/DataTable";
+import { DataTable, type ServerTableState } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { FacetedFilter } from "@/components/FacetedFilter";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
@@ -15,7 +16,6 @@ import {
   FilterChip,
   FilterSidebar,
   IndustryFilterToggle,
-  inDateRange,
 } from "@/components/library-filters";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,6 +23,7 @@ import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import {
   api,
+  type CommentListQuery,
   type CommentView,
   type IndustryView,
   type PlatformConfig,
@@ -85,8 +86,30 @@ function formatCount(n?: number | null): string {
   return String(n);
 }
 
+// 表格列 id → 后端排序字段(白名单;其余列不可排序)
+const SORT_BY_MAP: Record<string, CommentListQuery["sortBy"]> = {
+  intent: "intent",
+  likes: "likeCount",
+  createdAt: "createdAt",
+  collectedAt: "collectedAt",
+};
+
+// 日期区间 → Unix 秒闭区间(与旧 inDateRange 的本地日 00:00:00 ~ 23:59:59.999 口径一致)
+const toDayStart = (d: Date) =>
+  Math.floor(new Date(d).setHours(0, 0, 0, 0) / 1000);
+const toDayEnd = (d: Date) =>
+  Math.floor(new Date(d).setHours(23, 59, 59, 999) / 1000);
+
 export function CommentLibraryPage() {
+  // 当前页数据 + 总数 + 取数中(服务端分页:comments 只持有一页)
   const [comments, setComments] = useState<CommentView[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [serverState, setServerState] = useState<ServerTableState>({
+    pageIndex: 0,
+    pageSize: 50,
+    sorting: [{ id: "collectedAt", desc: true }],
+  });
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [search, setSearch] = useState("");
@@ -96,81 +119,92 @@ export function CommentLibraryPage() {
   const [commentRange, setCommentRange] = useState<DateRange | undefined>();
   const [kindFilter, setKindFilter] = useState<string[]>([]); // []=全部形态
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
+  // 搜索延迟值:输入即时回显,查询/重取延后到空闲帧(与内容库一致)
+  const deferredSearch = useDeferredValue(search);
+  // 请求序号竞态守卫:筛选快速切换时,慢的旧响应不覆盖新响应
+  const reqSeq = useRef(0);
+
+  // 由当前筛选 + 分页/排序构造后端查询参数(导出翻页复用同一口径)
+  const buildQuery = useCallback(
+    (opts: {
+      sorting?: ServerTableState["sorting"];
+      limit: number;
+      offset: number;
+    }): CommentListQuery => {
+      const sort = opts.sorting?.[0];
+      return {
+        search: deferredSearch.trim() || null,
+        platform: platformFilter || null,
+        kinds: kindFilter,
+        industry: industryFilter === "__all" ? null : industryFilter,
+        intentLevels: intentFilter as CommentListQuery["intentLevels"],
+        createdFrom: commentRange?.from ? toDayStart(commentRange.from) : null,
+        createdTo: commentRange?.from
+          ? toDayEnd(commentRange.to ?? commentRange.from)
+          : null,
+        sortBy: sort ? (SORT_BY_MAP[sort.id] ?? null) : null,
+        sortDir: sort ? (sort.desc ? "desc" : "asc") : null,
+        limit: opts.limit,
+        offset: opts.offset,
+      };
+    },
+    [deferredSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange],
+  );
 
   useEffect(() => {
-    api
-      .listComments()
-      .then(setComments)
-      .catch((e) => toast.error(`加载评论失败: ${e}`));
     api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
     api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
   }, []);
 
+  // 筛选变化回到第一页(offset 页在列表变化后会漂移);分页/排序变化由 fetch effect 直接响应
+  useEffect(() => {
+    setServerState((s) => (s.pageIndex === 0 ? s : { ...s, pageIndex: 0 }));
+  }, [deferredSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange]);
+
+  useEffect(() => {
+    const query = buildQuery({
+      sorting: serverState.sorting,
+      limit: serverState.pageSize,
+      offset: serverState.pageIndex * serverState.pageSize,
+    });
+    const seq = ++reqSeq.current;
+    setLoading(true);
+    api
+      .listCommentsPage(query)
+      .then((res) => {
+        if (seq !== reqSeq.current) return; // 已有更新的请求发出,丢弃本次
+        setComments(res.items);
+        setTotal(res.total);
+      })
+      .catch((e) => {
+        if (seq !== reqSeq.current) return;
+        toast.error(`加载评论失败: ${e}`);
+      })
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
+  }, [buildQuery, serverState]);
+
   const platformName = useCallback((id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
 
-  // 各行业评论数(侧栏角标)
-  const industryCounts = useMemo(() => {
-    const map: Record<string, number> = { __all: comments.length };
-    for (const c of comments) {
-      if (c.industry) map[c.industry] = (map[c.industry] ?? 0) + 1;
-    }
-    return map;
-  }, [comments]);
-
-  const filtered = useMemo(() => {
-    return comments.filter((c) => {
-      if (platformFilter && c.platform !== platformFilter) return false;
-      if (kindFilter.length > 0 && !kindFilter.includes(c.contentKind ?? ""))
-        return false;
-      if (industryFilter !== "__all" && c.industry !== industryFilter)
-        return false;
-      if (intentFilter.length > 0) {
-        // 多选:评论意向键(未分析记 "unanalyzed")命中所选任一项才保留
-        const intentKey = c.intentLevel ?? "unanalyzed";
-        if (!intentFilter.includes(intentKey)) return false;
-      }
-      if (!inDateRange(c.createdAt, commentRange)) return false;
-      if (search) {
-        const q = search.toLowerCase();
-        return (
-          c.text.toLowerCase().includes(q) ||
-          c.authorNickname.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [
-    comments,
-    platformFilter,
-    kindFilter,
-    industryFilter,
-    intentFilter,
-    commentRange,
-    search,
-  ]);
-
-  // 默认排序:创建时间(采集入库)降序为主;同一时间内按意向 高→中→低→无→未分析
-  const sorted = useMemo(() => {
-    const intentRank = (level: IntentLevel | null): number => {
-      switch (level) {
-        case "high":
-          return 5;
-        case "medium":
-          return 4;
-        case "low":
-          return 3;
-        case "none":
-          return 2;
-        default:
-          return 1; // 未分析(intentLevel 为 null)
-      }
-    };
-    return [...filtered].sort((a, b) => {
-      if (b.collectedAt !== a.collectedAt) return b.collectedAt - a.collectedAt;
-      return intentRank(b.intentLevel) - intentRank(a.intentLevel);
-    });
-  }, [filtered]);
+  // 各行业评论数(侧栏角标):走后端聚合,跟随当前筛选(除行业自身——与列表口径一致)。
+  // 「全部」角标用列表 total,渲染时合并传入
+  const [industryCounts, setIndustryCounts] = useState<Record<string, number>>({});
+  const countsSeq = useRef(0);
+  useEffect(() => {
+    const query = buildQuery({ limit: 1, offset: 0 });
+    const seq = ++countsSeq.current;
+    api
+      .commentIndustryCounts(query)
+      .then((list) => {
+        if (seq !== countsSeq.current) return; // 过期响应丢弃
+        const map: Record<string, number> = {};
+        for (const it of list) map[it.industry] = it.count;
+        setIndustryCounts(map);
+      })
+      .catch((e) => console.warn("加载行业角标失败:", e));
+  }, [buildQuery]);
 
   const hasFilter =
     platformFilter !== "" ||
@@ -409,12 +443,24 @@ export function CommentLibraryPage() {
 
   // 导出当前筛选 + 排序后的评论为 Excel(.xlsx);路径经系统保存对话框选定
   async function handleExport() {
-    if (sorted.length === 0) {
+    if (total === 0) {
       toast.error("当前没有可导出的评论");
       return;
     }
     try {
-      const rows = sorted.map((c) => ({
+      // 分页接口翻页拼全量(导出是低频动作,串行翻页可接受,不新增导出专用命令)
+      const all: CommentView[] = [];
+      const pageSize = 2000;
+      let offset = 0;
+      for (;;) {
+        const res = await api.listCommentsPage(
+          buildQuery({ sorting: serverState.sorting, limit: pageSize, offset }),
+        );
+        all.push(...res.items);
+        if (all.length >= res.total || res.items.length === 0) break;
+        offset += pageSize;
+      }
+      const rows = all.map((c) => ({
         平台: platformName(c.platform),
         评论者: c.authorNickname,
         作者主页:
@@ -425,6 +471,7 @@ export function CommentLibraryPage() {
         意向: c.intentLevel ? INTENT_META[c.intentLevel].label : "未分析",
         意向理由: c.intentReason ?? "",
         采集关键词: c.keyword ?? "",
+        视频ID: c.contentId,
         所属内容标题: c.contentTitle ?? "",
         内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
         评论时间: formatTimestamp(c.createdAt),
@@ -456,6 +503,7 @@ export function CommentLibraryPage() {
         { wch: 8 }, // 意向
         { wch: 40 }, // 意向理由
         { wch: 20 }, // 采集关键词
+        { wch: 24 }, // 视频ID
         { wch: 34 }, // 所属内容标题
         { wch: 46 }, // 内容链接
         { wch: 20 }, // 评论时间
@@ -497,7 +545,7 @@ export function CommentLibraryPage() {
       {!sidebarCollapsed && (
         <FilterSidebar
           industries={industries}
-          industryCounts={industryCounts}
+          industryCounts={{ ...industryCounts, __all: total }}
           industryFilter={industryFilter}
           onIndustry={setIndustryFilter}
           onCollapse={() => setSidebarCollapsed(true)}
@@ -591,10 +639,16 @@ export function CommentLibraryPage() {
 
         <DataTable
           columns={columns}
-          data={sorted}
+          data={comments}
           itemLabel="评论"
           getRowId={(c) => c.id}
           defaultPageSize={50}
+          serverControl={{
+            total,
+            state: serverState,
+            onStateChange: setServerState,
+            loading,
+          }}
           emptyState={
             <EmptyState
               title="暂无评论"
