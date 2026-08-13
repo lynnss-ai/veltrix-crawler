@@ -16,6 +16,10 @@ dist-ssr
 target/
 **/target/
 
+# ffmpeg 137MB 超过 GitHub 100MB 单文件上限,不入库;
+# tauri.conf.json 仍引用它,新机器打包前需手动放置
+src-tauri/resources/ffmpeg.exe
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
