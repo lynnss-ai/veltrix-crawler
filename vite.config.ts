@@ -32,7 +32,9 @@ export default defineConfig(async () => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // 显式绑 IPv4:Node 17+ DNS 解析 localhost 优先返回 ::1,只绑 IPv6 时
+    // WebView2 访问 devUrl(http://localhost:1420)走 IPv4 会被拒,窗口白屏
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",
@@ -42,7 +44,15 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // target/ 是 Rust 构建产物目录(十万级文件且频繁变动),chokidar 全量扫描会长时间
+      // 阻塞事件循环,dev server 表现为「白屏、接口无响应」;dist/node_modules 同理排除
+      ignored: [
+        "**/src-tauri/**",
+        "**/target/**",
+        "**/dist/**",
+        "**/node_modules/**",
+        "**/.git/**",
+      ],
     },
   },
 }));

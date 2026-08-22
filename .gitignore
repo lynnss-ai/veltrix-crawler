@@ -30,3 +30,7 @@ src-tauri/resources/ffmpeg.exe
 *.njsproj
 *.sln
 *.sw?
+
+# 迁移脚本本地凭证(勿提交)
+scripts/.pg-dsn
+scripts/.venv/

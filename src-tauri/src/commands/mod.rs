@@ -222,6 +222,427 @@ pub fn set_database_config(
     cfg.save(&state.config_dir)
 }
 
+/// 生成局域网远程访问用的数据库连接串(系统设置「数据库」复制入口)。
+/// 连接串含密码属敏感操作:先用当前登录用户密码做 argon2 二次校验。
+/// 仅当前生效后端为 PostgreSQL 时可用;主机部分替换为本机局域网 IP
+/// (UDP 路由探测,只选出站网卡不实际发包),账号/密码/端口/库名/参数原样保留。
+#[tauri::command]
+pub async fn get_remote_database_url(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<String> {
+    let user = current_user(&state).ok_or_else(|| CrawlerError::Auth("未登录".into()))?;
+    admin::verify_user_password(&state.db, &user.name, &password).await?;
+
+    let url = {
+        let cfg = lock_config(&state)?;
+        veltrix_core::db::resolve_url(&state.config_dir, &cfg.database)?
+    };
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        return Err(CrawlerError::Config(
+            "当前使用的是本地 SQLite,远程连接串仅在 PostgreSQL 下可用".into(),
+        ));
+    }
+    let lan_ip = lan_ipv4()?;
+    replace_url_host(&url, &lan_ip)
+}
+
+/// 本机局域网 IPv4:向公网地址发起 UDP「连接」(只选路由不实际发包),取出站网卡地址。
+fn lan_ipv4() -> Result<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| CrawlerError::Config(format!("获取本机局域网 IP 失败: {e}")))?;
+    sock.connect("8.8.8.8:80")
+        .map_err(|e| CrawlerError::Config(format!("获取本机局域网 IP 失败: {e}")))?;
+    let ip = sock
+        .local_addr()
+        .map_err(|e| CrawlerError::Config(format!("获取本机局域网 IP 失败: {e}")))?
+        .ip();
+    if !ip.is_ipv4() {
+        return Err(CrawlerError::Config("未找到可用的局域网 IPv4 地址".into()));
+    }
+    Ok(ip.to_string())
+}
+
+/// 把 postgres 连接串的主机部分替换为指定 IP,其余部分(账号/密码/端口/库名/参数)原样保留。
+fn replace_url_host(url: &str, new_host: &str) -> Result<String> {
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| CrawlerError::Config("连接串缺少协议头".into()))?;
+    let after_scheme = &url[scheme_end + 3..];
+    // authority 结束于第一个 '/'
+    let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..path_start];
+    let rest = &after_scheme[path_start..];
+    // host 起点:last '@' 之后(无 @ 则整个 authority 即 host)
+    let host_start = authority.rfind('@').map(|i| i + 1).unwrap_or(0);
+    let userinfo = &authority[..host_start];
+    let hostport = &authority[host_start..];
+    // 端口:host 后第一个 ':'(本机 PG 均为 IPv4/主机名,不展开 IPv6)
+    let port = match hostport.find(':') {
+        Some(i) => &hostport[i..],
+        None => "",
+    };
+    Ok(format!(
+        "{}{}{}{}{}",
+        &url[..scheme_end + 3],
+        userinfo,
+        new_host,
+        port,
+        rest
+    ))
+}
+
+// ===================== SQLite → PostgreSQL 一键迁移 =====================
+
+/// 单表迁移结果(read=源读取行数,written=实际写入行数;幂等重跑时 written 可为 0)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMigrationView {
+    pub table: String,
+    pub read: i64,
+    pub written: i64,
+    /// 目标库不存在该表(未搬)
+    pub skipped: bool,
+}
+
+/// 迁移进度事件(db-migrate-progress)负载:前端对话框据此渲染进度条。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MigrateProgressEvent {
+    table: String,
+    /// 当前第几张表(1 起)
+    table_index: usize,
+    table_total: usize,
+    /// 当前表总行数(reading 阶段为 0,读完回填)
+    table_rows: i64,
+    /// 当前表已写入行数
+    table_written: i64,
+    /// reading / writing / done
+    phase: &'static str,
+}
+
+/// 把当前 SQLite 库的全量数据复制到指定 PostgreSQL 连接串(系统设置「数据库」一键迁移)。
+///
+/// 语义(与 scripts/migrate-sqlite-to-pg.py 一致):
+/// - 目标库先用实体 DDL 建表(init_schema),再逐表 INSERT ... ON CONFLICT DO NOTHING,
+///   幂等可重复执行,源库全程只读;
+/// - SQLite 的 0/1 布尔列按目标库 information_schema 的 boolean 列转换(PG 布尔不收整数);
+/// - 迁移后重置目标库自增序列(setval 到 max(id)),防止后续插入撞主键;
+/// - 逐表/逐批 emit `db-migrate-progress` 事件,前端渲染进度条。
+#[tauri::command]
+pub async fn migrate_sqlite_to_pg(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    target_url: String,
+) -> Result<Vec<TableMigrationView>> {
+    use sea_orm::{TransactionTrait, Value};
+    use tauri::Emitter;
+
+    let emit = |p: MigrateProgressEvent| {
+        let _ = app.emit("db-migrate-progress", p);
+    };
+
+    let source = state.db.clone();
+    if source.get_database_backend() != DatabaseBackend::Sqlite {
+        return Err(CrawlerError::Config(
+            "当前已是 PostgreSQL,无需迁移(该功能用于 SQLite → PG)".into(),
+        ));
+    }
+    if !target_url.starts_with("postgres://") && !target_url.starts_with("postgresql://") {
+        return Err(CrawlerError::Config(
+            "目标连接串必须以 postgres:// 开头".into(),
+        ));
+    }
+
+    // 目标库不存在(SQLSTATE 3D000)时自动建库:连同服务器的 postgres 维护库 CREATE DATABASE;
+    // 其余连接失败(拒连/认证失败等)直接报错,不做任何尝试
+    let target = match sea_orm::Database::connect(&target_url).await {
+        Ok(db) => db,
+        Err(e) => {
+            let msg = e.to_string();
+            if !(msg.contains("3D000") || msg.contains("does not exist")) {
+                return Err(CrawlerError::Config(format!(
+                    "连接目标 PostgreSQL 失败: {e}"
+                )));
+            }
+            create_pg_database(&target_url).await.map_err(|ce| {
+                CrawlerError::Config(format!(
+                    "目标数据库不存在,自动创建失败: {ce}(可手动 CREATE DATABASE 后重试)"
+                ))
+            })?;
+            sea_orm::Database::connect(&target_url)
+                .await
+                .map_err(|e2| CrawlerError::Config(format!("建库后重连失败: {e2}")))?
+        }
+    };
+    // 目标建表(已存在则跳过);目标连不上/无权限在此直接报错,不会动源库
+    veltrix_core::db::init_schema(&target).await?;
+
+    // 目标库的布尔列集合:SQLite 存 0/1,插 PG 前转 bool
+    let bool_cols: std::collections::HashSet<(String, String)> = target
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT table_name, column_name FROM information_schema.columns \
+             WHERE table_schema='public' AND data_type='boolean'".to_owned(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("读取目标库结构失败: {e}")))?
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.try_get::<String>("", "table_name").ok()?,
+                r.try_get::<String>("", "column_name").ok()?,
+            ))
+        })
+        .collect();
+
+    // 源库表清单(sqlite_ 前缀为内部表,不搬)
+    let tables: Vec<String> = source
+        .query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name".to_owned(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("读取源库表清单失败: {e}")))?
+        .iter()
+        .filter_map(|r| r.try_get::<String>("", "name").ok())
+        .collect();
+
+    const BATCH: usize = 200;
+    let mut report = Vec::new();
+    let table_total = tables.len();
+    for (idx, table) in tables.into_iter().enumerate() {
+        let table_index = idx + 1;
+        emit(MigrateProgressEvent {
+            table: table.clone(),
+            table_index,
+            table_total,
+            table_rows: 0,
+            table_written: 0,
+            phase: "reading",
+        });
+        // 源列(声明类型) + 目标列交集:只搬两边都有的列
+        let pragma = source
+            .query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("PRAGMA table_info(\"{table}\")"),
+            ))
+            .await
+            .map_err(|e| CrawlerError::Config(format!("读取源表结构失败({table}): {e}")))?;
+        let src_cols: Vec<(String, String)> = pragma
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.try_get::<String>("", "name").ok()?,
+                    r.try_get::<String>("", "type").ok()?.to_uppercase(),
+                ))
+            })
+            .collect();
+        let tgt_cols: std::collections::HashSet<String> = target
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema='public' AND table_name=$1",
+                [table.clone().into()],
+            ))
+            .await
+            .map_err(|e| CrawlerError::Config(format!("读取目标表结构失败({table}): {e}")))?
+            .iter()
+            .filter_map(|r| r.try_get::<String>("", "column_name").ok())
+            .collect();
+        if tgt_cols.is_empty() {
+            tracing::warn!("目标库不存在表 {table},跳过");
+            emit(MigrateProgressEvent {
+                table: table.clone(),
+                table_index,
+                table_total,
+                table_rows: 0,
+                table_written: 0,
+                phase: "done",
+            });
+            report.push(TableMigrationView { table, read: 0, written: 0, skipped: true });
+            continue;
+        }
+        let cols: Vec<(String, String)> = src_cols
+            .into_iter()
+            .filter(|(name, _)| tgt_cols.contains(name))
+            .collect();
+        let col_list = cols
+            .iter()
+            .map(|(n, _)| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let rows = source
+            .query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT {col_list} FROM \"{table}\""),
+            ))
+            .await
+            .map_err(|e| CrawlerError::Config(format!("读取源表失败({table}): {e}")))?;
+        let table_rows = rows.len() as i64;
+        emit(MigrateProgressEvent {
+            table: table.clone(),
+            table_index,
+            table_total,
+            table_rows,
+            table_written: 0,
+            phase: "writing",
+        });
+
+        // 逐表事务:每批一条多行 INSERT,ON CONFLICT DO NOTHING 保证幂等
+        let txn = target
+            .begin()
+            .await
+            .map_err(|e| CrawlerError::Config(format!("开启目标事务失败({table}): {e}")))?;
+        let mut written: i64 = 0;
+        for (batch_i, chunk) in rows.chunks(BATCH).enumerate() {
+            let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * cols.len());
+            let mut placeholders = String::new();
+            for (row_i, row) in chunk.iter().enumerate() {
+                if row_i > 0 {
+                    placeholders.push_str(", ");
+                }
+                placeholders.push('(');
+                for (col_i, (name, decl)) in cols.iter().enumerate() {
+                    if col_i > 0 {
+                        placeholders.push_str(", ");
+                    }
+                    placeholders.push_str(&format!("${}", row_i * cols.len() + col_i + 1));
+                    let is_bool_target = bool_cols.contains(&(table.clone(), name.clone()));
+                    // 按 SQLite 声明类型取裸值;目标是布尔列时把 0/1 转 bool
+                    let v: Value = if is_bool_target {
+                        Value::from(row.try_get::<Option<i64>>("", name).ok().flatten().map(|n| n != 0))
+                    } else if decl.contains("INT") || decl.contains("BOOL") {
+                        Value::from(row.try_get::<Option<i64>>("", name).ok().flatten())
+                    } else if decl.contains("REAL") || decl.contains("FLOA") || decl.contains("DOUB") {
+                        Value::from(row.try_get::<Option<f64>>("", name).ok().flatten())
+                    } else if decl.contains("BLOB") {
+                        Value::from(row.try_get::<Option<Vec<u8>>>("", name).ok().flatten())
+                    } else {
+                        Value::from(row.try_get::<Option<String>>("", name).ok().flatten())
+                    };
+                    values.push(v);
+                }
+                placeholders.push(')');
+            }
+            let sql = format!(
+                "INSERT INTO \"{table}\" ({col_list}) VALUES {placeholders} ON CONFLICT DO NOTHING"
+            );
+            let res = txn
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    values,
+                ))
+                .await
+                .map_err(|e| CrawlerError::Config(format!("写入目标表失败({table}): {e}")))?;
+            written += res.rows_affected() as i64;
+            // 批次进度按「已处理行数」推进(幂等重跑 rows_affected=0 时进度条也照常走)
+            emit(MigrateProgressEvent {
+                table: table.clone(),
+                table_index,
+                table_total,
+                table_rows,
+                table_written: (batch_i * BATCH + chunk.len()) as i64,
+                phase: "writing",
+            });
+        }
+        txn.commit()
+            .await
+            .map_err(|e| CrawlerError::Config(format!("提交目标事务失败({table}): {e}")))?;
+        tracing::info!(table = %table, read = rows.len(), written, "迁移表完成");
+        emit(MigrateProgressEvent {
+            table: table.clone(),
+            table_index,
+            table_total,
+            table_rows,
+            table_written: table_rows,
+            phase: "done",
+        });
+        report.push(TableMigrationView {
+            read: rows.len() as i64,
+            written,
+            table,
+            skipped: false,
+        });
+    }
+
+    // 自增序列重置:带显式 id 迁入后,序列仍指向旧值会撞主键
+    let serial_cols = target
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT table_name, column_name FROM information_schema.columns \
+             WHERE table_schema='public' AND column_default LIKE 'nextval%'".to_owned(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("读取目标序列失败: {e}")))?;
+    for r in &serial_cols {
+        let (Ok(t), Ok(c)) = (
+            r.try_get::<String>("", "table_name"),
+            r.try_get::<String>("", "column_name"),
+        ) else {
+            continue;
+        };
+        let _ = target
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT setval(pg_get_serial_sequence('\"{t}\"','{c}'), \
+                     COALESCE((SELECT MAX(\"{c}\") FROM \"{t}\"), 1))"
+                ),
+            ))
+            .await;
+    }
+
+    Ok(report)
+}
+
+/// 在目标服务器上创建连接串所指的数据库(连默认 postgres 维护库执行 CREATE DATABASE)。
+/// 库名做标识符白名单校验,杜绝拼串注入;已存在(42P04)视为成功(重试/并发幂等)。
+async fn create_pg_database(target_url: &str) -> Result<()> {
+    let after_scheme = target_url
+        .splitn(2, "://")
+        .nth(1)
+        .ok_or_else(|| CrawlerError::Config("连接串缺少协议头".into()))?;
+    // 库名 = path 段(去查询串/fragment)
+    let path = after_scheme
+        .find('/')
+        .map(|i| &after_scheme[i + 1..])
+        .unwrap_or("");
+    let db_name = path.split(['?', '#']).next().unwrap_or("").trim();
+    if db_name.is_empty()
+        || !db_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(CrawlerError::Config(format!(
+            "连接串中的库名无效(仅允许字母/数字/_/-): {db_name}"
+        )));
+    }
+    // 维护库连接串:同账号同主机,库名换成 postgres
+    let host_part = &after_scheme[..after_scheme.find('/').unwrap_or(after_scheme.len())];
+    let scheme = &target_url[..target_url.len() - after_scheme.len()];
+    let maintenance = format!("{scheme}{host_part}/postgres");
+    let db = sea_orm::Database::connect(&maintenance)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("连接 postgres 维护库失败: {e}")))?;
+    match db
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("CREATE DATABASE \"{db_name}\""),
+        ))
+        .await
+    {
+        Ok(_) => Ok(()),
+        // 已存在 = 目标达成(并发/重复迁移场景)
+        Err(e) if e.to_string().contains("42P04") || e.to_string().contains("already exists") => {
+            Ok(())
+        }
+        Err(e) => Err(CrawlerError::Config(format!("CREATE DATABASE 失败: {e}"))),
+    }
+}
+
 /// 保存采集素材的存储根目录(系统设置「存储路径」)。
 /// 写入 `config.media.output_dir` 并持久化;空串表示回退应用默认数据目录。
 #[tauri::command]

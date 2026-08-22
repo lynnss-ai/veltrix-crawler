@@ -8,7 +8,7 @@
 
 use super::{CollectControl, InterceptedResponse};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Webview};
+use tauri::{AppHandle, Emitter, Manager, Webview};
 
 /// 命中响应的窗口级缓冲。每个采集窗口一份,采集前清空、采集后取走。
 pub type ResponseSink = Arc<Mutex<Vec<InterceptedResponse>>>;
@@ -101,10 +101,22 @@ pub fn install(
     cap_entries: bool,
     signals: Option<SignalCtx>,
 ) {
+    // 空 stream 兜底(页内重取):仅采集窗口启用——有信号桥回传(signals)、
+    // 非 Agent 全量(emit 只作展示)、非登录/访问窗口(cap_entries 漏捕无碍)。
+    // GetContent 对缓存命中 / Service Worker 应答的响应常返回空流,漏捕后由页面
+    // 重新 fetch 同一条已签名 URL 补回,经 intercept_sink_push 命令落进 sink。
+    let fallback = if signals.is_some() && emit.is_none() && !cap_entries {
+        Some(win::FallbackCtx::new(
+            webview.app_handle().clone(),
+            webview.label().to_string(),
+        ))
+    } else {
+        None
+    };
     // with_webview 把闭包调度到 WebView 线程执行;失败仅告警,不阻断采集
     if let Err(e) = webview.with_webview(move |pw| {
         // SAFETY: 在 WebView2 自身线程上访问其 COM 接口
-        unsafe { win::install(pw, patterns, sink, emit, cap_entries, signals) }
+        unsafe { win::install(pw, patterns, sink, emit, cap_entries, signals, fallback) }
     }) {
         tracing::warn!("安装原生网络拦截失败(退回页面 hook): {e}");
     }
@@ -191,6 +203,46 @@ mod win {
     use windows::core::{w, HSTRING, Interface, PCWSTR, PWSTR};
     use windows::Win32::System::Com::{CoTaskMemFree, IStream};
 
+    /// 空 stream 兜底上下文:AppHandle + 窗口 label(用于页内 eval 重取)+ 已重取 URL 去重集合。
+    #[derive(Clone)]
+    pub struct FallbackCtx {
+        app: tauri::AppHandle,
+        label: String,
+        seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    }
+
+    impl FallbackCtx {
+        pub fn new(app: tauri::AppHandle, label: String) -> Self {
+            Self {
+                app,
+                label,
+                seen: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            }
+        }
+    }
+
+    /// 在页面上下文重取已签名 URL(带会话 Cookie,禁缓存),响应体经
+    /// `intercept_sink_push` 命令回传该窗口拦截缓冲。
+    /// 回传走 Tauri invoke 而非 chrome.webview.postMessage:后者在采集窗口实测不送达
+    /// (WebMessageReceived 从未触发,api_done 同样靠 invoke 兜底)。
+    /// a_bogus / msToken 覆盖 URL 参数与短时时间窗,同 URL 立即重放一般仍被放行。
+    fn eval_refetch(app: &tauri::AppHandle, label: &str, url: &str) {
+        use tauri::Manager;
+        let Some(window) = app.get_webview_window(label) else {
+            return;
+        };
+        let Ok(url_js) = serde_json::to_string(url) else {
+            return;
+        };
+        let Ok(label_js) = serde_json::to_string(label) else {
+            return;
+        };
+        let js = format!(
+            r#"(function(){{var u={url_js},l={label_js};function push(t){{try{{window.__TAURI_INTERNALS__.invoke('intercept_sink_push',{{label:l,url:u,body:t}});}}catch(e){{}}}}fetch(u,{{credentials:'include',cache:'no-store'}}).then(function(r){{return r.text();}}).then(push).catch(function(){{push('');}});}})();"#
+        );
+        let _ = window.eval(&js);
+    }
+
     pub unsafe fn install(
         webview: PlatformWebview,
         patterns: Arc<Vec<String>>,
@@ -198,6 +250,7 @@ mod win {
         emit: Option<EmitCtx>,
         cap_entries: bool,
         signals: Option<SignalCtx>,
+        fallback: Option<FallbackCtx>,
     ) {
         let core = match webview.controller().CoreWebView2() {
             Ok(c) => c,
@@ -290,14 +343,32 @@ mod win {
                 }
 
                 // 异步取响应内容流;拿到后读成字符串推入缓冲(+ Agent 模式推前端)
+                let mut status: i32 = 0;
+                let _ = response.StatusCode(&mut status);
                 let sink = sink.clone();
                 let emit = emit.clone();
+                let fallback = fallback.clone();
                 let completed = WebResourceResponseViewGetContentCompletedHandler::create(Box::new(
                     move |_result: windows::core::Result<()>, stream: Option<IStream>| {
                         let Some(stream) = stream else {
-                            // GetContent 返回空 stream(多为命中缓存无 body / 响应被丢弃):
-                            // 此前静默 return 无任何痕迹,补 warn 便于定位漏采
-                            tracing::warn!(url = %url, "拦截器 GetContent 返回空 stream,漏捕该响应");
+                            // GetContent 返回空 stream(命中缓存 / Service Worker 应答 / body 已被消费,
+                            // 拿不到响应体):打 warn 留痕后,由页面以会话 Cookie 重取同一条已签名 URL
+                            // 兜底补回(intercept_sink_push 命令 → sink)。seen 去重防「重取响应再空 stream」
+                            // 死循环;仅 200 值得重取(204/304/重定向本就无业务 body)
+                            tracing::warn!(url = %url, status, "拦截器 GetContent 返回空 stream,漏捕该响应");
+                            if status == 200 {
+                                if let Some(fb) = &fallback {
+                                    let first = fb
+                                        .seen
+                                        .lock()
+                                        .map(|mut s| s.insert(url.clone()))
+                                        .unwrap_or(false);
+                                    if first {
+                                        tracing::info!(url = %url, "空 stream → 触发页内重取兜底");
+                                        eval_refetch(&fb.app, &fb.label, &url);
+                                    }
+                                }
+                            }
                             return Ok(());
                         };
                         let body = read_stream(&stream, STREAM_READ_CAP, &url);

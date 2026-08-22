@@ -68,7 +68,7 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 2. `webview::pool` 复用该账号的 WebView 窗口(**per-account 数据目录隔离** = 多账号互不串登录态),导航到搜索页,注入脚本 hook fetch/XHR。
 3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底 / 网络无响应 / 手动停 即结束。计数排除库中已有 content_id;**去重跳过**:本任务已采 ∪ 去重台账 `collect_records`(同平台、近 90 天)的内容整体跳过,删单条内容不清台账,「清空业务数据」连带清台账。
 4. adapter(`DouyinAdapter` / `XhsAdapter` 等,注册在 `lib.rs`)把响应解析为统一 `Content` / `Comment`,**只解析、不发请求**。
-5. 边采边入库(on-conflict upsert)。阶段顺序:内容采集 → 作者画像补采 → 评论采集 → 直链补取(开「音频提取」时;刻意排在评论后、关窗前)→ 关窗放锁 → 素材下载(并发 15 路,不占窗口)→ 语音转写 → 评论意向分析 → Obsidian 同步 → 落 `completed`。
+5. 边采边入库(on-conflict upsert)。阶段顺序:内容采集 → 作者画像补采 → 评论采集 → 直链补取(开「音频提取」时;刻意排在评论后)→ 素材下载(并发 15 路;**采集窗口保活、账号锁延后到下载结束才释放**——每个并发批从存活窗口取一次轮换后的新会话 Cookie,用户关窗即终止)→ 关窗放锁 → 语音转写 → 评论意向分析 → Obsidian 同步 → 落 `completed`。
 
 **新增平台** = 加平台配置 + 实现 `PlatformAdapter` trait + 在 `lib.rs` 注册,不改调度/模型/上报。
 

@@ -21,27 +21,109 @@ const DATABASE_URL_ENV: &str = "VELTRIX_DATABASE_URL";
 /// 连接超时秒数。
 const CONNECT_TIMEOUT_SECS: u64 = 8;
 
+/// PG 连接串规范化:startup packet 追加 `lc_messages=C`。
+/// 中文 Windows 装的 PG 默认 lc_messages=Chinese_China.936,服务端错误消息是 GBK 编码,
+/// sqlx 按 UTF-8 解码直接抛 protocol error,把真实原因(认证失败 / 库不存在等)吞掉;
+/// 强制 C 区域让服务端回 ASCII 错误消息,真实错误才能透传到 UI 与日志。
+fn normalize_pg_url(url: &str) -> String {
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        return url.to_owned();
+    }
+    if url.contains("lc_messages") {
+        return url.to_owned();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}options[lc_messages]=C")
+}
+
 /// 连接数据库并确保表结构存在。
 /// 若按配置/环境变量解析出的连接串无法连接(如用户填了无效连接串),
 /// 自动回退到默认本地 SQLite,避免启动崩溃。
+/// PG 目标库不存在(SQLSTATE 3D000)时先自动建库再重连,与「一键迁移」行为对齐。
 pub async fn connect(config_dir: &Path, cfg: &DatabaseConfig) -> Result<DatabaseConnection> {
     let url = resolve_url(config_dir, cfg)?;
     let db = match try_connect(&url, cfg.max_connections).await {
         Ok(db) => db,
         Err(e) => {
-            let fallback = default_sqlite_url(config_dir)?;
-            if fallback == url {
-                // 连默认本地库都失败,无从回退
-                return Err(e);
+            // 目标 PG 库不存在 → 自动建库后重连一次;建不了/不是该错误则走原回退
+            let retried = if create_pg_database_if_missing(&url, &e.to_string()).await {
+                try_connect(&url, cfg.max_connections).await.ok()
+            } else {
+                None
+            };
+            match retried {
+                Some(db) => db,
+                None => {
+                    let fallback = default_sqlite_url(config_dir)?;
+                    if fallback == url {
+                        // 连默认本地库都失败,无从回退
+                        return Err(e);
+                    }
+                    // ⚠️ 数据完整性风险:PG 连接失败时静默回退本地 SQLite,数据落点与配置预期不符。
+                    // Cloud 多实例部署下会导致数据分裂(各实例独立 sqlite 文件),应为 error 级别便于监控发现。
+                    tracing::error!("连接数据库失败({e}),已回退默认本地 SQLite: {fallback}。请检查数据库连接配置。");
+                    try_connect(&fallback, cfg.max_connections).await?
+                }
             }
-            // ⚠️ 数据完整性风险:PG 连接失败时静默回退本地 SQLite,数据落点与配置预期不符。
-            // Cloud 多实例部署下会导致数据分裂(各实例独立 sqlite 文件),应为 error 级别便于监控发现。
-            tracing::error!("连接数据库失败({e}),已回退默认本地 SQLite: {fallback}。请检查数据库连接配置。");
-            try_connect(&fallback, cfg.max_connections).await?
         }
     };
     init_schema(&db).await?;
     Ok(db)
+}
+
+/// PG 目标库不存在时自动建库:连同服务器的 postgres 维护库执行 CREATE DATABASE。
+/// 返回 true = 库已就绪(新建或已存在),调用方可重连;false = 非「库不存在」场景,未做处理。
+/// 库名做白名单校验(字母/数字/_/-),杜绝拼串注入。
+async fn create_pg_database_if_missing(url: &str, connect_err: &str) -> bool {
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        return false;
+    }
+    if !(connect_err.contains("3D000") || connect_err.contains("does not exist")) {
+        return false;
+    }
+    let after_scheme = url.splitn(2, "://").nth(1).unwrap_or("");
+    // 库名 = path 段(去查询串/fragment)
+    let path = after_scheme
+        .find('/')
+        .map(|i| &after_scheme[i + 1..])
+        .unwrap_or("");
+    let db_name = path.split(['?', '#']).next().unwrap_or("").trim();
+    if db_name.is_empty()
+        || !db_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        tracing::warn!("PG 连接串库名无效,放弃自动建库: {db_name}");
+        return false;
+    }
+    // 维护库连接串:同账号同主机,库名换成 postgres
+    let host_part = &after_scheme[..after_scheme.find('/').unwrap_or(after_scheme.len())];
+    let scheme = &url[..url.len() - after_scheme.len()];
+    let maintenance = format!("{scheme}{host_part}/postgres");
+    let db = match Database::connect(&normalize_pg_url(&maintenance)).await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("自动建库:连接 postgres 维护库失败: {e}");
+            return false;
+        }
+    };
+    match db
+        .execute_unprepared(&format!("CREATE DATABASE \"{db_name}\""))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!("PG 目标库不存在,已自动创建: {db_name}");
+            true
+        }
+        // 已存在 = 目标达成(并发启动/重试场景)
+        Err(e) if e.to_string().contains("42P04") || e.to_string().contains("already exists") => {
+            true
+        }
+        Err(e) => {
+            tracing::warn!("自动建库失败({db_name}): {e}");
+            false
+        }
+    }
 }
 
 /// 测试给定连接串能否连通(不建表、不影响当前连接)。
@@ -58,7 +140,7 @@ pub async fn test_connection(url: &str) -> Result<()> {
 
 /// 按给定连接串建立连接(不建表)。
 async fn try_connect(url: &str, max_connections: u32) -> Result<DatabaseConnection> {
-    let mut opt = ConnectOptions::new(url.to_owned());
+    let mut opt = ConnectOptions::new(normalize_pg_url(url));
     opt.max_connections(max_connections)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .sqlx_logging(false);
@@ -122,7 +204,8 @@ pub fn resolve_url(config_dir: &Path, cfg: &DatabaseConfig) -> Result<String> {
 
 /// 建表(若不存在)。用实体生成跨方言 DDL,SQLite / PG 通用。
 /// 后续新增表在此追加 `create_table` 调用。
-async fn init_schema(db: &DatabaseConnection) -> Result<()> {
+/// pub 供桌面端「迁移到 PG」命令在目标库上预建表结构复用。
+pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     let schema = Schema::new(db.get_database_backend());
 
     create_table(db, &schema, entity::account::Entity, "accounts").await?;
@@ -303,6 +386,8 @@ async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("extra_filters", "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'"),
         // 定向采集目标链接(JSON 数组,视频链接/主页链接);旧行回填 '[]'(非定向任务)
         ("target_urls", "ALTER TABLE tasks ADD COLUMN target_urls TEXT NOT NULL DEFAULT '[]'"),
+        // 指定采集账号(accounts.id);可空,旧行回填 NULL = 自动轮换
+        ("account_id", "ALTER TABLE tasks ADD COLUMN account_id TEXT"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db

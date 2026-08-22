@@ -407,9 +407,16 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
     if (window.__veltrixSeen.length < 300) window.__veltrixSeen.push(url);
     // 诊断:页面实际调用的每个 /api/ 接口「路径」首次出现时打到 HUD,便于核对页面真实接口
     // (如小红书改版排查搜索/评论接口是否真的发出、路径是否变化)。按路径去重,不刷屏。
+    // 仅顶层帧输出:initialization_script 在所有帧注入,字节安全 SDK 的沙箱 iframe 每发一次
+    // 遥测(security.zijieapi.com/api/metrics/emit)都是新帧上下文,各自「首次出现」会刷屏;
+    // 页面真实业务接口都在顶层帧发出,诊断价值不损失。
+    // 已知遥测/埋点接口(无任何业务数据,逐页导航各报一次会淹没真实日志)直接跳过;
+    // 注意抖音真实业务接口是 /aweme/v1/web/...,不含 /api/,本诊断本就看不到它们
+    var __veltrixApiSkip = ['/api/metrics/emit', '/api/metrics/collect'];
     try {{
       var p = (url || '').split('?')[0];
-      if (p.indexOf('/api/') !== -1 && !__veltrixApiSeen[p]) {{
+      var skipped = __veltrixApiSkip.some(function (s) {{ return p.indexOf(s) !== -1; }});
+      if (window === window.top && p.indexOf('/api/') !== -1 && !skipped && !__veltrixApiSeen[p]) {{
         __veltrixApiSeen[p] = 1;
         if (window.__veltrixHud && window.__veltrixHud.log) {{
           window.__veltrixHud.log({{ level: 'info', message: '🔎 接口 ' + p }});
@@ -935,6 +942,58 @@ pub fn build_detail_eval(template: &str, id: &str, token: &str) -> String {
         "(function () {{ var id = encodeURIComponent('{id_esc}'); \
          var token = encodeURIComponent('{token_esc}'); \
          window.location.assign('{tpl}'.split('{{id}}').join(id).split('{{token}}').join(token)); }})();"
+    )
+}
+
+/// 构造「详情页 SSR 数据回传」脚本(抖音直链刷新的第二通道):视频页 /video/{id} 的
+/// RENDER_DATA / _ROUTER_DATA 内嵌完整 aweme_detail(含 video.play_addr / music.play_url),
+/// JS 直读 DOM 即可拿到,完全不经过 WebView2 GetContent——规避「拦截器空 stream 丢包」导致
+/// 直链刷新整批失败的根因。递归找到目标 aweme_id 的详情对象后,包成 {aweme_detail: ...}、
+/// 以合成详情接口 URL 经 intercept_sink_push 命令回传 sink(Tauri invoke,与 intercept_push
+/// 同通道;chrome.webview.postMessage 在采集窗口实测不送达),适配器按 ContentDetail 原路径解析。
+pub fn build_detail_ssr_eval(label: &str, content_id: &str) -> String {
+    let id_json = serde_json::to_string(content_id).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    // 必报结果:命中(__ssr=hit)带详情 JSON;未命中(__ssr=miss)带诊断位
+    // (rd=RENDER_DATA 是否存在,router=_ROUTER_DATA 是否存在)——此前 miss 静默 return,
+    // 无法区分「SSR 无详情」与「脚本没执行 / invoke 没送达」
+    format!(
+        r#"(function(){{
+  var target = {id}, label = {label};
+  var hasRD = false, hasRouter = false;
+  function report(mark, body, diag) {{
+    try {{
+      window.__TAURI_INTERNALS__.invoke('intercept_sink_push', {{
+        label: label,
+        url: 'https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=' + target + '&__ssr=' + mark + '&' + diag,
+        body: body
+      }});
+    }} catch (e) {{}}
+  }}
+  function walk(o, d) {{
+    if (!o || typeof o !== 'object' || d > 14) return null;
+    if (o.aweme_detail && typeof o.aweme_detail === 'object') return o.aweme_detail;
+    if (o.aweme_id != null && String(o.aweme_id) === target && o.video) return o;
+    for (var k in o) {{ var r = walk(o[k], d + 1); if (r) return r; }}
+    return null;
+  }}
+  var detail = null;
+  try {{
+    var el = document.getElementById('RENDER_DATA');
+    hasRD = !!el;
+    if (el) detail = walk(JSON.parse(decodeURIComponent(el.textContent)), 0);
+  }} catch (e) {{}}
+  try {{ hasRouter = !!window._ROUTER_DATA; }} catch (e) {{}}
+  if (!detail && hasRouter) {{ try {{ detail = walk(window._ROUTER_DATA, 0); }} catch (e) {{}} }}
+  var diag = 'rd=' + (hasRD ? 1 : 0) + '&router=' + (hasRouter ? 1 : 0);
+  if (detail && detail.video) {{
+    report('hit', JSON.stringify({{ aweme_detail: detail }}), diag);
+  }} else {{
+    report('miss', '', diag);
+  }}
+}})();"#,
+        id = id_json,
+        label = label_json
     )
 }
 
@@ -1829,6 +1888,7 @@ pub fn build_hud_init_script() -> String {
   var DEFAULT_KW = '日志';
   var SID_KEY = '__veltrix_hud_sid';
   var TID_KEY = '__veltrix_hud_tid';
+  var SEQ_KEY = '__veltrix_hud_seq';
   // 状态色:绿=正常运行中 / 红=异常或需处理 / 灰=已停止
   var COLOR_OK = '#22c55e', COLOR_ERR = '#ef4444', COLOR_IDLE = '#9ca3af';
   // 收起态三态视觉(颜色 + 图标 + 悬浮文案):最小化后一眼区分「运行中 / 异常 / 已停止」
@@ -2083,7 +2143,7 @@ pub fn build_hud_init_script() -> String {
     var line = document.createElement('div');
     var color = item.level === 'error' ? '#f87171' : (item.level === 'warn' ? '#fbbf24' : '#9ca3af');
     line.style.cssText = 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:' + color + ';';
-    line.textContent = (item.time || '') + '  ' + (item.message || '');
+    line.textContent = (item.seq ? '#' + item.seq + ' ' : '') + (item.time || '') + '  ' + (item.message || '');
     body.appendChild(line);
     body.scrollTop = body.scrollHeight;
   }
@@ -2213,6 +2273,14 @@ pub fn build_hud_init_script() -> String {
     },
     log: function (item) {
       item = item || {};
+      // 序号:单调递增计数器存 sessionStorage,整页导航后延续(与日志列表同生命周期),
+      // 便于在 HUD 上按序核对「打开 → 成功/未果 → 重试结果」的逐条链路
+      var seq = 0;
+      try {
+        seq = (parseInt(sessionStorage.getItem(SEQ_KEY) || '0', 10) || 0) + 1;
+        sessionStorage.setItem(SEQ_KEY, String(seq));
+      } catch (e) {}
+      item.seq = seq;
       // 完整年月日时分秒:采集常跨零点 / 长时间运行,单时分秒看不出是哪一天
       var dt = new Date();
       var p2 = function (n) { return (n < 10 ? '0' : '') + n; };

@@ -12,7 +12,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tauri::State;
-use veltrix_core::db::entity::{collect_log, comment, content, task, task_run};
+use veltrix_core::db::entity::{account, collect_log, comment, content, task, task_run};
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 任务下单个关键词的采集统计(内容数 / 实际入库评论数),供任务列表按关键词分行展示。
@@ -31,6 +31,8 @@ pub struct TaskView {
     pub name: String,
     pub industry: String,
     pub platform: String,
+    /// 指定采集账号(accounts.id);None = 按「最久未用」自动轮换
+    pub account_id: Option<String>,
     pub keywords: Vec<String>,
     /// 定向采集目标链接(视频链接 / 主页链接);空数组 = 关键词搜索任务
     pub target_urls: Vec<String>,
@@ -102,6 +104,7 @@ impl From<task::Model> for TaskView {
             name: m.name,
             industry: m.industry,
             platform: m.platform,
+            account_id: m.account_id,
             keywords,
             target_urls,
             trigger: m.trigger_type,
@@ -152,6 +155,9 @@ pub struct TaskInput {
     pub name: String,
     pub industry: String,
     pub platform: String,
+    /// 指定采集账号(accounts.id);缺省/空 = 按「最久未用」自动轮换
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub keywords: Vec<String>,
     /// 定向采集目标链接(前端可能不传,默认空数组 = 关键词搜索任务)
     #[serde(default)]
@@ -353,6 +359,25 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
     let audio_extract = input.audio_extract || input.ai_extract;
     // 自动重试上限夹在 0~10,避免误填超大值把调度器拖进无限重试循环
     let max_retries = input.max_retries.clamp(0, 10);
+    // 指定采集账号:空串归一化为 None(自动轮换);指定时校验存在且与任务平台匹配,
+    // 状态是否在运行时再查(账号可能在运行前重新登录恢复可用)
+    let account_id = input
+        .account_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(aid) = &account_id {
+        let acc = account::Entity::find_by_id(aid.clone())
+            .one(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("查询账号失败: {e}")))?
+            .ok_or_else(|| CrawlerError::Config("指定账号不存在(可能已被删除)".into()))?;
+        if acc.platform != input.platform {
+            return Err(CrawlerError::Config(format!(
+                "指定账号属于平台 {},与任务平台 {} 不匹配",
+                acc.platform, input.platform
+            )));
+        }
+    }
     match existing {
         Some(model) => {
             // self scope 用户只能改自己的任务(与 set_author_monitored_by_id 检查口径一致)
@@ -363,6 +388,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.name = Set(input.name);
             am.industry = Set(input.industry);
             am.platform = Set(input.platform);
+            am.account_id = Set(account_id);
             am.keywords = Set(keywords_json);
             am.target_urls = Set(target_urls_json);
             am.trigger_type = Set(input.trigger);
@@ -396,6 +422,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 name: Set(input.name),
                 industry: Set(input.industry),
                 platform: Set(input.platform),
+                account_id: Set(account_id),
                 keywords: Set(keywords_json),
                 target_urls: Set(target_urls_json),
                 trigger_type: Set(input.trigger),
@@ -1476,12 +1503,14 @@ pub struct CommentListResult {
     pub total: i64,
 }
 
-/// 全量库「待转写 / 待提取评论」计数(与前端 needsTranscript / needsComments 逐条口径一致)。
+/// 全量库「待转写 / 待提取评论 / 待采集音频」计数(与前端 needsTranscript / needsComments 逐条口径一致)。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentLibraryStats {
     pub untranscribed: i64,
     pub pending_comment: i64,
+    /// 音频采集失败/缺失的视频数(素材失败且无音频文件),对应「采集音频」批量按钮
+    pub missing_audio: i64,
 }
 
 #[derive(Serialize)]
@@ -1491,12 +1520,13 @@ pub struct IndustryCount {
     pub count: i64,
 }
 
-/// 批量处理种类(对应前端「提取文案 / 提取评论」按钮)
+/// 批量处理种类(对应前端「提取文案 / 提取评论 / 采集音频」按钮)
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchKind {
     Transcript,
     Comments,
+    Audio,
 }
 
 /// WHERE 片段 + 占位符参数(统一用 ?,由 Statement 按后端转换为 $n)
@@ -1982,7 +2012,7 @@ pub async fn list_comments_page(
     Ok(CommentListResult { items, total })
 }
 
-/// 全量库「待转写 / 待提取评论」计数(与前端 needsTranscript / needsComments 逐条口径一致,
+/// 全量库「待转写 / 待提取评论 / 待采集音频」计数(与前端 needsTranscript / needsComments 逐条口径一致,
 /// 含任务穿透 / 平台 / 行业 / 时间 / 搜索等全部当前筛选)。
 #[tauri::command]
 pub async fn content_library_stats(
@@ -1996,7 +2026,9 @@ pub async fn content_library_stats(
          SUM(CASE WHEN kind = 'video' AND (transcript IS NULL OR trim(transcript) = '') \
              AND audio_path IS NOT NULL AND audio_path <> '' THEN 1 ELSE 0 END) AS untranscribed, \
          SUM(CASE WHEN comment_collected IS NOT TRUE \
-             AND (comment_count IS NULL OR comment_count != 0) THEN 1 ELSE 0 END) AS pending_comment \
+             AND (comment_count IS NULL OR comment_count != 0) THEN 1 ELSE 0 END) AS pending_comment, \
+         SUM(CASE WHEN kind = 'video' \
+             AND (audio_path IS NULL OR audio_path = '') THEN 1 ELSE 0 END) AS missing_audio \
          FROM contents WHERE 1=1 {}",
         filter.conds
     );
@@ -2016,6 +2048,9 @@ pub async fn content_library_stats(
             .unwrap_or(0),
         pending_comment: first
             .and_then(|r| r.try_get("", "pending_comment").ok())
+            .unwrap_or(0),
+        missing_audio: first
+            .and_then(|r| r.try_get("", "missing_audio").ok())
             .unwrap_or(0),
     })
 }
@@ -2041,6 +2076,13 @@ pub async fn list_batch_content_ids(
             filter.conds.push_str(
                 " AND comment_collected IS NOT TRUE \
                  AND (comment_count IS NULL OR comment_count != 0)",
+            );
+        }
+        BatchKind::Audio => {
+            // 缺音频的视频:不限素材状态——failed(下载失败)/ pending(历史任务媒体阶段未跑)/
+            // success(任务未开音频提取)都可能是缺音频,用户点「采集音频」即显式要求补采
+            filter.conds.push_str(
+                " AND kind = 'video' AND (audio_path IS NULL OR audio_path = '')",
             );
         }
     }

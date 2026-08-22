@@ -5,6 +5,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowLeft,
+  AudioLines,
   Eye,
   FileSpreadsheet,
   LayoutGrid,
@@ -158,6 +159,8 @@ export function ContentLibraryPage({
   const [batchExporting, setBatchExporting] = useState(false);
   // 批量重试转写失败进行中(防重复点击)
   const [batchRetryingTranscripts, setBatchRetryingTranscripts] = useState(false);
+  // 批量采集音频进行中(防重复点击)
+  const [batchCollectingAudio, setBatchCollectingAudio] = useState(false);
   // 补采评论弹窗:目标 ids + 确认后清空表格选择的回调;null=未打开
   const [commentDialog, setCommentDialog] = useState<{
     ids: string[];
@@ -169,9 +172,9 @@ export function ContentLibraryPage({
   const [cmIntent, setCmIntent] = useState(false);
   // 补采评论进行中(防重复点击;逐视频开详情页采集,耗时较长)
   const [collectingComments, setCollectingComments] = useState(false);
-  // 提取文案/评论进行中:列表只显示本批待处理条目,成功一条移除一条;null=未在提取
+  // 提取文案/评论/采集音频进行中:列表只显示本批待处理条目,成功一条移除一条;null=未在提取
   const [processing, setProcessing] = useState<{
-    kind: "transcript" | "comments";
+    kind: "transcript" | "comments" | "audio";
     ids: Set<string>;
   } | null>(null);
   // 事件监听回调里读最新 processing(监听器只注册一次,不能闭包旧值)
@@ -422,6 +425,48 @@ export function ContentLibraryPage({
     };
   }, []);
 
+  // 批量采集音频实时刷新:后端每处理完一条发事件,采集音频进行中
+  // 成功的行从列表消失(「成功一条移除一条」);失败的保留并就地刷新徽章/错误
+  useEffect(() => {
+    type Payload = {
+      id: string;
+      mediaStatus: "pending" | "failed" | "success";
+      audioExtracted: boolean | null;
+      mediaError: string | null;
+      audioPath: string | null;
+    };
+    const unlisten = listen<Payload>("content-media-updated", (e) => {
+      const proc = processingRef.current;
+      if (proc?.kind !== "audio" || !proc.ids.has(e.payload.id)) return;
+      const p = e.payload;
+      // 成功一条:角标缺音频数同步 -1(进行中实时可见),行从列表移除
+      if (p.audioExtracted === true) {
+        setLibStats((prev) => ({
+          ...prev,
+          missingAudio: Math.max(0, prev.missingAudio - 1),
+        }));
+      }
+      setContents((prev) =>
+        prev.flatMap((x) => {
+          if (x.id !== p.id) return [x];
+          if (p.audioExtracted === true) return [];
+          return [
+            {
+              ...x,
+              mediaStatus: p.mediaStatus,
+              audioExtracted: p.audioExtracted,
+              mediaError: p.mediaError,
+              audioPath: p.audioPath,
+            },
+          ];
+        }),
+      );
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   // 平台筛选列出全部平台(与行业侧栏一致),不只展示已有数据的平台
   const platformOptions = useMemo(() => platforms.map((p) => p.id), [platforms]);
 
@@ -448,6 +493,7 @@ export function ContentLibraryPage({
   const [libStats, setLibStats] = useState<ContentLibraryStats>({
     untranscribed: 0,
     pendingComment: 0,
+    missingAudio: 0,
   });
   const statsSeq = useRef(0);
   useEffect(() => {
@@ -748,6 +794,48 @@ export function ContentLibraryPage({
       setProcessing(null);
       setCancelling(false);
       setBatchRetryingTranscripts(false);
+    }
+  }
+
+  // 批量采集音频:后端对当前筛选中「缺音频」的视频重跑下载+音频提取
+  // (并发与采集主链路素材下载一致,15 路;直链过期的会开采集窗口刷新后再试)。
+  // 交互同批量转写:点击后列表先筛出本批,成功一条移除一条;
+  // 完成后清 processing,成功数用服务端剩余缺音频统计倒推
+  async function handleBatchCollectAudios() {
+    if (batchCollectingAudio || libStats.missingAudio === 0) return;
+    setBatchCollectingAudio(true);
+    try {
+      // 点击瞬间按当前筛选口径取目标快照(后续成功移除不改变集合)
+      const ids = await api.listBatchContentIds(
+        buildQuery({ limit: 1, offset: 0 }),
+        "audio",
+      );
+      if (ids.length === 0) {
+        // 计数与目标快照口径不一致(如计数滞后)时不能静默无事发生,给用户明确反馈
+        toast.info("当前筛选下没有缺音频的视频");
+        return;
+      }
+      setProcessing({ kind: "audio", ids: new Set(ids) });
+      const processed = await api.batchCollectAudios(ids);
+      // 不再整表重拉:本批剩余 = 同口径服务端缺音频数(等价旧「重拉后过滤本批」)
+      const stats = await api.contentLibraryStats(
+        buildQuery({ limit: 1, offset: 0 }),
+      );
+      // 回写角标统计:此前只用于 toast,不更新 state,导致「采集音频 · N 条」批后不刷新
+      setLibStats(stats);
+      const remain = stats.missingAudio;
+      const ok = Math.max(0, processed - remain);
+      toast.success(
+        remain > 0
+          ? `批量采集音频完成 · 共处理 ${processed} 条,成功 ${ok} 条,仍有 ${remain} 条缺音频`
+          : `批量采集音频完成 · ${processed} 条全部成功`,
+      );
+    } catch (e) {
+      toast.error(`批量采集音频失败: ${e}`);
+    } finally {
+      setProcessing(null);
+      setCancelling(false);
+      setBatchCollectingAudio(false);
     }
   }
 
@@ -1075,10 +1163,27 @@ export function ContentLibraryPage({
             ))}
             {/* 全量库批量提取入口:与平台行同排靠右(不与上方筛选行对齐)。
                 提取评论:待提计数 + 弹窗设评论参数,无选择上下文 reset 传空操作 */}
+            {!kindFilter && libStats.missingAudio > 0 && (
+              <Button
+                variant="outline"
+                className="ml-auto h-7 cursor-pointer border-emerald-500/40 px-3 text-xs text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400"
+                disabled={batchCollectingAudio}
+                onClick={handleBatchCollectAudios}
+              >
+                {batchCollectingAudio ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <AudioLines />
+                )}
+                采集音频 · {libStats.missingAudio} 条
+              </Button>
+            )}
             {!kindFilter && libStats.pendingComment > 0 && (
               <Button
                 variant="outline"
-                className="ml-auto h-7 cursor-pointer border-violet-500/40 px-3 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
+                className={`h-7 cursor-pointer border-violet-500/40 px-3 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400 ${
+                  libStats.missingAudio > 0 ? "" : "ml-auto"
+                }`}
                 disabled={collectingComments}
                 onClick={async () => {
                   // 点击瞬间按当前筛选口径取目标快照(与「提取文案」一致)
@@ -1102,12 +1207,14 @@ export function ContentLibraryPage({
               </Button>
             )}
             {/* 提取文案:待提(有音频无文案)计数 + 一键批量提取;
-                评论按钮不在(已提完)时用 ml-auto 保持靠右 */}
+                前面的按钮不在时用 ml-auto 保持靠右 */}
             {!kindFilter && libStats.untranscribed > 0 && (
               <Button
                 variant="outline"
                 className={`h-7 cursor-pointer border-amber-500/40 px-3 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400 ${
-                  libStats.pendingComment > 0 ? "" : "ml-auto"
+                  libStats.missingAudio > 0 || libStats.pendingComment > 0
+                    ? ""
+                    : "ml-auto"
                 }`}
                 disabled={batchRetryingTranscripts}
                 onClick={handleBatchRetryTranscripts}
@@ -1129,7 +1236,9 @@ export function ContentLibraryPage({
               <span>
                 {processing.kind === "transcript"
                   ? "正在提取文案"
-                  : "正在提取评论"}{" "}
+                  : processing.kind === "audio"
+                    ? "正在采集音频"
+                    : "正在提取评论"}{" "}
                 · 剩余{" "}
                 <span className="font-mono font-medium">
                   {processingRemaining}

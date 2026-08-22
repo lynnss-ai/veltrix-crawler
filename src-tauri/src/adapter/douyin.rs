@@ -246,6 +246,24 @@ impl DouyinAdapter {
 
     /// 保留少量平台特有字段,既不丢关键信息又不让库膨胀。
     fn parse_extra(info: &Value) -> Value {
+        // 原声视频的 music.play_url 即完整音轨 MP3 直链(douyinstatic,无短期签名,主备双 CDN):
+        // 采音频可直接下载,免拉视频流 + ffmpeg 转码。仅限「原声」——用他人配乐的视频该字段
+        // 只有歌曲片段(无人声),拿它转写会得到歌词而非口播文案,故非原声不下发 audio_url
+        let music = info.get("music");
+        let is_original_sound = music
+            .and_then(|m| m.get("is_original_sound"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let audio_url = if is_original_sound {
+            music
+                .and_then(|m| m.get("play_url"))
+                .and_then(|p| p.get("url_list"))
+                .and_then(Value::as_array)
+                .and_then(|l| l.first())
+                .and_then(Value::as_str)
+        } else {
+            None
+        };
         serde_json::json!({
             // share_url 在 share_info 下,非 aweme_info 顶层
             "share_url": info
@@ -254,6 +272,7 @@ impl DouyinAdapter {
                 .and_then(Value::as_str),
             "duration": info.get("video").and_then(|v| v.get("duration")).and_then(Value::as_i64),
             "aweme_type": info.get("aweme_type").and_then(Value::as_i64),
+            "audio_url": audio_url,
         })
     }
 
@@ -462,6 +481,9 @@ impl DouyinAdapter {
     /// 解析内容详情接口响应为单条内容(供「补取/刷新视频直链」)。详情接口
     /// `/aweme/v1/web/aweme/detail/` 返回 `aweme_detail`(结构同搜索项的 aweme_info),
     /// 复用 parse_aweme 提取,主要为拿到新鲜的 video.play_addr 直链。
+    /// 注意:主页模态冷导航实际只发 `aweme/post?locate_item_id=`(作品列表),详情接口未必调用——
+    /// 该兼容放在「直链刷新」调用方(按 content_id 从 UserPosts 解析结果里捞目标条),
+    /// 这里刻意不认 post 列表:定向单条采集也走本解析,混入作者其它作品会污染采集范围。
     fn parse_detail(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
         let mut contents = Vec::new();

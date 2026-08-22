@@ -15,6 +15,8 @@ pub struct Model {
     pub industry: String,
     /// 平台 id(platforms.id 的弱关联,逻辑外键)
     pub platform: String,
+    /// 指定采集账号(accounts.id 的弱关联,逻辑外键);None = 按「最久未用」自动轮换
+    pub account_id: Option<String>,
     /// 关键词 JSON 数组,例如 `["a","b"]`
     pub keywords: String,
     /// 触发类型:once-now / daily / watching

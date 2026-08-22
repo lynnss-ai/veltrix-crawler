@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount, TableMigrationView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -23,6 +23,12 @@ export const api = {
     invoke<void>("test_database_connection", { url }),
   setDatabaseConfig: (url: string, maxConnections: number) =>
     invoke<void>("set_database_config", { url, maxConnections }),
+  // 复制局域网远程连接串(仅 PG):需当前用户密码二次校验,主机替换为本机局域网 IP
+  getRemoteDatabaseUrl: (password: string) =>
+    invoke<string>("get_remote_database_url", { password }),
+  // SQLite → PG 一键迁移:目标自动建表,幂等(已存在的行跳过),源库只读
+  migrateSqliteToPg: (targetUrl: string) =>
+    invoke<TableMigrationView[]>("migrate_sqlite_to_pg", { targetUrl }),
   setStoragePath: (path: string) =>
     invoke<void>("set_storage_path", { path }),
   // 智能体可编辑附加规范(kind: coding/computer/rpa);下一轮对话注入生效,无需重启
@@ -420,7 +426,7 @@ export const api = {
   contentLibraryStats: (query: ContentListQuery) =>
     invoke<ContentLibraryStats>("content_library_stats", { query }),
   // 批量处理的目标内容 id 快照(点击瞬间与当前筛选口径一致)
-  listBatchContentIds: (query: ContentListQuery, batch: "transcript" | "comments") =>
+  listBatchContentIds: (query: ContentListQuery, batch: "transcript" | "comments" | "audio") =>
     invoke<string[]>("list_batch_content_ids", { query, batch }),
   // 侧栏行业角标计数(忽略行业筛选自身,其余筛选同列表口径)
   contentIndustryCounts: (query: ContentListQuery) =>
@@ -465,6 +471,10 @@ export const api = {
   // 批量转写:对指定 id(当前筛选列表中「有音频无文案」的条目)重跑语音转写,返回处理条数
   retryFailedTranscripts: (ids: string[]) =>
     invoke<number>("retry_failed_transcripts", { ids }),
+  // 批量采集音频:对指定 id(当前筛选列表中「缺音频」的视频)重跑视频下载+音频提取,
+  // 直链过期的会开采集窗口刷新直链后再试;并发与采集主链路素材下载一致(15 路),返回处理条数
+  batchCollectAudios: (ids: string[]) =>
+    invoke<number>("batch_collect_audios", { ids }),
   // 全量库补采评论:对选中内容按评论参数(时间范围 / 单视频上限 / 意向分析)重采一级评论
   recollectComments: (
     ids: string[],

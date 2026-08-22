@@ -12,8 +12,10 @@ import { ProvidersSection, ProviderFormSheet } from "./settings-providers";
 import { Check, ExternalLink, FolderOpen, GripVertical, Loader2, TriangleAlert, Unplug, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
+import { copyToClipboard } from "@/lib/utils";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -32,6 +34,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { Progress } from "@/components/ui/progress";
 import {
   Card,
   CardContent,
@@ -648,6 +651,41 @@ function RemoteControlSection() {
   );
 }
 
+// 数据库迁移进度事件负载(后端 db-migrate-progress;tableWritten 语义为「已处理行数」)
+interface MigrateProgress {
+  table: string;
+  tableIndex: number;
+  tableTotal: number;
+  tableRows: number;
+  tableWritten: number;
+  phase: "reading" | "writing" | "done";
+}
+
+// 迁移进度条:独立迁移与「迁移并切换」两个对话框共用;总进度 = 已完成表 + 当前表内进度
+function MigrateProgressBar({ p }: { p: MigrateProgress }) {
+  const inTable = p.tableRows > 0 ? p.tableWritten / p.tableRows : 1;
+  const pct = Math.min(
+    100,
+    Math.round(((p.tableIndex - 1 + inTable) / p.tableTotal) * 100),
+  );
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span className="truncate">
+          {p.phase === "reading" ? "读取" : "写入"} {p.table}({p.tableIndex}/
+          {p.tableTotal})
+        </span>
+        <span className="shrink-0 font-mono">{pct}%</span>
+      </div>
+      <Progress value={pct} />
+      <div className="text-xs text-muted-foreground">
+        本表已处理 {p.tableWritten.toLocaleString()}/{p.tableRows.toLocaleString()}{" "}
+        行
+      </div>
+    </div>
+  );
+}
+
 function GeneralSection({
   cfg,
   refreshKey,
@@ -666,6 +704,25 @@ function GeneralSection({
   const [testing, setTesting] = useState(false);
   const [dbPath, setDbPath] = useState<string | null>(null);
   const [dataDir, setDataDir] = useState("");
+  // 远程连接串复制:密码二次校验对话框
+  const [remoteDbOpen, setRemoteDbOpen] = useState(false);
+  const [remoteDbPassword, setRemoteDbPassword] = useState("");
+  const [remoteDbBusy, setRemoteDbBusy] = useState(false);
+  // SQLite → PG 一键迁移:确认对话框 + 进行中
+  const [migrateOpen, setMigrateOpen] = useState(false);
+  const [migrating, setMigrating] = useState(false);
+  // 保存切换(SQLite → PG)时的二次确认:是否随迁数据
+  const [switchSaveOpen, setSwitchSaveOpen] = useState(false);
+  // 迁移进度(后端 db-migrate-progress 事件驱动)
+  const [migrateProg, setMigrateProg] = useState<MigrateProgress | null>(null);
+  useEffect(() => {
+    const un = listen<MigrateProgress>("db-migrate-progress", (e) =>
+      setMigrateProg(e.payload),
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
   // 海外平台音频拉流代理:三态 auto(空)/ off / custom(URL);baseline 存后端原始 proxy 串
   const [proxyMode, setProxyMode] = useState<"auto" | "off" | "custom">("auto");
   const [proxyUrl, setProxyUrl] = useState("");
@@ -753,6 +810,98 @@ function GeneralSection({
       toast.error(`连接失败: ${e}`);
     } finally {
       setTesting(false);
+    }
+  }
+
+  // 复制局域网远程连接串:密码校验通过后由后端生成(主机换成本机局域网 IP)
+  async function copyRemoteDbUrl() {
+    setRemoteDbBusy(true);
+    try {
+      const url = await api.getRemoteDatabaseUrl(remoteDbPassword);
+      const ok = await copyToClipboard(url);
+      if (ok) {
+        toast.success("已复制远程连接串,同局域网设备可用它连接本机数据库");
+        setRemoteDbOpen(false);
+        setRemoteDbPassword("");
+      } else {
+        toast.error("复制到剪贴板失败");
+      }
+    } catch (e) {
+      // 密码错误 / 非 PG 等后端校验失败:保留对话框供重试
+      toast.error(String(e));
+    } finally {
+      setRemoteDbBusy(false);
+    }
+  }
+
+  // 一键迁移:把当前 SQLite 全量数据复制到输入框里的 PG 连接串(幂等,源库不动)
+  async function migrateToPg() {
+    setMigrating(true);
+    setMigrateProg(null);
+    try {
+      const report = await api.migrateSqliteToPg(dbUrl.trim());
+      const read = report.reduce((s, r) => s + r.read, 0);
+      const written = report.reduce((s, r) => s + r.written, 0);
+      const skipped = report.filter((r) => r.skipped).length;
+      toast.success(
+        `迁移完成:${report.length - skipped} 张表,源 ${read} 行,新写入 ${written} 行(已存在的自动跳过)。保存连接串并重启后生效`,
+        { duration: 8000 },
+      );
+      setMigrateOpen(false);
+    } catch (e) {
+      toast.error(String(e), { duration: 6000 });
+    } finally {
+      setMigrating(false);
+    }
+  }
+
+  // 保存数据库连接配置(切换后重启生效)
+  async function saveDbConfig() {
+    const url = dbUrl.trim();
+    try {
+      await api.setDatabaseConfig(url, Number(maxConn) || 1);
+      setDbBaseline({ url: dbUrl, maxConn });
+      toast.success("数据库配置已保存,重启应用后生效");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  // 保存入口:SQLite → PG 的切换先弹二次确认(是否随迁数据),其余直接保存
+  function handleSaveDb() {
+    const url = dbUrl.trim();
+    // 非空连接串必须是合法格式,避免存入无效值导致下次启动连不上
+    if (url && !/^(sqlite:|postgres:\/\/|postgresql:\/\/)/i.test(url)) {
+      toast.error("连接串格式不正确,应以 sqlite: 或 postgres:// 开头");
+      return;
+    }
+    // dbPath 非空 = 当前生效的是 SQLite;目标是 PG 即构成「切换后端」
+    if (dbPath && /^postgres(ql)?:\/\//i.test(url)) {
+      setSwitchSaveOpen(true);
+      return;
+    }
+    void saveDbConfig();
+  }
+
+  // 「迁移并切换」:迁移成功才保存新连接串;失败不保存,避免出现「切了但没数据」
+  async function migrateThenSave() {
+    setMigrating(true);
+    setMigrateProg(null);
+    try {
+      const report = await api.migrateSqliteToPg(dbUrl.trim());
+      const read = report.reduce((s, r) => s + r.read, 0);
+      const written = report.reduce((s, r) => s + r.written, 0);
+      await api.setDatabaseConfig(dbUrl.trim(), Number(maxConn) || 1);
+      setDbBaseline({ url: dbUrl, maxConn });
+      toast.success(
+        `迁移完成并切换:源 ${read} 行,新写入 ${written} 行(PG 已有数据未动)。重启应用后使用 PG`,
+        { duration: 8000 },
+      );
+      setSwitchSaveOpen(false);
+    } catch (e) {
+      toast.error(`迁移未完成,配置未保存: ${e}`, { duration: 6000 });
+    } finally {
+      setMigrating(false);
     }
   }
 
@@ -884,21 +1033,7 @@ function GeneralSection({
         title="数据库"
         description="含密码建议改用环境变量 VELTRIX_DATABASE_URL(优先级更高、不落盘)。"
         dirty={dbDirty}
-        onSave={() => {
-          const url = dbUrl.trim();
-          // 非空连接串必须是合法格式,避免存入无效值导致下次启动连不上
-          if (url && !/^(sqlite:|postgres:\/\/|postgresql:\/\/)/i.test(url)) {
-            toast.error("连接串格式不正确,应以 sqlite: 或 postgres:// 开头");
-            return;
-          }
-          api
-            .setDatabaseConfig(url, Number(maxConn) || 1)
-            .then(() => {
-              setDbBaseline({ url: dbUrl, maxConn });
-              toast.success("数据库配置已保存,重启应用后生效");
-            })
-            .catch((e) => toast.error(String(e)));
-        }}
+        onSave={handleSaveDb}
       >
         <dl className="space-y-3">
           <Row label="当前大小">
@@ -944,14 +1079,14 @@ function GeneralSection({
           <div className="flex gap-2">
             <Input
               id="db-url"
-              placeholder="留空使用本地 SQLite;postgres://... 切换 PG"
+              placeholder="留空用本地 SQLite;PG 例: postgres://postgres:123456@127.0.0.1:5432/veltrix_db"
               value={dbUrl}
               onChange={(e) => setDbUrl(e.target.value)}
             />
             <Button
               type="button"
               variant="outline"
-              className="shrink-0"
+              className="h-10 shrink-0"
               disabled={!dbUrl.trim() || testing}
               onClick={testDbConnection}
             >
@@ -970,6 +1105,42 @@ function GeneralSection({
             onChange={(e) => setMaxConn(e.target.value)}
           />
         </div>
+        {/* 局域网远程访问:仅 PG 有意义;复制出的连接串主机为本机局域网 IP,含密码故需校验 */}
+        <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+          <div className="space-y-0.5">
+            <div className="text-sm font-medium">远程连接串(仅 PostgreSQL)</div>
+            <p className="text-xs text-muted-foreground">
+              复制出主机为本机局域网 IP 的连接串,供同局域网设备连接本机数据库
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className="shrink-0"
+            onClick={() => setRemoteDbOpen(true)}
+          >
+            复制远程连接串
+          </Button>
+        </div>
+        {/* 一键迁移:当前是 SQLite 且连接串填了 PG 时显示;幂等复制,源库不动 */}
+        {dbPath && /^postgres(ql)?:\/\//i.test(dbUrl.trim()) && (
+          <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">迁移本地数据到 PG</div>
+              <p className="text-xs text-muted-foreground">
+                把当前 SQLite 的全部数据复制到上方连接串(已存在的行自动跳过,可重复执行)
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="shrink-0"
+              onClick={() => setMigrateOpen(true)}
+            >
+              一键迁移
+            </Button>
+          </div>
+        )}
         {dbDirty && (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
             数据库连接配置修改后需重启应用才能重连生效。
@@ -1002,6 +1173,115 @@ function GeneralSection({
           </div>
         </CardContent>
       </Card>
+
+      {/* 复制远程连接串:密码二次校验(连接串含数据库密码,属敏感信息) */}
+      <AlertDialog
+        open={remoteDbOpen}
+        onOpenChange={(open) => {
+          setRemoteDbOpen(open);
+          if (!open) setRemoteDbPassword("");
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>复制远程连接串</AlertDialogTitle>
+            <AlertDialogDescription>
+              连接串包含数据库账号密码,需验证当前登录用户的密码。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="remote-db-password">当前用户密码</Label>
+            <Input
+              id="remote-db-password"
+              type="password"
+              placeholder="输入当前登录用户的密码"
+              value={remoteDbPassword}
+              onChange={(e) => setRemoteDbPassword(e.target.value)}
+            />
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={remoteDbBusy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={remoteDbBusy || remoteDbPassword.length === 0}
+              onClick={(e) => {
+                // 阻止默认关闭:校验失败时保留对话框供重试
+                e.preventDefault();
+                void copyRemoteDbUrl();
+              }}
+            >
+              {remoteDbBusy && <Loader2 className="size-4 animate-spin" />}
+              验证并复制
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* SQLite → PG 一键迁移确认:非破坏性(源库只读、目标 upsert),无需密码 */}
+      <AlertDialog open={migrateOpen} onOpenChange={setMigrateOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>迁移本地数据到 PostgreSQL</AlertDialogTitle>
+            <AlertDialogDescription>
+              将把当前 SQLite 数据库的全部表复制到连接串指定的 PG
+              库(目标自动建表;已存在的行自动跳过,可重复执行;源库不会被修改)。
+              数据量大时需要几十秒,期间请勿操作采集任务。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {migrating && migrateProg && <MigrateProgressBar p={migrateProg} />}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={migrating}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={migrating}
+              onClick={(e) => {
+                e.preventDefault();
+                void migrateToPg();
+              }}
+            >
+              {migrating && <Loader2 className="size-4 animate-spin" />}
+              {migrating ? "迁移中…" : "开始迁移"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 保存切换二次确认:选「迁移并切换」先迁后切;迁移只补缺失行,不覆盖/删除 PG 已有数据 */}
+      <AlertDialog open={switchSaveOpen} onOpenChange={setSwitchSaveOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>切换到 PostgreSQL</AlertDialogTitle>
+            <AlertDialogDescription>
+              当前本地 SQLite 中已有数据。切换前是否把数据迁移到目标 PG 库?
+              迁移只补入缺失的行,PG 中已存在的数据不会被覆盖或删除;本地
+              SQLite 文件也会原样保留作为备份。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {migrating && migrateProg && <MigrateProgressBar p={migrateProg} />}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={migrating}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={migrating}
+              className="bg-secondary text-secondary-foreground hover:bg-secondary/80"
+              onClick={(e) => {
+                e.preventDefault();
+                setSwitchSaveOpen(false);
+                void saveDbConfig();
+              }}
+            >
+              不迁移,直接切换
+            </AlertDialogAction>
+            <AlertDialogAction
+              disabled={migrating}
+              onClick={(e) => {
+                e.preventDefault();
+                void migrateThenSave();
+              }}
+            >
+              {migrating && <Loader2 className="size-4 animate-spin" />}
+              {migrating ? "迁移中…" : "迁移并切换"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   );
 }

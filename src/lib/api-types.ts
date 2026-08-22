@@ -380,6 +380,8 @@ export interface TaskView {
   name: string;
   industry: string;
   platform: string;
+  // 指定采集账号(accounts.id);null = 按「最久未用」自动轮换
+  accountId?: string | null;
   keywords: string[];
   // 定向采集目标链接(视频链接 / 作者主页链接);空数组 = 关键词搜索任务,定向任务 keywords 恒空
   targetUrls: string[];
@@ -450,6 +452,8 @@ export interface TaskInput {
   name: string;
   industry: string;
   platform: string;
+  // 指定采集账号(accounts.id);省略/null = 按「最久未用」自动轮换
+  accountId?: string | null;
   keywords: string[];
   // 定向采集目标链接(视频链接 / 主页链接);省略/空 = 关键词搜索任务
   targetUrls?: string[];
@@ -482,6 +486,14 @@ export interface TaskStatusPatch {
   startedAt?: number | null;
   finishedAt?: number | null;
   archived?: boolean | null;
+}
+
+// SQLite → PG 一键迁移的单表结果(read=源读取,written=实际写入;skipped=目标库无此表)
+export interface TableMigrationView {
+  table: string;
+  read: number;
+  written: number;
+  skipped: boolean;
 }
 
 // 全量库:采集落库的内容(对应后端 ContentView / contents 表)
@@ -713,6 +725,8 @@ export interface CommentListResult {
 export interface ContentLibraryStats {
   untranscribed: number;
   pendingComment: number;
+  // 音频采集失败/缺失的视频数(素材失败且无音频文件),对应「采集音频」批量按钮
+  missingAudio: number;
 }
 
 export interface IndustryCount {

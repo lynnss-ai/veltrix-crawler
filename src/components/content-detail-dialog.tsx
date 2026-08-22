@@ -1,6 +1,6 @@
-// 全屏内容详情弹窗:顶部通栏(翻篇 + 页面切换 + 链接操作),正文两页:
-// 「概览」= 素材区(图文瀑布全图 / 视频封面+音频)+ 作者卡 + 内容卡;
-// 「文案与评论」= 通栏双栏,左转写文案、右该内容评论列表(点赞倒序)。
+// 全屏内容详情弹窗:顶部通栏(翻篇 + 链接操作;非视频另有「概览/文案与评论」页切换)。
+// 视频:不分页,单屏三栏 —— 左转写文案+本地音频、中该内容评论(点赞倒序)、右作者卡+内容卡。
+// 图文:「概览」= 素材瀑布全图 + 作者卡 + 内容卡;「文案与评论」= 文案 + 评论双栏。
 // 素材点开看大图、方向键浏览,看完可续看下一个。
 // 键盘:大图未开时 ←/→ 切上一篇/下一篇;大图打开时 ←/→ 翻图(可跨内容续看)。
 import { useCallback, useEffect, useState, type ReactNode } from "react";
@@ -295,8 +295,8 @@ export function ContentDetailDialog({
   // 右侧评论栏:当前内容的评论列表(点赞倒序)
   const [comments, setComments] = useState<CommentView[]>([]);
   const [commentsLoading, setCommentsLoading] = useState(false);
-  // 正文分页:overview=素材 + 作者/内容卡;text=文案与评论通栏双栏。
-  // 切上一篇/下一篇时保持当前页,连续看文案不用来回切
+  // 正文分页(仅图文等非视频内容):overview=素材 + 作者/内容卡;text=文案与评论通栏双栏。
+  // 视频不分页(单屏三栏),该状态不影响视频;切上一篇/下一篇时保持当前页
   const [page, setPage] = useState<"overview" | "text">("overview");
   // 大图浏览态:定位到某条内容的第几张图(null=未打开大图)
   const [lightbox, setLightbox] = useState<{
@@ -345,6 +345,11 @@ export function ContentDetailDialog({
     ? convertFileSrc(author.avatarPath)
     : (author?.avatar ?? "");
   const avatarFallback = author?.avatarPath ? (author.avatar ?? "") : undefined;
+
+  // 是否视频:视频单屏三栏、不分页。用列表项 kind 兜底,详情未加载完也能定版式
+  const isVideo =
+    (content ?? (currentIndex >= 0 ? items[currentIndex] : undefined))?.kind ===
+    "video";
 
   // 列表顺序的上一篇/下一篇(不跳过无图内容,视频也能看信息)
   const hasPrev = currentIndex > 0;
@@ -445,6 +450,138 @@ export function ContentDetailDialog({
       .finally(() => setMonitoring(false));
   }
 
+  // 文案栏:转写文案;withAudio(视频三栏左栏)时不套卡片、文案直接铺开,底部钉本地音频
+  // 播放器(旧数据已提取但未记录路径时给出指引);图文「文案与评论」页保留通栏卡片
+  const transcriptColumn = (withAudio: boolean) => (
+    <div className="flex min-h-0 flex-1 flex-col bg-muted/20 p-4">
+      <div
+        className={
+          withAudio
+            ? "flex min-h-0 w-full flex-1 flex-col"
+            : "mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col rounded-lg border bg-card shadow-sm"
+        }
+      >
+        <div
+          className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-muted-foreground ${withAudio ? "" : "border-b"}`}
+        >
+          <AudioLines className="size-4" />
+          {content?.kind === "video" ? "视频文案" : "文案"}
+          {content?.transcript && (
+            <SimpleTooltip content="复制全文">
+              <button
+                type="button"
+                className="ml-auto cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
+                onClick={() => {
+                  navigator.clipboard
+                    ?.writeText(content.transcript ?? "")
+                    .then(() => toast.success("已复制视频文案"))
+                    .catch(() => toast.error("复制失败"));
+                }}
+              >
+                <Copy className="size-4" />
+              </button>
+            </SimpleTooltip>
+          )}
+        </div>
+        <div
+          className={`veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed ${withAudio ? "px-3 pb-4" : "p-4"}`}
+        >
+          {content?.transcript ? (
+            content.transcript
+          ) : (
+            <span className="text-muted-foreground">
+              {loading && !content
+                ? "加载中…"
+                : content?.transcriptError
+                  ? `转写失败:${content.transcriptError}`
+                  : content?.kind === "video"
+                    ? "暂无文案(未开启 AI 文案提取,或转写尚未完成)"
+                    : "该内容形式没有语音文案"}
+            </span>
+          )}
+        </div>
+      </div>
+      {withAudio &&
+        (content?.audioPath ? (
+          <audio
+            controls
+            preload="metadata"
+            src={convertFileSrc(content.audioPath)}
+            className="mt-3 w-full shrink-0"
+          />
+        ) : content?.audioExtracted ? (
+          <div className="mt-3 w-full shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
+          </div>
+        ) : null)}
+    </div>
+  );
+
+  // 评论栏:该内容的评论列表(点赞倒序,热评在前)
+  const commentsColumn = (widthCls: string) => (
+    <div className={`flex ${widthCls} shrink-0 flex-col border-l`}>
+      <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
+        <MessagesSquare className="size-4" />
+        评论 · {comments.length}
+        {commentsLoading && <Loader2 className="size-3.5 animate-spin" />}
+      </div>
+      <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto">
+        {comments.length === 0 && !commentsLoading ? (
+          <div className="flex h-full items-center justify-center p-4 text-center text-xs text-muted-foreground">
+            暂无评论(未采集评论,或该内容没有评论)
+          </div>
+        ) : (
+          comments.map((cm) => (
+            <div
+              key={cm.id}
+              className="flex gap-2 border-b px-3 py-2.5 last:border-0"
+            >
+              {cm.authorAvatar ? (
+                <img
+                  src={cm.authorAvatar}
+                  alt=""
+                  loading="lazy"
+                  referrerPolicy="no-referrer"
+                  className="size-7 shrink-0 rounded-full border object-cover"
+                  onError={(e) => {
+                    (e.currentTarget as HTMLImageElement).style.display =
+                      "none";
+                  }}
+                />
+              ) : (
+                <div className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-muted-foreground">
+                  <User className="size-3.5" />
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5 text-xs">
+                  <span className="truncate font-medium">
+                    {cm.authorNickname || "匿名"}
+                  </span>
+                  {cm.intentLevel && INTENT_LABEL[cm.intentLevel] && (
+                    <span className="shrink-0 rounded bg-fuchsia-500/10 px-1 text-[10px] text-fuchsia-600 dark:text-fuchsia-400">
+                      {INTENT_LABEL[cm.intentLevel]}
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0 text-muted-foreground">
+                    {fmtDate(cm.createdAt)}
+                  </span>
+                </div>
+                <p className="mt-0.5 whitespace-pre-wrap break-words text-sm leading-snug">
+                  {cm.text}
+                </p>
+                <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
+                  <ThumbsUp className="size-3" />
+                  {fmtCount(cm.likeCount)}
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <>
       <Dialog
@@ -492,21 +629,23 @@ export function ContentDetailDialog({
             {loading && detail && (
               <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
             )}
-            {/* 页面切换:概览(素材+作者/内容卡)/ 文案与评论(通栏双栏) */}
-            <div className="mx-auto inline-flex h-8 items-center rounded-md border p-0.5">
-              <PageButton
-                active={page === "overview"}
-                label="概览"
-                icon={LayoutGrid}
-                onClick={() => setPage("overview")}
-              />
-              <PageButton
-                active={page === "text"}
-                label="文案与评论"
-                icon={FileText}
-                onClick={() => setPage("text")}
-              />
-            </div>
+            {/* 页面切换:概览(素材+作者/内容卡)/ 文案与评论(通栏双栏);视频单屏三栏,无需切换 */}
+            {!isVideo && (
+              <div className="mx-auto inline-flex h-8 items-center rounded-md border p-0.5">
+                <PageButton
+                  active={page === "overview"}
+                  label="概览"
+                  icon={LayoutGrid}
+                  onClick={() => setPage("overview")}
+                />
+                <PageButton
+                  active={page === "text"}
+                  label="文案与评论"
+                  icon={FileText}
+                  onClick={() => setPage("text")}
+                />
+              </div>
+            )}
             <span className="ml-auto inline-flex items-center gap-1">
               <SimpleTooltip content="复制原文链接">
                 <Button
@@ -544,24 +683,21 @@ export function ContentDetailDialog({
             </span>
           </div>
 
-          {page === "overview" ? (
+          {/* 左侧区域按内容形式/分页切换:视频=文案+音频、评论两栏(不分页);
+              图文概览=素材区;图文「文案与评论」=文案+评论。
+              右栏作者卡+内容卡各页共用,始终钉在最右 */}
           <div className="flex min-h-0 flex-1">
-          {/* 素材区:图文=瀑布流全图(点开看大图);视频=封面 + 底部音频播放
-              (视频文案挪到「文案与评论」页) */}
+          {isVideo ? (
+          <>
+            {transcriptColumn(true)}
+            {commentsColumn("w-[520px]")}
+          </>
+          ) : page === "overview" ? (
+          <>
+          {/* 素材区:图文瀑布流全图(点开看大图) */}
           <div className="flex min-h-0 flex-1 flex-col bg-muted/20">
           <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-4">
             {entries.length > 0 ? (
-              content?.kind === "video" ? (
-                // 视频:封面单张居中(点开看大图);转写文案在「文案与评论」页
-                <div className="mx-auto max-w-xl">
-                  <FallbackImage
-                    src={entries[0].src}
-                    fallback={entries[0].fallback}
-                    onClick={() => openLightbox(0)}
-                    className="w-full cursor-zoom-in rounded-lg border bg-card shadow-sm transition hover:opacity-95"
-                  />
-                </div>
-              ) : (
               // 瀑布流:按图片原始比例错落排列,break-inside-avoid 防跨列断裂
               <div className="columns-2 gap-3 sm:columns-3 xl:columns-4 [&>*]:mb-3">
                 {entries.map((it, i) => (
@@ -580,7 +716,6 @@ export function ContentDetailDialog({
                   </div>
                 ))}
               </div>
-              )
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
                 <div className="text-center">
@@ -590,26 +725,19 @@ export function ContentDetailDialog({
               </div>
             )}
           </div>
-          {/* 本地音频(仅视频):钉在素材区底部;旧数据未记录路径时给出指引 */}
-          {content?.kind === "video" &&
-            (content.audioPath ? (
-              <div className="shrink-0 px-4 pb-4">
-                <audio
-                  controls
-                  preload="metadata"
-                  src={convertFileSrc(content.audioPath)}
-                  className="w-full"
-                />
-              </div>
-            ) : content.audioExtracted ? (
-              <div className="mx-4 mb-4 shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                音频已提取,但该条为旧数据未记录文件路径;在列表「重新拉取素材」后即可在此播放。
-              </div>
-            ) : null)}
           </div>
-
-          {/* 右栏:作者卡 + 内容卡(导航通栏已上移至对话框顶部) */}
-          <div className="flex w-[520px] shrink-0 flex-col border-l">
+          </>
+          ) : (
+          /* 文案与评论页(图文):左文案、右该内容评论列表(点赞倒序) */
+          <>
+            {transcriptColumn(false)}
+            {commentsColumn("w-[480px]")}
+          </>
+          )}
+          {/* 右栏:作者卡 + 内容卡(各页共用,始终钉在最右) */}
+          <div
+            className={`flex ${isVideo ? "w-[440px]" : "w-[520px]"} shrink-0 flex-col border-l`}
+          >
             <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto p-5">
               {loading && !detail ? (
                 <div className="py-16 text-center text-sm text-muted-foreground">
@@ -894,113 +1022,6 @@ export function ContentDetailDialog({
             </div>
           </div>
           </div>
-          ) : (
-          /* 文案与评论页:通栏双栏,左转写文案、右该内容评论列表(点赞倒序) */
-          <div className="flex min-h-0 flex-1">
-            {/* 文案:通栏宽,长文不再挤窄列 */}
-            <div className="flex min-h-0 flex-1 flex-col bg-muted/20 p-4">
-              <div className="mx-auto flex h-full w-full max-w-4xl flex-col rounded-lg border bg-card shadow-sm">
-                <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
-                  <AudioLines className="size-4" />
-                  {content?.kind === "video" ? "视频文案" : "文案"}
-                  {content?.transcript && (
-                    <SimpleTooltip content="复制全文">
-                      <button
-                        type="button"
-                        className="ml-auto cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
-                        onClick={() => {
-                          navigator.clipboard
-                            ?.writeText(content.transcript ?? "")
-                            .then(() => toast.success("已复制视频文案"))
-                            .catch(() => toast.error("复制失败"));
-                        }}
-                      >
-                        <Copy className="size-4" />
-                      </button>
-                    </SimpleTooltip>
-                  )}
-                </div>
-                <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap p-4 text-sm leading-relaxed">
-                  {content?.transcript ? (
-                    content.transcript
-                  ) : (
-                    <span className="text-muted-foreground">
-                      {content?.transcriptError
-                        ? `转写失败:${content.transcriptError}`
-                        : content?.kind === "video"
-                          ? "暂无文案(未开启 AI 文案提取,或转写尚未完成)"
-                          : "该内容形式没有语音文案"}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </div>
-            {/* 评论:该内容的评论列表(点赞倒序,热评在前) */}
-            <div className="flex w-[480px] shrink-0 flex-col border-l">
-              <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
-                <MessagesSquare className="size-4" />
-                评论 · {comments.length}
-                {commentsLoading && (
-                  <Loader2 className="size-3.5 animate-spin" />
-                )}
-              </div>
-              <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto">
-                {comments.length === 0 && !commentsLoading ? (
-                  <div className="flex h-full items-center justify-center p-4 text-center text-xs text-muted-foreground">
-                    暂无评论(未采集评论,或该内容没有评论)
-                  </div>
-                ) : (
-                  comments.map((cm) => (
-                    <div
-                      key={cm.id}
-                      className="flex gap-2 border-b px-3 py-2.5 last:border-0"
-                    >
-                      {cm.authorAvatar ? (
-                        <img
-                          src={cm.authorAvatar}
-                          alt=""
-                          loading="lazy"
-                          referrerPolicy="no-referrer"
-                          className="size-7 shrink-0 rounded-full border object-cover"
-                          onError={(e) => {
-                            (e.currentTarget as HTMLImageElement).style.display =
-                              "none";
-                          }}
-                        />
-                      ) : (
-                        <div className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-muted-foreground">
-                          <User className="size-3.5" />
-                        </div>
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 text-xs">
-                          <span className="truncate font-medium">
-                            {cm.authorNickname || "匿名"}
-                          </span>
-                          {cm.intentLevel && INTENT_LABEL[cm.intentLevel] && (
-                            <span className="shrink-0 rounded bg-fuchsia-500/10 px-1 text-[10px] text-fuchsia-600 dark:text-fuchsia-400">
-                              {INTENT_LABEL[cm.intentLevel]}
-                            </span>
-                          )}
-                          <span className="ml-auto shrink-0 text-muted-foreground">
-                            {fmtDate(cm.createdAt)}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm leading-snug">
-                          {cm.text}
-                        </p>
-                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
-                          <ThumbsUp className="size-3" />
-                          {fmtCount(cm.likeCount)}
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-          )}
         </DialogContent>
       </Dialog>
 

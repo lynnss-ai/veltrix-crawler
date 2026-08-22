@@ -70,16 +70,8 @@ pub async fn transcribe(req: TranscribeRequest<'_>) -> Result<TranscribeOutcome>
         )));
     }
     // GLM 仅接受 wav/mp3 且时长 ≤30s;MiMo 同样只认 wav/mp3(400: input_audio.format must be one of wav, mp3)。
-    // 非 mp3 一律先转码为 96kbps 单声道 mp3,既满足格式要求,也把「时长 ≤30s」换算成可靠的体积阈值(300KB≈25s)。
-    let mut converted: Option<PathBuf> = None;
-    let audio_path: &Path = if provider_requires_mp3(req.provider_code) && !is_mp3(req.audio_path) {
-        let mp3 = convert_to_mp3(req.audio_path, req.ffmpeg_path).await?;
-        converted = Some(mp3);
-        converted.as_deref().unwrap()
-    } else {
-        req.audio_path
-    };
-    let result = transcribe_inner(&req, audio_path).await;
+    let (audio_path, converted) = prepare_asr_audio(&req).await?;
+    let result = transcribe_inner(&req, &audio_path).await;
     // 转码临时文件无论成败都清理(失败忽略,不影响转写结果)
     if let Some(path) = converted {
         let _ = tokio::fs::remove_file(&path).await;
@@ -101,14 +93,7 @@ pub async fn transcribe_stream(
         )));
     }
     // GLM/MiMo 均仅接受 wav/mp3:与 transcribe 同口径先转码(录音小片段通常是 webm)
-    let mut converted: Option<PathBuf> = None;
-    let audio_path: &Path = if provider_requires_mp3(req.provider_code) && !is_mp3(req.audio_path) {
-        let mp3 = convert_to_mp3(req.audio_path, req.ffmpeg_path).await?;
-        converted = Some(mp3);
-        converted.as_deref().unwrap()
-    } else {
-        req.audio_path
-    };
+    let (audio_path, converted) = prepare_asr_audio(&req).await?;
     // 人声门禁:无人声的片段(静音 / 底噪 / 气口)不上行 ASR——省配额,也避免空音频诱发幻觉文本。
     // VAD 判定走 spawn_blocking(ffmpeg 同步解码);判定异常保守放行(join 失败视为有语音)。
     let path_for_vad = audio_path.to_path_buf();
@@ -135,10 +120,10 @@ pub async fn transcribe_stream(
         });
     }
     let result = match req.provider_code {
-        "mimo" => mimo_transcribe_stream(&req, audio_path, &mut on_delta).await,
-        "glm" => glm_transcribe_stream(&req, audio_path, &mut on_delta).await,
+        "mimo" => mimo_transcribe_stream(&req, &audio_path, &mut on_delta).await,
+        "glm" => glm_transcribe_stream(&req, &audio_path, &mut on_delta).await,
         // 回退:非流式整段转写,全文一次性回传
-        _ => transcribe_single(&req, audio_path).await.map(|(text, usage)| {
+        _ => transcribe_single(&req, &audio_path).await.map(|(text, usage)| {
             if !text.is_empty() {
                 on_delta(text.clone());
             }
@@ -188,6 +173,53 @@ fn is_mp3(path: &Path) -> bool {
 /// GLM 与 MiMo 官方均限制 wav/mp3;wav 直传可解,其余(webm/ogg/aac 等)一律转 mp3。
 fn provider_requires_mp3(code: &str) -> bool {
     matches!(code, "glm" | "mimo")
+}
+
+/// 按厂商 ASR 要求预处理音频,返回 (可用音频路径, 待清理的转码临时文件)。
+/// 非 mp3 一律转码为 96kbps 单声道 mp3:既满足格式要求,也把 GLM「时长 ≤30s」换算成可靠的体积阈值(300KB≈25s)。
+async fn prepare_asr_audio(req: &TranscribeRequest<'_>) -> Result<(PathBuf, Option<PathBuf>)> {
+    if !provider_requires_mp3(req.provider_code) {
+        return Ok((req.audio_path.to_path_buf(), None));
+    }
+    let need_convert = if is_mp3(req.audio_path) {
+        // GLM transcriptions 只收单声道(错误码 1214):库里「原声直链下载」的 mp3 未过 ffmpeg 转码,
+        // 可能是立体声;扩展名判断不足以放行,需按实际声道数决定是否归一转码
+        req.provider_code == "glm" && !is_mono_audio(req.audio_path, req.ffmpeg_path).await
+    } else {
+        true
+    };
+    if need_convert {
+        let mp3 = convert_to_mp3(req.audio_path, req.ffmpeg_path).await?;
+        return Ok((mp3.clone(), Some(mp3)));
+    }
+    Ok((req.audio_path.to_path_buf(), None))
+}
+
+/// 判断音频是否单声道:ffmpeg -i 的 stderr 即含流信息(形如 "Audio: mp3, 22050 Hz, mono"),
+/// 无需 ffprobe(桌面端只捆绑 ffmpeg.exe)。解析不出声道信息按非单声道处理:
+/// 多转一次码只是慢,漏判立体声则 GLM 直接 1214 报错。
+async fn is_mono_audio(path: &Path, ffmpeg_path: Option<&str>) -> bool {
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg")
+        .to_string();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&program);
+        crate::media::hide_console_window(&mut cmd);
+        // 只读流信息,无输出文件 ffmpeg 退出码非 0 属预期,不影响 stderr 内容
+        let Ok(out) = cmd.arg("-i").arg(&path).output() else {
+            return false;
+        };
+        let info = String::from_utf8_lossy(&out.stderr);
+        let Some(stream) = info.lines().find(|l| l.contains("Audio:")) else {
+            return false;
+        };
+        stream.contains("mono") || stream.contains("1 channel")
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// 把任意本地音频转码为 96kbps 单声道 mp3(GLM ASR 用,参数与 media 模块抽音频口径一致)。

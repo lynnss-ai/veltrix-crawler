@@ -542,6 +542,11 @@ const PROFILE_POSTS_POLL_MS: u64 = 300;
 /// 实测多数情况是分页加载慢而非风控:保持节奏继续滚动等待,20 轮(≈44s)仍无增长才放弃。
 const PROFILE_POSTS_STALL_STOP: u32 = 20;
 
+/// 定向主页增量采集:连续几页「整页全是已采作品」即判定接上历史进度、提前收尾。
+/// 取 2 而非 1:单页全旧可能只是置顶调整 / 排序抖动 / 该页恰好全是近期已采,
+/// 连续两页全旧才认为后续页大概率也都是旧数据,再往下滚是空转。
+const PROFILE_INCREMENTAL_KNOWN_PAGES: u32 = 2;
+
 /// 评论 API 直采(抖音):完成回传的轮询间隔(毫秒)。
 const COMMENT_API_POLL_MS: u64 = 500;
 /// 评论 API 直采:整体等待上限(秒)。页内脚本可能被导航 / 冻结打断永不回传,
@@ -1017,23 +1022,41 @@ impl WebviewPool {
         // None → 各装一个拦截器 → 后装的 sink 覆盖先装的,先装那个成无人消费的孤儿)
         // 页内信号桥:控制句柄已由 CollectBridge 注入时,随拦截器一起注册
         // (远程页面的 Tauri invoke 会被 ACL 拒,信号走 WebView 原生消息)
-        let signals = self.control.get().map(|c| native_intercept::SignalCtx {
-            app: webview.app_handle().clone(),
-            control: c.clone(),
-        });
         if let Ok(mut map) = self.sinks.lock() {
             if let Some(sink) = map.get(label) {
                 return sink.clone();
             }
             let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
+            let signals = self.control.get().map(|c| native_intercept::SignalCtx {
+                app: webview.app_handle().clone(),
+                control: c.clone(),
+            });
             native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries, signals);
             map.insert(label.to_string(), sink.clone());
             return sink;
         }
         // 锁异常时降级:直接装但不记录(下次调用再试)
         let sink: ResponseSink = Arc::new(Mutex::new(Vec::new()));
+        let signals = self.control.get().map(|c| native_intercept::SignalCtx {
+            app: webview.app_handle().clone(),
+            control: c.clone(),
+        });
         native_intercept::install(webview, Arc::new(patterns.to_vec()), sink.clone(), emit, cap_entries, signals);
         sink
+    }
+
+    /// 往指定窗口的拦截缓冲直接推一条响应(页内脚本经 Tauri invoke 回传用)。
+    /// chrome.webview.postMessage → WebMessageReceived 在采集窗口实测不送达,
+    /// 空 stream 重取 / SSR 直读等回传改走 invoke(与 intercept_push 同通道)。
+    pub fn push_window_sink(&self, label: &str, url: String, body: String) -> bool {
+        let Some(sink) = self.window_sink(label) else {
+            return false;
+        };
+        if let Ok(mut buf) = sink.lock() {
+            buf.push(crate::webview::InterceptedResponse { url, body });
+            return true;
+        }
+        false
     }
 
     /// 取某窗口的原生拦截缓冲(collect 用于清空/取走本轮命中响应)。
@@ -1544,6 +1567,11 @@ pub struct ProfilePostsCollectRequest<'a> {
     /// 作品列表接口 URL 特征(如抖音 /aweme/v1/web/aweme/post/):拦截命中即首屏已回,
     /// 滚动加载时据响应数增长判到底;None 时退回固定等待。
     pub posts_pattern: Option<&'a str>,
+    /// 增量采集:适配器(滚动中解析新到页的作品 id)。与 `known_ids` 齐备时按
+    /// 「连续 N 页全是已采作品」提前收尾;任一缺失退回旧行为(滚到接口到底)。
+    pub adapter: Option<&'a Arc<dyn PlatformAdapter>>,
+    /// 增量采集:已采内容 id 台账(本任务已采 ∪ 去重台账近 90 天,与落库去重同口径)。
+    pub known_ids: Option<&'a HashSet<String>>,
 }
 
 impl CollectBridge {
@@ -1703,6 +1731,8 @@ impl CollectBridge {
     /// ② 作品接口响应解析失败页数(拦截器截断 / 风控脏页,该页内容已丢失);
     /// ③ 对账——拦截响应里画像 `user.aweme_count`(作者声明总数) vs 去重后实采 aweme_id 数,
     ///    不一致打 ⚠️(含两个数字),一致打 ✅;拿不到 aweme_count 时不出对账日志。
+    /// `incremental_stopped`=增量采集提前收尾(未滚到底):实采数必然远小于声明数,
+    /// 对账无意义,改打一条说明,不用「对账不符」误导用户。
     fn report_profile_collect_audit(
         &self,
         app: &AppHandle,
@@ -1710,6 +1740,7 @@ impl CollectBridge {
         task_id: Option<&str>,
         posts_pattern: Option<&str>,
         responses: &[InterceptedResponse],
+        incremental_stopped: bool,
     ) {
         // ① SSR 兜底标记(可能多条,正常只一条)
         for resp in responses
@@ -1748,8 +1779,16 @@ impl CollectBridge {
                 &format!("⚠️ {failed} 页作品接口响应解析失败(可能被截断或风控)· 该页内容已丢失"),
             );
         }
-        // ③ 对账:作者声明总数 vs 去重后实采数
-        if let Some(declared) = extract_declared_posts_count(responses) {
+        // ③ 对账:作者声明总数 vs 去重后实采数(增量提前收尾时必然不符,改打说明)
+        if incremental_stopped {
+            self.log_step(
+                app,
+                window,
+                task_id,
+                "info",
+                "ℹ️ 增量采集已于历史进度处收尾(未滚到底)· 声明总数对账跳过",
+            );
+        } else if let Some(declared) = extract_declared_posts_count(responses) {
             let got = count_distinct_aweme_ids(responses, pattern);
             if got as i64 == declared {
                 self.log_step(
@@ -2059,6 +2098,8 @@ impl CollectBridge {
 
         // 导航 → 注 session 回放首屏 → 等列表接口 → 滚动加载直到到底;结果存住不早退
         // (同 collect:无论成败都要取走会话并清停止标志,防缓冲与标志残留)。
+        // 增量采集提前收尾标记:供收尾审计区分「接上历史进度」与「真到底」(对账口径不同)
+        let mut incremental_stopped = false;
         let run_result: Result<()> = async {
             window
                 .eval(crate::webview::build_navigate_eval(req.url))
@@ -2116,6 +2157,12 @@ impl CollectBridge {
             let mut stagnant = 0u32;
             // 「接口较慢」提示每段停滞只报一次(恢复增长后重置,下一段停滞再报)
             let mut stall_logged = false;
+            // 增量采集状态:两路拦截通道各一个游标(只解析「新到」的作品页,不重复解析);
+            // known_streak 连续「整页全是已采作品」页数;incremental_stopped 供收尾审计区分
+            // 「提前接上历史进度」与「真到底」,对账口径不同
+            let mut incr_session_cursor = 0usize;
+            let mut incr_sink_cursor = 0usize;
+            let mut known_streak = 0u32;
             for _round in 0..PROFILE_POSTS_MAX_ROUNDS {
                 if self.control.is_stopping(session_id) || collect_window_gone(&window) {
                     break;
@@ -2203,6 +2250,59 @@ impl CollectBridge {
                     last_len = len;
                     stagnant = 0;
                     stall_logged = false;
+                    // 增量采集判定:适配器 + 已采台账齐备时,解析新到的作品页响应,
+                    // 连续 PROFILE_INCREMENTAL_KNOWN_PAGES 页全是已采作品即接上历史进度、提前收尾,
+                    // 不再把作者全部作品列表滚一遍(作品多的作者重跑从几十页降到一两页)
+                    if let (Some(adapter), Some(known), Some(pattern)) =
+                        (req.adapter, req.known_ids, req.posts_pattern)
+                    {
+                        let (fresh_session, cursor) =
+                            self.channel.peek_session_from(session_id, incr_session_cursor);
+                        incr_session_cursor = cursor;
+                        let mut fresh = fresh_session;
+                        if let Some(s) = sink.as_ref() {
+                            if let Ok(buf) = s.lock() {
+                                if buf.len() > incr_sink_cursor {
+                                    fresh.extend_from_slice(&buf[incr_sink_cursor..]);
+                                    incr_sink_cursor = buf.len();
+                                }
+                            }
+                        }
+                        fresh.retain(|r| r.url.contains(pattern));
+                        if !fresh.is_empty() {
+                            let ctx = FetchContext {
+                                keyword: req.url.to_string(),
+                                responses: fresh,
+                            };
+                            // 解析失败 / 空页(截断脏页)不参与判定:不累计也不重置连击
+                            if let Ok(out) = adapter.parse(&TaskKind::UserPosts, &ctx).await {
+                                if !out.contents.is_empty() {
+                                    let has_new = out
+                                        .contents
+                                        .iter()
+                                        .any(|c| !known.contains(&c.content_id));
+                                    if has_new {
+                                        known_streak = 0;
+                                    } else {
+                                        known_streak += 1;
+                                    }
+                                    if known_streak >= PROFILE_INCREMENTAL_KNOWN_PAGES {
+                                        incremental_stopped = true;
+                                        self.log_step(
+                                            app,
+                                            &window,
+                                            req.task_id,
+                                            "info",
+                                            &format!(
+                                                "⏭️ 增量采集 · 连续 {known_streak} 页均为已采作品 · 已接上历史进度,提前收尾"
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // 接口明确到底(has_more=0):不必再等停滞轮,直接收尾
                     if self.latest_posts_has_more(sink.as_ref(), session_id, req.posts_pattern)
                         == Some(false)
@@ -2265,6 +2365,7 @@ impl CollectBridge {
             req.task_id,
             req.posts_pattern,
             &responses,
+            incremental_stopped,
         );
         // 停止判定与 collect 一致(必须在 clear 之前读 is_stopping);label 按任务级解析
         let label = task_window_label(&cfg.id, req.account_id, req.task_id);
@@ -3268,6 +3369,18 @@ impl CollectBridge {
             self.control.clear(session_id);
             return Err(e);
         }
+        // 导航详情页后立即挂安全验证自检:命中风控(滑块 / 验证页)时页面经 report_collect_verify
+        // 置 verifying,下方据此暂停等人工解除——此前固定短等到期即返回、调用方随即关窗,
+        // 用户连验证弹窗都来不及看到,直链刷新必然失败
+        let verify_eval = crate::webview::build_verify_check_eval(
+            session_id,
+            &cfg.collect.verify_selectors,
+            &cfg.collect.verify_texts,
+            &cfg.collect.verify_url_patterns,
+        );
+        if !verify_eval.is_empty() {
+            let _ = window.eval(&verify_eval);
+        }
         // 等页面开始产出拦截响应再注入会话(快网秒回);随后等网络静默收齐首屏详情响应
         // (最多 DETAIL_FETCH_WAIT_MS),兼顾快网提速与慢网完整。
         let nav_ready =
@@ -3276,6 +3389,55 @@ impl CollectBridge {
         tracing::debug!(nav_ready, "详情补取:导航后等首屏响应");
         let _ = window.eval(build_set_session_eval(session_id));
         let _ = wait_network_idle(&window, sink.as_ref(), 800, DETAIL_FETCH_WAIT_MS).await;
+        // 无响应且未上报验证:自检经页面 invoke 异步到达、比响应等待略晚,
+        // 多等片刻让风控上报落地,避免把「风控拦死」误判成「页面无响应」直接关窗
+        if !nav_ready && !verify_eval.is_empty() {
+            for _ in 0..5 {
+                if self.control.is_verifying(session_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        // 风控等待(至多 2 轮,与采集主链路同一套人工解除语义):
+        // 解除后页面会重发详情请求,重挂会话与自检、重等一轮收响应;用户点结束 / 超时则放弃本条
+        for _ in 0..2 {
+            if !self.control.is_verifying(session_id) {
+                break;
+            }
+            let cleared = self
+                .wait_verify_cleared(
+                    &window,
+                    session_id,
+                    &verify_eval,
+                    &cfg.collect.verify_url_patterns,
+                    &cfg.id,
+                )
+                .await;
+            if !cleared {
+                break;
+            }
+            let _ = window.eval(build_set_session_eval(session_id));
+            let _ =
+                wait_nav_response(&window, sink.as_ref(), None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS)
+                    .await;
+            // 解除后页面可能已重载,补挂自检(脚本幂等,重复注入无副作用)
+            if !verify_eval.is_empty() {
+                let _ = window.eval(&verify_eval);
+            }
+            let _ = wait_network_idle(&window, sink.as_ref(), 800, DETAIL_FETCH_WAIT_MS).await;
+        }
+
+        // 抖音直链刷新第二通道:视频页 SSR 内嵌 aweme_detail,读 DOM 回传不依赖 GetContent
+        // (网络接口响应空 stream 丢包时仍能拿到 play_addr)。消息经 postMessage 异步落 sink,
+        // 稍候再取走本轮响应,避免兜底数据迟到丢失
+        if cfg.id == "douyin" {
+            let _ = window.eval(crate::webview::build_detail_ssr_eval(
+                window.label(),
+                req.content_id,
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
 
         let responses = self.take_collected_responses(session_id, sink.as_ref());
         self.control.clear(session_id);

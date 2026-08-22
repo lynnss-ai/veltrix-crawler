@@ -731,6 +731,8 @@ impl AppConfig {
                 // 详情页 URL 模板:走「作者主页 + modal_id」模态,{id}=aweme_id、{token}=作者 sec_uid。
                 // 评论稳定显示在右侧「评论」tab,图文 / 视频同一套布局;而旧的 /video/{id} 对图文内容
                 // 布局不对、评论区出不来(采不到右侧评论)。评论采集导航用,{id} 出现两处(modal_id/vid)。
+                // 注意:直链刷新(补取 play_addr)不用此模板——改用 /video/{id} 定向视频页,
+                // SSR 内嵌 aweme_detail 可读 DOM 回传(见 refresh_stream_urls 的模板覆盖)。
                 "https://www.douyin.com/user/{token}?modal_id={id}&vid={id}",
                 vec![
                     "/aweme/v1/web/general/search/",

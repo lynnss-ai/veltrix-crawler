@@ -1,8 +1,8 @@
 // 任务新建/编辑表单抽屉:从 CollectPage 抽出的独立 Sheet 组件(props 自洽,无闭包捕获)。
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { api } from "@/lib/api";
-import type { IndustryView, TaskInput } from "@/lib/api";
+import type { AccountView, IndustryView, TaskInput } from "@/lib/api";
 import { filterMetaFor, extraFiltersFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY } from "./collect-meta";
 import type { TaskTrigger, SortMode, TimeRange, TaskItem, CommentTimeRange, PlatformOption } from "./collect-meta";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -89,6 +89,28 @@ export function TaskFormSheet({
   const [name, setName] = useState(initial?.name ?? "");
   const [industry, setIndustry] = useState(initial?.industry ?? "");
   const [platform, setPlatform] = useState(initial?.platform ?? "");
+  // 采集账号:"" = 自动轮换(默认);否则为 accounts.id。选中平台后异步加载该平台账号列表
+  const [accountId, setAccountId] = useState(initial?.accountId ?? "");
+  const [accounts, setAccounts] = useState<AccountView[]>([]);
+  // 记录上一次的平台:仅用户主动切换平台时清空账号选择,编辑态首进(platform 未变)保留原绑定
+  const prevPlatformRef = useRef(initial?.platform ?? "");
+  useEffect(() => {
+    if (prevPlatformRef.current !== platform) {
+      prevPlatformRef.current = platform;
+      setAccountId("");
+    }
+    if (!platform) {
+      setAccounts([]);
+      return;
+    }
+    api
+      .listAccounts(platform)
+      .then(setAccounts)
+      .catch((e) => {
+        console.warn("加载平台账号失败:", e);
+        setAccounts([]);
+      });
+  }, [platform]);
   const [keywordsRaw, setKeywordsRaw] = useState(() => {
     if (!initial) return "";
     // 定向任务关键词存占位词「定向采集」(仅展示用),目标链接存 targetUrls;老数据可能没有该字段
@@ -261,6 +283,7 @@ export function TaskFormSheet({
       name: trimmedName,
       industry,
       platform,
+      accountId: accountId || null,
       keywords: mode === "targeted" ? ["定向采集"] : rawLines,
       targetUrls,
       // 定向采集是一次性任务:不走定时/监听,保存即按「立即一次」执行
@@ -300,6 +323,8 @@ export function TaskFormSheet({
   const platformSort = filterMetaFor(platform).sort;
   const platformTime = filterMetaFor(platform).time;
   const platformDims = extraFiltersFor(platform);
+  // 仅「已登录可用」的账号可被指定为采集账号;失效/停用不出现在选项里(运行时后端同样会拦)
+  const activeAccounts = accounts.filter((a) => a.status === "active");
   const hasFilters =
     platformSort.length > 0 ||
     platformTime.length > 0 ||
@@ -426,6 +451,63 @@ export function TaskFormSheet({
               </SelectContent>
             </Select>
           </div>
+          </div>
+          {/* 采集账号:跟随平台加载,仅「已登录可用」的账号可选;不选 = 按「最久未用」自动轮换 */}
+          <div className="space-y-1.5">
+            <Label htmlFor="task-account">采集账号</Label>
+            <Select
+              value={accountId || "auto"}
+              onValueChange={(v) => setAccountId(v === "auto" ? "" : v)}
+              disabled={!platform}
+            >
+              <SelectTrigger id="task-account" className="w-full">
+                <SelectValue
+                  placeholder={platform ? "自动轮换(默认)" : "请先选择所属平台"}
+                />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">自动轮换(默认)</SelectItem>
+                {activeAccounts.map((a) => (
+                  <SelectItem
+                    key={a.id}
+                    value={a.id}
+                    className="[&>span:last-child]:w-full"
+                  >
+                    <span className="flex w-full items-center gap-1.5">
+                      <span>{a.label || a.id}</span>
+                      {a.code && (
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {a.code}
+                        </span>
+                      )}
+                    </span>
+                  </SelectItem>
+                ))}
+                {/* 平台无可用账号时给引导,而非一个空下拉 */}
+                {platform && activeAccounts.length === 0 && (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    该平台暂无已登录账号,请先到「账号管理」登录
+                  </div>
+                )}
+                {/* 编辑态:原绑定账号已不可选(被删 / 登录失效 / 停用)时显式占位提示,而非静默丢值 */}
+                {accountId && !activeAccounts.some((a) => a.id === accountId) && (
+                  <SelectItem value={accountId} disabled>
+                    {(() => {
+                      const bound = accounts.find((a) => a.id === accountId);
+                      if (!bound) return "原指定账号已不存在";
+                      return `原指定账号「${bound.label || bound.id}」${
+                        bound.status === "invalid" ? "登录已失效" : "已停用"
+                      }`;
+                    })()}
+                  </SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {platform
+                ? "仅列出已登录可用的账号;不选则按「最久未用」自动轮换,指定后每次采集固定用该账号"
+                : "选择平台后可指定采集账号"}
+            </p>
           </div>
           {/* 采集筛选:紧跟平台下方,不加标题/分割线/外框。该平台无任何筛选项(如快手)时整块隐藏;
               定向采集按视频 ID 直取,不涉及搜索排序/时间筛选,同样隐藏 */}

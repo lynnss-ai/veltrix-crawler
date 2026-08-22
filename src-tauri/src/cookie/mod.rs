@@ -181,6 +181,53 @@ impl CookiePool {
         ))
     }
 
+    /// 占用任务指定的账号(区别于 acquire 的自动轮换):校验存在、平台匹配、状态可用,
+    /// 占用方式与 acquire 相同(CAS 更新 last_used_at,参与后续轮换公平性)。
+    pub async fn acquire_by_id(&self, account_id: &str, platform: &str) -> Result<Account> {
+        const MAX_RETRIES: usize = 5;
+        let now = Utc::now().timestamp();
+        for _ in 0..MAX_RETRIES {
+            let model = AccountEntity::find_by_id(account_id)
+                .one(&self.db)
+                .await
+                .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?
+                .ok_or_else(|| {
+                    CrawlerError::Account(format!("指定账号不存在(可能已被删除): {account_id}"))
+                })?;
+            if model.platform != platform {
+                return Err(CrawlerError::Account(format!(
+                    "指定账号属于平台 {},与任务平台 {platform} 不匹配",
+                    model.platform
+                )));
+            }
+            if model.status != AccountStatus::Active.as_str() {
+                return Err(CrawlerError::Account(format!(
+                    "指定账号「{}」当前不可用(状态: {}),请在账号管理处理后重试,或改用自动轮换",
+                    model.label, model.status
+                )));
+            }
+
+            let snapshot_last_used = model.last_used_at;
+            let snapshot: Account = model.clone().into();
+
+            // 乐观 CAS:只在 last_used_at 仍是候选时刻的值时更新
+            let res = AccountEntity::update_many()
+                .col_expr(account::Column::LastUsedAt, sea_orm::sea_query::Expr::value(now))
+                .filter(account::Column::Id.eq(model.id.clone()))
+                .filter(account::Column::LastUsedAt.eq(snapshot_last_used))
+                .exec(&self.db)
+                .await
+                .map_err(|e| CrawlerError::Account(format!("占用账号失败: {e}")))?;
+            if res.rows_affected == 1 {
+                return Ok(snapshot);
+            }
+            // 0 行 = 已被其他线程抢走,重新读取再试
+        }
+        Err(CrawlerError::Account(
+            "并发争用激烈,获取账号失败,请稍后重试".into(),
+        ))
+    }
+
     /// 标记账号登录态失效(Cookie 过期),需重新登录。账号不存在时静默。
     pub async fn mark_invalid(&self, account_id: &str) -> Result<()> {
         if let Some(model) = AccountEntity::find_by_id(account_id)

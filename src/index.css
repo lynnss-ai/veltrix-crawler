@@ -5,6 +5,38 @@
 /* 启用 class 策略的暗色模式:祖先含 .dark 时激活 dark: 变体 */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* 阿里巴巴普惠体 3.0(免费商用,已内嵌打包,离线可用):
+   按 Tailwind 字重映射 400/500/600/700 四档,覆盖正文到标题的全部用法。
+   WOFF2 由官方 TTF 转制(fontTools),存 src/assets/fonts/,经 Vite 指纹打包。 */
+@font-face {
+  font-family: "Alibaba PuHuiTi 3.0";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./assets/fonts/AlibabaPuHuiTi-3-55-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Alibaba PuHuiTi 3.0";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./assets/fonts/AlibabaPuHuiTi-3-65-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Alibaba PuHuiTi 3.0";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./assets/fonts/AlibabaPuHuiTi-3-75-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Alibaba PuHuiTi 3.0";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./assets/fonts/AlibabaPuHuiTi-3-85-Bold.woff2") format("woff2");
+}
+
 @layer base {
   /* 原生 button/select 在 reset 下默认不是手型,统一补上;禁用态显示禁止符号。
      放 base 层,个别元素仍可用 cursor-* utility 覆盖。 */

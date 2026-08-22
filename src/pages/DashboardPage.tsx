@@ -29,6 +29,7 @@ import {
 } from "@/lib/api";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { AnimatedNumber } from "@/components/animated-number";
+import { formatCount } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import {
@@ -676,7 +677,8 @@ const DonutCard = memo(function DonutCard({
       <h3 className="mb-3 text-sm font-semibold text-foreground">{title}</h3>
       <div className="flex items-center gap-4">
         <DonutChart data={data} />
-        <div className="flex flex-1 flex-col gap-2 text-xs">
+        {/* min-w-0:允许图例列收缩,大数值 + 长标签组合不会把卡片撑溢出 */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2 text-xs">
           {data.map((d) => {
             const pct = total > 0 ? Math.round((d.value / total) * 100) : 0;
             return (
@@ -688,8 +690,16 @@ const DonutCard = memo(function DonutCard({
                 <span className="truncate text-muted-foreground">
                   {d.label}
                 </span>
-                <span className="ml-auto shrink-0 font-mono text-foreground">
-                  <AnimatedNumber value={d.value} />
+                {/* 过万折算(x.x万)防溢出;title 悬浮显示完整数值 */}
+                <span
+                  className="ml-auto shrink-0 font-mono text-foreground"
+                  title={d.value.toLocaleString()}
+                >
+                  {d.value >= 10000 ? (
+                    formatCount(d.value)
+                  ) : (
+                    <AnimatedNumber value={d.value} />
+                  )}
                 </span>
                 <span className="w-9 shrink-0 text-right font-mono text-muted-foreground">
                   {pct}%

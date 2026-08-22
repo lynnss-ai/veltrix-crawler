@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useCountUp } from "@/components/animated-number";
+import { formatCount } from "@/lib/utils";
 
 export function DonutChart({
   data,
@@ -84,7 +85,8 @@ export function DonutChart({
             className="fill-muted-foreground"
             fontSize={11}
           >
-            {hoveredItem.value.toLocaleString()}
+            {/* 过万折算(x.x万),SVG 文本不换行,完整数字会溢出圆环 */}
+            {formatCount(hoveredItem.value)}
           </text>
         </>
       ) : (
@@ -97,7 +99,8 @@ export function DonutChart({
             fontSize={22}
             fontWeight={600}
           >
-            {animatedTotal.toLocaleString()}
+            {/* 过万折算(x.x万):SVG 文本不换行,大数字全量会溢出圆环 */}
+            {formatCount(animatedTotal)}
           </text>
           <text
             x={size / 2}

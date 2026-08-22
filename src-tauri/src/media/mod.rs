@@ -1106,6 +1106,45 @@ async fn process_video(
     };
     let audio_path = audio_dir.join(format!("{prefix}.{audio_format}"));
 
+    // 原声视频的音乐直链(extra.audio_url,抖音 music.play_url,MP3 无短期签名):
+    // 目标格式 mp3 时直接下载,免 ffmpeg 拉整个视频流转码(几 MB vs 几十 MB 视频);
+    // 下载失败退回下方视频直链 ffmpeg 老路径
+    if audio_format == "mp3" {
+        if let Some(audio_url) = content
+            .extra
+            .get("audio_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // 与 ffmpeg 路径同一取消语义:手动停止后不再发起下载
+            let cancelled = cancel
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+            if cancelled {
+                return VideoOutcome {
+                    downloaded: false,
+                    audio_extracted: Some(false),
+                    error: Some("已手动停止".into()),
+                    audio_path: None,
+                };
+            }
+            match download_to_file(audio_url, &audio_path).await {
+                Ok(()) => {
+                    return VideoOutcome {
+                        downloaded: true,
+                        audio_extracted: Some(true),
+                        error: None,
+                        audio_path: Some(audio_path.to_string_lossy().into_owned()),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(content_id = %content.content_id, "音乐直链下载失败,退回视频转音频: {e}");
+                }
+            }
+        }
+    }
+
     // 防盗链 Referer 优先按内容所属平台解析(视频 CDN 域名多变,按平台比按 CDN 子串更稳),
     // 平台未命中再退回 CDN 子串匹配。referer 是 &'static str,可直接进 spawn_blocking 闭包。
     let referer = REFERER_BY_PLATFORM
