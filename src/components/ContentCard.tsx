@@ -271,6 +271,14 @@ export const ContentCard = memo(function ContentCard({
             </p>
           </details>
         )}
+        {c.kind === "video" && c.transcript === "" && !c.transcriptError && (
+          <SimpleTooltip content="语音转写已完成,但未识别到人声(纯音乐/静音内容)">
+            <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+              <AudioLines className="size-3" />
+              空文案
+            </span>
+          </SimpleTooltip>
+        )}
         {c.kind === "video" && !c.transcript && c.transcriptError && (
           <SimpleTooltip content={c.transcriptError}>
             <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">

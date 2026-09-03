@@ -77,6 +77,9 @@ struct MediaDownloadParams<'a> {
     transcription_cfg: &'a veltrix_core::config::TranscriptionConfig,
     /// 音频提取(视频下载 + 转 mp3);含 AI 文案提取隐含的音频需求
     audio_extract: bool,
+    /// 保留视频文件(自动发布素材):视频落盘到 video/ 目录并回写 contents.video_path;
+    /// 与 audio_extract 独立,同开时抽音频复用已落盘的本地视频
+    keep_video: bool,
     /// 任务停止标记来源:素材下载 / 语音转写阶段据此中断(每完成一条检查一次)
     bridge: &'a CollectBridge,
     /// AI 文案提取:素材结束后对音频做语音转写
@@ -386,8 +389,10 @@ pub async fn run_task(
     let comment_limit = model.comment_limit.max(0) as usize;
     let analyze_comment_intent = model.analyze_comment_intent;
     // 音频提取:开 → 视频下载并转音频(mp3 留存);AI 文案提取依赖音频(upsert 已强制,这里 || 兜底)。
-    // 两者皆关 → 视频不下载、不存储
+    // 两者皆关 → 视频不转音频
     let audio_extract = model.audio_extract || model.ai_extract;
+    // 保留视频:开 → 视频落盘到 video/ 目录供自动发布;与音频提取独立
+    let keep_video = model.keep_video;
     // AI 文案提取:开 → 素材阶段结束后对音频做语音转写;关 → 只留音频不转写
     let ai_extract = model.ai_extract;
     // 采集完成后是否自动同步到发起者(owner)的 Obsidian vault
@@ -535,6 +540,7 @@ pub async fn run_task(
             comment_limit,
             analyze_comment_intent,
             audio_extract,
+            keep_video,
             ai_extract,
             auto_sync_obsidian,
             sort_mode,
@@ -590,6 +596,8 @@ struct RunTaskCtx {
     analyze_comment_intent: bool,
     /// 音频提取(视频下载 + 转 mp3);含 AI 文案提取隐含的音频需求
     audio_extract: bool,
+    /// 保留视频文件(自动发布素材);与音频提取独立
+    keep_video: bool,
     /// AI 文案提取(语音转写);依赖 audio_extract
     ai_extract: bool,
     auto_sync_obsidian: bool,
@@ -1895,6 +1903,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
         comment_limit,
         analyze_comment_intent,
         audio_extract,
+        keep_video,
         ai_extract,
         auto_sync_obsidian,
         sort_mode,
@@ -2289,6 +2298,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 media_cfg: &media_cfg,
                 transcription_cfg: &transcription_cfg,
                 audio_extract,
+                keep_video,
                 ai_extract,
                 session_cookie,
                 bridge: &bridge,
@@ -3086,8 +3096,12 @@ async fn download_media_core(
             async move {
             // 标题在下载前取;用于 HUD 逐条日志展示
             let title = log_content_title(&content);
-            // 素材类型标签(实时日志按类型着色):视频且开了音频提取 → [音频];图文 → [图片];其余(仅封面/头像)→ [封面]
-            let tag = if content.kind == ContentKind::Video && params.audio_extract {
+            // 素材类型标签(实时日志按类型着色):视频按开关标 [视频]/[音频]/[视频+音频];图文 → [图片];其余(仅封面/头像)→ [封面]
+            let tag = if content.kind == ContentKind::Video && params.audio_extract && params.keep_video {
+                "素材[视频+音频]"
+            } else if content.kind == ContentKind::Video && params.keep_video {
+                "素材[视频]"
+            } else if content.kind == ContentKind::Video && params.audio_extract {
                 "素材[音频]"
             } else if content.kind == ContentKind::Video {
                 "素材[封面]"
@@ -3098,7 +3112,10 @@ async fn download_media_core(
                 &content,
                 root_ref,
                 params.media_cfg,
-                params.audio_extract,
+                crate::media::MediaSwitches {
+                    audio_extract: params.audio_extract,
+                    keep_video: params.keep_video,
+                },
                 item_cookie.as_deref(),
                 Some(cancel),
             )
@@ -3193,6 +3210,7 @@ async fn download_media_core(
 }
 
 /// 采集结束后统一语音转写:把每条视频转出的音频逐条调 ASR 厂商,回写 content.transcript。
+/// transcript 三态:NULL=未转写/失败(可重试),空串=已转写但未识别到语音(空文案,不再重试),非空=文案。
 /// 按系统设置「语音转写」的并发数限速并发,失败仅告警不中断;未配置/厂商不支持 ASR 则跳过。不占采集通道(主体已结束)。
 #[allow(clippy::too_many_arguments)]
 async fn transcribe_for_contents(
@@ -3278,6 +3296,9 @@ async fn transcribe_for_contents(
             .await;
             match result {
                 Ok(outcome) => {
+                    if outcome.text.trim().is_empty() {
+                        tracing::info!(content_id = %id, "转写完成:未识别到语音,标记空文案");
+                    }
                     // SQLite 写需串行:并发 ASR 结果回写时持锁,防止 database is locked
                     let _guard = db_write_lock.lock().await;
                     record_transcription_usage(&db, &id, &cfg_model, &cfg_provider, &outcome.usages).await;
@@ -3360,6 +3381,7 @@ async fn record_transcription_usage(
 }
 
 /// 回写单条内容的转写结果(只更新 transcript / transcript_error 两列,不触碰其它字段)。
+/// text 传 Some("") 表示「已转写但未识别到语音」(空文案标记);None 表示失败/未转写。
 async fn record_transcript(
     db: &DatabaseConnection,
     id: &str,
@@ -3582,6 +3604,11 @@ fn media_outcome_active(
     if let Some(p) = &outcome.audio_path {
         am.audio_path = Set(Some(p.clone()));
     }
+    // 视频落盘路径回写:自动发布读本地视频用(仅 keep_video 下载成功时有值);
+    // 失败/未开不覆盖旧值(NotSet),便于重试后保留上次成功路径
+    if let Some(p) = &outcome.video_path {
+        am.video_path = Set(Some(p.clone()));
+    }
     if let Some(v) = outcome.video_downloaded {
         am.video_downloaded = Set(Some(v));
     }
@@ -3746,34 +3773,42 @@ pub async fn retry_content_media(
     // clone 出媒体配置,避免跨 await 持有配置锁
     let media_cfg = { lock_config(&state)?.media.clone() };
     let root = crate::media::media_root(&state.config_dir, &media_cfg);
-    // 重试遵循任务的「音频提取 / AI 文案提取」设置:前者决定视频是否下载并转音频,后者决定是否补转写
-    let (audio_extract, ai_extract) = match veltrix_core::db::entity::task::Entity::find_by_id(
+    // 重试遵循任务的「音频提取 / AI 文案提取 / 保留视频」设置:
+    // 分别决定视频是否转音频、是否补转写、是否补落盘视频文件
+    let (audio_extract, keep_video, ai_extract) = match veltrix_core::db::entity::task::Entity::find_by_id(
         row.task_id.clone(),
     )
     .one(&state.db)
     .await
     {
-        Ok(Some(t)) => (t.audio_extract || t.ai_extract, t.ai_extract),
+        Ok(Some(t)) => (t.audio_extract || t.ai_extract, t.keep_video, t.ai_extract),
         other => {
             // 查不到任务行(DB 错误 / 任务已删)不能静默按「不提取」处理:那会让视频
             // 「封面下载成功即判成功」而音频仍缺。按内容行自身状态推断:
-            // 视频且尚无音频 → 仍需下载转音频;不补转写(无任务设置可依)
+            // 视频且尚无音频 → 仍需下载转音频;视频且尚无落盘文件 → 仍需补视频;不补转写(无任务设置可依)
             tracing::warn!(content_id = %id, "重试:查询任务提取设置失败({other:?}),按内容行状态推断");
             let need_audio = row.kind == "video"
                 && row.audio_path.as_deref().map(|s| s.is_empty()).unwrap_or(true);
-            (need_audio, false)
+            let need_video = row.kind == "video"
+                && row.video_path.as_deref().map(|s| s.is_empty()).unwrap_or(true);
+            (need_audio, need_video, false)
         }
     };
+    let switches = crate::media::MediaSwitches { audio_extract, keep_video };
     let mut content = content_from_model(&row);
     // 重试无绑定账号:取该平台一个可用账号的 Cookie 供 ffmpeg 拉流(防盗链 CDN 校验会话)
     let cookie = fetch_platform_cookie(&state.db, &row.platform).await;
     let mut outcome =
-        crate::media::process_content(&content, &root, &media_cfg, audio_extract, cookie.as_deref(), None)
+        crate::media::process_content(&content, &root, &media_cfg, switches, cookie.as_deref(), None)
             .await;
 
     // 视频素材失败(典型:直链短期签名过期;无直链时 process_video 未执行、
-    // audio_extracted 为 None,同样是缺直链场景)→ 经详情页强制重取新鲜直链后再试一次。
-    if audio_extract && content.kind == ContentKind::Video && outcome.audio_extracted != Some(true) {
+    // audio_extracted 为 None,同样是缺直链场景;keep_video 开而视频没落盘同理)
+    // → 经详情页强制重取新鲜直链后再试一次。
+    let need_refresh = content.kind == ContentKind::Video
+        && ((audio_extract && outcome.audio_extracted != Some(true))
+            || (keep_video && outcome.video_path.is_none()));
+    if need_refresh {
         let platform_cfg = { lock_config(&state)?.platforms.get(&row.platform).cloned() };
         match (platform_cfg, state.cookies.acquire(&row.platform).await) {
             (Some(cfg), Ok(acc)) => {
@@ -3820,7 +3855,7 @@ pub async fn retry_content_media(
                         &content,
                         &root,
                         &media_cfg,
-                        audio_extract,
+                        switches,
                         session_cookie.as_deref(),
                         None, // 单条重试:无任务停止标志
                     )
@@ -3982,10 +4017,11 @@ pub async fn retry_failed_transcripts(
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询待转写内容失败: {e}")))?;
-    // 防御:已有文案的条目不重试(如行级重试刚成功,前端列表还没刷新)
+    // 防御:已转写过的条目不重试(transcript 非 NULL 即转写过,含空串「空文案」标记;
+    // 如行级重试刚成功,前端列表还没刷新)。NULL=未转写/上次失败,仍可重试
     let rows: Vec<_> = rows
         .into_iter()
-        .filter(|r| r.transcript.as_deref().map(str::trim).unwrap_or("").is_empty())
+        .filter(|r| r.transcript.is_none())
         .collect();
     if rows.is_empty() {
         return Ok(0);
@@ -4220,7 +4256,11 @@ pub async fn batch_collect_audios(
                                 &content,
                                 &root_i,
                                 &media_i,
-                                true,
+                                // 内容库批量补音频:只补音频,不动视频落盘(keep_video 由任务重跑/补偿负责)
+                                crate::media::MediaSwitches {
+                                    audio_extract: true,
+                                    keep_video: false,
+                                },
                                 cookie.as_deref(),
                                 Some(cancel_i),
                             )
@@ -4312,6 +4352,7 @@ pub async fn batch_collect_audios(
                         cover_path: None,
                         avatar_path: None,
                         audio_path: None,
+                        video_path: None,
                         video_downloaded: Some(false),
                         image_total: None,
                         image_done: None,
@@ -4364,8 +4405,8 @@ pub async fn batch_collect_audios(
             if !ai_extract_tasks.contains(&row.task_id) {
                 continue;
             }
-            if !row.transcript.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                continue; // 已有文案不补
+            if row.transcript.is_some() {
+                continue; // 已转写过不补(含空串「空文案」标记)
             }
             by_task
                 .entry((row.task_id.clone(), row.platform.clone()))
@@ -4452,6 +4493,8 @@ pub async fn compensate_task(
     let ai_extract = model.ai_extract;
     // 音频提取(含 AI 文案提取隐含需求):决定补偿时视频是否下载转音频
     let audio_extract = model.audio_extract || model.ai_extract;
+    // 保留视频:补偿时同样按任务设置补落盘(自动发布素材)
+    let keep_video = model.keep_video;
     let analyze_comment_intent = model.analyze_comment_intent;
     let media_cfg = { lock_config(&state)?.media.clone() };
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
@@ -4593,6 +4636,7 @@ pub async fn compensate_task(
                     media_cfg: &media_cfg,
                     transcription_cfg: &transcription_cfg,
                     audio_extract,
+                    keep_video,
                     ai_extract,
                     session_cookie,
                     bridge: &bridge,
@@ -5544,6 +5588,7 @@ fn content_to_active(
         cover_path: Set(None),
         avatar_path: Set(None),
         audio_path: Set(None),
+        video_path: Set(None),
         // 转写文本采集时未知,语音转写后回写
         transcript: Set(None),
         transcript_error: Set(None),
@@ -6220,6 +6265,7 @@ mod tests {
             cover_path: None,
             avatar_path: None,
             audio_path: None,
+            video_path: None,
             video_downloaded: None,
             image_total: None,
             image_done: None,
@@ -6269,6 +6315,7 @@ mod tests {
             cover_path: None,
             avatar_path: None,
             audio_path: None,
+            video_path: None,
             transcript: None,
             transcript_error: None,
             video_downloaded: None,
@@ -6380,6 +6427,7 @@ mod tests {
             name: "t".into(),
             industry: "i".into(),
             platform: "douyin".into(),
+            account_id: None,
             keywords: "[]".into(),
             trigger_type: "daily".into(),
             scheduled_at: None,
@@ -6389,6 +6437,7 @@ mod tests {
             per_keyword_limit: 0,
             min_likes: 0,
             audio_extract: false,
+            keep_video: false,
             ai_extract: false,
             collect_comments: false,
             comment_time_range: "any".into(),

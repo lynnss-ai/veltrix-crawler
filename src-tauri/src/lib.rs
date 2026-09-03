@@ -9,6 +9,7 @@ mod llm;
 mod media;
 mod model;
 mod obsidian;
+mod publish;
 mod sandbox;
 mod webview;
 
@@ -434,6 +435,7 @@ pub fn run() {
             }
 
             let cookies = Arc::new(cookie::CookiePool::new(db.clone()));
+            let publish = Arc::new(publish::PublishAccounts::new(db.clone()));
             tracing::info!(
                 platforms = cfg.platforms.len(),
                 "配置与账号池就绪,数据目录: {}",
@@ -592,6 +594,7 @@ pub fn run() {
                 registry,
                 db,
                 cookies,
+                publish,
                 webviews: Arc::new(webview::pool::WebviewPool::new()),
                 intercept_channel: Arc::new(webview::InterceptChannel::new()),
                 rpa_channel: Arc::new(webview::RpaChannel::new()),
@@ -798,6 +801,15 @@ pub fn run() {
             commands::clear_account_login,
             commands::open_login_window,
             commands::login_status_report,
+            // 发布服务:客户分组(只读)/ 账号池 / 登录窗口
+            commands::publish::list_publish_platforms,
+            commands::publish::list_publish_customers,
+            commands::publish::list_publish_accounts,
+            commands::publish::create_publish_account,
+            commands::publish::update_publish_account,
+            commands::publish::delete_publish_account,
+            commands::publish::open_publish_account_login,
+            commands::publish::close_publish_account_window,
             // 采集:拦截回传与启动
             commands::intercept_push,
             commands::intercept_sink_push,

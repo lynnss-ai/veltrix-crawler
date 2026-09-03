@@ -144,24 +144,22 @@ async fn try_connect(url: &str, max_connections: u32) -> Result<DatabaseConnecti
     opt.max_connections(max_connections)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .sqlx_logging(false);
+    // SQLite 单写者:采集期并发写库(增量入库 / 日志 writer / 进度回写 / 媒体回写)需要
+    // WAL(读写并发)+ busy_timeout(写冲突自动重试)+ synchronous=NORMAL。
+    // 注意不能用 connect 后 execute 的方式设:PRAGMA 是连接级状态,那样只落在当时那一条
+    // 连接上,池后续新建连接(最多 max_connections 条)又回到默认值(尤其 busy_timeout=0,
+    // 并发写立刻 "database is locked")。挂到 SqliteConnectOptions 上,每条池连接建连即执行。
+    if url.starts_with("sqlite") {
+        opt.map_sqlx_sqlite_opts(|sqlx_opt| {
+            sqlx_opt
+                .pragma("journal_mode", "WAL")
+                .pragma("busy_timeout", "5000")
+                .pragma("synchronous", "NORMAL")
+        });
+    }
     let db = Database::connect(opt)
         .await
         .map_err(|e| CrawlerError::Config(format!("连接数据库失败: {e}")))?;
-    // SQLite 默认单写者、无忙等待:连接池有多条连接(默认 8)且采集期并发写库
-    // (增量入库 / 日志 writer / 进度回写 / 媒体回写)会立刻抛 "database is locked"。
-    // 开 WAL 让读写并发、设 busy_timeout 让写冲突自动重试,消除并发丢更新。
-    // PG 不走此分支(仅对 sqlite 连接串生效)。
-    if url.starts_with("sqlite") {
-        for pragma in [
-            "PRAGMA journal_mode=WAL;",
-            "PRAGMA busy_timeout=5000;",
-            "PRAGMA synchronous=NORMAL;",
-        ] {
-            if let Err(e) = db.execute_unprepared(pragma).await {
-                tracing::warn!("设置 SQLite PRAGMA 失败({pragma}): {e}");
-            }
-        }
-    }
     Ok(db)
 }
 
@@ -244,6 +242,14 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::chat_memory::Entity, "chat_memories").await?;
     create_table(db, &schema, entity::model_usage_record::Entity, "model_usage_records").await?;
     create_table(db, &schema, entity::agent_route_log::Entity, "agent_route_logs").await?;
+    // 发布服务:发布账号(独立于采集账号池 accounts;分组维度复用 customers 表,不再单独建分类表)
+    create_table(
+        db,
+        &schema,
+        entity::publish_account::Entity,
+        "publish_accounts",
+    )
+    .await?;
 
     // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
@@ -340,6 +346,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("image_done", "ALTER TABLE contents ADD COLUMN image_done INTEGER"),
         ("comment_collected", "ALTER TABLE contents ADD COLUMN comment_collected BOOLEAN"),
         ("intent_analyzed", "ALTER TABLE contents ADD COLUMN intent_analyzed BOOLEAN"),
+        // 视频落盘路径(开「保留视频」时留存,发布服务复用素材);可空,旧行 None=未落盘
+        ("video_path", "ALTER TABLE contents ADD COLUMN video_path TEXT"),
     ] {
         if !column_exists(db, "contents", col).await {
             if let Err(e) = db
@@ -372,22 +380,25 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     }
 
     // 兼容已建的 tasks 表:补评论采集列(开关 / 过滤参数 / 评论采集阶段进度)。
-    // 布尔与整数 NOT NULL DEFAULT 0,文本默认 'any'(不限),旧行回填默认值语义为「未开评论采集」。
+    // 布尔 NOT NULL DEFAULT FALSE、整数 DEFAULT 0,文本默认 'any'(不限),旧行回填默认值语义为「未开评论采集」。
+    // (布尔默认值必须用 FALSE 而非 0:PG 布尔列不接受整数默认值,SQLite ≥3.23 两种写法都认)
     for (col, ddl) in [
-        ("collect_comments", "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT 0"),
+        ("collect_comments", "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT FALSE"),
         ("comment_time_range", "ALTER TABLE tasks ADD COLUMN comment_time_range TEXT NOT NULL DEFAULT 'any'"),
         ("comment_limit", "ALTER TABLE tasks ADD COLUMN comment_limit INTEGER NOT NULL DEFAULT 0"),
-        ("analyze_comment_intent", "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT 0"),
+        ("analyze_comment_intent", "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT FALSE"),
         ("comment_video_total", "ALTER TABLE tasks ADD COLUMN comment_video_total INTEGER NOT NULL DEFAULT 0"),
         ("comment_video_done", "ALTER TABLE tasks ADD COLUMN comment_video_done INTEGER NOT NULL DEFAULT 0"),
-        ("archived", "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"),
-        ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT 0"),
+        ("archived", "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT FALSE"),
         // 平台专属额外筛选(抖音视频时长/搜索范围/内容形式等),JSON 对象,旧行回填 '{}'(全不限)
         ("extra_filters", "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'"),
         // 定向采集目标链接(JSON 数组,视频链接/主页链接);旧行回填 '[]'(非定向任务)
         ("target_urls", "ALTER TABLE tasks ADD COLUMN target_urls TEXT NOT NULL DEFAULT '[]'"),
         // 指定采集账号(accounts.id);可空,旧行回填 NULL = 自动轮换
         ("account_id", "ALTER TABLE tasks ADD COLUMN account_id TEXT"),
+        // 「保留视频」开关:采集后视频落盘留存,供发布服务复用;旧行回填 0(不保留)
+        ("keep_video", "ALTER TABLE tasks ADD COLUMN keep_video BOOLEAN NOT NULL DEFAULT FALSE"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -406,7 +417,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         if let Err(e) = db
             .execute(Statement::from_string(
                 backend,
-                "ALTER TABLE tasks ADD COLUMN audio_extract BOOLEAN NOT NULL DEFAULT 0".to_owned(),
+                "ALTER TABLE tasks ADD COLUMN audio_extract BOOLEAN NOT NULL DEFAULT FALSE".to_owned(),
             ))
             .await
         {
@@ -414,7 +425,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         } else if let Err(e) = db
             .execute(Statement::from_string(
                 backend,
-                "UPDATE tasks SET audio_extract = 1 WHERE ai_extract = 1".to_owned(),
+                // TRUE/FALSE 字面量 SQLite(=1/0)与 PG 通用,避免 PG 布尔列赋整数报错
+                "UPDATE tasks SET audio_extract = TRUE WHERE ai_extract = TRUE".to_owned(),
             ))
             .await
         {
@@ -470,7 +482,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("summary", "ALTER TABLE chat_conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''"),
         ("summarized_upto_id", "ALTER TABLE chat_conversations ADD COLUMN summarized_upto_id BIGINT NOT NULL DEFAULT 0"),
         ("agent_type", "ALTER TABLE chat_conversations ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'chat'"),
-        ("archived", "ALTER TABLE chat_conversations ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"),
+        ("archived", "ALTER TABLE chat_conversations ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE"),
         ("plan_todos", "ALTER TABLE chat_conversations ADD COLUMN plan_todos TEXT NOT NULL DEFAULT ''"),
     ] {
         if !column_exists(db, "chat_conversations", col).await {
@@ -508,7 +520,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     for (col, ddl) in [
         ("embedding", "ALTER TABLE chat_memories ADD COLUMN embedding TEXT"),
         ("embed_model", "ALTER TABLE chat_memories ADD COLUMN embed_model TEXT"),
-        ("pinned", "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0"),
+        ("pinned", "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE"),
         // 记忆模块深化:分类 + 重要度/置信度打分 + 命中计数/时间衰减(检索排序与淘汰用)
         ("mem_type", "ALTER TABLE chat_memories ADD COLUMN mem_type TEXT NOT NULL DEFAULT 'other'"),
         ("importance", "ALTER TABLE chat_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3"),
@@ -534,7 +546,7 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         if let Err(e) = db
             .execute(Statement::from_string(
                 backend,
-                "ALTER TABLE authors ADD COLUMN is_blacklisted BOOLEAN NOT NULL DEFAULT 0"
+                "ALTER TABLE authors ADD COLUMN is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE"
                     .to_owned(),
             ))
             .await

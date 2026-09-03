@@ -384,12 +384,12 @@ export function ContentLibraryPage({
         prev.flatMap((x) => {
           const p = batch.get(x.id);
           if (!p) return [x];
-          // 提取文案进行中且本条转写成功:从列表移除(「成功一条消失一条」的渐进效果);
-          // 失败的保留在列表里,转写错误就地显示
+          // 提取文案进行中且本条转写完成:从列表移除(「成功一条消失一条」的渐进效果);
+          // transcript 非 null 即完成(含空串「空文案」标记);失败的保留在列表里,转写错误就地显示
           if (
             proc?.kind === "transcript" &&
             proc.ids.has(x.id) &&
-            (p.transcript ?? "").trim()
+            p.transcript != null
           ) {
             return [];
           }
@@ -732,6 +732,9 @@ export function ContentLibraryPage({
       );
       if (res.transcript) {
         toast.success("文案已重新转写");
+      } else if (res.transcript === "") {
+        // 空串 = 转写成功但未识别到语音(空文案标记),不是失败
+        toast.info("转写完成 · 未识别到语音,已标记空文案");
       } else {
         toast.error(
           `转写仍失败${res.transcriptError ? `: ${res.transcriptError}` : ""}`,
@@ -960,8 +963,9 @@ export function ContentLibraryPage({
                     重新拉取素材
                   </DropdownMenuItem>
                 )}
-                {/* 文案未转写(含当时缺 API Key 被跳过的)或转写失败,且有音频:只重跑语音转写 */}
-                {!c.transcript && c.audioPath && (
+                {/* 文案未转写(含当时缺 API Key 被跳过的)或转写失败,且有音频:只重跑语音转写;
+                    空串「空文案」是已转写标记,不提供重试入口 */}
+                {c.transcript == null && c.audioPath && (
                   <DropdownMenuItem
                     disabled={retryingTranscript.has(c.id)}
                     onClick={() => handleRetryTranscript(c)}

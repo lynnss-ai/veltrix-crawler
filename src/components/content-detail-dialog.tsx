@@ -3,7 +3,7 @@
 // 图文:「概览」= 素材瀑布全图 + 作者卡 + 内容卡;「文案与评论」= 文案 + 评论双栏。
 // 素材点开看大图、方向键浏览,看完可续看下一个。
 // 键盘:大图未开时 ←/→ 切上一篇/下一篇;大图打开时 ←/→ 翻图(可跨内容续看)。
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -179,6 +179,7 @@ const STEP_SUCCESS_CLS: Record<string, string> = {
   视频: "bg-sky-100 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300",
   音频: "bg-violet-100 text-violet-700 dark:bg-violet-950/60 dark:text-violet-300",
   文案: "bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300",
+  空文案: "bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300",
   图片: "bg-teal-100 text-teal-700 dark:bg-teal-950/60 dark:text-teal-300",
   评论: "bg-blue-100 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300",
   意向: "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/60 dark:text-fuchsia-300",
@@ -292,9 +293,16 @@ export function ContentDetailDialog({
   const [detail, setDetail] = useState<ContentDetailView | null>(null);
   const [loading, setLoading] = useState(false);
   const [monitoring, setMonitoring] = useState(false);
-  // 右侧评论栏:当前内容的评论列表(点赞倒序)
+  // 右侧评论栏:当前内容的评论列表(点赞倒序,游标分页「加载更多」)
   const [comments, setComments] = useState<CommentView[]>([]);
+  // 该内容评论总数(标题展示;首屏响应才带)
+  const [commentsTotal, setCommentsTotal] = useState<number | null>(null);
+  // 下一页游标;null = 已到底,隐藏「加载更多」
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [commentsLoading, setCommentsLoading] = useState(false);
+  const [commentsLoadingMore, setCommentsLoadingMore] = useState(false);
+  // 请求竞态保护:快速切上一篇/下一篇时,过期响应(序号不匹配)直接丢弃
+  const commentsReqSeq = useRef(0);
   // 正文分页(仅图文等非视频内容):overview=素材 + 作者/内容卡;text=文案与评论通栏双栏。
   // 视频不分页(单屏三栏),该状态不影响视频;切上一篇/下一篇时保持当前页
   const [page, setPage] = useState<"overview" | "text">("overview");
@@ -321,22 +329,61 @@ export function ContentDetailDialog({
       .finally(() => setLoading(false));
   }, [activeId]);
 
-  // 评论栏:随内容切换加载该内容的评论(与详情并行,互不阻塞)
+  // 评论栏:随内容切换加载首页评论(与详情并行,互不阻塞);分页由「加载更多」续拉
   useEffect(() => {
     if (!activeId) {
       setComments([]);
+      setCommentsTotal(null);
+      setNextCursor(null);
       return;
     }
+    const seq = ++commentsReqSeq.current;
+    // 切换内容先清空旧列表,避免上一篇的评论在新内容加载期间闪显
+    setComments([]);
+    setCommentsTotal(null);
+    setNextCursor(null);
     setCommentsLoading(true);
     api
       .listContentComments(activeId)
-      .then(setComments)
+      .then((page) => {
+        if (seq !== commentsReqSeq.current) return; // 已切到其他内容,丢弃过期响应
+        setComments(page.items);
+        setCommentsTotal(page.total);
+        setNextCursor(page.nextCursor);
+      })
       .catch((e) => {
+        if (seq !== commentsReqSeq.current) return;
         console.warn("加载评论失败:", e);
         setComments([]);
+        setCommentsTotal(null);
       })
-      .finally(() => setCommentsLoading(false));
+      .finally(() => {
+        if (seq === commentsReqSeq.current) setCommentsLoading(false);
+      });
   }, [activeId]);
+
+  // 「加载更多」:按游标续拉下一页并追加到列表末尾
+  const loadMoreComments = () => {
+    if (!activeId || !nextCursor || commentsLoadingMore) return;
+    const seq = commentsReqSeq.current; // 沿用当前内容的序号,内容切换后旧页响应被丢弃
+    setCommentsLoadingMore(true);
+    api
+      .listContentComments(activeId, nextCursor)
+      .then((page) => {
+        if (seq !== commentsReqSeq.current) return;
+        setComments((prev) => [...prev, ...page.items]);
+        setCommentsTotal(page.total);
+        setNextCursor(page.nextCursor);
+      })
+      .catch((e) => {
+        if (seq !== commentsReqSeq.current) return;
+        console.warn("加载更多评论失败:", e);
+        toast.error(`加载更多评论失败: ${e}`);
+      })
+      .finally(() => {
+        if (seq === commentsReqSeq.current) setCommentsLoadingMore(false);
+      });
+  };
 
   const content = detail?.content;
   const author = detail?.author;
@@ -488,6 +535,10 @@ export function ContentDetailDialog({
         >
           {content?.transcript ? (
             content.transcript
+          ) : content?.transcript === "" ? (
+            <span className="text-muted-foreground">
+              转写完成,未识别到语音(空文案)
+            </span>
           ) : (
             <span className="text-muted-foreground">
               {loading && !content
@@ -522,7 +573,7 @@ export function ContentDetailDialog({
     <div className={`flex ${widthCls} shrink-0 flex-col border-l`}>
       <div className="flex items-center gap-1.5 border-b px-3 py-2 text-sm font-medium text-muted-foreground">
         <MessagesSquare className="size-4" />
-        评论 · {comments.length}
+        评论 · {commentsTotal ?? comments.length}
         {commentsLoading && <Loader2 className="size-3.5 animate-spin" />}
       </div>
       <div className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto">
@@ -577,6 +628,23 @@ export function ContentDetailDialog({
               </div>
             </div>
           ))
+        )}
+        {/* 游标分页:还有下一页时显示「加载更多」,已到底不显示 */}
+        {nextCursor && (
+          <div className="flex justify-center border-t px-3 py-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="cursor-pointer text-xs text-muted-foreground"
+              disabled={commentsLoadingMore}
+              onClick={loadMoreComments}
+            >
+              {commentsLoadingMore && (
+                <Loader2 className="size-3.5 animate-spin" />
+              )}
+              加载更多(已显示 {comments.length} / {commentsTotal ?? "…"})
+            </Button>
+          </div>
         )}
       </div>
     </div>
@@ -970,9 +1038,11 @@ export function ContentDetailDialog({
                             errorTip={content.mediaError}
                           />
                           <StateBadge
-                            label="文案"
+                            label={
+                              content.transcript === "" ? "空文案" : "文案"
+                            }
                             state={
-                              content.transcript
+                              content.transcript != null
                                 ? true
                                 : content.transcriptError
                                   ? false

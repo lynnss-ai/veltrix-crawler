@@ -71,7 +71,11 @@ pub async fn transcribe(req: TranscribeRequest<'_>) -> Result<TranscribeOutcome>
     }
     // GLM 仅接受 wav/mp3 且时长 ≤30s;MiMo 同样只认 wav/mp3(400: input_audio.format must be one of wav, mp3)。
     let (audio_path, converted) = prepare_asr_audio(&req).await?;
-    let result = transcribe_inner(&req, &audio_path).await;
+    let result = transcribe_inner(&req, &audio_path)
+        .await
+        // 审核类错误统一在此改写为友好提示。切片路径的 1301 已在 transcribe_chunked 内
+        // 按段跳过(不会传到这里);能到这儿的审核错误只有单段直传路径。
+        .map_err(content_filter_hint);
     // 转码临时文件无论成败都清理(失败忽略,不影响转写结果)
     if let Some(path) = converted {
         let _ = tokio::fs::remove_file(&path).await;
@@ -134,7 +138,8 @@ pub async fn transcribe_stream(
     if let Some(path) = converted {
         let _ = tokio::fs::remove_file(&path).await;
     }
-    let (text, usage) = result?;
+    // 流式无切片路径,审核类错误整体失败,同样改写为友好提示
+    let (text, usage) = result.map_err(content_filter_hint)?;
     Ok(TranscribeOutcome {
         text,
         usages: vec![usage],
@@ -294,6 +299,10 @@ async fn transcribe_single(
 
 /// 大音频转写:VAD 语音间隙优先切片(降级:静音探测 → 按时长硬切)→ 逐段转写 → 按时间序拼接。
 /// 切片为临时产物,无论成败都清理;任一段失败则整体失败(已转文本不留,避免半截文案)。
+/// 例外:内容安全审核拦截(智谱 1301 等)是确定性拒绝,重试无用——跳过该段、
+/// 文内留缺段标记,保住其余段结果,避免整篇因一段敏感内容永远无法转写。
+/// 全部切片返回空文本不算失败:请求都成功、只是未识别到语音(纯音乐/静音视频),
+/// 返回空串由调用方按「空文案」落库(transcript 空串标记,区别于 NULL 未转写)。
 async fn transcribe_chunked(
     req: &TranscribeRequest<'_>,
     audio_path: &Path,
@@ -327,17 +336,43 @@ async fn transcribe_chunked(
         let mut usages: Vec<TokenUsage> = Vec::with_capacity(total);
         // 逐段串行:外层 transcribe_for_contents 已按配置的内容并发数在飞,段内再并发会打爆 ASR rate limit
         for (idx, chunk) in chunks.iter().enumerate() {
-            let (text, usage) = transcribe_single(req, chunk).await.map_err(|e| {
-                CrawlerError::Config(format!("第 {}/{total} 段转写失败: {e}", idx + 1))
-            })?;
-            usages.push(usage);
-            let text = text.trim();
-            if !text.is_empty() {
-                texts.push(text.to_string());
+            // 发送前兜底:切片阶段的退化过滤(media 层)可能漏掉容器时长虚高的尾段碎片,
+            // 这里再按真实解码时长拦一道——碎片送 ASR 会被智谱按参数错误拒(1210),直接跳过
+            if !chunk_is_sendable(chunk, req.ffmpeg_path).await {
+                tracing::warn!(chunk = idx + 1, total, "切片过短,发送前跳过(不送 ASR)");
+                continue;
+            }
+            match transcribe_single(req, chunk).await {
+                Ok((text, usage)) => {
+                    usages.push(usage);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        texts.push(text.to_string());
+                    }
+                }
+                Err(e) if is_content_filter_block(&e) => {
+                    // 内容安全审核拦截是确定性拒绝(重试无用):跳过该段、文内留缺段标记,
+                    // 保住其余段。请求已发出照常计费,usage 补 0 保持「请求次数」口径
+                    tracing::warn!(chunk = idx + 1, total, "该段被厂商内容安全审核拦截,跳过本段");
+                    usages.push(TokenUsage::default());
+                    texts.push(format!("[第 {} 段被平台内容安全审核拦截,本段缺失]", idx + 1));
+                }
+                Err(e) => {
+                    // 带上切片体积:1210 类「参数有误」多与切片本身(过短/空壳)相关,便于排查
+                    let size = std::fs::metadata(chunk).map(|m| m.len()).unwrap_or(0);
+                    return Err(CrawlerError::Config(format!(
+                        "第 {}/{total} 段转写失败(切片 {size} 字节): {e}",
+                        idx + 1
+                    )));
+                }
             }
         }
         if texts.is_empty() {
-            return Err(CrawlerError::Config("切片转写无有效文本".into()));
+            tracing::info!(chunks = total, "切片转写完成:各段均未识别到语音(空文案)");
+            return Ok(TranscribeOutcome {
+                text: String::new(),
+                usages,
+            });
         }
         Ok(TranscribeOutcome {
             text: texts.join("\n"),
@@ -348,6 +383,42 @@ async fn transcribe_chunked(
     // 清理切片临时目录(失败忽略,不影响转写结果)
     let _ = tokio::fs::remove_dir_all(&dir).await;
     result
+}
+
+/// 切片发送前最小体积(字节):与 media 层 MIN_CHUNK_BYTES 同口径,<2KB 是「只有封装头的空壳」。
+const MIN_SEND_CHUNK_BYTES: u64 = 2048;
+/// 切片发送前最小真实解码时长(秒):与 media 层 MIN_DECODED_CHUNK_SECS 同口径。
+const MIN_SEND_CHUNK_SECS: f64 = 0.5;
+/// 体积超过该值(96kbps ≈ 2s)必然时长达标,跳过解码探测省一次 ffmpeg 进程。
+const SEND_CHUNK_PROBE_MAX_BYTES: u64 = 24 * 1024;
+
+/// 切片发送 ASR 前的体积/时长检查(media 层切完过滤之后的第二道保险):
+/// 容器时长虚高的尾段碎片(真实解码 0.2s 左右)送智谱会被 1210 拒,直接跳过。
+/// 探测失败保守放行(与 media 层口径一致:宁多送一次,不因探测异常丢内容)。
+async fn chunk_is_sendable(chunk: &Path, ffmpeg_path: Option<&str>) -> bool {
+    let size = tokio::fs::metadata(chunk)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if size < MIN_SEND_CHUNK_BYTES {
+        return false;
+    }
+    if size > SEND_CHUNK_PROBE_MAX_BYTES {
+        return true;
+    }
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg")
+        .to_string();
+    let chunk = chunk.to_path_buf();
+    // ffmpeg 同步解码探测,包在 spawn_blocking 避免阻塞 tokio 工作线程
+    match tokio::task::spawn_blocking(move || crate::media::probe_decoded_seconds(&program, &chunk))
+        .await
+    {
+        Ok(Some(secs)) => secs >= MIN_SEND_CHUNK_SECS,
+        _ => true,
+    }
 }
 
 /// MiMo ASR 的 messages 载荷:内联 input_audio(base64 data url,不打印到日志,避免污染 + 泄露),
@@ -469,6 +540,27 @@ async fn mimo_transcribe_stream(
     Ok((full, usage))
 }
 
+/// 是否「内容安全审核拦截」错误(智谱 1301 / 响应带 contentFilter)。
+/// 这类拒绝由内容本身触发,是确定性的——区别于限流/网络抖动,重试无意义。
+fn is_content_filter_block(e: &CrawlerError) -> bool {
+    let msg = format!("{e}");
+    msg.contains("1301") || msg.contains("contentFilter")
+}
+
+/// 整体失败路径的 1301 提示改写:原始 400 响应体对用户不友好,
+/// 换成明确结论(审核拦截、重试无效、可换厂商);非审核类错误原样透传。
+/// 只能用在段级跳过(transcribe_chunked)之外——改写过文案后 code 字符串丢失,
+/// is_content_filter_block 将无法再识别它。
+fn content_filter_hint(e: CrawlerError) -> CrawlerError {
+    if is_content_filter_block(&e) {
+        CrawlerError::Config(
+            "厂商内容安全审核拦截:该音频(或其转写结果)被判定为敏感内容,重试无效;可改换其他转写厂商".into(),
+        )
+    } else {
+        e
+    }
+}
+
 /// 智谱 GLM ASR:走 `/audio/transcriptions`,multipart/form-data 上传文件
 /// (model + stream=false + file),非流式响应 JSON 的 `text` 字段即完整转写文本。
 /// 入参音频保证已是 mp3(见 transcribe 的转码预处理);接口单条 ≤25MB 且 ≤30s,
@@ -505,6 +597,9 @@ async fn glm_transcribe(
         true,
     )
     .await?;
+    // 注意:这里不做 content_filter_hint 改写——原始 400 响应体(含 code 1301 /
+    // contentFilter)要原样向上传播,transcribe_chunked 靠它识别「审核拦截」做段级跳过;
+    // 若在此改写,分类依据(错误码字符串)被抹掉,跳过逻辑永远不命中,整篇转写被一段拖垮。
     let body: serde_json::Value = resp
         .json()
         .await
@@ -656,6 +751,22 @@ fn glm_frame_delta(prev_frame: &str, frame: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_filter_block_detected() {
+        let e = CrawlerError::Config("智谱 GLM 语音转写 返回错误状态 400: {\"contentFilter\":[{\"level\":1,\"role\":\"assistant\"}],\"error\":{\"code\":\"1301\",\"message\":\"...\"}}".into());
+        assert!(is_content_filter_block(&e));
+        let other = CrawlerError::Config("智谱 GLM 语音转写 返回错误状态 400: {\"error\":{\"code\":\"1210\"}}".into());
+        assert!(!is_content_filter_block(&other));
+        // 提示改写只作用于审核类错误
+        let hinted = content_filter_hint(e);
+        assert!(format!("{hinted}").contains("审核拦截"));
+        // 回归:改写后 code 字符串丢失、不能再被分类器命中——
+        // 分类(段级跳过)必须在改写之前完成,否则 1301 段永远走「整体失败」
+        assert!(!is_content_filter_block(&hinted));
+        let passthrough = content_filter_hint(other);
+        assert!(format!("{passthrough}").contains("1210"));
+    }
 
     #[test]
     fn sse_data_extracts_payload() {

@@ -77,6 +77,8 @@ pub struct Model {
     pub comment_collected: Option<bool>,
     /// 是否已做意向分析(意向分析后回写);None=未分析
     pub intent_analyzed: Option<bool>,
+    /// 视频文件本地落盘路径(任务开「保留视频」时下载留存,发布服务复用该素材);None=未落盘
+    pub video_path: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

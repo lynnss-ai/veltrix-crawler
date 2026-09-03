@@ -26,8 +26,9 @@ const DEFAULT_SCROLL_INTERVAL_MS: u64 = 1500;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 8000;
 /// 默认拟人滚动分段数:一次翻页拆成多段小幅滚动,比一次到底更接近真人。
 const DEFAULT_SCROLL_SEGMENTS: u32 = 4;
-/// 默认数据库连接池上限。
-const DEFAULT_DB_MAX_CONNECTIONS: u32 = 8;
+/// 默认数据库连接池上限。8 在「采集写库 + 转写回写 + 前端轮询 + 内嵌 HTTP API」并发下
+/// 会被打满(查询排队超 acquire 超时即报 pool timed out);WAL 下读可并发,放宽到 16。
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 16;
 
 /// 【已弃用】单平台限速与退避策略,全仓库无引用,保留仅兼容旧配置文件反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +420,63 @@ pub struct PlatformConfig {
     pub extra: serde_json::Value,
 }
 
+/// 单个发布平台的配置(发布服务独立平台清单,与采集平台表 `platforms` 平行但互不复用)。
+///
+/// 发布平台登录页是各家的**创作者中心**,与采集登录态(主站)是两套体系、刻意分离;
+/// 即使与采集站同域 Cookie 不共享也没关系——发布窗口用 `veltrix-pub-` 前缀 label,
+/// 数据目录与采集账号隔离,登录态按发布账号独立持久化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishPlatformConfig {
+    /// 平台唯一 ID(如 "wechat_channels" / "xhs");与采集平台 id 相同的纯属巧合,不互相引用。
+    pub id: String,
+    /// 展示名。
+    pub name: String,
+    /// 创作者中心登录页地址:用户在可见 WebView 内完成登录。
+    pub login_url: String,
+    /// 是否启用。停用后不再出现在「新增发布账号」的平台下拉里,但已有账号保留。
+    pub enabled: bool,
+    /// 登录态真实检测配置(登录窗口内自检);全空则跳过检测、沿用乐观行为。
+    #[serde(default)]
+    pub login_check: LoginCheckConfig,
+}
+
+/// 内置发布平台清单(顺序即前端展示顺序)。登录页均为各家创作者中心;
+/// 视频号只有发布侧、无对应采集平台。login_check 复用 `builtin_login_check` 的通用选择器
+/// 作为开箱起点(登录 CTA 文案中文平台间通用),真实页面结构需本机核对后调整。
+fn builtin_publish_platforms() -> Vec<PublishPlatformConfig> {
+    let item = |id: &str, name: &str, login_url: &str| PublishPlatformConfig {
+        id: id.to_string(),
+        name: name.to_string(),
+        login_url: login_url.to_string(),
+        enabled: true,
+        login_check: builtin_login_check(id),
+    };
+    let mut list = vec![
+        // 视频号助手:登录页以扫码为主,通用选择器里补一条扫码文案(需本机核对)
+        item(
+            "wechat_channels",
+            "视频号助手",
+            "https://channels.weixin.qq.com/login.html",
+        ),
+        item(
+            "xhs",
+            "小红书创作者平台",
+            "https://creator.xiaohongshu.com/login?selfLogout=true",
+        ),
+        item("douyin", "抖音创作者中心", "https://creator.douyin.com/"),
+        item(
+            "kuaishou",
+            "快手创作者服务平台",
+            "https://cp.kuaishou.com/profile",
+        ),
+    ];
+    list[0]
+        .login_check
+        .logged_out_texts
+        .push("微信扫码登录".to_string());
+    list
+}
+
 /// 远程上报配置。具体后端规格待用户提供,先做成可插拔占位。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportConfig {
@@ -579,6 +637,10 @@ impl Default for DatabaseConfig {
 pub struct AppConfig {
     /// 平台表,key 为平台 ID。用 BTreeMap 保证序列化顺序稳定、便于人工管理。
     pub platforms: BTreeMap<String, PlatformConfig>,
+    /// 发布平台清单(创作者中心登录),独立于采集平台表;Vec 顺序即展示顺序。
+    /// 旧配置文件无此字段时按内置默认补全,无需用户删档重建。
+    #[serde(default = "builtin_publish_platforms")]
+    pub publish_platforms: Vec<PublishPlatformConfig>,
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
@@ -651,6 +713,15 @@ impl AppConfig {
         match self.platforms.get(id) {
             Some(p) if p.enabled => Ok(p),
             Some(_) => Err(CrawlerError::Config(format!("平台已停用: {id}"))),
+            None => Err(CrawlerError::UnknownPlatform(id.to_string())),
+        }
+    }
+
+    /// 取启用中的发布平台配置(发布服务独立清单,不查采集平台表)。口径同 `platform()`。
+    pub fn publish_platform(&self, id: &str) -> Result<&PublishPlatformConfig> {
+        match self.publish_platforms.iter().find(|p| p.id == id) {
+            Some(p) if p.enabled => Ok(p),
+            Some(_) => Err(CrawlerError::Config(format!("发布平台已停用: {id}"))),
             None => Err(CrawlerError::UnknownPlatform(id.to_string())),
         }
     }
@@ -859,6 +930,7 @@ impl AppConfig {
         }
         Self {
             platforms,
+            publish_platforms: builtin_publish_platforms(),
             database: DatabaseConfig::default(),
             report: ReportConfig::default(),
             media: MediaConfig::default(),

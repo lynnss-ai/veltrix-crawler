@@ -1,26 +1,25 @@
-// 工作区(营销 / 对话 / 创作)排列顺序:存 localStorage,系统配置里可调,侧栏即时响应。
+// 侧栏服务(运营 / 对话 / 创作 / 发布服务)排列顺序:存 localStorage,系统设置里可调,侧栏即时响应。
 import { useEffect, useState } from "react";
-import type { Workspace } from "@/components/app-sidebar";
+import type { ServiceKey } from "@/components/app-sidebar";
 
 const STORAGE_KEY = "veltrix.workspace.order";
 // 改动后用自定义事件通知同窗口的侧栏即时刷新(localStorage 的 storage 事件只跨窗口触发)
 const CHANGE_EVENT = "veltrix-workspace-order-changed";
-// 合法工作区集合,数组顺序即默认顺序
-const ALL: Workspace[] = ["management", "chat", "cowork"];
+// 合法服务集合,数组顺序即默认顺序。服务栏只平铺工作区(运营/对话/创作);
+// 发布服务是独立产品、不进服务栏,入口在 Logo 右侧「切换平台」。
+const ALL: ServiceKey[] = ["management", "chat", "cowork", "publish"];
 
-/** 读取保存的工作区顺序;缺失 / 损坏 / 与合法集合不符时回退默认顺序。 */
-export function readWorkspaceOrder(): Workspace[] {
+/** 读取保存的服务顺序;缺失 / 损坏时回退默认顺序。 */
+export function readWorkspaceOrder(): ServiceKey[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const arr = JSON.parse(raw) as Workspace[];
-      // 必须恰好覆盖全部合法 key(防止增删工作区后旧配置残缺)
-      if (
-        Array.isArray(arr) &&
-        arr.length === ALL.length &&
-        ALL.every((k) => arr.includes(k))
-      ) {
-        return arr;
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        // 容忍性合并:保留已保存的合法顺序,后来新增的服务按默认序补尾——
+        // 老配置(如只有 3 个工作区)不因服务增加而整体失效
+        const kept = arr.filter((k): k is ServiceKey => ALL.includes(k));
+        return [...kept, ...ALL.filter((k) => !kept.includes(k))];
       }
     }
   } catch {
@@ -29,8 +28,8 @@ export function readWorkspaceOrder(): Workspace[] {
   return ALL;
 }
 
-/** 持久化工作区顺序并广播变更事件。 */
-export function writeWorkspaceOrder(order: Workspace[]): void {
+/** 持久化服务顺序并广播变更事件。 */
+export function writeWorkspaceOrder(order: ServiceKey[]): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(order));
   } catch {
@@ -39,9 +38,9 @@ export function writeWorkspaceOrder(order: Workspace[]): void {
   window.dispatchEvent(new Event(CHANGE_EVENT));
 }
 
-/** 响应式工作区顺序:系统配置改动经自定义事件即时同步到侧栏。 */
-export function useWorkspaceOrder(): [Workspace[], (order: Workspace[]) => void] {
-  const [order, setOrder] = useState<Workspace[]>(readWorkspaceOrder);
+/** 响应式服务顺序:系统设置改动经自定义事件即时同步到侧栏。 */
+export function useWorkspaceOrder(): [ServiceKey[], (order: ServiceKey[]) => void] {
+  const [order, setOrder] = useState<ServiceKey[]>(readWorkspaceOrder);
   useEffect(() => {
     const sync = () => setOrder(readWorkspaceOrder());
     window.addEventListener(CHANGE_EVENT, sync);
@@ -51,7 +50,7 @@ export function useWorkspaceOrder(): [Workspace[], (order: Workspace[]) => void]
       window.removeEventListener("storage", sync);
     };
   }, []);
-  const update = (next: Workspace[]) => {
+  const update = (next: ServiceKey[]) => {
     writeWorkspaceOrder(next);
     setOrder(next);
   };

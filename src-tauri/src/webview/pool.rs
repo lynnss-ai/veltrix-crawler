@@ -14,7 +14,7 @@
 //!
 //! `CollectBridge` 在池之上对外暴露「关键词 → 拦截到的接口响应集合」的统一采集调用。
 
-use veltrix_core::config::{CollectConfig, PlatformConfig, RpaStep};
+use veltrix_core::config::{CollectConfig, PlatformConfig, PublishPlatformConfig, RpaStep};
 use veltrix_core::error::{CrawlerError, Result};
 use crate::adapter::{FetchContext, PlatformAdapter};
 use crate::model::TaskKind;
@@ -581,6 +581,13 @@ pub(crate) fn window_label(platform: &str, account_id: &str) -> String {
     format!("veltrix-{platform}-{account_id}")
 }
 
+/// 发布账号登录窗口标签:保留 `veltrix-` 前缀以命中 capabilities 的 `veltrix-*` 通配
+/// (远程平台页面 invoke 回传登录态),中间 `-pub-` 段与采集账号窗口区隔——
+/// 数据目录按 label 派生,故发布账号与采集账号的登录态目录天然隔离。
+pub(crate) fn publish_window_label(platform: &str, account_id: &str) -> String {
+    format!("veltrix-pub-{platform}-{account_id}")
+}
+
 /// 采集窗口标签:按「平台 + 账号 + 任务」唯一,任务间互不共用窗口(串数据/串日志的根因修复)。
 /// 登录窗口仍用 `window_label`(按账号);任务内多关键词/评论/定向复用同一任务窗口。
 pub(crate) fn collect_window_label(platform: &str, account_id: &str, task_id: &str) -> String {
@@ -841,6 +848,10 @@ struct WindowSpec<'a> {
     title: &'a str,
     /// 登录态自检脚本(登录窗口注入,周期性回传登录态);None=不检测。
     login_check_script: Option<String>,
+    /// 强制窗口 label(同时作为数据目录派生依据)。None = 按平台/账号/任务推导(采集路径);
+    /// 发布账号登录窗口用 `veltrix-pub-` 前缀 label,与采集账号数据目录隔离。
+    /// 采集路径一律传 None,行为零变化。
+    label_override: Option<&'a str>,
 }
 
 /// 可见 WebView 池。`tauri::WebviewWindow` 是 `Clone` 句柄,可安全跨任务持有。
@@ -869,7 +880,10 @@ impl WebviewPool {
     /// 确保指定窗口存在;已存在则复用(保留登录态)。
     /// 采集窗口(spec.task_id 非空)按任务级 label;登录 / 访问平台窗口按账号级 label。
     fn ensure_window(&self, app: &AppHandle, spec: &WindowSpec<'_>) -> Result<WebviewWindow> {
-        let label = task_window_label(spec.platform, spec.account_id, spec.task_id);
+        let label = spec
+            .label_override
+            .map(str::to_string)
+            .unwrap_or_else(|| task_window_label(spec.platform, spec.account_id, spec.task_id));
 
         // 任务级采集窗口与账号级(登录)窗口共用同一 WebView2 用户数据目录,两窗并存可能冲突;
         // 开采集窗前先接管——关掉该账号的账号级窗口(此前采集本就复用登录窗口本身,等价行为)。
@@ -919,7 +933,11 @@ impl WebviewPool {
         // 每账号独立用户数据目录,隔离 Cookie / 登录态(WebView2 在 Windows 生效)。
         // 注意:数据目录始终按**账号级** label 派生——登录态在账号目录里,任务级采集窗口
         // 必须共用同一账号目录,绝不能按任务分目录(会丢登录态且目录膨胀)。
-        let account_label = window_label(spec.platform, spec.account_id);
+        // label_override(发布账号登录窗)时按覆盖 label 派生,与采集账号目录隔离。
+        let account_label = spec
+            .label_override
+            .map(str::to_string)
+            .unwrap_or_else(|| window_label(spec.platform, spec.account_id));
         let data_dir = self.account_data_dir(app, &account_label)?;
         tracing::info!(
             label = %label,
@@ -1195,6 +1213,8 @@ impl WebviewPool {
             with_hud: false,
             title: &title,
             login_check_script: login_check_script.clone(),
+            // 采集登录窗口按账号级 label 派生,不覆盖
+            label_override: None,
         };
         tracing::info!(
             platform,
@@ -1208,6 +1228,60 @@ impl WebviewPool {
             .map_err(|e| CrawlerError::Config(format!("显示窗口失败: {e}")))?;
         // 复用已存在窗口时 initialization_script 不会重挂,这里对当前页面补一次 eval,
         // 确保「再次点登录复用旧窗口」也能立即开始自检
+        if let Some(script) = &login_check_script {
+            let _ = window.eval(script);
+        }
+        Ok(window)
+    }
+
+    /// 打开发布账号的登录窗口。与 `open_login` 的差别:
+    /// ① 配置取自发布平台清单(创作者中心登录页),非采集平台表;
+    /// ② 窗口 label / 数据目录用 `veltrix-pub-` 前缀(label_override),与采集账号隔离;
+    /// ③ 登录自检上报的 account_id 带 `pub:` 前缀,`login_status_report` 据此路由到
+    ///    发布账号池而非采集账号池。采集路径完全不经此函数,行为零变化。
+    pub fn open_login_publish(
+        &self,
+        app: &AppHandle,
+        platform: &str,
+        account_id: &str,
+        account_label: &str,
+        cfg: &PublishPlatformConfig,
+    ) -> Result<WebviewWindow> {
+        let label = publish_window_label(platform, account_id);
+        let title = format!("发布登录 {} - {}", cfg.name, account_label);
+        let login_check_script = if cfg.login_check.is_enabled() {
+            Some(crate::webview::build_login_check_script(
+                &format!("{}{account_id}", crate::publish::LOGIN_REPORT_PREFIX),
+                &cfg.login_check.logged_in_selectors,
+                &cfg.login_check.logged_out_texts,
+                &cfg.login_check.login_cookie_names,
+            ))
+        } else {
+            None
+        };
+        let spec = WindowSpec {
+            platform,
+            account_id,
+            task_id: None,
+            initial_url: &cfg.login_url,
+            // 发布登录页是创作者中心,不做接口拦截(发布侧无采集适配器)
+            patterns: &[],
+            // 登录窗口不是采集,不注入采集 HUD 浮层
+            with_hud: false,
+            title: &title,
+            login_check_script: login_check_script.clone(),
+            label_override: Some(&label),
+        };
+        tracing::info!(
+            platform,
+            account_id,
+            login_url = %cfg.login_url,
+            "打开发布账号登录窗口"
+        );
+        let window = self.ensure_window(app, &spec)?;
+        window
+            .show()
+            .map_err(|e| CrawlerError::Config(format!("显示窗口失败: {e}")))?;
         if let Some(script) = &login_check_script {
             let _ = window.eval(script);
         }
@@ -1652,6 +1726,8 @@ impl CollectBridge {
             with_hud: true,
             title: &title,
             login_check_script: None,
+            // 采集窗口按平台/账号/任务推导 label,不覆盖
+            label_override: None,
         };
         let window = self.pool.ensure_window(app, &spec)?;
 

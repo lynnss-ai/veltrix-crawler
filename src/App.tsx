@@ -7,6 +7,7 @@ import {
   isOffNavPage,
   type PageKey,
   type ProductKey,
+  type ServiceKey,
   type Workspace,
 } from "@/components/app-sidebar";
 import { UserCenterPage } from "@/pages/UserCenterPage";
@@ -24,6 +25,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { CollectPage } from "@/pages/CollectPage";
 import type { TaskContentFilter } from "@/pages/collect-meta";
 import { AccountsPage } from "@/pages/AccountsPage";
+import { PublishAccountsPage } from "@/pages/PublishAccountsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IndustryPage } from "@/pages/IndustryPage";
 import { CustomersPage } from "@/pages/CustomersPage";
@@ -98,6 +100,22 @@ function renderPage(
       return <CollectPage onNavigate={onNavigate} />;
     case "accounts":
       return <AccountsPage currentUser={loggedUser.username} />;
+    case "publish-dashboard":
+      return (
+        <PlaceholderPage
+          title="数据大盘"
+          description="发布数据大盘建设中。后续汇总各客户账号的发布量、今日已发与账号状态。"
+        />
+      );
+    case "publish-content":
+      return (
+        <PlaceholderPage
+          title="内容发布"
+          description="自动发布流程建设中。后续支持选择素材与客户账号,自动完成发布。"
+        />
+      );
+    case "publish-accounts":
+      return <PublishAccountsPage />;
     case "system-config":
       return <SettingsPage />;
     case "user-center":
@@ -242,16 +260,22 @@ function App() {
     setBootState("login");
   }
 
-  // 切换工作区时跳转到该工作区的默认页
-  function handleWorkspaceChange(next: Workspace) {
-    setWorkspace(next);
-    setActive(getWorkspaceDefaultPage(next));
-  }
-
   // 切换产品时整体跳到该产品默认落地页(本期不记忆各产品上次停留页)
   function handleProductChange(next: ProductKey) {
     setProduct(next);
     setActive(getProductDefaultPage(next));
+  }
+
+  // 服务统一切换(侧栏平铺 tab / Logo 右侧「切换平台」):运营/对话/创作属协作平台工作区,
+  // 发布服务是独立产品;从发布服务切回工作区时一并把产品切回协作平台
+  function handleServiceChange(next: ServiceKey) {
+    if (next === "publish") {
+      handleProductChange("publish");
+      return;
+    }
+    setProduct("crawler");
+    setWorkspace(next);
+    setActive(getWorkspaceDefaultPage(next));
   }
 
   // 数据穿透:从任务列表/详情跳全量库时携带的过滤上下文(按任务 / 单次运行);跳别处自动清空
@@ -407,7 +431,7 @@ function App() {
           product={product}
           onProductChange={handleProductChange}
           workspace={workspace}
-          onWorkspaceChange={handleWorkspaceChange}
+          onServiceChange={handleServiceChange}
           active={active}
           onChange={handleNavigate}
           user={loggedUser.username}

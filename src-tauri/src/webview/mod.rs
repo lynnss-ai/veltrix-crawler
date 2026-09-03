@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 pub mod cookies;
+pub mod cdp;
 pub mod filter_locate;
 pub mod native_intercept;
 pub mod pool;

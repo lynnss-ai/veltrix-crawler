@@ -164,6 +164,9 @@ export function TaskFormSheet({
   const [audioExtract, setAudioExtract] = useState(
     initial?.audioExtract ?? DEFAULT_STRATEGY.audioExtract,
   );
+  const [keepVideo, setKeepVideo] = useState(
+    initial?.keepVideo ?? DEFAULT_STRATEGY.keepVideo,
+  );
   const [aiExtract, setAiExtract] = useState(
     initial?.aiExtract ?? DEFAULT_STRATEGY.aiExtract,
   );
@@ -302,6 +305,7 @@ export function TaskFormSheet({
       minLikes: Math.max(0, Number(minLikes) || 0),
       // AI 文案提取依赖音频提取:开文案提取时强制带上音频提取(后端 upsert 同样兜底)
       audioExtract: audioExtract || aiExtract,
+      keepVideo,
       aiExtract,
       autoSyncObsidian,
       collectComments,
@@ -678,6 +682,23 @@ export function TaskFormSheet({
                 // AI 文案提取依赖音频提取,关闭音频时同步关闭文案提取
                 if (!v) setAiExtract(false);
               }}
+              className="scale-125"
+            />
+          </div>
+          {/* 保留视频:落盘 mp4 留存(发布服务复用素材用),纯下载不依赖 ffmpeg */}
+          <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+            <div className="space-y-0.5">
+              <Label htmlFor="task-keep-video" className="cursor-pointer">
+                保留视频
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                把采集到的视频下载保存到本地(占磁盘,供发布服务复用素材)
+              </p>
+            </div>
+            <Switch
+              id="task-keep-video"
+              checked={keepVideo}
+              onCheckedChange={setKeepVideo}
               className="scale-125"
             />
           </div>

@@ -45,20 +45,35 @@ pub struct MediaOutcome {
     pub avatar_path: Option<String>,
     /// 视频转出的音频(mp3)本地绝对路径,供后续语音转写读取;None=非视频/转码失败
     pub audio_path: Option<String>,
-    /// 视频文件是否下载成功(仅 video + 音频提取);None=非视频/未尝试
+    /// 保留视频(keep_video)落盘的本地绝对路径,供自动发布读取;None=未开/下载失败
+    pub video_path: Option<String>,
+    /// 视频文件是否下载成功(仅 video + 音频提取/保留视频);None=非视频/未尝试
     pub video_downloaded: Option<bool>,
     /// 图文图片总数 / 已成功下载数(仅 image)
     pub image_total: Option<i32>,
     pub image_done: Option<i32>,
 }
 
-/// 视频子流程结果:下载是否成功、音频是否提取成功、失败原因、音频路径。
+/// 任务级素材开关:从任务行透传到媒体阶段的处理策略,与单条内容无关。
+/// 聚成结构体而非平铺参数:process_content 参数本就偏多,逐项加开关会继续膨胀签名
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MediaSwitches {
+    /// 音频提取(视频转 mp3 留存);含 AI 文案提取隐含的音频需求
+    pub audio_extract: bool,
+    /// 保留视频文件:视频落盘到 video/ 目录供自动发布使用(与音频提取相互独立)
+    pub keep_video: bool,
+}
+
+/// 视频子流程结果:下载是否成功、音频是否提取成功、失败原因、音频/视频路径。
 struct VideoOutcome {
+    /// 主素材是否就绪:keep_video 开 = 视频已落盘;否则 = 音频提取成功
     downloaded: bool,
     audio_extracted: Option<bool>,
     error: Option<String>,
     /// 转出的音频本地路径(转码成功时填,供转写)
     audio_path: Option<String>,
+    /// 落盘的视频本地路径(keep_video 下载成功时填,供自动发布)
+    video_path: Option<String>,
 }
 
 /// output_dir 为空时的回退子目录名(相对配置目录)。
@@ -344,6 +359,64 @@ pub async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 视频落盘的防盗链上下文:Referer / 会话 Cookie / 代理配置,口径对齐 ffmpeg 拉流路径。
+/// 聚成结构体:三个都是可选的策略信息,平铺会让下载函数签名膨胀
+struct VideoFetchCtx<'a> {
+    referer: Option<&'a str>,
+    cookie: Option<&'a str>,
+    proxy_setting: &'a str,
+}
+
+/// 下载视频直链落盘(任务开 keep_video 时调用)。
+/// 为什么不用 download_to_file:视频 CDN(抖音/快手/小红书)强制校验 Referer + 完整 UA + 会话
+/// Cookie,download_to_file 只按 CDN 子串补 Referer,直接复用会整批 403;海外 CDN 还按地域
+/// 限制,需与 ffmpeg 拉流同源的代理。reqwest 只搬运不重封装,比 ffmpeg -c copy 快且保原文件。
+async fn download_video_file(url: &str, path: &Path, ctx: &VideoFetchCtx<'_>) -> Result<()> {
+    if url.trim().is_empty() {
+        return Err(CrawlerError::Parse("下载地址为空".into()));
+    }
+    // 海外 CDN 需要代理时现场建带代理的客户端(冷门路径,不进全局共享客户端);
+    // 国内 CDN 走共享客户端吃 keep-alive
+    let owned_client;
+    let client: &reqwest::Client = if url_needs_proxy(url) {
+        match resolve_proxy(ctx.proxy_setting) {
+            Some(proxy) => {
+                owned_client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+                    .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
+                    .proxy(
+                        reqwest::Proxy::all(&proxy)
+                            .map_err(|e| CrawlerError::Parse(format!("代理配置无效: {e}")))?,
+                    )
+                    .build()
+                    .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?;
+                &owned_client
+            }
+            None => DOWNLOAD_CLIENT
+                .as_ref()
+                .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?,
+        }
+    } else {
+        DOWNLOAD_CLIENT
+            .as_ref()
+            .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?
+    };
+    // 完整 UA 恒带:抖音 CDN 对「半成品 UA」直接 close TCP;Referer / Cookie 有则带
+    let mut req = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, BROWSER_UA);
+    if let Some(referer) = ctx.referer {
+        req = req.header(reqwest::header::REFERER, referer);
+    }
+    if let Some(ck) = ctx.cookie.map(str::trim).filter(|c| !c.is_empty()) {
+        req = req.header(reqwest::header::COOKIE, ck);
+    }
+    let resp = req.send().await?.error_for_status()?;
+    let bytes = resp.bytes().await?;
+    tokio::fs::write(path, &bytes).await?;
+    Ok(())
+}
+
 /// 同作者头像下载互斥(键:平台-uid):并发批量处理内容时,同作者的多条内容会同时发现
 /// 头像「不新鲜」而各自重复下载、互相覆盖写同一文件;加锁让首个任务下载,其余等锁后经
 /// 新鲜检查命中、直接复用。锁表随进程累积(每作者一个空 Mutex 的 Arc),量级可忽略。
@@ -452,11 +525,64 @@ pub fn extract_audio_from_url(
         ]);
     }
     cmd.arg(audio);
-    // 整体超时兜底:-rw_timeout 管单次 I/O 停滞,这里管总时长(长视频正常提取也就几分钟)。
-    // 超时杀子进程记失败——挂起的 ffmpeg 会占死 spawn_blocking 线程,10 路并发全挂即拖垮整个下载阶段
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    wait_ffmpeg(child, &cancel)
+}
+
+/// 从已落盘的本地视频文件抽音频(keep_video 与 audio_extract 同开时复用本地文件,免二次拉流)。
+/// 本地输入无需重连 / 防盗链头 / 代理,参数是 extract_audio_from_url 的精简子集;
+/// mp3 输出优化、取消与超时语义与拉流路径完全一致。
+pub fn extract_audio_from_file(
+    video: &Path,
+    audio: &Path,
+    ffmpeg_path: Option<&str>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<()> {
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg");
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
+    cmd.arg("-i").arg(video).arg("-vn"); // -vn 丢视频流,只保留音频
+    // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
+    let is_mp3 = audio
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("mp3"))
+        .unwrap_or(false);
+    if is_mp3 {
+        cmd.args([
+            "-acodec",
+            "libmp3lame",
+            "-ab",
+            "96k",
+            "-ar",
+            "22050",
+            "-ac",
+            "1",
+            "-threads",
+            "1",
+        ]);
+    }
+    cmd.arg(audio);
+    let child = cmd
+        .spawn()
+        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    wait_ffmpeg(child, &cancel)
+}
+
+/// 等待 ffmpeg 子进程退出:500ms 轮询,任务取消即强杀,超 FFMPEG_EXTRACT_MAX 兜底杀进程。
+/// 从拉流转音频抽出的公共等待逻辑,供「直链 / 本地文件」两种输入复用同一取消与超时语义。
+fn wait_ffmpeg(
+    mut child: std::process::Child,
+    cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<()> {
+    // 整体超时兜底:-rw_timeout 管单次 I/O 停滞,这里管总时长(长视频正常提取也就几分钟)。
+    // 超时杀子进程记失败——挂起的 ffmpeg 会占死 spawn_blocking 线程,并发全挂即拖垮整个下载阶段
     let deadline = std::time::Instant::now() + FFMPEG_EXTRACT_MAX;
     let status = loop {
         match child.try_wait() {
@@ -476,7 +602,7 @@ pub fn extract_audio_from_url(
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(CrawlerError::Parse(format!(
-                        "ffmpeg 拉流转音频超时(超过 {} 分钟),已终止",
+                        "ffmpeg 转音频超时(超过 {} 分钟),已终止",
                         FFMPEG_EXTRACT_MAX.as_secs() / 60
                     )));
                 }
@@ -487,7 +613,7 @@ pub fn extract_audio_from_url(
     };
     if !status.success() {
         return Err(CrawlerError::Parse(format!(
-            "ffmpeg 拉流转音频失败:{}",
+            "ffmpeg 转音频失败:{}",
             describe_ffmpeg_exit(status.code())
         )));
     }
@@ -567,6 +693,80 @@ struct SilenceRange {
     end: f64,
 }
 
+/// 退化切片体积下限(字节):归一化后 96kbps mp3 ≈ 12KB/秒,<2KB 意味着真实有效帧不足
+/// 0.2s —— 基本是「只有封装头的空壳」。mp3 容器时长是估算值,真实流可能更短,按估算时长
+/// 规划的尾段会切出这种空壳;送给 ASR 会被当参数错误拒(智谱 1210),故直接丢弃。
+const MIN_CHUNK_BYTES: u64 = 2048;
+/// 切片实际解码时长下限(秒):mp3 容器时长与实际流时长有偏差(VBR 估算 + 帧对齐),
+/// 「尾段保护」按容器时长规划出的 1s 尾段实际解码可能只有 0.2~0.3s,智谱网关按参数错误
+/// 拒收(1210)。故对体积偏小的切片再做一次解码探测,真实时长不足该值直接丢弃不送 ASR。
+const MIN_DECODED_CHUNK_SECS: f64 = 0.5;
+/// 需做解码时长探测的体积上限(字节):96kbps 下 24KB ≈ 2s,真实时长低于下限的碎片
+/// 体积必然在此范围内;更大的切片(≈25s 主段)直接放行,避免每段多跑一次 ffmpeg 解码。
+const PROBE_DURATION_MAX_BYTES: u64 = 24 * 1024;
+
+/// 丢弃退化切片(删文件 + 日志):避免空壳/超短切片送 ASR 被拒而拖垮整篇转写。
+/// 判定优先级:字节数过小必丢(空壳);体积偏小的再跑一次解码探测,真实音频时长
+/// 不足 MIN_DECODED_CHUNK_SECS 也丢(容器时长虚高的尾段碎片)。
+/// ffmpeg_path 为空回退系统 PATH——打包版走捆绑 ffmpeg,探测才不会静默失效。
+fn drop_degenerate_chunks(chunks: Vec<PathBuf>, ffmpeg_path: Option<&str>) -> Vec<PathBuf> {
+    let program = ffmpeg_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("ffmpeg");
+    chunks
+        .into_iter()
+        .filter(|p| {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            if size < MIN_CHUNK_BYTES {
+                tracing::warn!(path = %p.display(), size, "切片体积过小(疑为无有效帧的空壳),丢弃不送 ASR");
+                let _ = std::fs::remove_file(p);
+                return false;
+            }
+            if size <= PROBE_DURATION_MAX_BYTES {
+                if let Some(secs) = probe_decoded_seconds(&program, p) {
+                    if secs < MIN_DECODED_CHUNK_SECS {
+                        tracing::warn!(path = %p.display(), size, secs, "切片实际解码时长过短,丢弃不送 ASR");
+                        let _ = std::fs::remove_file(p);
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// 探测音频流的实际解码时长(秒):解码为 16kHz 16bit 单声道 PCM 到 stdout,
+/// 按输出字节数换算时长。不依赖 ffmpeg 的 `time=` 进度输出——短于 0.5s 的碎片
+/// 解码瞬间完成、进度行根本不打印(曾因此探测返回 None 而漏放碎片,智谱 1210)。
+/// 解码失败返回 None,由调用方保守放行。
+pub(crate) fn probe_decoded_seconds(program: &str, audio: &Path) -> Option<f64> {
+    let mut cmd = std::process::Command::new(program);
+    hide_console_window(&mut cmd);
+    let output = cmd
+        .arg("-hide_banner")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(audio)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // 16kHz 单声道 16bit:s16le 每样本 2 字节,字节数 / 2 / 16000 = 秒
+    Some(output.stdout.len() as f64 / 2.0 / 16000.0)
+}
+
 /// 语音间隙优先切片(ASR 用):先 WebRTC VAD 逐帧判定人声,把连续非人声 ≥0.5s 的区间作为
 /// 可切间隙(BGM 不算人声,带背景音乐的视频也能找到句间缝隙);VAD 失败/全程无间隙时降级
 /// silencedetect 能量静音探测,仍无结果回退 `split_audio` 按时长硬切,保证任何音频都有产出。
@@ -582,8 +782,10 @@ pub fn split_audio_for_asr(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .unwrap_or("ffmpeg");
-    // 探测 / 时长读取 / 切点规划任一步失败都沿「VAD → 静音 → 硬切」回退,行为不差于原硬切逻辑
-    let fallback = || split_audio(audio, out_dir, max_seconds, ffmpeg_path);
+    // 探测 / 时长读取 / 切点规划任一步失败都沿「VAD → 静音 → 硬切」回退,行为不差于原硬切逻辑;
+    // 两条路径产出的切片都过一道退化过滤(空壳切片不送 ASR)
+    let fallback =
+        || split_audio(audio, out_dir, max_seconds, ffmpeg_path).map(|c| drop_degenerate_chunks(c, ffmpeg_path));
     let gaps = match detect_speech_gaps(program, audio) {
         Ok(g) if !g.is_empty() => g,
         other => {
@@ -615,12 +817,14 @@ pub fn split_audio_for_asr(
     if cuts.is_empty() {
         return fallback();
     }
-    cut_audio_at(program, audio, out_dir, &cuts).or_else(|e| {
-        tracing::warn!("按语音间隙切片失败({e}),回退按时长硬切");
-        // 清掉可能已产出的半成品切片,避免与硬切产物混在同一目录被一起收走
-        let _ = std::fs::remove_dir_all(out_dir);
-        fallback()
-    })
+    cut_audio_at(program, audio, out_dir, &cuts)
+        .or_else(|e| {
+            tracing::warn!("按语音间隙切片失败({e}),回退按时长硬切");
+            // 清掉可能已产出的半成品切片,避免与硬切产物混在同一目录被一起收走
+            let _ = std::fs::remove_dir_all(out_dir);
+            fallback()
+        })
+        .map(|c| drop_degenerate_chunks(c, ffmpeg_path))
 }
 
 /// VAD 帧长:WebRTC VAD 只接受 10/20/30ms 帧,取 30ms(判定次数最少,精度足够)。
@@ -812,6 +1016,8 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
 /// 规划切点(纯函数,便于单测):沿时间轴贪心,每段在不超过 max_secs 的前提下
 /// 切在「最后一个可用静音中点」;该区间内无静音则硬切一刀兜底,保证不超上限。
 /// 返回切点绝对时间(升序);总时长不超过上限时返回空(无需切)。
+/// 尾段保护:切完剩余不足 MIN_CHUNK_SECS 时放弃这一刀,尾巴并入前段(略超 max_secs),
+/// 避免产出不足 1 秒的碎片段被 ASR 拒(智谱 1210)。
 fn plan_silence_cuts(duration: f64, max_secs: f64, silences: &[SilenceRange]) -> Vec<f64> {
     let midpoints: Vec<f64> = silences
         .iter()
@@ -821,14 +1027,28 @@ fn plan_silence_cuts(duration: f64, max_secs: f64, silences: &[SilenceRange]) ->
     let mut start = 0.0;
     while duration - start > max_secs {
         let deadline = start + max_secs;
+        // 静音中点需同时满足:距段首 ≥MIN(不切碎头)、不超死线、切完尾巴 ≥MIN(不碎尾)——
+        // 不足 1s 的碎片段(叠加 -c copy 帧对齐后可能几乎没有有效帧)会被 ASR 当参数错误拒(智谱 400/1210)
         let pick = midpoints
             .iter()
             .copied()
-            .filter(|&m| m > start + MIN_CHUNK_SECS && m <= deadline)
+            .filter(|&m| {
+                m > start + MIN_CHUNK_SECS && m <= deadline && duration - m >= MIN_CHUNK_SECS
+            })
             .last();
-        let cut = pick.unwrap_or(deadline);
-        cuts.push(cut);
-        start = cut;
+        match pick {
+            Some(cut) => {
+                cuts.push(cut);
+                start = cut;
+            }
+            // 硬切会留下 <1s 碎尾时放弃这一刀,尾巴并入本段:
+            // 只略超 max_secs,仍在厂商硬上限内(GLM 25s+1s ≪ 30s 上限)
+            None if duration - deadline < MIN_CHUNK_SECS => break,
+            None => {
+                cuts.push(deadline);
+                start = deadline;
+            }
+        }
     }
     cuts
 }
@@ -934,17 +1154,17 @@ fn sanitize_filename(raw: &str) -> String {
     }
 }
 
-/// 处理单条内容的全部素材:封面、作者头像、图文图片、视频转音频。
-/// 目录结构 `{root}/{platform}/{今天 YYYY-MM-DD}/{video|image}/`(封面/图文图片),
+/// 处理单条内容的全部素材:封面、作者头像、图文图片、视频(落盘 / 转音频)。
+/// 目录结构 `{root}/{platform}/{今天 YYYY-MM-DD}/{video|image}/`(封面/图文图片/保留的视频),
 /// 视频转出的音频另存 `.../{今天}/audio/`,文件名以 content_id 为前缀。
 /// 副产品(封面/头像/图片)失败仅 `tracing::warn!`;主素材成败汇总进 `MediaOutcome` 返回供回写。
 pub async fn process_content(
     content: &Content,
     root: &Path,
     media: &MediaConfig,
-    audio_extract: bool,
+    switches: MediaSwitches,
     cookie: Option<&str>,
-    // 取消标志:任务手动停止时置位,在飞的 ffmpeg 拉流转码会被强杀(500ms 内感知)
+    // 取消标志:任务手动停止时置位,在飞的 ffmpeg 转码会被强杀(500ms 内感知)
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> MediaOutcome {
     let kind_dir = if content.kind == ContentKind::Video {
@@ -964,6 +1184,7 @@ pub async fn process_content(
             cover_path: None,
             avatar_path: None,
             audio_path: None,
+            video_path: None,
             video_downloaded: None,
             image_total: None,
             image_done: None,
@@ -1021,32 +1242,54 @@ pub async fn process_content(
         cover_path,
         avatar_path,
         audio_path: None,
+        video_path: None,
         video_downloaded: None,
         image_total: None,
         image_done: None,
     };
 
-    // 视频:仅当任务开启「音频提取」(AI 文案提取隐含开启)才下载并转音频(只留音频);
-    // 未开则视频不下载、不存储——不需要音频/文案就不留视频。
-    if content.kind == ContentKind::Video && audio_extract {
+    // 视频:任务开「音频提取」(AI 文案提取隐含开启)则转音频;开「保留视频」则落盘到
+    // video/ 目录供自动发布。两开关独立;皆关则视频不下载、不存储。
+    if content.kind == ContentKind::Video && (switches.audio_extract || switches.keep_video) {
         match content.video_url.as_deref().filter(|s| !s.is_empty()) {
             Some(video_url) => {
-                // 音频单独存到 audio 目录(与封面/视频分开),便于检索与转写读取
+                // 音频单独存到 audio 目录(与封面/视频分开),便于检索与转写读取;仅抽音频时需要
                 let audio_dir = root.join(&content.platform).join(&today).join(DIR_AUDIO);
-                if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
-                    tracing::warn!(content_id = %content.content_id, "创建音频目录失败: {e}");
-                    outcome.ok = false;
-                    outcome.error = Some(format!("创建音频目录失败: {e}"));
-                    outcome.video_downloaded = Some(false);
-                } else {
-                    let video =
-                        process_video(content, &audio_dir, &prefix, video_url, media, cookie, cancel).await;
-                    outcome.ok = video.downloaded;
-                    outcome.audio_extracted = video.audio_extracted;
+                // 音频目录创建失败仍继续执行:keep_video 的落盘不被这一失败阻断
+                let audio_dir_ready = !switches.audio_extract
+                    || match tokio::fs::create_dir_all(&audio_dir).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(content_id = %content.content_id, "创建音频目录失败: {e}");
+                            outcome.error = Some(format!("创建音频目录失败: {e}"));
+                            false
+                        }
+                    };
+                let video = process_video(&VideoJob {
+                    content,
+                    video_url,
+                    prefix: &prefix,
+                    video_dir: &dir,
+                    audio_dir: &audio_dir,
+                    media,
+                    cookie,
+                    // 音频目录没建好则本条跳过抽音频(视频落盘不受影响),错误已记入 outcome
+                    switches: MediaSwitches {
+                        audio_extract: switches.audio_extract && audio_dir_ready,
+                        keep_video: switches.keep_video,
+                    },
+                    cancel,
+                })
+                .await;
+                outcome.ok = video.downloaded;
+                outcome.audio_extracted = video.audio_extracted;
+                // 音频目录错误优先保留(视频子流程成功时 error 为 None,不覆盖已有错误)
+                if video.error.is_some() || outcome.error.is_none() {
                     outcome.error = video.error;
-                    outcome.audio_path = video.audio_path;
-                    outcome.video_downloaded = Some(video.downloaded);
                 }
+                outcome.audio_path = video.audio_path;
+                outcome.video_path = video.video_path;
+                outcome.video_downloaded = Some(video.downloaded);
             }
             None => {
                 // 视频内容却无直链:多为详情解析失败,标记失败(重试需重新采集刷新链接)
@@ -1088,17 +1331,42 @@ pub async fn process_content(
     outcome
 }
 
-/// 视频子流程:不落地视频,直接让 ffmpeg 从视频直链拉流转音频并保存到 audio 目录(只留音频)。
-/// ffmpeg 在阻塞线程池(spawn_blocking)执行,不占异步运行时工作线程。
-async fn process_video(
-    content: &Content,
-    audio_dir: &Path,
-    prefix: &str,
-    video_url: &str,
-    media: &MediaConfig,
-    cookie: Option<&str>,
+/// 视频子流程入参:目录 / 直链 / 开关聚成结构体(项目约定函数参数 ≤4,
+/// 此前平铺签名已 7 参,加 keep_video 所需目录后必须收口)。
+struct VideoJob<'a> {
+    content: &'a Content,
+    video_url: &'a str,
+    /// 文件名前缀(sanitize 后的 content_id)
+    prefix: &'a str,
+    /// 视频落盘目录 `{root}/{platform}/{今天}/video`;keep_video 开时写入 `{prefix}.mp4`
+    video_dir: &'a Path,
+    /// 音频输出目录 `{root}/{platform}/{今天}/audio`
+    audio_dir: &'a Path,
+    media: &'a MediaConfig,
+    cookie: Option<&'a str>,
+    switches: MediaSwitches,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> VideoOutcome {
+}
+
+/// 视频子流程:按开关组合处理——
+/// - 仅 keep_video:视频下载落盘到 video/ 目录(自动发布素材),不转音频;
+/// - 仅 audio_extract:不落地视频,ffmpeg 从直链拉流转音频(只留音频);
+/// - 两者皆开:先落盘视频,再让 ffmpeg 从本地文件抽音频(少拉一次流);
+///   落盘失败仅记 error 不阻断,音频退回直链拉流。
+/// ffmpeg 在阻塞线程池(spawn_blocking)执行,不占异步运行时工作线程。
+async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
+    let VideoJob {
+        content,
+        video_url,
+        prefix,
+        video_dir,
+        audio_dir,
+        media,
+        cookie,
+        switches,
+        // 取消标志是 Arc 不能移出共享引用,按引用绑定(as_ref/clone 经自动解引用照常可用)
+        ref cancel,
+    } = *job;
     let audio_format = if media.audio_format.trim().is_empty() {
         "mp3"
     } else {
@@ -1106,9 +1374,74 @@ async fn process_video(
     };
     let audio_path = audio_dir.join(format!("{prefix}.{audio_format}"));
 
+    // 防盗链 Referer 优先按内容所属平台解析(视频 CDN 域名多变,按平台比按 CDN 子串更稳),
+    // 平台未命中再退回 CDN 子串匹配。referer 是 &'static str,可直接进 spawn_blocking 闭包。
+    // 视频落盘与拉流抽音频共用同一份 Referer
+    let referer = REFERER_BY_PLATFORM
+        .iter()
+        .find(|(platform, _)| content.platform == *platform)
+        .map(|(_, r)| *r)
+        .or_else(|| {
+            REFERER_BY_CDN
+                .iter()
+                .find(|(cdn, _)| video_url.contains(cdn))
+                .map(|(_, r)| *r)
+        });
+
+    // keep_video:先把视频落盘。失败仅记 error 不返回——音频提取仍可走直链,
+    // 「落盘失败」与「音频失败」的 error 在收尾处合并,不互相覆盖
+    let mut local_video: Option<PathBuf> = None;
+    let mut video_path_out: Option<String> = None;
+    let mut keep_error: Option<String> = None;
+    if switches.keep_video {
+        // 与 ffmpeg 路径同一取消语义:手动停止后不再发起下载
+        let cancelled = cancel
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+        if cancelled {
+            return VideoOutcome {
+                downloaded: false,
+                audio_extracted: if switches.audio_extract { Some(false) } else { None },
+                error: Some("已手动停止".into()),
+                audio_path: None,
+                video_path: None,
+            };
+        }
+        let video_file = video_dir.join(format!("{prefix}.mp4"));
+        let fetch_ctx = VideoFetchCtx {
+            referer,
+            cookie,
+            proxy_setting: &media.proxy,
+        };
+        match download_video_file(video_url, &video_file, &fetch_ctx).await {
+            Ok(()) => {
+                video_path_out = Some(video_file.to_string_lossy().into_owned());
+                local_video = Some(video_file);
+            }
+            Err(e) => {
+                tracing::warn!(content_id = %content.content_id, "保留视频下载失败: {e}");
+                keep_error = Some(format!("下载视频失败: {e}"));
+            }
+        }
+    }
+    // 主素材就绪口径:keep_video 开 = 视频已落盘;否则 = 音频提取成功
+    let video_downloaded = local_video.is_some();
+
+    // 不开音频提取(仅保留视频):落盘结果即最终结果
+    if !switches.audio_extract {
+        return VideoOutcome {
+            downloaded: video_downloaded,
+            audio_extracted: None,
+            error: keep_error,
+            audio_path: None,
+            video_path: video_path_out,
+        };
+    }
+
     // 原声视频的音乐直链(extra.audio_url,抖音 music.play_url,MP3 无短期签名):
-    // 目标格式 mp3 时直接下载,免 ffmpeg 拉整个视频流转码(几 MB vs 几十 MB 视频);
-    // 下载失败退回下方视频直链 ffmpeg 老路径
+    // 目标格式 mp3 时直接下载,免 ffmpeg 转码(几 MB vs 几十 MB 视频);
+    // 下载失败退回下方 ffmpeg 路径
     if audio_format == "mp3" {
         if let Some(audio_url) = content
             .extra
@@ -1123,19 +1456,22 @@ async fn process_video(
                 .unwrap_or(false);
             if cancelled {
                 return VideoOutcome {
-                    downloaded: false,
+                    downloaded: video_downloaded,
                     audio_extracted: Some(false),
                     error: Some("已手动停止".into()),
                     audio_path: None,
+                    video_path: video_path_out,
                 };
             }
             match download_to_file(audio_url, &audio_path).await {
                 Ok(()) => {
                     return VideoOutcome {
-                        downloaded: true,
+                        downloaded: if switches.keep_video { video_downloaded } else { true },
                         audio_extracted: Some(true),
-                        error: None,
+                        // 视频落盘失败但音频成功:仍带回落盘错误供 media_error 记录
+                        error: keep_error,
                         audio_path: Some(audio_path.to_string_lossy().into_owned()),
+                        video_path: video_path_out,
                     };
                 }
                 Err(e) => {
@@ -1145,21 +1481,9 @@ async fn process_video(
         }
     }
 
-    // 防盗链 Referer 优先按内容所属平台解析(视频 CDN 域名多变,按平台比按 CDN 子串更稳),
-    // 平台未命中再退回 CDN 子串匹配。referer 是 &'static str,可直接进 spawn_blocking 闭包。
-    let referer = REFERER_BY_PLATFORM
-        .iter()
-        .find(|(platform, _)| content.platform == *platform)
-        .map(|(_, r)| *r)
-        .or_else(|| {
-            REFERER_BY_CDN
-                .iter()
-                .find(|(cdn, _)| video_url.contains(cdn))
-                .map(|(_, r)| *r)
-        });
-
-    // ffmpeg 同步阻塞,挪到阻塞线程池;直接从直链拉流转音频,不下载/不落地视频文件。
-    // 抖音等 CDN 偶发「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
+    // ffmpeg 同步阻塞,挪到阻塞线程池。优先用已落盘的本地视频(免二次拉流);
+    // 未落盘(keep_video 关或下载失败)则从直链拉流。抖音等 CDN 偶发
+    // 「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_EXTRACT_ATTEMPTS {
         // 任务已手动停止:不再(重)试,直接以取消收尾
@@ -1169,47 +1493,63 @@ async fn process_video(
             .unwrap_or(false)
         {
             return VideoOutcome {
-                downloaded: false,
+                downloaded: video_downloaded,
                 audio_extracted: Some(false),
                 error: Some("已手动停止".into()),
                 audio_path: None,
+                video_path: video_path_out,
             };
         }
         // ffmpeg 全局限流:同一时刻最多 MAX_FFMPEG_CONCURRENCY 个子进程在转码。
         // 排队等待比并发打满更稳(CPU / 带宽 / CDN 并发限制),permit 随本次尝试结束释放。
         // 信号量不会关闭,Err 仅理论路径;ok() 拿到 Option 持有 permit,随本次尝试结束释放
         let _ffmpeg_permit = FFMPEG_SEMAPHORE.acquire().await.ok();
-        let url_for_task = video_url.to_string();
         let audio_for_task = audio_path.clone();
         let ffmpeg_for_task = media.ffmpeg_path.clone();
-        // cookie / proxy 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
-        let cookie_for_task = cookie.map(str::to_string);
-        let proxy_for_task = media.proxy.clone();
         let cancel_for_task = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            extract_audio_from_url(
-                &url_for_task,
-                &audio_for_task,
-                ffmpeg_for_task.as_deref(),
-                referer,
-                cookie_for_task.as_deref(),
-                &proxy_for_task,
-                cancel_for_task,
-            )
-        })
-        .await;
+        let result = if let Some(local) = &local_video {
+            // 本地文件抽音频:无防盗链/代理问题,参数精简
+            let video_for_task = local.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_audio_from_file(
+                    &video_for_task,
+                    &audio_for_task,
+                    ffmpeg_for_task.as_deref(),
+                    cancel_for_task,
+                )
+            })
+            .await
+        } else {
+            let url_for_task = video_url.to_string();
+            // cookie / proxy 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
+            let cookie_for_task = cookie.map(str::to_string);
+            let proxy_for_task = media.proxy.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_audio_from_url(
+                    &url_for_task,
+                    &audio_for_task,
+                    ffmpeg_for_task.as_deref(),
+                    referer,
+                    cookie_for_task.as_deref(),
+                    &proxy_for_task,
+                    cancel_for_task,
+                )
+            })
+            .await
+        };
 
         match result {
             Ok(Ok(())) => {
                 return VideoOutcome {
-                    downloaded: true,
+                    downloaded: if switches.keep_video { video_downloaded } else { true },
                     audio_extracted: Some(true),
-                    error: None,
+                    error: keep_error,
                     audio_path: Some(audio_path.to_string_lossy().into_owned()),
+                    video_path: video_path_out,
                 };
             }
             Ok(Err(e)) => {
-                tracing::warn!(content_id = %content.content_id, attempt, "视频拉流转音频失败: {e}");
+                tracing::warn!(content_id = %content.content_id, attempt, "视频转音频失败: {e}");
                 last_error = Some(format!("音频提取失败: {e}"));
             }
             Err(e) => {
@@ -1224,10 +1564,15 @@ async fn process_video(
     }
 
     VideoOutcome {
-        downloaded: false,
+        downloaded: if switches.keep_video { video_downloaded } else { false },
         audio_extracted: Some(false),
-        error: last_error,
+        // 落盘与音频可能各错一处,合并呈现便于排查(任一成功都不丢另一处的失败原因)
+        error: match (keep_error, last_error) {
+            (Some(v), Some(a)) => Some(format!("{v};{a}")),
+            (v, a) => v.or(a),
+        },
         audio_path: None,
+        video_path: video_path_out,
     }
 }
 
@@ -1295,6 +1640,27 @@ mod tests {
     #[test]
     fn plan_cuts_empty_when_within_limit() {
         assert!(plan_silence_cuts(20.0, 25.0, &[sil(9.0, 10.0)]).is_empty());
+    }
+
+    #[test]
+    fn plan_cuts_merges_tiny_tail_into_last_chunk() {
+        // 174.9s / 25s:静音中点 24/49/…/149;第 7 段(149s 起)死线 174s,
+        // 硬切尾巴仅 0.9s < MIN_CHUNK_SECS → 放弃该刀,尾巴并入第 7 段(25.9s,仍低于 GLM 30s 硬上限)
+        let silences: Vec<SilenceRange> = (1..=6)
+            .map(|i| {
+                let m = i as f64 * 25.0 - 1.0;
+                sil(m - 0.2, m + 0.2)
+            })
+            .collect();
+        let cuts = plan_silence_cuts(174.9, 25.0, &silences);
+        assert_eq!(cuts, vec![24.0, 49.0, 74.0, 99.0, 124.0, 149.0]);
+    }
+
+    #[test]
+    fn plan_cuts_picks_silence_that_keeps_tail_above_min() {
+        // 175.9s:第 7 段(150s 起)死线 175s 硬切碎尾(0.9s),但 173.5s 有静音中点,切这里尾巴 2.4s 合法
+        let cuts = plan_silence_cuts(175.9, 25.0, &[sil(173.3, 173.7)]);
+        assert_eq!(cuts, vec![25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 173.5]);
     }
 
     // 30ms/帧、最小间隙 0.5s → 连续 ≥17 帧非人声才算间隙

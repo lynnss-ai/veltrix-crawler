@@ -81,9 +81,12 @@ async fn usage_by_model(
     } else {
         String::new()
     };
+    // SUM(bigint) 在 PG 返回 NUMERIC,sqlx 无法解成 i64(会被 unwrap_or(0) 静默吞成 0),
+    // CAST AS BIGINT 两边通用(SQLite 对任意类型名按数值亲和处理)
     let sql = format!(
-        "SELECT model, SUM(prompt_tokens) AS pt, SUM(completion_tokens) AS ct, \
-         SUM(total_tokens) AS tt, MAX(created_at) AS last_req \
+        "SELECT model, CAST(SUM(prompt_tokens) AS BIGINT) AS pt, \
+         CAST(SUM(completion_tokens) AS BIGINT) AS ct, \
+         CAST(SUM(total_tokens) AS BIGINT) AS tt, MAX(created_at) AS last_req \
          FROM model_usage_records \
          WHERE created_at >= {start} AND created_at <= {end} {owner_filter} \
          GROUP BY model ORDER BY tt DESC"
@@ -171,10 +174,11 @@ async fn trend_data(
     }
     let dlen = dates.len();
 
+    // 同上:SUM(bigint) 在 PG 是 NUMERIC,需 CAST 回 BIGINT 才能解成 i64
     let value_expr = match metric {
-        "tokens" => "SUM(total_tokens)",
+        "tokens" => "CAST(SUM(total_tokens) AS BIGINT)",
         "requests" => "COUNT(*)",
-        _ => "SUM(total_tokens)",
+        _ => "CAST(SUM(total_tokens) AS BIGINT)",
     };
     let date_expr = match backend {
         DatabaseBackend::Sqlite => {

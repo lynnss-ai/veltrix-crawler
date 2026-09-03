@@ -26,7 +26,7 @@ import {
   type CloudConnectionState,
   type RoleModelConfig,
 } from "@/lib/api";
-import { WORKSPACES, type Workspace } from "@/components/app-sidebar";
+import { SERVICES, type ServiceKey } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { Button } from "@/components/ui/button";
@@ -381,26 +381,30 @@ export function SettingsPage() {
   );
 }
 
-// 通用配置卡片:标题 + 内容 + (可选)保存按钮,保存后短暂提示
+// 菜单顺序编辑器:治理侧栏顶部工作区(运营 / 对话 / 创作)的排列,拖动排序,松手即时生效。
+// 发布服务是独立产品、不进服务栏(入口在 Logo 右侧「切换平台」),不参与排序。
 function WorkspaceOrderEditor() {
   const [order, setOrder] = useWorkspaceOrder();
+  // 排序只针对工作区:从完整服务顺序中滤掉发布服务
+  const workspaceOrder = order.filter((k) => k !== "publish");
   // 拖动期间的本地工作副本;非拖动态与 order 同步
-  const [items, setItems] = useState<Workspace[]>(order);
+  const [items, setItems] = useState<ServiceKey[]>(workspaceOrder);
   const [draggingKey, setDraggingKey] = useState<string | null>(null);
   const draggingRef = useRef<string | null>(null);
-  const itemsRef = useRef<Workspace[]>(order);
+  const itemsRef = useRef<ServiceKey[]>(workspaceOrder);
   const listRef = useRef<HTMLUListElement>(null);
 
   // 外部改了顺序且当前不在拖动时,同步本地副本
   useEffect(() => {
     if (!draggingRef.current) {
-      setItems(order);
-      itemsRef.current = order;
+      setItems(workspaceOrder);
+      itemsRef.current = workspaceOrder;
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order]);
 
   const labelOf = (key: string) =>
-    WORKSPACES.find((w) => w.key === key)?.label ?? key;
+    SERVICES.find((w) => w.key === key)?.label ?? key;
 
   function startDrag(e: React.PointerEvent<HTMLLIElement>, key: string) {
     if (e.button !== 0) return; // 仅左键
@@ -424,7 +428,7 @@ function WorkspaceOrderEditor() {
       }
     }
     setItems((prev) => {
-      const from = prev.indexOf(key as Workspace);
+      const from = prev.indexOf(key as ServiceKey);
       if (from < 0 || from === target) return prev;
       const next = [...prev];
       const [moved] = next.splice(from, 1);
@@ -436,8 +440,8 @@ function WorkspaceOrderEditor() {
 
   function endDrag() {
     if (draggingRef.current) {
-      // 顺序确有变化才持久化并提示(原地松手不打扰)
-      const changed = itemsRef.current.some((k, i) => k !== order[i]);
+      // 顺序确有变化才持久化并提示(原地松手不打扰);与工作区子序列比对(发布服务不参与)
+      const changed = itemsRef.current.some((k, i) => k !== workspaceOrder[i]);
       if (changed) {
         setOrder(itemsRef.current);
         toast.success("菜单顺序已更新");
@@ -909,7 +913,7 @@ function GeneralSection({
     <>
       <SettingsCard
         title="菜单顺序"
-        description="拖动调整侧边栏顶部工作区(营销 / 对话 / 创作)的排列顺序,松手即时生效。"
+        description="拖动调整侧边栏顶部工作区(运营 / 对话 / 创作)的排列顺序,松手即时生效。发布服务是独立产品,入口在侧栏 Logo 右侧的「切换平台」。"
       >
         <WorkspaceOrderEditor />
       </SettingsCard>

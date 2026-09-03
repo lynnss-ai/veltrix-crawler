@@ -43,6 +43,20 @@ pub async fn eval_json(_webview: &Webview, _js: &str) -> Option<String> {
     None
 }
 
+/// 池化采集窗口(`tauri::WebviewWindow`)的薄封装:窗口持有者(如自动发布流程)
+/// 手上只有 WebviewWindow,而 `WebviewWindow` 实现的是 `AsRef<Webview>`(非 Deref),
+/// 故在此转一道,与 `eval_json` 走同一实现。行为完全等价于 `eval_json(window.as_ref(), js)`。
+#[cfg(windows)]
+pub async fn eval_json_window(window: &tauri::WebviewWindow, js: &str) -> Option<String> {
+    eval_json(window.as_ref(), js).await
+}
+
+/// 非 Windows:同 `eval_json`,回读退化为 None。
+#[cfg(not(windows))]
+pub async fn eval_json_window(_window: &tauri::WebviewWindow, _js: &str) -> Option<String> {
+    None
+}
+
 #[cfg(windows)]
 mod win {
     use tauri::webview::PlatformWebview;

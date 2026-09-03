@@ -9,6 +9,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
+use sea_orm::sea_query::{Expr, ExprTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tauri::State;
@@ -46,6 +47,8 @@ pub struct TaskView {
     pub min_likes: i32,
     /// 音频提取开关(视频转 mp3 留存)
     pub audio_extract: bool,
+    /// 保留视频文件开关(视频落盘供自动发布;与音频提取独立)
+    pub keep_video: bool,
     /// AI 文案提取开关(依赖音频提取)
     pub ai_extract: bool,
     /// 评论采集开关
@@ -115,6 +118,7 @@ impl From<task::Model> for TaskView {
             per_keyword_limit: m.per_keyword_limit,
             min_likes: m.min_likes,
             audio_extract: m.audio_extract,
+            keep_video: m.keep_video,
             ai_extract: m.ai_extract,
             collect_comments: m.collect_comments,
             comment_time_range: m.comment_time_range,
@@ -172,6 +176,9 @@ pub struct TaskInput {
     /// 音频提取开关(前端可能不传,默认关闭)
     #[serde(default)]
     pub audio_extract: bool,
+    /// 保留视频文件开关(前端可能不传,默认关闭)
+    #[serde(default)]
+    pub keep_video: bool,
     pub ai_extract: bool,
     /// 评论采集开关(前端可能不传,默认关闭)
     #[serde(default)]
@@ -306,17 +313,17 @@ async fn keyword_stats_for_tasks(
 
         // 评论:内连接 contents 按 (task_id, platform, content_id) 归到关键词。
         // 内容主键是 {task_id}-{platform}-{content_id},同任务内 (platform, content_id) 唯一,不会翻倍;
-        // 内连接等价旧实现「content 映射里找不到的评论不计数」。占位符由 Statement 按后端转换(参数化防注入)。
+        // 内连接等价旧实现「content 映射里找不到的评论不计数」。占位符由 raw_statement 按后端改写(参数化防注入)。
         let sql = "SELECT ct.keyword AS kw, COUNT(*) AS cnt FROM comments cm \
                    JOIN contents ct ON ct.task_id = cm.task_id AND ct.platform = cm.platform \
                    AND ct.content_id = cm.content_id \
                    WHERE cm.task_id = ? AND cm.collected_at >= ? \
                    GROUP BY ct.keyword";
         let comment_rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all(raw_statement(
                 db.get_database_backend(),
-                sql,
-                [task_id.clone().into(), (*started).into()],
+                sql.to_owned(),
+                vec![task_id.clone().into(), (*started).into()],
             ))
             .await
             .unwrap_or_default();
@@ -399,6 +406,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.per_keyword_limit = Set(input.per_keyword_limit);
             am.min_likes = Set(input.min_likes);
             am.audio_extract = Set(audio_extract);
+            am.keep_video = Set(input.keep_video);
             am.ai_extract = Set(input.ai_extract);
             am.collect_comments = Set(input.collect_comments);
             am.comment_time_range = Set(input.comment_time_range);
@@ -433,6 +441,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 per_keyword_limit: Set(input.per_keyword_limit),
                 min_likes: Set(input.min_likes),
                 audio_extract: Set(audio_extract),
+                keep_video: Set(input.keep_video),
                 ai_extract: Set(input.ai_extract),
                 collect_comments: Set(input.collect_comments),
                 comment_time_range: Set(input.comment_time_range),
@@ -578,7 +587,8 @@ pub struct ContentView {
     pub avatar_path: Option<String>,
     /// 视频转出音频本地绝对路径(详情页播放用);None=非视频/未提取/旧数据未记录
     pub audio_path: Option<String>,
-    /// 视频语音转写文本(转写成功后回写),前端展示
+    /// 视频语音转写文本(转写成功后回写),前端展示;
+    /// 空串=已转写但未识别到语音(空文案标记),None=未转写/转写失败
     pub transcript: Option<String>,
     /// 转写失败原因(供前端区分未转写与失败)
     pub transcript_error: Option<String>,
@@ -1529,10 +1539,38 @@ pub enum BatchKind {
     Audio,
 }
 
-/// WHERE 片段 + 占位符参数(统一用 ?,由 Statement 按后端转换为 $n)
+/// WHERE 片段 + 占位符参数(统一用 ? 书写,执行前由 raw_statement 按后端改写)
 struct FilterParts {
     conds: String,
     values: Vec<sea_orm::Value>,
+}
+
+/// 构造手写 SQL 的 Statement。SeaORM 对原始 SQL 不做占位符转换,而 sqlx 的
+/// PostgreSQL 驱动只认 `$N`(不认 `?`),故 PG 下把 `?` 顺次改写为 `$1..$N`;
+/// SQLite/MySQL 原样保留。约定:手写 SQL 中 `?` 只作占位符,含 `?` 的文本一律走绑定参数。
+fn raw_statement(
+    backend: sea_orm::DatabaseBackend,
+    sql: String,
+    values: Vec<sea_orm::Value>,
+) -> Statement {
+    let sql = match backend {
+        sea_orm::DatabaseBackend::Postgres => {
+            let mut out = String::with_capacity(sql.len() + 8);
+            let mut idx = 0usize;
+            for ch in sql.chars() {
+                if ch == '?' {
+                    idx += 1;
+                    out.push('$');
+                    out.push_str(&idx.to_string());
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+        _ => sql,
+    };
+    Statement::from_sql_and_values(backend, sql, values)
 }
 
 /// 追加一条 AND 条件(值为占位符参数)
@@ -1911,11 +1949,7 @@ pub async fn list_contents_page(
     );
     let id_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
-            backend,
-            id_sql,
-            filter.values.clone(),
-        ))
+        .query_all(raw_statement(backend, id_sql, filter.values.clone()))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
     let ids: Vec<String> = id_rows
@@ -1937,7 +1971,7 @@ pub async fn list_contents_page(
         );
         let count_rows = state
             .db
-            .query_all(Statement::from_sql_and_values(backend, count_sql, filter.values))
+            .query_all(raw_statement(backend, count_sql, filter.values))
             .await
             .map_err(|e| CrawlerError::Config(format!("统计内容失败: {e}")))?;
         count_rows
@@ -1973,11 +2007,7 @@ pub async fn list_comments_page(
     );
     let id_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
-            backend,
-            id_sql,
-            filter.values.clone(),
-        ))
+        .query_all(raw_statement(backend, id_sql, filter.values.clone()))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
     let ids: Vec<String> = id_rows
@@ -1996,7 +2026,7 @@ pub async fn list_comments_page(
     );
     let count_rows = state
         .db
-        .query_all(Statement::from_sql_and_values(backend, count_sql, filter.values))
+        .query_all(raw_statement(backend, count_sql, filter.values))
         .await
         .map_err(|e| CrawlerError::Config(format!("统计评论失败: {e}")))?;
     let total = count_rows
@@ -2014,6 +2044,7 @@ pub async fn list_comments_page(
 
 /// 全量库「待转写 / 待提取评论 / 待采集音频」计数(与前端 needsTranscript / needsComments 逐条口径一致,
 /// 含任务穿透 / 平台 / 行业 / 时间 / 搜索等全部当前筛选)。
+/// 待转写口径:transcript IS NULL(未转写/上次失败);空串是「空文案」已转写标记,不计入。
 #[tauri::command]
 pub async fn content_library_stats(
     state: State<'_, AppState>,
@@ -2023,7 +2054,7 @@ pub async fn content_library_stats(
     let filter = content_filter(&query, me.scope == "self", &me.name);
     let sql = format!(
         "SELECT \
-         SUM(CASE WHEN kind = 'video' AND (transcript IS NULL OR trim(transcript) = '') \
+         SUM(CASE WHEN kind = 'video' AND transcript IS NULL \
              AND audio_path IS NOT NULL AND audio_path <> '' THEN 1 ELSE 0 END) AS untranscribed, \
          SUM(CASE WHEN comment_collected IS NOT TRUE \
              AND (comment_count IS NULL OR comment_count != 0) THEN 1 ELSE 0 END) AS pending_comment, \
@@ -2034,7 +2065,7 @@ pub async fn content_library_stats(
     );
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
             filter.values,
@@ -2067,8 +2098,9 @@ pub async fn list_batch_content_ids(
     let mut filter = content_filter(&query, me.scope == "self", &me.name);
     match batch {
         BatchKind::Transcript => {
+            // transcript IS NULL = 未转写/上次失败;空串是「空文案」已转写标记,不重跑
             filter.conds.push_str(
-                " AND kind = 'video' AND (transcript IS NULL OR trim(transcript) = '') \
+                " AND kind = 'video' AND transcript IS NULL \
                  AND audio_path IS NOT NULL AND audio_path <> ''",
             );
         }
@@ -2092,7 +2124,7 @@ pub async fn list_batch_content_ids(
     );
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
             filter.values,
@@ -2124,7 +2156,7 @@ pub async fn content_industry_counts(
     );
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
             filter.values,
@@ -2159,7 +2191,7 @@ pub async fn comment_industry_counts(
     );
     let rows = state
         .db
-        .query_all(Statement::from_sql_and_values(
+        .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
             filter.values,
@@ -2457,13 +2489,43 @@ fn build_comment_view(
     view
 }
 
+/// 内容详情评论栏分页:每页条数(首屏 + 每次「加载更多」)。
+const COMMENT_PAGE_SIZE: u32 = 50;
+/// 单页上限:防御异常入参,避免一次拉几千条把详情页拖垮。
+const COMMENT_PAGE_MAX: u32 = 200;
+
+/// 内容详情评论栏的分页响应:本页评论 + 总数(标题展示)+ 下一页游标。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentPageView {
+    pub items: Vec<CommentView>,
+    pub total: i64,
+    /// 下一页游标;None = 已到底(前端据此隐藏「加载更多」)
+    pub next_cursor: Option<String>,
+}
+
+/// 解析评论分页游标(格式 `"{点赞数}:{评论行id}"`,用最后一个冒号分隔——
+/// 行 id 为 `{task_id}-{platform}-{comment_id}` 不含冒号,防御性解析不受影响)。
+fn parse_comment_cursor(cursor: &str) -> Result<(i64, String)> {
+    let invalid = || CrawlerError::Config(format!("评论分页游标非法: {cursor}"));
+    let (likes, id) = cursor.rsplit_once(':').ok_or_else(invalid)?;
+    let likes: i64 = likes.parse().map_err(|_| invalid())?;
+    if id.is_empty() {
+        return Err(invalid());
+    }
+    Ok((likes, id.to_string()))
+}
+
 /// 单条内容的评论列表(全量库详情右侧评论栏):按内容行精确匹配
 /// (task_id + platform + content_id),按点赞数倒序(热评在前)。
+/// 游标分页:首页不带 cursor;has_more 时返回 nextCursor,前端「加载更多」续拉。
 #[tauri::command]
 pub async fn list_content_comments(
     state: State<'_, AppState>,
     content_id: String,
-) -> Result<Vec<CommentView>> {
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<CommentPageView> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let row = content::Entity::find_by_id(content_id)
         .one(&state.db)
@@ -2480,17 +2542,52 @@ pub async fn list_content_comments(
         .flatten()
         .map(|t| t.industry)
         .unwrap_or_default();
-    let rows = comment::Entity::find()
+    // 点赞数 NULL 按 0 参与排序与游标比较(排序/过滤口径一致,否则 NULL 行翻页会漏)
+    let likes = Expr::col(comment::Column::LikeCount).if_null(0);
+    let mut q = comment::Entity::find()
         .filter(comment::Column::TaskId.eq(row.task_id.clone()))
         .filter(comment::Column::Platform.eq(row.platform.clone()))
-        .filter(comment::Column::ContentId.eq(row.content_id.clone()))
-        .order_by_desc(comment::Column::LikeCount)
-        .limit(LIST_HARD_CAP)
+        .filter(comment::Column::ContentId.eq(row.content_id.clone()));
+    let total = q
+        .clone()
+        .count(&state.db)
+        .await
+        .unwrap_or(0);
+    if let Some(cur) = cursor.as_deref().filter(|c| !c.is_empty()) {
+        let (last_likes, last_id) = parse_comment_cursor(cur)?;
+        // 复合游标条件:点赞数更小,或点赞数相同但行 id 更大(id 升序 tiebreak,不重不漏)
+        q = q.filter(
+            Condition::any()
+                .add(likes.clone().lt(last_likes))
+                .add(likes.clone().eq(last_likes).and(comment::Column::Id.gt(last_id))),
+        );
+    }
+    let limit = limit.unwrap_or(COMMENT_PAGE_SIZE).clamp(1, COMMENT_PAGE_MAX) as u64;
+    // 多取一条判断是否还有下一页,避免前端再发一次空页请求
+    let rows = q
+        .order_by_desc(likes)
+        .order_by_asc(comment::Column::Id)
+        .limit(limit + 1)
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
-    Ok(rows
+    let has_more = rows.len() as u64 > limit;
+    let items: Vec<CommentView> = rows
         .into_iter()
+        .take(limit as usize)
         .map(|m| build_comment_view(m, Some(&row), &industry))
-        .collect())
+        .collect();
+    // 游标取本页末行的 (点赞数, 行 id);与排序/过滤同口径(NULL 按 0)
+    let next_cursor = has_more
+        .then(|| {
+            items
+                .last()
+                .map(|last| format!("{}:{}", last.like_count.unwrap_or(0), last.id))
+        })
+        .flatten();
+    Ok(CommentPageView {
+        items,
+        total: total as i64,
+        next_cursor,
+    })
 }

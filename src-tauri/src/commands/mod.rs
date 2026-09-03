@@ -8,6 +8,7 @@ pub mod cloud;
 pub mod collect;
 pub mod creation;
 pub mod dashboard;
+pub mod publish;
 pub mod task;
 // 再导出采集执行引擎的全部命令与类型,保持 commands::X 路径不变(lib.rs invoke_handler 依赖)。
 pub use collect::*;
@@ -43,6 +44,8 @@ pub struct AppState {
     /// 全局数据库连接(运行时二选一 SQLite / PostgreSQL),供账号池等持久化复用。
     pub db: DatabaseConnection,
     pub cookies: Arc<CookiePool>,
+    /// 发布账号池(独立账号体系):与采集 CookiePool 分表分服务,只管「写」不做轮换。
+    pub publish: Arc<crate::publish::PublishAccounts>,
     pub webviews: Arc<WebviewPool>,
     pub intercept_channel: Arc<InterceptChannel>,
     /// 拟人 RPA 运行结果回传通道(`rpa_done` 命令写入,采集端等待)。
@@ -1253,6 +1256,10 @@ pub async fn login_status_report(
     if let Ok(mut map) = state.login_verdicts.lock() {
         map.insert(account_id.clone(), status.clone());
     }
+    // 发布账号上报(account_id 带 `pub:` 前缀):路由到发布账号池,不走采集账号逻辑
+    if account_id.starts_with(crate::publish::LOGIN_REPORT_PREFIX) {
+        return publish::publish_login_status_report(&state, &app, &account_id, &status).await;
+    }
     // 检测到已登录:实时置 active,前端即时变绿,不必等关窗
     if status == "in" {
         if let Err(e) = state.cookies.mark_active(&account_id).await {
@@ -1282,6 +1289,7 @@ pub fn open_login_window(
     let pcfg = lock_config(&state)?.platform(&platform)?.clone();
     let webviews = state.webviews.clone();
     let cookies = state.cookies.clone();
+    let publish = state.publish.clone();
     let login_verdicts = state.login_verdicts.clone();
     // 每次打开登录窗口清掉旧结论,避免上次会话的判定残留影响本次关窗终态
     if let Ok(mut map) = login_verdicts.lock() {
@@ -1302,7 +1310,18 @@ pub fn open_login_window(
                         let app = app_for_event.clone();
                         let platform = platform_for_event.clone();
                         let verdicts = login_verdicts.clone();
+                        let publish = publish.clone();
                         tauri::async_runtime::spawn(async move {
+                            // 发布账号窗口(account_id 带 `pub:` 前缀):终态路由到发布账号池,
+                            // 与采集账号「out → invalid,其余乐观 active」口径不同——
+                            // 发布账号要求确实报过 "in" 才置 active
+                            if acc.starts_with(crate::publish::LOGIN_REPORT_PREFIX) {
+                                publish::finalize_publish_login(&publish, &verdicts, &acc).await;
+                                use tauri::Emitter;
+                                let _ = app
+                                    .emit(crate::publish::ACCOUNT_UPDATED_EVENT, &platform);
+                                return;
+                            }
                             let last = verdicts
                                 .lock()
                                 .ok()

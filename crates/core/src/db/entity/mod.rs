@@ -19,6 +19,7 @@ pub mod keyword;
 pub mod prompt;
 pub mod prompt_category;
 pub mod provider;
+pub mod publish_account;
 pub mod shot_prompt;
 pub mod task;
 pub mod task_run;

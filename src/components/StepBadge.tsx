@@ -8,6 +8,7 @@ const STEP_SUCCESS_CLS: Record<string, string> = {
   视频: "bg-sky-100 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300",
   音频: "bg-violet-100 text-violet-700 dark:bg-violet-950/60 dark:text-violet-300",
   文案: "bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300",
+  空文案: "bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300",
   图片: "bg-teal-100 text-teal-700 dark:bg-teal-950/60 dark:text-teal-300",
   评论: "bg-blue-100 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300",
   意向: "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/60 dark:text-fuchsia-300",

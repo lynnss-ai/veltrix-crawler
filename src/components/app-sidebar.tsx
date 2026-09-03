@@ -18,6 +18,7 @@ import {
   Radar,
   Receipt,
   Rocket,
+  Send,
   Settings,
   SquarePen,
   Tags,
@@ -77,6 +78,9 @@ export type PageKey =
   | "dashboard"
   | "collect-tasks"
   | "accounts"
+  | "publish-dashboard"
+  | "publish-content"
+  | "publish-accounts"
   | "assets-all"
   | "assets-content"
   | "assets-image"
@@ -145,20 +149,18 @@ const MENU_GROUPS: MenuGroup[] = [
 ];
 
 // 顶层产品:同一账号体系下的多个 AI 产品,Logo 旁 Grip 切换。
-// crawler=协作平台(采集) publish=发布服务(占位)。
+// crawler=协作平台(采集) publish=发布服务。
 export type ProductKey = "crawler" | "publish";
 
 interface ProductMeta {
   key: ProductKey;
   name: string;
   icon: LucideIcon;
-  // 占位产品:点击仅提示「即将上线」,不切换上下文
-  placeholder?: boolean;
 }
 
 const PRODUCTS: ProductMeta[] = [
   { key: "crawler", name: "协作平台", icon: Radar },
-  { key: "publish", name: "发布服务", icon: Rocket, placeholder: true },
+  { key: "publish", name: "发布服务", icon: Rocket },
 ];
 
 // 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(创作);后两者暂为占位
@@ -169,6 +171,15 @@ export const WORKSPACES: { key: Workspace; label: string }[] = [
   { key: "management", label: "运营" },
   { key: "chat", label: "对话" },
   { key: "cowork", label: "创作" },
+];
+
+// 侧栏顶部「服务」切换项 = 协作平台的工作区(运营/对话/创作)+ 独立产品(发布服务)。
+// 服务栏只平铺工作区;发布服务不进服务栏,入口在 Logo 右侧的「切换平台」(Grip 图标)。
+// 工作区顺序由系统设置「菜单顺序」治理(useWorkspaceOrder)。
+export type ServiceKey = Workspace | "publish";
+export const SERVICES: { key: ServiceKey; label: string }[] = [
+  ...WORKSPACES,
+  { key: "publish", label: "发布服务" },
 ];
 
 // 各工作区的导航菜单;management 沿用现有 MENU_GROUPS,其余先占位
@@ -198,14 +209,26 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
   ],
 };
 
+// 发布服务产品的导航菜单(独立于协作平台的工作区菜单)
+const PUBLISH_MENUS: MenuGroup[] = [
+  {
+    title: "发布服务",
+    items: [
+      { key: "publish-dashboard", label: "数据大盘", icon: LayoutDashboard },
+      { key: "publish-content", label: "内容发布", icon: Send },
+      { key: "publish-accounts", label: "客户账号", icon: Users },
+    ],
+  },
+];
+
 // 某工作区的默认页(第一个菜单项),切换工作区时跳转到此
 export function getWorkspaceDefaultPage(workspace: Workspace): PageKey {
   return WORKSPACE_MENUS[workspace][0].items[0].key;
 }
 
 // 某产品的默认落地页,切换产品时跳转到此
-export function getProductDefaultPage(_product: ProductKey): PageKey {
-  return "dashboard";
+export function getProductDefaultPage(product: ProductKey): PageKey {
+  return product === "publish" ? "publish-dashboard" : "dashboard";
 }
 
 // 不在侧栏导航中、但可由个人中心等入口进入的页面,补面包屑(标题栏 H1 取 page)
@@ -224,7 +247,7 @@ export function getPageBreadcrumb(key: PageKey): {
   group: string;
   page: string;
 } {
-  for (const groups of Object.values(WORKSPACE_MENUS)) {
+  for (const groups of [...Object.values(WORKSPACE_MENUS), PUBLISH_MENUS]) {
     for (const group of groups) {
       const item = group.items.find((i) => i.key === key);
       if (item) return { group: group.title, page: item.label };
@@ -502,7 +525,8 @@ interface AppSidebarProps {
   product: ProductKey;
   onProductChange: (product: ProductKey) => void;
   workspace: Workspace;
-  onWorkspaceChange: (workspace: Workspace) => void;
+  // 服务统一切换入口(运营/对话/创作平铺 tab;发布服务经「切换平台」也路由到它)
+  onServiceChange: (key: ServiceKey) => void;
   active: PageKey;
   onChange: (key: PageKey) => void;
   user: string;
@@ -513,17 +537,21 @@ export function AppSidebar({
   product,
   onProductChange,
   workspace,
-  onWorkspaceChange,
+  onServiceChange,
   active,
   onChange,
   user,
   onLogout,
 }: AppSidebarProps) {
-  // 工作区切换标签的展示顺序(系统配置可调);按保存顺序排列,缺失项忽略
+  // 服务切换的展示顺序(系统配置可调);按保存顺序排列,缺失项忽略
   const [wsOrder] = useWorkspaceOrder();
-  const orderedWorkspaces = wsOrder
-    .map((key) => WORKSPACES.find((w) => w.key === key))
-    .filter((w): w is (typeof WORKSPACES)[number] => Boolean(w));
+  const orderedServices = wsOrder
+    .map((key) => SERVICES.find((w) => w.key === key))
+    .filter((w): w is (typeof SERVICES)[number] => Boolean(w));
+  // 服务栏只平铺工作区(运营/对话/创作);发布服务是独立产品,入口在 Logo 右侧「切换平台」
+  const visibleServices = orderedServices.filter((sv) => sv.key !== "publish");
+  // 当前激活的服务:发布服务产品激活 "publish"(服务栏无对应 tab,故无高亮),协作平台产品激活当前工作区
+  const activeService: ServiceKey = product === "publish" ? "publish" : workspace;
 
   // 当前产品(用于 Logo 副标题与产品切换高亮)
   const currentProduct = PRODUCTS.find((p) => p.key === product) ?? PRODUCTS[0];
@@ -562,8 +590,12 @@ export function AppSidebar({
     // 侧栏固定容器默认 top-0/h-svh,会顶到自定义标题栏后面;
     // 这里按标题栏高度 --titlebar-h 下移并缩高,使其从标题栏下方开始
     <Sidebar
-      // 对话 / 创作工作区:收起即完全隐藏(offcanvas);运营工作区保持收成图标条(icon)
-      collapsible={workspace === "management" ? "icon" : "offcanvas"}
+      // 对话 / 创作工作区:收起即完全隐藏(offcanvas);运营工作区与发布服务保持收成图标条(icon)
+      collapsible={
+        product === "publish" || workspace === "management"
+          ? "icon"
+          : "offcanvas"
+      }
       className="top-(--titlebar-h)! h-[calc(100svh-var(--titlebar-h))]!"
     >
       <SidebarHeader>
@@ -616,12 +648,7 @@ export function AppSidebar({
                       }
                       onClick={() => {
                         if (isCurrent) return;
-                        // 占位产品仅提示;真实产品切换上下文
-                        if (item.placeholder) {
-                          toast.info(`${item.name} 即将上线`);
-                        } else {
-                          onProductChange(item.key);
-                        }
+                        onProductChange(item.key);
                       }}
                     >
                       <Icon className={isCurrent ? "text-primary" : ""} />
@@ -639,31 +666,32 @@ export function AppSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
 
-        {/* 工作区分类切换:运营 / 对话 / 创作(仅协作平台产品有子工作区) */}
-        {product === "crawler" && (
-          <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
-            {orderedWorkspaces.map((ws) => (
-              <button
-                key={ws.key}
-                type="button"
-                onClick={() => onWorkspaceChange(ws.key)}
-                className={cn(
-                  "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
-                  workspace === ws.key
-                    ? "bg-background text-primary shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {ws.label}
-              </button>
-            ))}
-          </div>
-        )}
+        {/* 服务切换:运营 / 对话 / 创作平铺;发布服务是独立产品,
+            入口在 Logo 右侧「切换平台」,不进服务栏;顺序在系统设置「菜单顺序」治理 */}
+        <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
+          {visibleServices.map((sv) => (
+            <button
+              key={sv.key}
+              type="button"
+              onClick={() => onServiceChange(sv.key)}
+              className={cn(
+                "flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
+                activeService === sv.key
+                  ? "bg-background text-primary shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {sv.label}
+            </button>
+          ))}
+        </div>
       </SidebarHeader>
 
       <SidebarContent className="group-data-[collapsible=icon]:overflow-y-auto">
-        {/* 对话工作区渲染会话列表,其余渲染静态菜单 */}
-        {workspace === "chat" ? (
+        {/* 发布服务产品渲染自己的菜单;对话工作区渲染会话列表,其余渲染静态菜单 */}
+        {product === "publish" ? (
+          renderMenuGroups(PUBLISH_MENUS)
+        ) : workspace === "chat" ? (
           <ChatConversationList active={active} onChange={onChange} />
         ) : (
           renderMenuGroups(WORKSPACE_MENUS[workspace])

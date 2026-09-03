@@ -6,7 +6,7 @@
 
 veltrix-crawler 是抖音 / 小红书 / 快手 / Bilibili / TikTok / YouTube 等平台的内容采集桌面应用(Tauri 2 + React 19)。核心特点:**不逆向平台签名**——用系统 WebView(Windows 为 WebView2)打开真实登录页,注入脚本 hook fetch/XHR 拦截页面自己发出的接口响应,适配器只负责把响应解析为统一模型,从而绕开 a_bogus / X-Bogus 等签名与风控。
 
-除采集外,应用还包含:账号池(Cookie 管理)、评论意向分析、语音转写(「AI 文案提取」)、Obsidian 同步、LLM 对话(多家 OpenAI 兼容厂商)、桌面操作 Agent(编程 / RPA / 电脑操作)、云端配对远程控制。
+除采集外,应用还包含:账号池(Cookie 管理)、评论意向分析、语音转写(「AI 文案提取」)、Obsidian 同步、LLM 对话(多家 OpenAI 兼容厂商)、桌面操作 Agent(编程 / RPA / 电脑操作)、云端配对远程控制、发布服务(独立分类账号池 + 自动发布,建设中——账号池已可用,发布流程在第 1 期)。
 
 桌面端窗口标题为 **VeltrixLoop**,Tauri identifier 为 `com.lynns.veltrix-crawler`。
 
@@ -43,10 +43,13 @@ crates/server    veltrix-server — 可独立部署的 HTTP API 服务二进制,
                                   部署形态由 VELTRIX_MODE 决定(cloud / desktop)
 src-tauri        veltrix-crawler— 桌面端(bin + lib):
   adapter/       平台解析器(douyin/xhs/kuaishou/bilibili/tiktok/youtube)
-  webview/       WebView 池(pool)、原生网络拦截(native_intercept)、脚本注入、cookie
+  webview/       WebView 池(pool)、原生网络拦截(native_intercept)、脚本注入、cookie、
+                 cdp(WebView2 DevTools 协议:DOM.setFileInputFiles 文件上传,发布用)、
+                 script_eval(ExecuteScript 同步回读,eval_json_window 供池化窗口用)
   commands/      Tauri 命令(task / collect / dashboard / admin / billing / cloud / creation)
   agent/         桌面操作 Agent(chat / coding / computer / rpa / shell / ocr / uia / orchestrator …)
-  cookie/        账号池;media/ 素材下载;model/ 跨平台统一模型
+  cookie/        采集账号池;publish/ 发布服务(独立分类账号池;自动发布流程建设中)
+  media/         素材下载;model/ 跨平台统一模型
   llm/           LLM 对话(chat / embedding / intent / speech / provider)
   cloud/         云端配对 / WebSocket 客户端 / 远程执行
   obsidian/      Obsidian 同步;sandbox/ 编程本地沙盒(Job Object / killpg)
@@ -60,7 +63,7 @@ docs/            设计文档(agent-platform-design.md 等)
 src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程平台域名 invoke
 ```
 
-数据库实体在 `crates/core/src/db/entity/`(account、content、comment、task、collect_record、chat_* 等 23 张表)。
+数据库实体在 `crates/core/src/db/entity/`(account、content、comment、task、collect_record、chat_*、customer、publish_account 等 24 张表)。
 
 ## 采集数据流(核心,改采集前先读懂)
 
@@ -81,9 +84,12 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 - **数据归属**:业务数据记 `owner`(用户名);用户有 `dataScope`(all/self),`list_*` 命令按 scope 过滤。配置类数据(平台/行业/提示词等)共用,不分归属。
 - **桌面鉴权**:桌面端登录**不发 token**,登录态存前端 localStorage + 后端 `AppState.current_user`;JWT 仅用于对外 HTTP API(`/api/v1`)。密码哈希用 argon2。
 - **任务状态机**:pending → running → downloading_media → completed(失败/手动停为 failed/cancelled)。**completed 算活跃、留在任务列表**,只有 failed/cancelled 进归档 tab。进度靠后端 `task-progress` 事件实时推送 + 前端 2s 轮询兜底(轮询条件必须含 running 与 downloading_media)。
+- **转写三态**:`contents.transcript` NULL=未转写/转写失败(可重试,`transcript_error` 存原因),**空串=已转写但未识别到语音**(空文案标记,前端显「空文案」徽章,不再进「待转写」统计与批量重试),非空=文案。「有文案」口径(`require_transcript` 筛选、导出、Obsidian 同步)仍排除空串。
 - **平台配置是抓包起点**:`crates/core/src/config/mod.rs` 的 `builtin_default` 里 `search_url_template` / `intercept_patterns` 只是开箱骨架,真实接口路径需本机 `bun run tauri dev` 抓包核对后调整(代码注释已标注)。
 - **Tauri 命令注册**:每个新 `#[tauri::command]` 都要加进 `lib.rs` 的 `invoke_handler![]` 列表才能被前端 invoke。
 - **采集 WebView 的远程权限**:`src-tauri/capabilities/collect-remote.json` 显式授权小红书/抖音/快手域名 invoke(回传拦截响应与 RPA 结果),新增平台域名要同步加这里。
+- **发布账号池独立于采集账号池**:发布账号存 `publish_accounts`,按 CRM 客户分组(`category_id` 存 customers.id,客户在运营 > 客户管理维护,发布侧只读、不再单独建分类表;悬空账号在前端「未关联客户」兜底分组可见),不复用 cookie/ 的轮换/acquire。发布窗口 label 为 `veltrix-pub-{platform}-{accountId}`(保留 `veltrix-` 前缀吃 capabilities 通配,数据目录与采集账号隔离);登录检测脚本 account_id 带 `pub:` 前缀,`login_status_report` 按前缀路由到 `publish::PublishAccounts`,状态机 active / invalid / limited / disabled。
+- **视频落盘**:任务开 `keep_video`(TaskFormSheet「保留视频」)时媒体阶段把 mp4 落盘到 `{media_root}/{platform}/{date}/video/{content_id}.mp4` 并回写 `contents.video_path`(默认只抽音频不留视频);发布服务复用此素材。
 
 ## 代码风格
 

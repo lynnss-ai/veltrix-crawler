@@ -395,6 +395,8 @@ export interface TaskView {
   aiExtract: boolean;
   // 音频提取:视频下载并转 mp3 留存;AI 文案提取开启时隐含开启
   audioExtract: boolean;
+  // 保留视频文件:视频落盘到 video/ 目录供自动发布(与音频提取独立)
+  keepVideo: boolean;
   // 评论采集:开启后按下列规则抓评论;关闭时其余字段无意义
   collectComments?: boolean;
   // 评论发布时间范围:3d / 7d / 14d / any(不限)
@@ -467,6 +469,8 @@ export interface TaskInput {
   aiExtract: boolean;
   // 音频提取:视频下载并转 mp3 留存;AI 文案提取开启时隐含开启
   audioExtract: boolean;
+  // 保留视频文件:视频落盘供自动发布;省略 = 关闭(与音频提取独立)
+  keepVideo?: boolean;
   // 评论采集相关(见 TaskView 同名字段说明)
   collectComments?: boolean;
   commentTimeRange?: "3d" | "7d" | "14d" | "any";
@@ -535,7 +539,8 @@ export interface ContentView {
   avatarPath: string | null;
   // 视频转出音频本地绝对路径(详情页播放用);null=非视频/未提取/旧数据未记录
   audioPath: string | null;
-  // 视频语音转写文本(转写成功后回写),前端展示
+  // 视频语音转写文本(转写成功后回写),前端展示;
+  // 空串 "" = 已转写但未识别到语音(空文案标记),null = 未转写/转写失败
   transcript: string | null;
   // 转写失败原因(区分未转写与失败)
   transcriptError: string | null;
@@ -632,7 +637,8 @@ export interface MediaStatusView {
   mediaStatus: "pending" | "success" | "failed" | null;
   audioExtracted: boolean | null;
   mediaError: string | null;
-  // 最新转写文本 / 失败原因(音频重试成功会顺带补转写,转写重试会更新两者)
+  // 最新转写文本 / 失败原因(音频重试成功会顺带补转写,转写重试会更新两者);
+  // transcript 空串 "" = 已转写但未识别到语音(空文案标记)
   transcript: string | null;
   transcriptError: string | null;
 }
@@ -669,6 +675,15 @@ export interface CommentView {
   contentAuthorAvatar: string | null;
   // 采集该内容时命中的关键词(从所属内容关联取;内容已删则为空串)
   keyword: string;
+}
+
+// 内容详情评论栏分页响应(对应后端 CommentPageView;按点赞数倒序游标分页)
+export interface CommentPageView {
+  items: CommentView[];
+  // 该内容下评论总数(标题展示;与分页无关)
+  total: number;
+  // 下一页游标;null = 已到底(隐藏「加载更多」)
+  nextCursor: string | null;
 }
 
 // 全量库内容分页查询参数(对应后端 ContentListQuery)。ids 模式(批量视图)忽略 limit/offset/sort。
@@ -874,6 +889,50 @@ export interface RecordingStatus {
   startedAt: number | null;
   // 输出 MP4 路径;未录制为 null
   outputPath: string | null;
+}
+
+// ===================== 发布服务 =====================
+
+// 发布平台清单(对应后端 list_publish_platforms):独立于采集平台配置,只返回启用的平台
+export interface PublishPlatformView {
+  id: string;
+  // 发布侧展示名(如「视频号助手」「小红书创作者平台」)
+  name: string;
+  loginUrl: string;
+  enabled: boolean;
+}
+
+// 发布账号的分组(客户):直接复用 CRM 客户(运营 > 客户管理),展示名称 + 编码
+export interface PublishCustomerView {
+  id: string;
+  name: string;
+  // 客户编码(如 CUS-XXXX)
+  code: string;
+  // 该客户下挂的发布账号数
+  accountCount: number;
+  createdAt: number;
+}
+
+// 发布账号(对应后端 PublishAccountView)
+export interface PublishAccountView {
+  id: string;
+  platform: string;
+  // 所属客户(customers.id)
+  categoryId: string | null;
+  label: string;
+  nickname: string;
+  avatar: string;
+  uid: string;
+  // active 正常 / invalid 失效 / limited 受限 / disabled 停用
+  status: "active" | "invalid" | "limited" | "disabled" | string;
+  // 失效 / 受限原因(空串 = 无)
+  failReason: string;
+  code: string;
+  lastLoginAt: number | null;
+  lastPublishAt: number | null;
+  // 今日已发布条数
+  todayPublished: number;
+  createdAt: number;
 }
 
 // ===================== 账单计费 =====================

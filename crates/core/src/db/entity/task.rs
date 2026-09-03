@@ -35,6 +35,8 @@ pub struct Model {
     pub min_likes: i32,
     /// 是否启用音频提取(视频下载并转 mp3 留存;AI 文案提取开启时隐含开启)
     pub audio_extract: bool,
+    /// 是否保留视频文件(下载后落盘不清理,供发布服务复用素材;默认 false,发布后源文件由发布侧管理)
+    pub keep_video: bool,
     /// 是否启用 AI 文案提取(依赖音频提取:转音频后做语音转写)
     pub ai_extract: bool,
     /// 是否采集评论(开启后内容采集完进入评论采集阶段)

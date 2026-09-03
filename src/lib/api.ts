@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount, TableMigrationView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -434,8 +434,8 @@ export const api = {
   commentIndustryCounts: (query: CommentListQuery) =>
     invoke<IndustryCount[]>("comment_industry_counts", { query }),
   // 单条内容的评论列表(全量库详情右侧评论栏,按点赞倒序)
-  listContentComments: (contentId: string) =>
-    invoke<CommentView[]>("list_content_comments", { contentId }),
+  listContentComments: (contentId: string, cursor?: string, limit?: number) =>
+    invoke<CommentPageView>("list_content_comments", { contentId, cursor, limit }),
   // 采集日志:加载某任务的历史日志(任务详情页打开时回显,再接实时事件)
   listCollectLogs: (taskId: string) =>
     invoke<CollectLogEntry[]>("list_collect_logs", { taskId }),
@@ -535,5 +535,39 @@ export const api = {
       start: start ?? null,
       end: end ?? null,
     }),
+
+  // 发布服务:发布平台清单(独立于采集平台配置;只返回启用的平台)
+  listPublishPlatforms: () =>
+    invoke<PublishPlatformView[]>("list_publish_platforms"),
+
+  // 发布服务:客户分组(只读;客户的增删改在运营 > 客户管理)
+  listPublishCustomers: () =>
+    invoke<PublishCustomerView[]>("list_publish_customers"),
+
+  // 发布服务:账号池(categoryId=null 不按客户过滤,返回全部)
+  listPublishAccounts: (categoryId: string | null) =>
+    invoke<PublishAccountView[]>("list_publish_accounts", { categoryId }),
+  createPublishAccount: (input: {
+    platform: string;
+    categoryId: string | null;
+    label: string;
+  }) => invoke<PublishAccountView>("create_publish_account", input),
+  updatePublishAccount: (
+    id: string,
+    categoryId: string | null,
+    label: string,
+  ) =>
+    invoke<PublishAccountView>("update_publish_account", {
+      id,
+      categoryId,
+      label,
+    }),
+  deletePublishAccount: (id: string) =>
+    invoke<void>("delete_publish_account", { id }),
+  // 打开该账号的平台登录窗口(扫码 / 登录);登录结果经 publish-account-updated 事件回推
+  openPublishAccountLogin: (id: string) =>
+    invoke<void>("open_publish_account_login", { id }),
+  closePublishAccountWindow: (id: string) =>
+    invoke<void>("close_publish_account_window", { id }),
 };
 
