@@ -120,14 +120,18 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<CustomerItem | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   // 所属行业下拉来自「行业类别」维护的真实数据
   const [industries, setIndustries] = useState<IndustryView[]>([]);
 
   async function loadCustomers() {
+    setLoading(true);
     try {
       setCustomers(await api.listCustomers());
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -274,6 +278,7 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
       <DataTable
         columns={columns}
         data={customers}
+        loading={loading}
         itemLabel="客户"
         globalFilterFn={customerFilterFn}
         getRowId={(row) => row.id}

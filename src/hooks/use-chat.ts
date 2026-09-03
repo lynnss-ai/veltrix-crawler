@@ -6,10 +6,13 @@ import type { ConversationView, ProviderDto } from "@/lib/api";
 
 export interface ChatContextValue {
   conversations: ConversationView[];
+  /** 首次读取会话列表时用于区分「尚未返回」与「确实没有会话」。 */
+  conversationsLoading: boolean;
   activeId: string | null;
   setActiveId: (id: string | null) => void;
   /** 模型厂商列表:登录后在 Provider 层加载一次、全局共享,避免各布局重挂载时重拉导致「尚无可用模型」竞态 */
   providers: ProviderDto[];
+  providersLoading: boolean;
   /** 新建会话时的待用场景类型(chat / coding);开新会话(activeId=null)时决定首条消息建会话的 agent_type 与布局 */
   pendingAgentType: string;
   setPendingAgentType: (t: string) => void;

@@ -1,6 +1,6 @@
 // 记忆管理:对话工作区下的整页模块。
 // 全局记忆(控制台式:数字条 + 工具栏 + 列表)/ 会话记忆(左右双栏 master-detail)两个标签。
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
   Brain,
   Loader2,
@@ -47,6 +47,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
+import { Pagination } from "@/components/Pagination";
 
 // 记忆分类的中文标签(与后端 MEM_TYPES 对应)
 const MEMORY_TYPE_LABELS: Record<string, string> = {
@@ -130,6 +131,9 @@ function GlobalMemorySection() {
   const [embedModel, setEmbedModel] = useState(EMBED_DEFAULT_MODEL);
   const [embedKey, setEmbedKey] = useState("");
   const [savingEmbed, setSavingEmbed] = useState(false);
+  const [pageIndex, setPageIndex] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+  const deferredSearch = useDeferredValue(search);
 
   function reload() {
     setLoading(true);
@@ -198,7 +202,7 @@ function GlobalMemorySection() {
   }
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return memories.filter((m) => {
       if (q && !m.content.toLowerCase().includes(q)) return false;
       if (sourceFilter !== "all" && m.source !== sourceFilter) return false;
@@ -207,7 +211,22 @@ function GlobalMemorySection() {
       if (statusFilter === "disabled" && m.enabled) return false;
       return true;
     });
-  }, [memories, search, sourceFilter, typeFilter, statusFilter]);
+  }, [memories, deferredSearch, sourceFilter, typeFilter, statusFilter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePageIndex = Math.min(pageIndex, pageCount - 1);
+  const pageItems = useMemo(
+    () =>
+      filtered.slice(
+        safePageIndex * pageSize,
+        (safePageIndex + 1) * pageSize,
+      ),
+    [filtered, safePageIndex, pageSize],
+  );
+
+  useEffect(() => {
+    setPageIndex(0);
+  }, [deferredSearch, sourceFilter, typeFilter, statusFilter, pageSize]);
 
   const stats = useMemo(() => {
     const total = memories.length;
@@ -598,7 +617,7 @@ function GlobalMemorySection() {
         />
       ) : (
         <div className="space-y-1.5">
-          {filtered.map((m) => (
+          {pageItems.map((m) => (
             <div
               key={m.id}
               className="group flex items-start gap-2.5 rounded-lg border bg-card px-3 py-2.5"
@@ -742,6 +761,20 @@ function GlobalMemorySection() {
               )}
             </div>
           ))}
+          {filtered.length > pageSize && (
+            <div className="border-t pt-3">
+              <Pagination
+                pageIndex={safePageIndex}
+                pageCount={pageCount}
+                onPageChange={setPageIndex}
+                totalCount={filtered.length}
+                itemLabel="条记忆"
+                pageSize={pageSize}
+                pageSizeOptions={[50, 100, 200]}
+                onPageSizeChange={setPageSize}
+              />
+            </div>
+          )}
         </div>
       )}
 

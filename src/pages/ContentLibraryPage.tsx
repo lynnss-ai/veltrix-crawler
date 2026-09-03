@@ -1,7 +1,7 @@
 // 资产库:展示采集落库的内容(contents 表)。全量库/内容库/图片库共用本组件。
 // 筛选:左侧栏(行业 + 创建时间 + 发布时间)+ 顶部(平台 chip + 关键字搜索)。
 // 关键字匹配 标题 / 采集关键词 / 文案;时间为预设范围。
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowLeft,
@@ -21,7 +21,6 @@ import {
 } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
-import * as XLSX from "xlsx";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 
@@ -65,6 +64,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import {
   api,
   type ContentLibraryStats,
@@ -125,7 +125,7 @@ export function ContentLibraryPage({
   // 服务端分页:contents 持有「当前已加载页/批」(表格=当前页,瀑布流=已 append 的各批)
   const [contents, setContents] = useState<ContentView[]>([]);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   // 表格视图的服务端分页/排序状态
   const [serverState, setServerState] = useState<ServerTableState>({
     pageIndex: 0,
@@ -214,11 +214,17 @@ export function ContentLibraryPage({
   };
   // 图片库图源:image=图文内容的图片(默认)/ cover=全量库全部内容的封面
   const [imageSource, setImageSource] = useState<"image" | "cover">("image");
-  // 搜索词延迟值:输入即时回显,筛选/大列表重渲染延后到空闲帧,避免逐键卡顿
-  const deferredSearch = useDeferredValue(search);
+  // 真正防抖后再查数据库;useDeferredValue 只降低渲染优先级,不会合并逐键请求。
+  const debouncedSearch = useDebouncedValue(search, 300);
 
-  const platformName = useCallback((id: string) =>
-    platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
+  const platformNames = useMemo(
+    () => new Map(platforms.map((p) => [p.id, p.name])),
+    [platforms],
+  );
+  const platformName = useCallback(
+    (id: string) => platformNames.get(id) ?? id,
+    [platformNames],
+  );
 
   // 任务穿透时按任务拉取(服务端过滤,旧任务内容不被全量上限截断);开关/目标任务变化时重取
   const penetratedTaskId =
@@ -243,7 +249,7 @@ export function ContentLibraryPage({
         keyword: penetratedTaskId ? (taskFilter?.keyword ?? null) : null,
         runStart: penetratedTaskId ? (taskFilter?.runStart ?? null) : null,
         runEnd: penetratedTaskId ? (taskFilter?.runEnd ?? null) : null,
-        search: deferredSearch.trim() || null,
+        search: debouncedSearch.trim() || null,
         platform: platformFilter || null,
         // kindFilter(库级形态)与 kindSearch(全量库内多选)UI 互斥
         kinds: kindFilter ? [kindFilter] : kindSearch,
@@ -273,7 +279,7 @@ export function ContentLibraryPage({
     [
       penetratedTaskId,
       taskFilter,
-      deferredSearch,
+      debouncedSearch,
       platformFilter,
       kindFilter,
       kindSearch,
@@ -292,7 +298,7 @@ export function ContentLibraryPage({
     setGridOffset((o) => (o === 0 ? o : 0));
   }, [
     viewMode,
-    deferredSearch,
+    debouncedSearch,
     platformFilter,
     kindSearch,
     industryFilter,
@@ -303,6 +309,11 @@ export function ContentLibraryPage({
     taskFilter,
     taskFilterOn,
   ]);
+
+  // IntersectionObserver 可能在父组件重渲染时重复触发;稳定回调配合 loading 守卫避免跳过 offset 页。
+  const loadMoreGrid = useCallback(() => {
+    setGridOffset((offset) => offset + GRID_PAGE_SIZE);
+  }, []);
 
   // 表格视图:服务端分页替换式拉取
   useEffect(() => {
@@ -590,6 +601,8 @@ export function ContentLibraryPage({
     }
     setBatchExporting(true);
     try {
+      // Excel 库体积较大,仅在用户实际导出时加载,避免拖慢内容库首屏。
+      const XLSX = await import("xlsx");
       const rows = withTranscript.map((c) => ({
         平台: platformName(c.platform),
         行业: c.industry,
@@ -1267,7 +1280,8 @@ export function ContentLibraryPage({
             <ImageWaterfall
               items={contents}
               total={total}
-              onLoadMore={() => setGridOffset((o) => o + GRID_PAGE_SIZE)}
+              loading={loading}
+              onLoadMore={loadMoreGrid}
               platformName={platformName}
               retrying={retrying}
               onOpenDetail={setDetailId}

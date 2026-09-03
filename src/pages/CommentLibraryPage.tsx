@@ -1,7 +1,7 @@
 // 评论库:展示采集落库的评论(comments 表)+ AI 意向标记。
 // 筛选:左侧栏(行业 + 角标)+ 顶部(意向 / 平台 chip + 评论日期 + 关键字)。
 // 数据走后端分页(list_comments_page):筛选/排序下沉 SQL,客户端只持有当前页。
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Download, Heart, MessageCircle, Search, X } from "lucide-react";
 import { type DateRange } from "react-day-picker";
@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import {
   api,
   type CommentListQuery,
@@ -37,7 +38,6 @@ import {
 } from "@/lib/platforms";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { EmptyState } from "@/components/EmptyState";
-import * as XLSX from "xlsx-js-style";
 import { save } from "@tauri-apps/plugin-dialog";
 import { recordDownload } from "@/lib/download-history";
 
@@ -104,7 +104,7 @@ export function CommentLibraryPage() {
   // 当前页数据 + 总数 + 取数中(服务端分页:comments 只持有一页)
   const [comments, setComments] = useState<CommentView[]>([]);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [serverState, setServerState] = useState<ServerTableState>({
     pageIndex: 0,
     pageSize: 50,
@@ -119,8 +119,8 @@ export function CommentLibraryPage() {
   const [commentRange, setCommentRange] = useState<DateRange | undefined>();
   const [kindFilter, setKindFilter] = useState<string[]>([]); // []=全部形态
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
-  // 搜索延迟值:输入即时回显,查询/重取延后到空闲帧(与内容库一致)
-  const deferredSearch = useDeferredValue(search);
+  // 输入即时回显,用户停顿后才触发列表与行业角标查询。
+  const debouncedSearch = useDebouncedValue(search, 300);
   // 请求序号竞态守卫:筛选快速切换时,慢的旧响应不覆盖新响应
   const reqSeq = useRef(0);
 
@@ -133,7 +133,7 @@ export function CommentLibraryPage() {
     }): CommentListQuery => {
       const sort = opts.sorting?.[0];
       return {
-        search: deferredSearch.trim() || null,
+        search: debouncedSearch.trim() || null,
         platform: platformFilter || null,
         kinds: kindFilter,
         industry: industryFilter === "__all" ? null : industryFilter,
@@ -148,7 +148,7 @@ export function CommentLibraryPage() {
         offset: opts.offset,
       };
     },
-    [deferredSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange],
+    [debouncedSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange],
   );
 
   useEffect(() => {
@@ -159,7 +159,7 @@ export function CommentLibraryPage() {
   // 筛选变化回到第一页(offset 页在列表变化后会漂移);分页/排序变化由 fetch effect 直接响应
   useEffect(() => {
     setServerState((s) => (s.pageIndex === 0 ? s : { ...s, pageIndex: 0 }));
-  }, [deferredSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange]);
+  }, [debouncedSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange]);
 
   useEffect(() => {
     const query = buildQuery({
@@ -185,8 +185,14 @@ export function CommentLibraryPage() {
       });
   }, [buildQuery, serverState]);
 
-  const platformName = useCallback((id: string) =>
-    platforms.find((p) => p.id === id)?.name ?? id, [platforms]);
+  const platformNames = useMemo(
+    () => new Map(platforms.map((p) => [p.id, p.name])),
+    [platforms],
+  );
+  const platformName = useCallback(
+    (id: string) => platformNames.get(id) ?? id,
+    [platformNames],
+  );
 
   // 各行业评论数(侧栏角标):走后端聚合,跟随当前筛选(除行业自身——与列表口径一致)。
   // 「全部」角标用列表 total,渲染时合并传入
@@ -448,6 +454,8 @@ export function CommentLibraryPage() {
       return;
     }
     try {
+      // 样式版 Excel 库接近 1 MB,低频导出动作再按需加载。
+      const xlsxPromise = import("xlsx-js-style");
       // 分页接口翻页拼全量(导出是低频动作,串行翻页可接受,不新增导出专用命令)
       const all: CommentView[] = [];
       const pageSize = 2000;
@@ -460,6 +468,7 @@ export function CommentLibraryPage() {
         if (all.length >= res.total || res.items.length === 0) break;
         offset += pageSize;
       }
+      const XLSX = await xlsxPromise;
       const rows = all.map((c) => ({
         平台: platformName(c.platform),
         评论者: c.authorNickname,

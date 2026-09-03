@@ -40,6 +40,7 @@ import {
 import { DonutChart } from "@/components/charts/DonutChart";
 import { AutoScrollList } from "@/components/charts/AutoScrollList";
 import { MultiTrendChart } from "@/components/charts/MultiTrendChart";
+import { PageLoading } from "@/components/PageLoading";
 
 // 实时刷新节流间隔:采集中 task-progress / collect-log 事件触发很频繁,
 // 而概览是多表聚合查询较重,10s 拉一次即可(此前 3s,采集期间仍会高频全表聚合;
@@ -84,6 +85,7 @@ export function DashboardPage() {
   );
   const [range, setRange] = useState<DateRange | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   const platformName = (id: string) =>
     platforms.find((p) => p.id === id)?.name ?? id;
@@ -101,7 +103,8 @@ export function DashboardPage() {
     api
       .dashboardOverview(start, end)
       .then(setData)
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(String(e)))
+      .finally(() => setInitialLoading(false));
   };
 
   // 节流刷新:距上次加载不足节流间隔时,挂一个尾随定时器补一次,保证最终状态不丢
@@ -181,6 +184,10 @@ export function DashboardPage() {
         { label: "失败", value: data.mediaStats.failed, color: "#ef4444" },
       ]
     : [];
+
+  if (initialLoading && !data) {
+    return <PageLoading variant="dashboard" />;
+  }
 
   return (
     <div className="veltrix-no-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-1">

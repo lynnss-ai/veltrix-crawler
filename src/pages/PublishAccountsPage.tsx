@@ -33,6 +33,7 @@ import { cn, formatTimestamp } from "@/lib/utils";
 import { platformClass, platformLabel } from "@/lib/platforms";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
+import { PageLoading } from "@/components/PageLoading";
 import { FieldError } from "@/components/FieldError";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
@@ -114,6 +115,7 @@ export function PublishAccountsPage() {
   const [selectedCustomer, setSelectedCustomer] = useState("");
   const [accounts, setAccounts] = useState<PublishAccountView[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   const [editingAccount, setEditingAccount] = useState<PublishAccountView | null>(null);
   const [isAccountFormOpen, setIsAccountFormOpen] = useState(false);
@@ -146,12 +148,11 @@ export function PublishAccountsPage() {
   }, []);
 
   useEffect(() => {
-    api
-      .listPublishPlatforms()
-      .then(setPlatforms)
-      .catch((e) => setError(String(e)));
-    loadCustomers();
-    loadAccounts();
+    Promise.all([
+      api.listPublishPlatforms().then(setPlatforms),
+      loadCustomers(),
+      loadAccounts(),
+    ]).finally(() => setLoading(false));
   }, [loadCustomers, loadAccounts]);
 
   // 登录窗口内登录成功 / 状态变化:后端推送事件,刷新账号列表与客户计数
@@ -369,6 +370,15 @@ export function PublishAccountsPage() {
       ? "未关联客户"
       : (customers.find((c) => c.id === selectedCustomer)?.name ?? "");
 
+  if (
+    loading &&
+    platforms.length === 0 &&
+    customers.length === 0 &&
+    accounts.length === 0
+  ) {
+    return <PageLoading />;
+  }
+
   return (
     <div
       className={`flex min-h-0 flex-1 flex-col gap-4 ${FORM_CONTROL_SIZING}`}
@@ -450,6 +460,7 @@ export function PublishAccountsPage() {
           <DataTable
             columns={columns}
             data={visibleAccounts}
+            loading={loading}
             itemLabel="账号"
             globalFilterFn={accountFilterFn}
             getRowId={(a) => a.id}

@@ -6,3 +6,11 @@ resolver = "2"
 # workspace 下 [profile] 仅在根生效,故放这里统一作用于桌面端/server/core。
 [profile.dev]
 debug = "line-tables-only"
+# 本项目桌面端 crate 较大,增量编译会长期堆积大量中间对象;
+# 关闭后用稍长的本地 crate 重编时间换取稳定得多的 target 体积。
+incremental = false
+
+# 第三方依赖无需文件/行号级调试信息;项目 workspace 成员仍沿用上面的
+# line-tables-only,因此业务代码 panic/backtrace 仍能定位到源码行。
+[profile.dev.package."*"]
+debug = 0

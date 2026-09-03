@@ -19,9 +19,9 @@
 
 body {
   margin: 0;
-  /* 与 index.css 全局字体栈保持一致(阿里巴巴普惠体优先,已内嵌字体文件) */
-  font-family: "Alibaba PuHuiTi 3.0", "Alibaba PuHuiTi", "PingFang SC",
-    "Microsoft YaHei", sans-serif;
+  /* 与 index.css 全局系统字体栈保持一致。 */
+  font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, -apple-system,
+    "Segoe UI", sans-serif;
   background: var(--color-bg);
   color: var(--color-text);
   font-size: 14px;

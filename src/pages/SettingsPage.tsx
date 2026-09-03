@@ -29,6 +29,7 @@ import {
 import { SERVICES, type ServiceKey } from "@/components/app-sidebar";
 import { useWorkspaceOrder } from "@/hooks/use-workspace-order";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { PageLoading } from "@/components/PageLoading";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -67,6 +68,7 @@ export function SettingsPage() {
   const [active, setActive] = useState<SectionKey>("general");
   const [cfg, setCfg] = useState<AppConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   const [providers, setProviders] = useState<Provider[]>([]);
   // 厂商预设 + 能力(code/name/apiUrl/chat/asr,后端单一真相源):
@@ -118,15 +120,14 @@ export function SettingsPage() {
     }
   }
   useEffect(() => {
-    api
-      .getAppConfig()
-      .then(setCfg)
-      .catch((e) => setError(String(e)));
-    reloadProviders();
-    api
-      .listProviderCapabilities()
-      .then(setCaps)
-      .catch((e) => console.warn("加载模型能力列表失败:", e));
+    Promise.all([
+      api.getAppConfig().then(setCfg).catch((e) => setError(String(e))),
+      api.listProviders().then(setProviders).catch((e) => setError(String(e))),
+      api
+        .listProviderCapabilities()
+        .then(setCaps)
+        .catch((e) => console.warn("加载模型能力列表失败:", e)),
+    ]).finally(() => setInitialLoading(false));
   }, []);
 
   function submitProvider(provider: Provider) {
@@ -149,6 +150,8 @@ export function SettingsPage() {
       })
       .catch((e) => toast.error(`删除失败: ${e}`));
   }
+
+  if (initialLoading) return <PageLoading />;
 
   return (
     <div

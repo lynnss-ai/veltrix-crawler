@@ -31,6 +31,7 @@ import {
 import { formatTimestamp } from "@/lib/utils";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
+import { PageLoading } from "@/components/PageLoading";
 import { FieldError } from "@/components/FieldError";
 import { CodeField, generateCode } from "@/components/CodeField";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
@@ -98,6 +99,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
     {},
   );
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   const [editing, setEditing] = useState<AccountView | null>(null);
   const [isFormOpen, setIsFormOpen] = useState(false);
@@ -111,12 +113,15 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
 
   const loadAccounts = useCallback(async (platform: string) => {
     if (!platform) return;
+    setLoading(true);
     try {
       const list = await api.listAccounts(platform);
       setAccounts(list);
       setAccountCounts((prev) => ({ ...prev, [platform]: list.length }));
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -136,11 +141,16 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
           ),
         );
         setAccountCounts(Object.fromEntries(entries));
+        if (list.length === 0) setLoading(false);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        setError(String(e));
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
+    setAccounts([]);
     loadAccounts(selectedPlatform);
   }, [selectedPlatform, loadAccounts]);
 
@@ -353,6 +363,8 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
     ([value, meta]) => ({ label: meta.label, value }),
   );
 
+  if (loading && platforms.length === 0) return <PageLoading />;
+
   return (
     <div
       className={`flex min-h-0 flex-1 flex-col gap-4 ${FORM_CONTROL_SIZING}`}
@@ -428,6 +440,7 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
           <DataTable
             columns={columns}
             data={accounts}
+            loading={loading}
             itemLabel="账号"
             globalFilterFn={accountFilterFn}
             getRowId={(a) => a.id}

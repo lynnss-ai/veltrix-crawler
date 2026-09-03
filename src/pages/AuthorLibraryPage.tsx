@@ -1,12 +1,13 @@
 // 作者库:采集到的作者档案(authors 表)。画像 + 已采内容聚合 + 监控开关。
 // 筛选:左侧行业栏(作者跨行业按其内容所属任务聚合)+ 平台 chip + 仅看监控 + 关键字。
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Eye, RefreshCw, Search, UserRound, X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
 import { DataTable } from "@/components/DataTable";
+import { PageLoading } from "@/components/PageLoading";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
@@ -49,6 +50,7 @@ export function AuthorLibraryPage() {
   const [authors, setAuthors] = useState<AuthorView[]>([]);
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
+  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [platformFilter, setPlatformFilter] = useState(""); // ""=全部
   const [industryFilter, setIndustryFilter] = useState("__all");
@@ -58,17 +60,25 @@ export function AuthorLibraryPage() {
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   // 画像补采进行中:禁用按钮,防重复触发
   const [enriching, setEnriching] = useState(false);
+  const deferredSearch = useDeferredValue(search);
 
-  const platformName = (id: string) =>
-    platforms.find((p) => p.id === id)?.name ?? id;
+  const platformNames = useMemo(
+    () => new Map(platforms.map((p) => [p.id, p.name])),
+    [platforms],
+  );
+  const platformName = useCallback(
+    (id: string) => platformNames.get(id) ?? id,
+    [platformNames],
+  );
 
   useEffect(() => {
-    api
-      .listAuthors()
-      .then(setAuthors)
-      .catch((e) => toast.error(`加载作者失败: ${e}`));
-    api.listPlatforms().then(setPlatforms).catch((e) => console.warn("加载平台列表失败:", e));
-    api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
+    Promise.all([
+      api.listAuthors().then(setAuthors),
+      api.listPlatforms().then(setPlatforms),
+      api.listIndustries().then(setIndustries),
+    ])
+      .catch((e) => toast.error(`加载作者库失败: ${e}`))
+      .finally(() => setLoading(false));
   }, []);
 
   const platformOptions = useMemo(() => platforms.map((p) => p.id), [platforms]);
@@ -90,8 +100,8 @@ export function AuthorLibraryPage() {
       if (industryFilter !== "__all" && !a.industries.includes(industryFilter))
         return false;
       if (monitoredOnly && !a.isMonitored) return false;
-      if (search) {
-        const q = search.toLowerCase();
+      if (deferredSearch) {
+        const q = deferredSearch.toLowerCase();
         return (
           a.nickname.toLowerCase().includes(q) ||
           a.uid.toLowerCase().includes(q) ||
@@ -100,7 +110,7 @@ export function AuthorLibraryPage() {
       }
       return true;
     });
-  }, [authors, platformFilter, industryFilter, monitoredOnly, search]);
+  }, [authors, platformFilter, industryFilter, monitoredOnly, deferredSearch]);
 
   const hasFilter =
     platformFilter !== "" ||
@@ -323,8 +333,10 @@ export function AuthorLibraryPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [platforms, toggling],
+    [platformName, toggling],
   );
+
+  if (loading && authors.length === 0) return <PageLoading />;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 gap-4">
@@ -408,6 +420,7 @@ export function AuthorLibraryPage() {
         <DataTable
           columns={columns}
           data={filtered}
+          loading={loading}
           itemLabel="作者"
           getRowId={(a) => a.id}
           defaultPageSize={50}

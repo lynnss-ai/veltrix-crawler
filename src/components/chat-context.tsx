@@ -7,6 +7,7 @@ import { ChatContext } from "@/hooks/use-chat";
 
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [conversations, setConversations] = useState<ConversationView[]>([]);
+  const [conversationsLoading, setConversationsLoading] = useState(true);
   const [activeId, setActiveId] = useState<string | null>(null);
   // 默认新会话=统一编排器(可直接对话,需要时把专门智能体当工具委派)
   const [pendingAgentType, setPendingAgentType] = useState<string>("orchestrator");
@@ -14,6 +15,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     null,
   );
   const [providers, setProviders] = useState<ProviderDto[]>([]);
+  const [providersLoading, setProvidersLoading] = useState(true);
   // 首条消息自动交接提示条:ChatPage 建好 Agent 会话后置位,ConversationShell 在新布局顶部渲染;状态随 Provider 卸载清理
   const [handoffNotice, setHandoffNotice] = useState<{
     convId: string;
@@ -24,17 +26,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [prefillMessage, setPrefillMessage] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
+    setConversationsLoading(true);
     try {
       setConversations(await api.listConversations());
     } catch {
       // 未登录 / 后端未就绪时忽略,稍后由页面重试
+    } finally {
+      setConversationsLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void reload();
     // 模型厂商列表加载一次(全局共享);失败忽略,配置后重进对话工作区会重载
-    api.listProviders().then(setProviders).catch((e) => console.warn("加载模型厂商列表失败:", e));
+    api
+      .listProviders()
+      .then(setProviders)
+      .catch((e) => console.warn("加载模型厂商列表失败:", e))
+      .finally(() => setProvidersLoading(false));
   }, [reload]);
 
   // 后端 AI 概括出会话标题后经 conversation-title 事件推送:就地更新列表里对应会话,不必整表重拉
@@ -60,9 +69,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     <ChatContext.Provider
       value={{
         conversations,
+        conversationsLoading,
         activeId,
         setActiveId,
         providers,
+        providersLoading,
         pendingAgentType,
         setPendingAgentType,
         pendingFirstMessage,

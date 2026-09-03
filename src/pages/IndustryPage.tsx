@@ -33,6 +33,7 @@ import {
 import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { DataTable } from "@/components/DataTable";
+import { PageLoading } from "@/components/PageLoading";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
 import { Button } from "@/components/ui/button";
@@ -94,6 +95,7 @@ export function IndustryPage() {
   );
   const [selectedId, setSelectedId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   // 行业的新增 / 编辑 / 删除
   const [industryForm, setIndustryForm] = useState<IndustryView | null>(null);
@@ -133,14 +135,18 @@ export function IndustryPage() {
   const loadKeywords = useCallback(async (industryId: string) => {
     if (!industryId) {
       setKeywords([]);
+      setLoading(false);
       return;
     }
+    setLoading(true);
     try {
       const list = await api.listKeywords(industryId);
       setKeywords(list);
       setKeywordCounts((prev) => ({ ...prev, [industryId]: list.length }));
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -282,6 +288,8 @@ export function IndustryPage() {
     [],
   );
 
+  if (loading && industries.length === 0) return <PageLoading />;
+
   return (
     <>
       <div
@@ -387,6 +395,7 @@ export function IndustryPage() {
           <DataTable
             columns={columns}
             data={keywordData}
+            loading={loading}
             itemLabel="关键词"
             globalFilterFn={keywordFilterFn}
             getRowId={(k) => k.id}

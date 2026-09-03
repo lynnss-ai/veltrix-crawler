@@ -11,6 +11,7 @@ import { DateRangePicker } from "@/components/DateRangePicker";
 import { StatCard } from "@/components/StatCard";
 import { DonutChart } from "@/components/charts/DonutChart";
 import { MultiTrendChart } from "@/components/charts/MultiTrendChart";
+import { PageLoading } from "@/components/PageLoading";
 
 const CHART_COLORS = [
   "#0ea5e9",
@@ -54,16 +55,31 @@ function toTimestamps(r?: DateRange) {
   return { start, end };
 }
 
+// 首屏六个统计区域默认使用同一时间范围,合并同一时刻的重复请求。
+// Promise 完成后移除,后续手动刷新仍会读取最新数据。
+const pendingOverview = new Map<string, Promise<BillingOverview>>();
+
+function loadBillingOverview(r?: DateRange): Promise<BillingOverview> {
+  const { start, end } = toTimestamps(r);
+  const key = `${start ?? "all"}:${end ?? "all"}`;
+  const existing = pendingOverview.get(key);
+  if (existing) return existing;
+  const request = api.billingOverview(start, end).finally(() => {
+    pendingOverview.delete(key);
+  });
+  pendingOverview.set(key, request);
+  return request;
+}
+
 function useBillingData() {
   const [data, setData] = useState<BillingOverview | null>(null);
   const [range, setRange] = useState<DateRange | undefined>();
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async (r?: DateRange) => {
     setLoading(true);
     try {
-      const { start, end } = toTimestamps(r);
-      const result = await api.billingOverview(start, end);
+      const result = await loadBillingOverview(r);
       setData(result);
     } catch {
       // 静默处理,由调用方决定是否展示
@@ -99,6 +115,10 @@ export function BillingPage() {
   const tokenDist = useBillingData();
   const reqDist = useBillingData();
   const detail = useBillingData();
+
+  if (summary.loading && !summary.data) {
+    return <PageLoading variant="dashboard" />;
+  }
 
   return (
     <div className="veltrix-no-scrollbar flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-1">

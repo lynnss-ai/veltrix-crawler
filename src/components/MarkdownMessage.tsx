@@ -3,13 +3,12 @@
 import { memo, useEffect, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { CodeHighlighter } from "@/components/code-highlighter";
 import {
   oneDark,
   oneLight,
 } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useTheme } from "next-themes";
-import mermaid from "mermaid";
 import { Check, Code, Copy, Download, Workflow } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -123,7 +122,7 @@ function CodeBlock({
           <code className="font-mono">{code}</code>
         </pre>
       ) : (
-        <SyntaxHighlighter
+        <CodeHighlighter
           language={lang || "text"}
           style={isDark ? oneDark : oneLight}
           customStyle={{
@@ -139,7 +138,7 @@ function CodeBlock({
           className="veltrix-thin-scrollbar"
         >
           {code}
-        </SyntaxHighlighter>
+        </CodeHighlighter>
       )}
     </div>
   );
@@ -158,32 +157,38 @@ function MermaidBlock({ code, plain }: { code: string; plain?: boolean }) {
   useEffect(() => {
     if (plain || view !== "diagram") return;
     let cancelled = false;
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: isDark ? "dark" : "default",
-      securityLevel: "strict",
-      fontFamily: "inherit",
-      // 自适应容器宽度;连线用曲线(沿用之前方式)
-      flowchart: { useMaxWidth: true, htmlLabels: false, curve: "basis" },
-      sequence: { useMaxWidth: true },
-      gantt: { useMaxWidth: true },
-    });
-    // id 不能含特殊字符;随机化避免多图冲突
-    const id = `mmd-${Math.random().toString(36).slice(2)}`;
-    mermaid.render(id, code).then(
-      (res) => {
-        if (!cancelled) {
-          setSvg(res.svg);
-          setErr("");
-        }
-      },
-      (e: unknown) => {
-        if (!cancelled) {
-          setErr(e instanceof Error ? e.message : String(e));
-          setSvg("");
-        }
-      },
-    );
+    // Mermaid 体积较大,只有消息里真的出现图表时才下载解析器。
+    import("mermaid")
+      .then(({ default: mermaid }) => {
+        if (cancelled) return undefined;
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: isDark ? "dark" : "default",
+          securityLevel: "strict",
+          fontFamily: "inherit",
+          // 自适应容器宽度;连线用曲线(沿用之前方式)
+          flowchart: { useMaxWidth: true, htmlLabels: false, curve: "basis" },
+          sequence: { useMaxWidth: true },
+          gantt: { useMaxWidth: true },
+        });
+        // id 不能含特殊字符;随机化避免多图冲突
+        const id = `mmd-${Math.random().toString(36).slice(2)}`;
+        return mermaid.render(id, code);
+      })
+      .then(
+        (res) => {
+          if (!cancelled && res) {
+            setSvg(res.svg);
+            setErr("");
+          }
+        },
+        (e: unknown) => {
+          if (!cancelled) {
+            setErr(e instanceof Error ? e.message : String(e));
+            setSvg("");
+          }
+        },
+      );
     return () => {
       cancelled = true;
     };

@@ -1,13 +1,27 @@
 // 对话外壳:统一入口,按当前会话的 agent_type 自动分发页面布局,无需手动选择。
 // 新会话先按 chat(单栏)呈现;发送时按意图判为 coding / rpa 则建对应会话并自动切到对应布局。
 // 已建会话锁定其 agent_type。
+import { lazy, Suspense } from "react";
 import { X } from "lucide-react";
 import { useChat } from "@/hooks/use-chat";
-import { ChatPage } from "@/pages/ChatPage";
-import { CodingLayout } from "@/components/coding-layout";
-import { RpaLayout } from "@/components/rpa-layout";
-import { ComputerLayout } from "@/components/computer-layout";
-import { LocalLayout } from "@/components/local-layout";
+import { PageLoading } from "@/components/PageLoading";
+
+// 各智能体工作区依赖编辑器、终端、Markdown 等大模块,只在真正进入对应模式时下载。
+const ChatPage = lazy(() =>
+  import("@/pages/ChatPage").then((m) => ({ default: m.ChatPage })),
+);
+const CodingLayout = lazy(() =>
+  import("@/components/coding-layout").then((m) => ({ default: m.CodingLayout })),
+);
+const RpaLayout = lazy(() =>
+  import("@/components/rpa-layout").then((m) => ({ default: m.RpaLayout })),
+);
+const ComputerLayout = lazy(() =>
+  import("@/components/computer-layout").then((m) => ({ default: m.ComputerLayout })),
+);
+const LocalLayout = lazy(() =>
+  import("@/components/local-layout").then((m) => ({ default: m.LocalLayout })),
+);
 
 // 交接提示条里的 Agent 中文名(与 ChatPage 的 AGENT_LABELS 保持一致)
 const AGENT_LABELS: Record<string, string> = {
@@ -83,7 +97,9 @@ export function ConversationShell() {
           </button>
         </div>
       )}
-      {layout}
+      <Suspense fallback={<PageLoading variant="workspace" />}>
+        {layout}
+      </Suspense>
     </div>
   );
 }

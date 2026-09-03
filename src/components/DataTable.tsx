@@ -77,6 +77,8 @@ function loadCustomize(key?: string): TableCustomizeState | null {
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
+  /** 首次取数或切换筛选时显示加载态,避免把尚未返回误显示为「暂无数据」。 */
+  loading?: boolean;
   itemLabel?: string;
   globalFilterFn?: FilterFn<TData>;
   getRowId?: (row: TData, index: number) => string;
@@ -109,6 +111,7 @@ export interface ServerTableState {
 export function DataTable<TData, TValue>({
   columns,
   data,
+  loading = false,
   itemLabel,
   globalFilterFn,
   getRowId,
@@ -119,6 +122,7 @@ export function DataTable<TData, TValue>({
   customizeKey,
   serverControl,
 }: DataTableProps<TData, TValue>) {
+  const isLoading = loading || serverControl?.loading === true;
   const customizable = !!customizeKey;
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -216,13 +220,17 @@ export function DataTable<TData, TValue>({
     // 服务端模式:排序/分页由后端完成,data 即当前页(manual 下对应 row model 自动旁路)
     manualPagination: !!serverControl,
     manualSorting: !!serverControl,
+    manualFiltering: !!serverControl,
     rowCount: serverControl?.total,
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    getFacetedRowModel: getFacetedRowModel(),
-    getFacetedUniqueValues: getFacetedUniqueValues(),
+    // 服务端模式的数据已完成筛选/排序/分页,不再让浏览器重复构建派生行模型。
+    getSortedRowModel: serverControl ? undefined : getSortedRowModel(),
+    getFilteredRowModel: serverControl ? undefined : getFilteredRowModel(),
+    getPaginationRowModel: serverControl ? undefined : getPaginationRowModel(),
+    getFacetedRowModel: serverControl ? undefined : getFacetedRowModel(),
+    getFacetedUniqueValues: serverControl
+      ? undefined
+      : getFacetedUniqueValues(),
     initialState: serverControl
       ? undefined
       : { pagination: { pageSize: defaultPageSize } },
@@ -330,7 +338,25 @@ export function DataTable<TData, TValue>({
               {rows.length === 0 ? (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={columns.length}>
-                    {emptyState ?? (
+                    {isLoading ? (
+                      <div
+                        className="space-y-4 py-8"
+                        role="status"
+                        aria-label="正在加载数据"
+                        aria-busy="true"
+                      >
+                        {["82%", "94%", "70%", "88%", "76%"].map(
+                          (width, index) => (
+                            <div
+                              key={index}
+                              className="h-4 animate-pulse rounded bg-muted"
+                              style={{ width }}
+                            />
+                          ),
+                        )}
+                        <span className="sr-only">正在加载数据</span>
+                      </div>
+                    ) : emptyState ?? (
                       <div className="py-12 text-center text-sm text-muted-foreground">
                         暂无数据
                       </div>
@@ -402,7 +428,7 @@ export function DataTable<TData, TValue>({
           </Table>
         </CardContent>
         <CardFooter className="flex items-center gap-2 border-t py-3">
-          {serverControl?.loading && (
+          {isLoading && (
             <Loader2 className="size-4 shrink-0 animate-spin text-muted-foreground" />
           )}
           <DataTablePagination

@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Play, RefreshCw, Square } from "lucide-react";
 import { toast } from "sonner";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { CodeHighlighter } from "@/components/code-highlighter";
 import {
   oneDark,
   oneLight,
@@ -342,7 +342,7 @@ const FileContent = memo(function FileContent({
     );
   }
   return (
-    <SyntaxHighlighter
+    <CodeHighlighter
       language={lang}
       style={resolvedTheme === "dark" ? oneDark : oneLight}
       customStyle={{
@@ -359,7 +359,7 @@ const FileContent = memo(function FileContent({
       wrapLongLines
     >
       {content}
-    </SyntaxHighlighter>
+    </CodeHighlighter>
   );
 });
 

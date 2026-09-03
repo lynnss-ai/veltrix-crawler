@@ -429,6 +429,7 @@ export function ChatPage() {
     activeId,
     setActiveId,
     providers,
+    providersLoading,
     setPendingAgentType,
     setPendingFirstMessage,
     setHandoffNotice,
@@ -440,6 +441,7 @@ export function ChatPage() {
   const { openOverlay: openScreenRecording } =
     useScreenRecording(handleRecordingSaved);
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   // 当前会话只渲染最近 visibleCount 条;切会话重置,「加载更早」时增加
   const [visibleCount, setVisibleCount] = useState(CHAT_PAGE_SIZE);
   const [input, setInput] = useState("");
@@ -755,15 +757,18 @@ export function ChatPage() {
     setLiveSubAgent(null); // 实时面板信号同属旧会话,切换即清(落库扫描兜底)
     if (!activeId) {
       setMessages([]);
+      setMessagesLoading(false);
       return;
     }
     // 本次发送刚自建的会话:消息由发送流程维护,跳过这次加载(避免与乐观追加/回复抢跑致重复)
     if (skipLoadRef.current === activeId) {
       skipLoadRef.current = null;
+      setMessagesLoading(false);
       return;
     }
     // 切换即清空旧会话消息,避免加载期间残留旧会话内容污染视图
     setMessages([]);
+    setMessagesLoading(true);
     api
       .listChatMessages(activeId)
       .then((msgs) => {
@@ -778,7 +783,10 @@ export function ChatPage() {
         }
         setFeedback(fb);
       })
-      .catch((e) => toast.error(`加载消息失败: ${e}`));
+      .catch((e) => toast.error(`加载消息失败: ${e}`))
+      .finally(() => {
+        if (gen === loadGenRef.current) setMessagesLoading(false);
+      });
   }, [activeId]);
 
   // 「改回普通对话」预填:交接提示条选回普通对话时,把原首条消息放进输入框(不自动发送,由用户决定)
@@ -1980,9 +1988,23 @@ export function ChatPage() {
           onScroll={onMessagesScroll}
           className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4 pb-[54px] [scrollbar-gutter:stable_both-edges]"
         >
-          {messages.length === 0 && !sending ? (
+          {messagesLoading ? (
+            <div
+              className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"
+              role="status"
+              aria-busy="true"
+            >
+              <Loader2 className="size-4 animate-spin" />
+              正在加载会话…
+            </div>
+          ) : messages.length === 0 && !sending ? (
             <div className="flex h-full items-center justify-center">
-              {models.length === 0 ? (
+              {providersLoading ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  正在加载模型…
+                </div>
+              ) : models.length === 0 ? (
                 <EmptyState
                   title="尚未配置模型"
                   description="请到系统配置 → 模型厂商,填好 API Key 与模型后再开始对话"

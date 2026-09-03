@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import {
   AppSidebar,
   getPageBreadcrumb,
@@ -10,7 +18,6 @@ import {
   type ServiceKey,
   type Workspace,
 } from "@/components/app-sidebar";
-import { UserCenterPage } from "@/pages/UserCenterPage";
 import { Button } from "@/components/ui/button";
 import { X } from "lucide-react";
 import { type RemoteStatus } from "@/components/RemoteConnect";
@@ -21,27 +28,79 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
-import { DashboardPage } from "@/pages/DashboardPage";
-import { CollectPage } from "@/pages/CollectPage";
 import type { TaskContentFilter } from "@/pages/collect-meta";
-import { AccountsPage } from "@/pages/AccountsPage";
-import { PublishAccountsPage } from "@/pages/PublishAccountsPage";
-import { SettingsPage } from "@/pages/SettingsPage";
-import { IndustryPage } from "@/pages/IndustryPage";
-import { CustomersPage } from "@/pages/CustomersPage";
-import { AuthorLibraryPage } from "@/pages/AuthorLibraryPage";
-import { MemoryCenterPage } from "@/pages/MemoryCenterPage";
-import { ConversationsPage } from "@/pages/ConversationsPage";
 import { ChatProvider } from "@/components/chat-context";
-import { ConversationShell } from "@/components/conversation-shell";
-import { ContentLibraryPage } from "@/pages/ContentLibraryPage";
-import { CommentLibraryPage } from "@/pages/CommentLibraryPage";
-import { UsersPage } from "@/pages/UsersPage";
-import { BillingPage } from "@/pages/BillingPage";
+import { PageLoading } from "@/components/PageLoading";
 import { PlaceholderPage } from "@/pages/PlaceholderPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { SetupWizard } from "@/pages/SetupWizard";
 import { checkForUpdate } from "@/lib/updater";
+
+// 业务页面按导航按需加载。内容库、设置、AI 工作区依赖较重,不应阻塞登录后首屏。
+const DashboardPage = lazy(() =>
+  import("@/pages/DashboardPage").then((m) => ({ default: m.DashboardPage })),
+);
+const CollectPage = lazy(() =>
+  import("@/pages/CollectPage").then((m) => ({ default: m.CollectPage })),
+);
+const AccountsPage = lazy(() =>
+  import("@/pages/AccountsPage").then((m) => ({ default: m.AccountsPage })),
+);
+const PublishAccountsPage = lazy(() =>
+  import("@/pages/PublishAccountsPage").then((m) => ({
+    default: m.PublishAccountsPage,
+  })),
+);
+const SettingsPage = lazy(() =>
+  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+);
+const IndustryPage = lazy(() =>
+  import("@/pages/IndustryPage").then((m) => ({ default: m.IndustryPage })),
+);
+const CustomersPage = lazy(() =>
+  import("@/pages/CustomersPage").then((m) => ({ default: m.CustomersPage })),
+);
+const AuthorLibraryPage = lazy(() =>
+  import("@/pages/AuthorLibraryPage").then((m) => ({
+    default: m.AuthorLibraryPage,
+  })),
+);
+const MemoryCenterPage = lazy(() =>
+  import("@/pages/MemoryCenterPage").then((m) => ({
+    default: m.MemoryCenterPage,
+  })),
+);
+const ConversationsPage = lazy(() =>
+  import("@/pages/ConversationsPage").then((m) => ({
+    default: m.ConversationsPage,
+  })),
+);
+const ConversationShell = lazy(() =>
+  import("@/components/conversation-shell").then((m) => ({
+    default: m.ConversationShell,
+  })),
+);
+const ContentLibraryPage = lazy(() =>
+  import("@/pages/ContentLibraryPage").then((m) => ({
+    default: m.ContentLibraryPage,
+  })),
+);
+const CommentLibraryPage = lazy(() =>
+  import("@/pages/CommentLibraryPage").then((m) => ({
+    default: m.CommentLibraryPage,
+  })),
+);
+const UsersPage = lazy(() =>
+  import("@/pages/UsersPage").then((m) => ({ default: m.UsersPage })),
+);
+const BillingPage = lazy(() =>
+  import("@/pages/BillingPage").then((m) => ({ default: m.BillingPage })),
+);
+const UserCenterPage = lazy(() =>
+  import("@/pages/UserCenterPage").then((m) => ({
+    default: m.UserCenterPage,
+  })),
+);
 
 // 登录态持久化键:桌面端走 IPC、不发 token,登录用户存 localStorage,刷新 / 重开免登录
 const AUTH_STORAGE_KEY = "veltrix.auth.user";
@@ -398,9 +457,7 @@ function App() {
 
   // 主体内容随登录/初始化状态切换;标题栏始终常驻,登录态才显示侧栏开关
   const loadingBody = (
-    <div className="flex h-full items-center justify-center bg-background text-sm text-muted-foreground">
-      加载中…
-    </div>
+    <PageLoading className="h-full bg-background p-4 md:p-6" />
   );
 
   let body: ReactNode;
@@ -487,7 +544,9 @@ function App() {
         onToggleSidebar={() => setSidebarOpen((open) => !open)}
         remoteStatus={remoteStatus}
       />
-      <div className="relative min-h-0 flex-1">{body}</div>
+      <div className="relative min-h-0 flex-1">
+        <Suspense fallback={loadingBody}>{body}</Suspense>
+      </div>
     </div>
   );
 }

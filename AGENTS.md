@@ -23,7 +23,7 @@ veltrix-crawler 是抖音 / 小红书 / 快手 / Bilibili / TikTok / YouTube 等
 - `bun install` — 安装前端依赖
 - `bun run tauri dev` — 开发模式:启动 Vite + 编译并打开桌面窗口(热更新)
 - `bun run dev` — 仅前端(浏览器调试,无 Tauri API,invoke 会失败)
-- `bun run tauri build` — 打包,产物在 `src-tauri/target/release/`(捆绑资源含 `src-tauri/resources/ffmpeg.exe`)
+- `bun run tauri build` — 打包;执行前自动递增补丁版本号并同步 `package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`,产物在 `target/release/`(捆绑资源含 `src-tauri/resources/ffmpeg.exe`)
 - `bun run build` — 前端构建,内含 `tsc` 类型检查
 - `bunx tsc --noEmit` — 仅跑前端类型检查(改完 .tsx/.ts 必跑)
 - `cargo check -p veltrix-crawler` — 桌面后端编译检查(改完 Rust 必跑)

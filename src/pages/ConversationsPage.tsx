@@ -52,6 +52,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Pagination } from "@/components/Pagination";
+import { PageLoading } from "@/components/PageLoading";
 
 function fmtMd(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -63,7 +64,7 @@ export function ConversationsPage({
 }: {
   onNavigate: (key: PageKey) => void;
 }) {
-  const { conversations, setActiveId, reload } = useChat();
+  const { conversations, conversationsLoading, setActiveId, reload } = useChat();
   const [tab, setTab] = useState<"active" | "archived">("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -236,6 +237,10 @@ export function ConversationsPage({
       toast.success(
         archived ? `已归档 ${ids.length} 条` : `已恢复 ${ids.length} 条`,
       );
+  }
+
+  if (conversationsLoading && conversations.length === 0) {
+    return <PageLoading />;
   }
 
   return (
