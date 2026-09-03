@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Loader2 } from "lucide-react";
 import type { ContentView } from "@/lib/api";
@@ -31,15 +31,19 @@ export function ImageWaterfall({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const [layout, setLayout] = useState({ columns: 2, width: 0 });
+  // 桌面内容区至少四列;宽屏提升到五列。首次数据尚未返回时容器还未挂载,
+  // 因此默认值本身也必须是可用的桌面布局,不能依赖后续测量兜底。
+  const [layout, setLayout] = useState({ columns: 4, width: 0 });
   const hasMore = total !== undefined && items.length < total;
+  const hasItems = items.length > 0;
 
   // 与原 CSS 断点保持一致;列数交给 JS 后,虚拟器才能准确分配瀑布流 lane。
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = scrollRef.current;
     if (!element) return;
     const update = (width: number) => {
-      const columns = width >= 1280 ? 5 : width >= 1024 ? 4 : width >= 640 ? 3 : 2;
+      if (width <= 0) return;
+      const columns = width >= 1280 ? 5 : 4;
       setLayout((prev) =>
         prev.columns === columns && prev.width === width
           ? prev
@@ -53,7 +57,8 @@ export function ImageWaterfall({
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+    // 首次请求期间 scrollRef 尚不存在;数据回来、容器真正挂载后必须重新绑定。
+  }, [hasItems]);
 
   const gap = 12;
   const estimatedCardWidth = Math.max(
@@ -73,6 +78,12 @@ export function ImageWaterfall({
     useAnimationFrameWithResizeObserver: true,
   });
   const virtualItems = virtualizer.getVirtualItems();
+
+  // 列数或列宽变化后清掉旧测量值。否则从窄窗放大时仍可能沿用旧卡片高度,
+  // 造成卡片间距过大或上下重叠。
+  useEffect(() => {
+    if (layout.width > 0) virtualizer.measure();
+  }, [layout.columns, layout.width, virtualizer]);
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
@@ -121,16 +132,18 @@ export function ImageWaterfall({
             const lane = virtualItem.lane;
             const widthPercent = 100 / layout.columns;
             const widthGap = (gap * (layout.columns - 1)) / layout.columns;
-            const leftGap = (lane * gap) / layout.columns;
             return (
               <div
                 key={virtualItem.key}
                 ref={virtualizer.measureElement}
                 data-index={virtualItem.index}
-                className="absolute left-0 top-0"
+                className="absolute left-0 top-0 min-w-0"
                 style={{
+                  // 宽度由父容器百分比决定,首次测量为 0 时也能正常铺开。
                   width: `calc(${widthPercent}% - ${widthGap}px)`,
-                  transform: `translate3d(calc(${lane * widthPercent}% + ${leftGap}px), ${virtualItem.start}px, 0)`,
+                  // translate 百分比基于卡片自身:每跨一列应移动 100% 自身宽度,
+                  // 再补一个固定 gap。旧实现误用了父容器列百分比,导致相互覆盖。
+                  transform: `translate3d(calc(${lane * 100}% + ${lane * gap}px), ${virtualItem.start}px, 0)`,
                 }}
               >
                 <WaterfallCard
