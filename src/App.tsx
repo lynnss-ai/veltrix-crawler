@@ -478,56 +478,60 @@ function App() {
     const breadcrumb = getPageBreadcrumb(active);
     body = (
       <ChatProvider>
-      <SidebarProvider
-        open={sidebarOpen}
-        onOpenChange={setSidebarOpen}
-        className="h-full min-h-0"
-        style={{ "--sidebar-width": "14rem" } as CSSProperties}
-      >
-        <AppSidebar
-          product={product}
-          onProductChange={handleProductChange}
-          workspace={workspace}
-          onServiceChange={handleServiceChange}
-          active={active}
-          onChange={handleNavigate}
-          user={loggedUser.username}
-          onLogout={handleLogout}
-        />
-        {/* min-w-0 让里面的 DataTable 横向滚动归自己处理,不溢出到窗口 */}
-        <SidebarInset className="min-w-0">
-          {/* 对话页整页即会话,不套标题与内边距外层;其余页保留标题 + 留白 */}
-          {active === "chat-sessions" ? (
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
-            </div>
-          ) : (
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
-              <div className="flex shrink-0 items-center justify-between gap-3">
-                {/* 关闭入口统一放在标题左侧、标题前面(脱离侧栏的单页面:系统设置/个人中心/对话记录等) */}
-                <div className="flex min-w-0 items-center gap-2">
-                  {isOffNavPage(active) && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={closeOffNavPage}
-                      title="关闭"
-                      className="size-9 text-muted-foreground hover:text-foreground"
-                    >
-                      <X className="size-6" />
-                      <span className="sr-only">关闭</span>
-                    </Button>
-                  )}
-                  <h1 className="truncate text-xl font-semibold text-foreground">
-                    {breadcrumb.page}
-                  </h1>
-                </div>
+        <SidebarProvider
+          open={sidebarOpen}
+          onOpenChange={setSidebarOpen}
+          className="h-full min-h-0"
+          style={{ "--sidebar-width": "14rem" } as CSSProperties}
+        >
+          <AppSidebar
+            product={product}
+            onProductChange={handleProductChange}
+            workspace={workspace}
+            onServiceChange={handleServiceChange}
+            active={active}
+            onChange={handleNavigate}
+            user={loggedUser.username}
+            onLogout={handleLogout}
+          />
+          {/* min-w-0 让里面的 DataTable 横向滚动归自己处理,不溢出到窗口 */}
+          <SidebarInset className="min-w-0">
+            {/* 页面级 Suspense 只替换内容区,切换菜单时侧栏与标题栏保持可见、可操作。 */}
+            {active === "chat-sessions" ? (
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                <Suspense fallback={<PageLoading variant="workspace" />}>
+                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
+                </Suspense>
               </div>
-              {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
-            </div>
-          )}
-        </SidebarInset>
-      </SidebarProvider>
+            ) : (
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
+                <div className="flex shrink-0 items-center justify-between gap-3">
+                  {/* 关闭入口统一放在标题左侧、标题前面(脱离侧栏的单页面:系统设置/个人中心/对话记录等) */}
+                  <div className="flex min-w-0 items-center gap-2">
+                    {isOffNavPage(active) && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={closeOffNavPage}
+                        title="关闭"
+                        className="size-9 text-muted-foreground hover:text-foreground"
+                      >
+                        <X className="size-6" />
+                        <span className="sr-only">关闭</span>
+                      </Button>
+                    )}
+                    <h1 className="truncate text-xl font-semibold text-foreground">
+                      {breadcrumb.page}
+                    </h1>
+                  </div>
+                </div>
+                <Suspense fallback={<PageLoading />}>
+                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
+                </Suspense>
+              </div>
+            )}
+          </SidebarInset>
+        </SidebarProvider>
       </ChatProvider>
     );
   }
@@ -545,7 +549,7 @@ function App() {
         remoteStatus={remoteStatus}
       />
       <div className="relative min-h-0 flex-1">
-        <Suspense fallback={loadingBody}>{body}</Suspense>
+        {body}
       </div>
     </div>
   );
