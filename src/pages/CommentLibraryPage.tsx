@@ -1,9 +1,11 @@
 // 评论库:展示采集落库的评论(comments 表)+ AI 意向标记。
 // 筛选:左侧栏(行业 + 角标)+ 顶部(意向 / 平台 chip + 评论日期 + 关键字)。
-// 数据走后端分页(list_comments_page):筛选/排序下沉 SQL,客户端只持有当前页。
+// 视图:瀑布流(默认;按评论来源聚合卡片,卡片内 6 条,更多开右侧抽屉;
+// 虚拟化分栏 + 滚动 append,与图片库瀑布流同加载方式)/ 表格(评论行)。
+// 数据走后端分页:筛选/排序下沉 SQL;表格持当前页,瀑布流持已 append 的各批。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { Download, Heart, MessageCircle, Search, X } from "lucide-react";
+import { Download, Heart, LayoutGrid, List, MessageCircle, Search, X } from "lucide-react";
 import { type DateRange } from "react-day-picker";
 import { toast } from "sonner";
 
@@ -25,6 +27,7 @@ import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import {
   api,
   type CommentListQuery,
+  type CommentSourceGroup,
   type CommentView,
   type IndustryView,
   type PlatformConfig,
@@ -36,8 +39,9 @@ import {
   contentDetailUrl,
   authorProfileUrl,
 } from "@/lib/platforms";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl, mediaThumbPath } from "@/lib/media-file-url";
 import { EmptyState } from "@/components/EmptyState";
+import { CommentWaterfall } from "@/components/comment-waterfall";
 import { save } from "@tauri-apps/plugin-dialog";
 import { recordDownload } from "@/lib/download-history";
 
@@ -71,13 +75,49 @@ const KIND_FILTERS: { value: string; label: string }[] = [
   { value: "article", label: "文章" },
 ];
 
-// 意向筛选项:all=全部,unanalyzed=尚未分析(intentLevel 为 null)
-const INTENT_FILTERS: { value: string; label: string }[] = [
-  { value: "high", label: "高意向" },
-  { value: "medium", label: "中意向" },
-  { value: "low", label: "低意向" },
-  { value: "none", label: "无意向" },
-  { value: "unanalyzed", label: "未分析" },
+// 意向筛选项:all=全部,unanalyzed=尚未分析(intentLevel 为 null);
+// 每种意向独立配色(选中实色、未选同色系描边文字),与表格意向徽章色系一致
+const INTENT_FILTERS: {
+  value: string;
+  label: string;
+  chipActive: string;
+  chipInactive: string;
+}[] = [
+  {
+    value: "high",
+    label: "高意向",
+    chipActive: "border-red-500 bg-red-500 text-white",
+    chipInactive:
+      "border-red-500/40 text-red-600 hover:bg-red-500/10 dark:text-red-400",
+  },
+  {
+    value: "medium",
+    label: "中意向",
+    chipActive: "border-amber-500 bg-amber-500 text-white",
+    chipInactive:
+      "border-amber-500/40 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400",
+  },
+  {
+    value: "low",
+    label: "低意向",
+    chipActive: "border-slate-500 bg-slate-500 text-white",
+    chipInactive:
+      "border-slate-500/40 text-slate-600 hover:bg-slate-500/10 dark:text-slate-400",
+  },
+  {
+    value: "none",
+    label: "无意向",
+    chipActive: "border-zinc-400 bg-zinc-400 text-white",
+    chipInactive:
+      "border-zinc-400/50 text-zinc-500 hover:bg-zinc-400/10 dark:text-zinc-400",
+  },
+  {
+    value: "unanalyzed",
+    label: "未分析",
+    chipActive: "border-violet-500 bg-violet-500 text-white",
+    chipInactive:
+      "border-violet-500/40 text-violet-600 hover:bg-violet-500/10 dark:text-violet-400",
+  },
 ];
 
 function formatCount(n?: number | null): string {
@@ -85,6 +125,9 @@ function formatCount(n?: number | null): string {
   if (n >= 10000) return `${(n / 10000).toFixed(1)}万`;
   return String(n);
 }
+
+// 瀑布流每批加载的来源数(滚动到底部哨兵 append 一批)
+const GRID_PAGE_SIZE = 12;
 
 // 表格列 id → 后端排序字段(白名单;其余列不可排序)
 const SORT_BY_MAP: Record<string, CommentListQuery["sortBy"]> = {
@@ -101,13 +144,14 @@ const toDayEnd = (d: Date) =>
   Math.floor(new Date(d).setHours(23, 59, 59, 999) / 1000);
 
 export function CommentLibraryPage() {
-  // 当前页数据 + 总数 + 取数中(服务端分页:comments 只持有一页)
+  const mediaFileUrl = useMediaFileUrl();
+  // 当前页数据 + 总数 + 取数中(表格=评论行当前页;瀑布流=已 append 的来源批次)
   const [comments, setComments] = useState<CommentView[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [serverState, setServerState] = useState<ServerTableState>({
     pageIndex: 0,
-    pageSize: 50,
+    pageSize: 20,
     sorting: [{ id: "collectedAt", desc: true }],
   });
   const [platforms, setPlatforms] = useState<PlatformConfig[]>([]);
@@ -119,6 +163,15 @@ export function CommentLibraryPage() {
   const [commentRange, setCommentRange] = useState<DateRange | undefined>();
   const [kindFilter, setKindFilter] = useState<string[]>([]); // []=全部形态
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
+  // 视图:瀑布流(默认)/ 表格。瀑布流数据后端按来源分组(list_comment_sources_page,
+  // 每组 6 条预览),offset 步进 append(与图片库瀑布流同加载方式);表格 = 评论行(20/页)
+  const [viewMode, setViewMode] = useState<"table" | "waterfall">("waterfall");
+  // 瀑布流分组数据(仅瀑布流视图使用;append 累积全部已加载批次)
+  const [groups, setGroups] = useState<CommentSourceGroup[]>([]);
+  const [groupTotal, setGroupTotal] = useState(0);
+  // 瀑布流已加载偏移(批起点;append 式,不能从 groups.length 推导——去重会少计)
+  const [gridOffset, setGridOffset] = useState(0);
+  const switchView = (mode: "table" | "waterfall") => setViewMode(mode);
   // 输入即时回显,用户停顿后才触发列表与行业角标查询。
   const debouncedSearch = useDebouncedValue(search, 300);
   // 请求序号竞态守卫:筛选快速切换时,慢的旧响应不覆盖新响应
@@ -156,12 +209,20 @@ export function CommentLibraryPage() {
     api.listIndustries().then(setIndustries).catch((e) => console.warn("加载行业列表失败:", e));
   }, []);
 
-  // 筛选变化回到第一页(offset 页在列表变化后会漂移);分页/排序变化由 fetch effect 直接响应
+  // 筛选/视图变化:表格回第一页、瀑布流回首批(offset 页在列表变化后会漂移)
   useEffect(() => {
     setServerState((s) => (s.pageIndex === 0 ? s : { ...s, pageIndex: 0 }));
-  }, [debouncedSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange]);
+    setGridOffset((o) => (o === 0 ? o : 0));
+  }, [viewMode, debouncedSearch, platformFilter, kindFilter, industryFilter, intentFilter, commentRange]);
 
+  // IntersectionObserver 可能在重渲染时重复触发;稳定回调配合 loading 守卫避免跳批
+  const loadMoreGrid = useCallback(() => {
+    setGridOffset((offset) => offset + GRID_PAGE_SIZE);
+  }, []);
+
+  // 表格视图:服务端分页替换式拉取(评论行)
   useEffect(() => {
+    if (viewMode !== "table") return;
     const query = buildQuery({
       sorting: serverState.sorting,
       limit: serverState.pageSize,
@@ -183,7 +244,38 @@ export function CommentLibraryPage() {
       .finally(() => {
         if (seq === reqSeq.current) setLoading(false);
       });
-  }, [buildQuery, serverState]);
+  }, [buildQuery, serverState, viewMode]);
+
+  // 瀑布流视图:offset 步进 append(加载更多);offset=0 时替换为首屏。
+  // 后端按来源分组并截好每组 6 条预览,前端不再分组/截断。
+  useEffect(() => {
+    if (viewMode !== "waterfall") return;
+    const query = buildQuery({ limit: GRID_PAGE_SIZE, offset: gridOffset });
+    const seq = ++reqSeq.current;
+    setLoading(true);
+    api
+      .listCommentSourcesPage(query, 6)
+      .then((res) => {
+        if (seq !== reqSeq.current) return;
+        setGroups((prev) => {
+          if (gridOffset === 0) return res.items;
+          // append 可能因数据变动与已加载批次重叠,按来源键去重
+          const seen = new Set(prev.map((g) => `${g.platform}-${g.contentId}`));
+          return [
+            ...prev,
+            ...res.items.filter((g) => !seen.has(`${g.platform}-${g.contentId}`)),
+          ];
+        });
+        setGroupTotal(res.total);
+      })
+      .catch((e) => {
+        if (seq !== reqSeq.current) return;
+        toast.error(`加载评论失败: ${e}`);
+      })
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
+  }, [buildQuery, gridOffset, viewMode]);
 
   const platformNames = useMemo(
     () => new Map(platforms.map((p) => [p.id, p.name])),
@@ -195,19 +287,22 @@ export function CommentLibraryPage() {
   );
 
   // 各行业评论数(侧栏角标):走后端聚合,跟随当前筛选(除行业自身——与列表口径一致)。
-  // 「全部」角标用列表 total,渲染时合并传入
+  // 「全部」角标用后端返回的 industryTotal(忽略行业筛选),不能复用列表 total——
+  // 列表 total 含行业过滤,选中某行业后「全部」会被错误显示成该行业的数量
   const [industryCounts, setIndustryCounts] = useState<Record<string, number>>({});
+  const [industryTotal, setIndustryTotal] = useState(0);
   const countsSeq = useRef(0);
   useEffect(() => {
     const query = buildQuery({ limit: 1, offset: 0 });
     const seq = ++countsSeq.current;
     api
       .commentIndustryCounts(query)
-      .then((list) => {
+      .then((res) => {
         if (seq !== countsSeq.current) return; // 过期响应丢弃
         const map: Record<string, number> = {};
-        for (const it of list) map[it.industry] = it.count;
+        for (const it of res.industries) map[it.industry] = it.count;
         setIndustryCounts(map);
+        setIndustryTotal(res.total);
       })
       .catch((e) => console.warn("加载行业角标失败:", e));
   }, [buildQuery]);
@@ -293,8 +388,9 @@ export function CommentLibraryPage() {
           ) {
             return <span className="text-xs text-muted-foreground">—</span>;
           }
+          // 列表小图用缩略图(缺失时文件服务惰性生成),原图只留给详情大图
           const cover = c.contentCoverPath
-            ? convertFileSrc(c.contentCoverPath)
+            ? mediaFileUrl(mediaThumbPath(c.contentCoverPath))
             : c.contentCoverUrl || "";
           const kindLabel =
             c.contentKind === "video"
@@ -444,7 +540,7 @@ export function CommentLibraryPage() {
         ),
       },
     ],
-    [platforms, platformName],
+    [platforms, platformName, mediaFileUrl],
   );
 
   // 导出当前筛选 + 排序后的评论为 Excel(.xlsx);路径经系统保存对话框选定
@@ -549,12 +645,12 @@ export function CommentLibraryPage() {
   }
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 gap-4">
+    <div className="flex min-h-0 min-w-0 flex-1 gap-2.5">
       {/* 左侧:行业筛选(可折叠,与图片库一致) */}
       {!sidebarCollapsed && (
         <FilterSidebar
           industries={industries}
-          industryCounts={{ ...industryCounts, __all: total }}
+          industryCounts={{ ...industryCounts, __all: industryTotal }}
           industryFilter={industryFilter}
           onIndustry={setIndustryFilter}
           onCollapse={() => setSidebarCollapsed(true)}
@@ -562,7 +658,7 @@ export function CommentLibraryPage() {
       )}
 
       <div
-        className={`flex min-h-0 min-w-0 flex-1 flex-col gap-3 ${FORM_CONTROL_SIZING}`}
+        className={`flex min-h-0 min-w-0 flex-1 flex-col gap-2.5 ${FORM_CONTROL_SIZING}`}
       >
         {/* 行业按钮(收起态) + 评论日期 + 关键字搜索 + 重置 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -607,6 +703,29 @@ export function CommentLibraryPage() {
               <X />
             </Button>
           )}
+          {/* 视图切换:瀑布流 / 表格(与图片库同款:靠右、激活实心高亮) */}
+          <div className="ml-auto inline-flex h-10 items-center rounded-md border p-0.5">
+            {(
+              [
+                { key: "waterfall", label: "瀑布流", icon: LayoutGrid },
+                { key: "table", label: "表格", icon: List },
+              ] as const
+            ).map((v) => (
+              <button
+                key={v.key}
+                type="button"
+                onClick={() => switchView(v.key)}
+                className={`inline-flex h-full cursor-pointer items-center gap-1 rounded px-2.5 text-xs font-medium transition-colors ${
+                  viewMode === v.key
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <v.icon className="size-3.5" />
+                {v.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* 平台 + 意向筛选同一排:各带标签 + 竖线分隔 */}
@@ -635,6 +754,8 @@ export function CommentLibraryPage() {
               key={f.value}
               label={f.label}
               active={intentFilter.includes(f.value)}
+              activeClassName={f.chipActive}
+              inactiveClassName={f.chipInactive}
               onClick={() =>
                 setIntentFilter((prev) =>
                   prev.includes(f.value)
@@ -646,25 +767,35 @@ export function CommentLibraryPage() {
           ))}
         </div>
 
-        <DataTable
-          columns={columns}
-          data={comments}
-          itemLabel="评论"
-          getRowId={(c) => c.id}
-          defaultPageSize={50}
-          serverControl={{
-            total,
-            state: serverState,
-            onStateChange: setServerState,
-            loading,
-          }}
-          emptyState={
-            <EmptyState
-              title="暂无评论"
-              description="开启任务的「评论采集」后,这里会展示采集到的评论与意向标记"
-            />
-          }
-        />
+        {viewMode === "table" ? (
+          <DataTable
+            columns={columns}
+            data={comments}
+            itemLabel="评论"
+            getRowId={(c) => c.id}
+            defaultPageSize={20}
+            serverControl={{
+              total,
+              state: serverState,
+              onStateChange: setServerState,
+              loading,
+            }}
+            emptyState={
+              <EmptyState
+                title="暂无评论"
+                description="开启任务的「评论采集」后,这里会展示采集到的评论与意向标记"
+              />
+            }
+          />
+        ) : (
+          <CommentWaterfall
+            groups={groups}
+            loading={loading}
+            total={groupTotal}
+            platformName={platformName}
+            onLoadMore={loadMoreGrid}
+          />
+        )}
       </div>
     </div>
   );

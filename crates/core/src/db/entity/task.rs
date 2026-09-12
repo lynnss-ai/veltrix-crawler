@@ -39,6 +39,8 @@ pub struct Model {
     pub keep_video: bool,
     /// 是否启用 AI 文案提取(依赖音频提取:转音频后做语音转写)
     pub ai_extract: bool,
+    /// 是否启用封面文字识别(采集后对封面图做 OCR,结果存 contents.cover_ocr_text)
+    pub cover_ocr: bool,
     /// 是否采集评论(开启后内容采集完进入评论采集阶段)
     pub collect_comments: bool,
     /// 评论发布时间范围过滤:3d / 7d / 14d / any(不限)

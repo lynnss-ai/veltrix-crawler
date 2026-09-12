@@ -252,6 +252,12 @@ fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
             // 不再把 .submit-button-wrapper 放进来:querySelector 按文档顺序会先返回外层 div(父在前)。
             let submit_sel = "svg.submit-button, .submit-button";
             vec![
+                // 新建隔离窗口虽然已可执行 JS,小红书首页的搜索组件和 Service Worker 仍可能处于
+                // 首次挂载阶段。先留一点稳定时间再操作,降低首个 /search/notes 响应出现空 stream 的概率。
+                RpaStep::Pause {
+                    min_ms: 1_500,
+                    max_ms: 2_500,
+                },
                 RpaStep::WaitFor {
                     selector: box_sel.into(),
                     timeout_ms: 10_000,
@@ -607,6 +613,58 @@ impl Default for TranscriptionConfig {
     }
 }
 
+/// 封面 OCR 默认接入(智谱 GLM):OCR 走智谱工具 API(files/ocr),开箱即用,用户仅需补 API Key。
+pub const DEFAULT_OCR_PROVIDER: &str = "glm";
+pub const DEFAULT_OCR_API_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+/// 封面 OCR 默认并发数:同时在飞的 OCR 请求数,偏保守以降低厂商限流概率。
+pub const DEFAULT_OCR_CONCURRENCY: u32 = 5;
+
+fn default_ocr_provider() -> String {
+    DEFAULT_OCR_PROVIDER.to_string()
+}
+
+fn default_ocr_api_url() -> String {
+    DEFAULT_OCR_API_URL.to_string()
+}
+
+fn default_ocr_concurrency() -> u32 {
+    DEFAULT_OCR_CONCURRENCY
+}
+
+fn default_ocr_local_precheck() -> bool {
+    true
+}
+
+/// 封面文字识别(OCR)配置(系统设置「封面文字识别」)。走智谱 OCR 工具 API(POST {api_url}/files/ocr,
+/// multipart 上传封面图),无模型参数;api_key 等敏感信息仍存数据库,不落配置文件(安全规范)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrConfig {
+    /// OCR 厂商 code(目前仅支持 glm 智谱;旧配置无此字段时由 serde default 回退)。
+    #[serde(default = "default_ocr_provider")]
+    pub provider: String,
+    /// API 地址(默认智谱 bigmodel v4;旧配置存空时由 load_or_default 回退默认)。
+    #[serde(default = "default_ocr_api_url")]
+    pub api_url: String,
+    /// OCR 并发数(同时在飞的 OCR 请求数);0 视为未设置,调用方回退默认值。
+    #[serde(default = "default_ocr_concurrency")]
+    pub concurrency: u32,
+    /// 调云端前先用本地系统 OCR(WinRT,离线零成本)预判封面有无文字:
+    /// 判定无文字则直接落空文本标记、不发付费请求;预判失败(非 Windows / 缺语言包)照常走云端。
+    #[serde(default = "default_ocr_local_precheck")]
+    pub local_precheck: bool,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_ocr_provider(),
+            api_url: default_ocr_api_url(),
+            concurrency: DEFAULT_OCR_CONCURRENCY,
+            local_precheck: true,
+        }
+    }
+}
+
 /// 数据库配置。运行时二选一:连接串决定后端(SQLite / PostgreSQL)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
@@ -651,6 +709,8 @@ pub struct AppConfig {
     pub intent: CommentIntentConfig,
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+    #[serde(default)]
+    pub ocr: OcrConfig,
 }
 
 impl AppConfig {
@@ -685,6 +745,13 @@ impl AppConfig {
         }
         if cfg.transcription.model.trim().is_empty() {
             cfg.transcription.model = default_asr_model();
+        }
+        // 兼容旧配置:ocr 字段缺失/存空时回退智谱默认(开箱即用,仅 api_key 需用户补)
+        if cfg.ocr.provider.trim().is_empty() {
+            cfg.ocr.provider = default_ocr_provider();
+        }
+        if cfg.ocr.api_url.trim().is_empty() {
+            cfg.ocr.api_url = default_ocr_api_url();
         }
         Ok(cfg)
     }
@@ -857,20 +924,31 @@ impl AppConfig {
                 "https://search.bilibili.com/video?keyword={keyword}",
                 // 详情页:{id}=bvid,评论采集导航用
                 "https://www.bilibili.com/video/{id}",
-                // 搜索前缀同时覆盖 wbi/search/type(视频 tab)与 wbi/search/all/v2(综合 tab);
-                // /x/v2/reply 前缀覆盖评论的 wbi/main 与旧 main 变体。真实路径需本机抓包核对
-                vec!["/x/web-interface/wbi/search/", "/x/web-interface/search/", "/x/v2/reply"],
+                // 搜索、评论、详情元数据与播放流;播放信息也会从详情页 SSR 回传。
+                vec![
+                    "/x/web-interface/wbi/search/",
+                    "/x/web-interface/search/",
+                    "/x/v2/reply",
+                    "/x/web-interface/view",
+                    "/x/player/",
+                ],
             ),
             (
                 "tiktok",
                 "TikTok",
                 "https://www.tiktok.com/",
                 "https://www.tiktok.com/search?q={keyword}",
-                // 详情页:用户名段填占位 `_`,TikTok 会按视频 id 重定向到规范地址;需本机核对
-                "https://www.tiktok.com/@_/video/{id}",
-                // 综合搜索 + 视频 tab 搜索 + 评论;接口结构与抖音同源(aweme 体系)。
+                // 详情页使用搜索结果作者的 uniqueId,避免 `@_` 在部分地区直接 404;
+                // {token} 由统一采集流程从 author.extra.unique_id 填入。
+                "https://www.tiktok.com/@{token}/video/{id}",
+                // 综合搜索 + 视频 tab 搜索 + 评论 + 内容详情;接口结构与抖音同源(aweme 体系)。
                 // ⚠️ 大陆网络访问不了 TikTok,需本机代理可用
-                vec!["/api/search/general/full/", "/api/search/item/full/", "/api/comment/list/"],
+                vec![
+                    "/api/search/general/full/",
+                    "/api/search/item/full/",
+                    "/api/comment/list/",
+                    "/api/item/detail/",
+                ],
             ),
             (
                 "youtube",
@@ -878,10 +956,14 @@ impl AppConfig {
                 "https://www.youtube.com/",
                 "https://www.youtube.com/results?search_query={keyword}",
                 "https://www.youtube.com/watch?v={id}",
-                // InnerTube:搜索分页走 /youtubei/v1/search,评论随观看页走 /youtubei/v1/next。
+                // InnerTube:搜索分页、评论与播放器详情。播放器也会从观看页 SSR 回传。
                 // ⚠️ 首屏结果内嵌在页面 ytInitialData 不走 XHR,首批 ~20 条采不到(滚动分页可采);
                 // 排序参数是 protobuf 编码的 sp=,静态映射表达不了,留空。需本机代理可用
-                vec!["/youtubei/v1/search", "/youtubei/v1/next"],
+                vec![
+                    "/youtubei/v1/search",
+                    "/youtubei/v1/next",
+                    "/youtubei/v1/player",
+                ],
             ),
         ] {
             let (sort_query_key, sort_query_map, time_query_key, time_query_map) =
@@ -936,6 +1018,7 @@ impl AppConfig {
             media: MediaConfig::default(),
             intent: CommentIntentConfig::default(),
             transcription: TranscriptionConfig::default(),
+            ocr: OcrConfig::default(),
         }
     }
 }

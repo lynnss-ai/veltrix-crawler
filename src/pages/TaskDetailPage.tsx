@@ -712,6 +712,11 @@ export function TaskDetailPage({
               音频提取
             </span>
           )}
+          {task.coverOcr && (
+            <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
+              封面文案提取
+            </span>
+          )}
           {task.collectComments && (
             <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-600 dark:text-violet-400">
               评论采集

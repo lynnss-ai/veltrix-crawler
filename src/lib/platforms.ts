@@ -108,11 +108,17 @@ export function platformColorHex(id: string): string | null {
 export function contentDetailUrl(
   platform: string,
   contentId: string | null | undefined,
+  xsecToken?: string | null,
 ): string | null {
   if (!contentId) return null;
   switch (platform) {
     case "douyin":
       return `https://www.douyin.com/video/${contentId}`;
+    case "xhs":
+      // 保留采集响应中的导航凭据,与采集详情窗口使用同一来源参数。
+      return `https://www.xiaohongshu.com/explore/${encodeURIComponent(contentId)}${
+        xsecToken ? `?${new URLSearchParams({ xsec_token: xsecToken, xsec_source: "pc_search" })}` : ""
+      }`;
     case "kuaishou":
       return `https://www.kuaishou.com/short-video/${contentId}`;
     case "bilibili":

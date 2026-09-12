@@ -3,3 +3,16 @@
 # rust-lld.exe 随 rustup 工具链分发,rustc 会自动从 sysroot 解析,无需额外安装或改 PATH。
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# OpenCV(智能剪辑-场景检测):预编译包在 third_party/opencv(不进 git);
+# opencv crate 生成绑定需要 libclang,由 scripts/.venv 里的 libclang pip 包提供。
+[env]
+LIBCLANG_PATH = { value = "scripts/.venv/Lib/site-packages/clang/native", relative = true }
+# 绑定生成器还需要 clang 可执行文件(解析头文件内置 include):zig cc 充当 clang 驱动
+CLANG_PATH = { value = "third_party/clang-shim/clang.cmd", relative = true }
+# pip libclang 停在 18.1.1,而本机 VS 18 STL 要求 clang ≥ 20(STL1000 static_assert);
+# 用 STL 官方的版本不匹配豁免宏跳过该检查(生成绑定的 C++ 编译走 MSVC cl.exe,不受影响)
+OPENCV_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+OPENCV_LINK_LIBS = "opencv_world4100"
+OPENCV_LINK_PATHS = { value = "third_party/opencv/build/x64/vc16/lib", relative = true }
+OPENCV_INCLUDE_PATHS = { value = "third_party/opencv/build/include", relative = true }

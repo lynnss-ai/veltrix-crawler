@@ -16,15 +16,13 @@
 // 拦截响应部分字段待解析链路接入,暂保留
 #![allow(dead_code)]
 
-pub mod cookies;
 pub mod cdp;
+pub mod cookies;
 pub mod filter_locate;
 pub mod native_intercept;
 pub mod pool;
 pub mod script_eval;
 
-use veltrix_core::config::RpaStep;
-use veltrix_core::error::{CrawlerError, Result};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +30,8 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use veltrix_core::config::RpaStep;
+use veltrix_core::error::{CrawlerError, Result};
 
 /// 一条被拦截的接口响应。`body` 为响应文本(通常是 JSON),由适配器解析。
 #[derive(Debug, Clone)]
@@ -440,7 +440,10 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
       var args = arguments;
       var url = (args[0] && args[0].url) ? args[0].url : String(args[0]);
       return origFetch.apply(this, args).then(function (resp) {{
-        try {{ resp.clone().text().then(function (t) {{ report(url, t); }}).catch(function () {{}}); }} catch (e) {{}}
+        // 只对命中拦截规则的请求二次读体:全量读体会拖慢页面其它每个接口响应
+        if (matched(url)) {{
+          try {{ resp.clone().text().then(function (t) {{ report(url, t); }}).catch(function () {{}}); }} catch (e) {{}}
+        }} else {{ report(url, null); }}
         return resp;
       }});
     }};
@@ -455,6 +458,7 @@ pub fn build_intercept_init_script(patterns: &[String]) -> String {
   XMLHttpRequest.prototype.send = function () {{
     var self = this;
     this.addEventListener('load', function () {{
+      if (!matched(self.__veltrixUrl)) {{ report(self.__veltrixUrl, null); return; }}
       try {{
         var t = (self.responseType === '' || self.responseType === 'text')
           ? self.responseText : JSON.stringify(self.response);
@@ -503,7 +507,10 @@ pub fn build_native_intercept_init_script_mac(patterns: &[String]) -> String {
       var args = arguments;
       var url = (args[0] && args[0].url) ? args[0].url : String(args[0]);
       return origFetch.apply(this, args).then(function (resp) {{
-        try {{ resp.clone().text().then(function (t) {{ report(url, t); }}).catch(function () {{}}); }} catch (e) {{}}
+        // 只对命中拦截规则的请求二次读体:全量读体会拖慢页面其它每个接口响应
+        if (matched(url)) {{
+          try {{ resp.clone().text().then(function (t) {{ report(url, t); }}).catch(function () {{}}); }} catch (e) {{}}
+        }} else {{ report(url, null); }}
         return resp;
       }});
     }};
@@ -518,6 +525,7 @@ pub fn build_native_intercept_init_script_mac(patterns: &[String]) -> String {
   XMLHttpRequest.prototype.send = function () {{
     var self = this;
     this.addEventListener('load', function () {{
+      if (!matched(self.__veltrixMacUrl)) return;
       try {{
         var t = (self.responseType === '' || self.responseType === 'text')
           ? self.responseText : JSON.stringify(self.response);
@@ -998,6 +1006,636 @@ pub fn build_detail_ssr_eval(label: &str, content_id: &str) -> String {
     )
 }
 
+/// TikTok 详情页不保证发 `/api/item/detail/`(首屏常直接命中 SSR 缓存),因此从
+/// `__UNIVERSAL_DATA_FOR_REHYDRATION__` / `SIGI_STATE` 读取目标 itemStruct,包装成真实详情
+/// 接口同形响应回传。后续仍交 TikTok 适配器解析,不在脚本里复制字段映射。
+pub fn build_tiktok_detail_ssr_eval(label: &str, content_id: &str) -> String {
+    let id_json = serde_json::to_string(content_id).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function(){{
+  var target = {id}, label = {label};
+  function report(mark, body) {{
+    try {{
+      window.__TAURI_INTERNALS__.invoke('intercept_sink_push', {{
+        label: label,
+        url: 'https://www.tiktok.com/api/item/detail/?itemId=' + target + '&__ssr=' + mark,
+        body: body
+      }});
+    }} catch (e) {{}}
+  }}
+  function walk(o, d) {{
+    if (!o || typeof o !== 'object' || d > 16) return null;
+    if (o.itemInfo && o.itemInfo.itemStruct) {{
+      var nested = o.itemInfo.itemStruct;
+      if (nested.id != null && String(nested.id) === target) return nested;
+    }}
+    if (o.id != null && String(o.id) === target && o.video) return o;
+    for (var k in o) {{ var r = walk(o[k], d + 1); if (r) return r; }}
+    return null;
+  }}
+  var detail = null;
+  for (var i = 0; i < 2 && !detail; i++) {{
+    try {{
+      var el = document.getElementById(i === 0 ? '__UNIVERSAL_DATA_FOR_REHYDRATION__' : 'SIGI_STATE');
+      if (el && el.textContent) detail = walk(JSON.parse(el.textContent), 0);
+    }} catch (e) {{}}
+  }}
+  if (!detail) {{ try {{ detail = walk(window.SIGI_STATE, 0); }} catch (e) {{}} }}
+  if (detail && detail.video) {{
+    report('hit', JSON.stringify({{ itemInfo: {{ itemStruct: detail }} }}));
+  }} else {{
+    report('miss', '');
+  }}
+}})();"#,
+        id = id_json,
+        label = label_json
+    )
+}
+
+/// 构造「详情页 SSR 数据回传」脚本(小红书直链补取/补全的兜底通道):explore 详情页
+/// 首屏常 SSR 直出、不再发 `/api/sns/web/v1/feed` XHR,拦截链拿不到详情响应,
+/// 导致直链补取/单条重试系统性失败(与抖音当初「补取直链未果」同根因,见 build_detail_ssr_eval)。
+/// `__INITIAL_STATE__.note.noteDetailMap` 内嵌目标笔记完整数据(含 video.media.stream 直链),
+/// JS 直读后包成 feed 接口同形响应({data:{items:[{id,note_card}]}})经 intercept_sink_push 回传,
+/// 适配器按 ContentDetail 原路径解析。注意:SSR 状态是站点 store 序列化(camelCase 键),
+/// 适配器按接口 snake_case 解析,回传前递归把键统一转 snake_case(masterUrl→master_url 等)。
+pub fn build_xhs_detail_ssr_eval(label: &str, content_id: &str) -> String {
+    let id_json = serde_json::to_string(content_id).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    // 必报结果:命中(__ssr=hit)带详情 JSON;未命中(__ssr=miss)带诊断位
+    // (state=__INITIAL_STATE__ 是否存在,map=是否遍历到 noteDetailMap)——区分「SSR 无详情」与「脚本没执行」
+    format!(
+        r#"(function(){{
+  var target = {id}, label = {label};
+  var hasState = false, hasMap = false;
+  function report(mark, body, diag) {{
+    try {{
+      window.__TAURI_INTERNALS__.invoke('intercept_sink_push', {{
+        label: label,
+        url: 'https://edith.xiaohongshu.com/api/sns/web/v1/feed?__ssr=' + mark + '&' + diag,
+        body: body
+      }});
+    }} catch (e) {{}}
+  }}
+  function toSnake(o) {{
+    if (Array.isArray(o)) return o.map(toSnake);
+    if (!o || typeof o !== 'object') return o;
+    var out = {{}};
+    for (var k in o) {{
+      var sk = k.replace(/([A-Z])/g, function (m) {{ return '_' + m.toLowerCase(); }});
+      out[sk] = toSnake(o[k]);
+    }}
+    return out;
+  }}
+  function findInMap(map) {{
+    if (!map || typeof map !== 'object') return null;
+    for (var k in map) {{
+      var n = map[k] && (map[k].note || map[k]);
+      if (!n || typeof n !== 'object') continue;
+      var nid = n.noteId || n.note_id || n.id;
+      if (k === target || (nid != null && String(nid) === target)) return n;
+    }}
+    return null;
+  }}
+  function walk(o, d) {{
+    if (!o || typeof o !== 'object' || d > 10) return null;
+    if (o.noteDetailMap) {{ hasMap = true; var r0 = findInMap(o.noteDetailMap); if (r0) return r0; }}
+    var nid = o.noteId || o.note_id;
+    if (nid != null && String(nid) === target && (o.video || o.imageList || o.image_list)) return o;
+    for (var k in o) {{ var r = walk(o[k], d + 1); if (r) return r; }}
+    return null;
+  }}
+  var note = null;
+  try {{
+    var st = window.__INITIAL_STATE__;
+    hasState = !!st;
+    if (st) note = walk(st, 0);
+  }} catch (e) {{}}
+  var diag = 'state=' + (hasState ? 1 : 0) + '&map=' + (hasMap ? 1 : 0);
+  if (note) {{
+    report('hit', JSON.stringify({{ data: {{ items: [{{ id: target, note_card: toSnake(note) }}] }} }}), diag);
+  }} else {{
+    report('miss', '', diag);
+  }}
+}})();"#,
+        id = id_json,
+        label = label_json
+    )
+}
+
+/// B站观看页把元数据和播放信息分别放在 `__INITIAL_STATE__` / `__playinfo__`。
+/// 页面命中 SSR 缓存而不再请求 playurl 时,合并成适配器认识的详情响应回传。
+pub fn build_bilibili_detail_ssr_eval(label: &str, content_id: &str) -> String {
+    let id_json = serde_json::to_string(content_id).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function(){{
+  var target = {id}, label = {label};
+  function report(mark, body) {{
+    try {{
+      window.__TAURI_INTERNALS__.invoke('intercept_sink_push', {{
+        label: label,
+        url: 'https://api.bilibili.com/x/player/wbi/playurl?bvid=' + target + '&__ssr=' + mark,
+        body: body
+      }});
+    }} catch (e) {{}}
+  }}
+  var state = null, play = null;
+  try {{ state = window.__INITIAL_STATE__ || null; }} catch (e) {{}}
+  try {{
+    var raw = window.__playinfo__ || null;
+    play = raw && (raw.data || raw.result || raw);
+  }} catch (e) {{}}
+  var view = state && (state.videoData || state.videoInfo || null);
+  if (play && (play.dash || play.durl)) {{
+    report('hit', JSON.stringify({{ data: {{ view: view || {{ bvid: target }}, tags: (state && state.tags) || [], play: play }} }}));
+  }} else {{
+    report('miss', '');
+  }}
+}})();"#,
+        id = id_json,
+        label = label_json
+    )
+}
+
+/// YouTube 观看页首屏播放器响应通常直接挂在 `ytInitialPlayerResponse`,不一定重新发
+/// `/youtubei/v1/player`。只回传已由页面解出的直链字段,不解析 signatureCipher。
+pub fn build_youtube_detail_ssr_eval(label: &str, content_id: &str) -> String {
+    let id_json = serde_json::to_string(content_id).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function(){{
+  var target = {id}, label = {label};
+  function report(mark, body) {{
+    try {{
+      window.__TAURI_INTERNALS__.invoke('intercept_sink_push', {{
+        label: label,
+        url: 'https://www.youtube.com/youtubei/v1/player?videoId=' + target + '&__ssr=' + mark,
+        body: body
+      }});
+    }} catch (e) {{}}
+  }}
+  var player = null;
+  try {{ player = window.ytInitialPlayerResponse || null; }} catch (e) {{}}
+  if (!player) {{
+    try {{
+      var app = document.querySelector('ytd-app');
+      player = app && app.data && (app.data.playerResponse || app.data.response) || null;
+    }} catch (e) {{}}
+  }}
+  if (player && player.videoDetails && String(player.videoDetails.videoId || '') === target) {{
+    report('hit', JSON.stringify(player));
+  }} else {{
+    report('miss', '');
+  }}
+}})();"#,
+        id = id_json,
+        label = label_json
+    )
+}
+
+/// 小红书页内直采脚本参数。详情与评论共用同一套签名、回传和停止机制。
+pub struct XhsApiCollectSpec<'a> {
+    pub session_id: u64,
+    pub content_id: &'a str,
+    pub xsec_token: &'a str,
+    pub limit: usize,
+    pub max_pages: u32,
+    pub kind: &'a str,
+}
+
+/// 小红书评论并发任务。每篇笔记内部仍按 cursor 串行翻页,仅不同笔记之间并行。
+pub struct XhsCommentJob<'a> {
+    pub content_id: &'a str,
+    pub xsec_token: &'a str,
+}
+
+/// 在已登录的小红书页面内复用站点自己的 API 封装与签名请求客户端,直接请求详情或评论分页。
+/// 本程序只组织业务参数;官方封装缺失、接口拒绝或风控时尝试兼容签名入口,最终由 Rust 回退 RPA。
+pub fn build_xhs_api_collect_eval(spec: &XhsApiCollectSpec<'_>) -> String {
+    let cfg = serde_json::json!({
+        "sessionId": spec.session_id,
+        "noteId": spec.content_id,
+        "xsecToken": spec.xsec_token,
+        "limit": spec.limit,
+        "maxPages": spec.max_pages,
+        "kind": spec.kind,
+    });
+    build_xhs_api_collect_script(&cfg)
+}
+
+/// 小红书评论双路直采脚本。共用同一页面签名环境,避免为同一账号并行创建 WebView；
+/// 两篇笔记并行,每篇自身按 cursor 顺序请求,与抖音批量评论采集的并发边界一致。
+pub fn build_xhs_comment_batch_eval(
+    session_id: u64,
+    jobs: &[XhsCommentJob<'_>],
+    limit: usize,
+    max_pages: u32,
+) -> String {
+    let jobs = jobs
+        .iter()
+        .map(|job| {
+            serde_json::json!({
+                "noteId": job.content_id,
+                "xsecToken": job.xsec_token,
+            })
+        })
+        .collect::<Vec<_>>();
+    let first = jobs.first().cloned().unwrap_or_default();
+    let cfg = serde_json::json!({
+        "sessionId": session_id,
+        "noteId": first.get("noteId").and_then(|value| value.as_str()).unwrap_or_default(),
+        "xsecToken": first.get("xsecToken").and_then(|value| value.as_str()).unwrap_or_default(),
+        "limit": limit,
+        "maxPages": max_pages,
+        "kind": "comments",
+        "jobs": jobs,
+    });
+    build_xhs_api_collect_script(&cfg)
+}
+
+fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
+    let cfg_json = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(function () {{
+  var GEN = (window.__veltrixXhsApiGen || 0) + 1;
+  window.__veltrixXhsApiGen = GEN;
+  window.__veltrixXhsApiAbort = false;
+  var CFG = {cfg_json};
+  var JOBS = Array.isArray(CFG.jobs) && CFG.jobs.length ? CFG.jobs : [{{ noteId: CFG.noteId, xsecToken: CFG.xsecToken }}];
+  var result = {{ platform: 'xhs', kind: CFG.kind, noteId: CFG.noteId, used: false, error: null, pages: 0, comments: 0, noComments: false, jobs: [] }};
+
+  function hud(level, message) {{
+    try {{ if (window.__veltrixHud && window.__veltrixHud.log) window.__veltrixHud.log({{ level: level, message: message }}); }} catch (e) {{}}
+  }}
+  function sleep(ms) {{ return new Promise(function (resolve) {{ setTimeout(resolve, ms); }}); }}
+  // 可中断 sleep:拆 200ms 小段轮询中止/代际标志——退避与翻页节拍期间,
+  // 手动停止或新一批脚本注入(代际接管)能立即响应,不闷头睡满整段。
+  async function interruptibleSleep(ms) {{
+    var waited = 0;
+    while (waited < ms) {{
+      if (window.__veltrixXhsApiAbort || window.__veltrixXhsApiGen !== GEN) return false;
+      var step = Math.min(200, ms - waited);
+      await sleep(step);
+      waited += step;
+    }}
+    return true;
+  }}
+  function finish() {{
+    if (window.__veltrixXhsApiGen !== GEN) return;
+    try {{ window.__veltrixXhsApiResult = JSON.stringify(result); }} catch (e) {{}}
+    var payload = {{ sessionId: CFG.sessionId, result: JSON.stringify(result) }};
+    var sent = window.__veltrixSignal && window.__veltrixSignal('api_done', payload);
+    if (!sent) {{
+      try {{ window.__TAURI_INTERNALS__.invoke('comment_api_done', payload); }} catch (e) {{}}
+    }}
+  }}
+  function normalizeHeaders(raw) {{
+    var src = raw && raw.headers ? raw.headers : raw;
+    if (!src || typeof src !== 'object') return null;
+    var out = {{}};
+    for (var key in src) {{
+      var low = key.toLowerCase();
+      if (low === 'x-s') out['X-S'] = String(src[key]);
+      else if (low === 'x-t') out['X-T'] = String(src[key]);
+      else if (low === 'x-s-common') out['X-S-Common'] = String(src[key]);
+      else if (low === 'x-b3-traceid') out['X-B3-Traceid'] = String(src[key]);
+    }}
+    return out['X-S'] && out['X-T'] ? out : null;
+  }}
+  function sign(path, bodyText) {{
+    var signer = window._webmsxyw || window.webmsxyw;
+    if (typeof signer !== 'function') return null;
+    var bodies = [bodyText || undefined];
+    if (bodyText) {{ try {{ bodies.push(JSON.parse(bodyText)); }} catch (e) {{}} }}
+    for (var i = 0; i < bodies.length; i++) {{
+      try {{
+        var headers = normalizeHeaders(signer(path, bodies[i]));
+        if (headers) return headers;
+      }} catch (e) {{}}
+    }}
+    return null;
+  }}
+  function captureWebpackRequire() {{
+    var requireFn = window.__veltrixXhsWebpackRequire || null;
+    if (requireFn) return requireFn;
+    try {{
+      var chunks = window.webpackChunkxhs_pc_web;
+      if (chunks && chunks.push) {{
+        chunks.push([[Date.now()], {{}}, function (runtime) {{ requireFn = runtime; }}]);
+        if (requireFn) window.__veltrixXhsWebpackRequire = requireFn;
+      }}
+    }} catch (e) {{}}
+    return requireFn;
+  }}
+  function discoverOfficialApis() {{
+    var requireFn = captureWebpackRequire();
+    var apis = window.__veltrixXhsOfficialApis || {{}};
+    var seen = [];
+    function visit(value, depth) {{
+      if (!value || depth > 2 || (typeof value !== 'object' && typeof value !== 'function')) return;
+      if (seen.indexOf(value) >= 0) return;
+      seen.push(value);
+      if (typeof value === 'function') {{
+        if (value.name === 'postApiSnsWebV1Feed') apis.detail = value;
+        else if (value.name === 'getApiSnsWebV2CommentPage') apis.comments = value;
+      }}
+      if (depth >= 2 || (apis.detail && apis.comments)) return;
+      try {{ Object.keys(value).slice(0, 120).forEach(function (key) {{ visit(value[key], depth + 1); }}); }} catch (e) {{}}
+    }}
+    try {{
+      var cache = requireFn && requireFn.c || {{}};
+      Object.keys(cache).forEach(function (id) {{
+        if (!apis.detail || !apis.comments) visit(cache[id] && cache[id].exports, 0);
+      }});
+    }} catch (e) {{}}
+    if (apis.detail || apis.comments) window.__veltrixXhsOfficialApis = apis;
+    return apis;
+  }}
+  function discoverRequestClients() {{
+    if (window.__veltrixXhsClients) return window.__veltrixXhsClients;
+    var requireFn = captureWebpackRequire();
+    var found = [], seen = [];
+    function visit(value, depth) {{
+      if (!value || depth > 2 || (typeof value !== 'object' && typeof value !== 'function')) return;
+      if (seen.indexOf(value) >= 0) return;
+      seen.push(value);
+      try {{
+        var request = value.interceptors && value.interceptors.request;
+        var handlers = request && request.handlers;
+        if ((typeof value === 'function' || typeof value.request === 'function') && Array.isArray(handlers) && handlers.some(Boolean)) {{
+          var base = value.defaults && value.defaults.baseURL || '';
+          found.push({{ client: value, score: handlers.filter(Boolean).length * 10 + (/xiaohongshu|edith/.test(base) ? 100 : 0) }});
+        }}
+      }} catch (e) {{}}
+      if (depth >= 2) return;
+      try {{ Object.keys(value).slice(0, 80).forEach(function (key) {{ visit(value[key], depth + 1); }}); }} catch (e) {{}}
+    }}
+    try {{
+      var cache = requireFn && requireFn.c || {{}};
+      Object.keys(cache).forEach(function (id) {{ visit(cache[id] && cache[id].exports, 0); }});
+    }} catch (e) {{}}
+    found.sort(function (a, b) {{ return b.score - a.score; }});
+    window.__veltrixXhsClients = found.slice(0, 8).map(function (item) {{ return item.client; }});
+    return window.__veltrixXhsClients;
+  }}
+  function responseJson(raw) {{
+    if (raw && raw.config && raw.status != null) return raw.data;
+    return raw;
+  }}
+  function responseData(json) {{
+    if (json && json.data && (json.success != null || json.code != null)) return json.data;
+    return json;
+  }}
+  function accepted(json) {{
+    return !!json && json.success !== false && (json.code == null || Number(json.code) === 0);
+  }}
+  async function requestThroughOfficialApi(options, bodyText) {{
+    var api = discoverOfficialApis()[options.officialKind];
+    if (typeof api !== 'function') return null;
+    var raw;
+    if (options.officialKind === 'detail') {{
+      var body = options.officialData || (bodyText ? JSON.parse(bodyText) : {{}});
+      raw = await api(body, {{}});
+    }} else {{
+      raw = await api({{ params: options.params || {{}} }});
+    }}
+    var json = responseJson(raw);
+    if (!accepted(json)) {{
+      var code = json && json.code != null ? json.code : '';
+      throw new Error('official-api-rejected-' + String(code));
+    }}
+    return json;
+  }}
+  async function requestThroughSiteClient(path, options, bodyText) {{
+    var clients = discoverRequestClients();
+    if (window.__veltrixXhsRequestClient) {{
+      clients = [window.__veltrixXhsRequestClient].concat(clients.filter(function (item) {{ return item !== window.__veltrixXhsRequestClient; }}));
+    }}
+    var data = undefined;
+    if (bodyText) {{ try {{ data = JSON.parse(bodyText); }} catch (e) {{ data = bodyText; }} }}
+    var config = {{
+      url: 'https://edith.xiaohongshu.com' + path,
+      method: options.method.toLowerCase(),
+      data: data,
+      withCredentials: true,
+      headers: {{ 'Content-Type': 'application/json;charset=UTF-8' }}
+    }};
+    for (var i = 0; i < clients.length; i++) {{
+      try {{
+        var client = clients[i];
+        var current = Object.assign({{}}, config, {{ headers: Object.assign({{}}, config.headers) }});
+        var raw = typeof client === 'function' ? await client(current) : await client.request(current);
+        var json = responseJson(raw);
+        if (accepted(json)) {{ window.__veltrixXhsRequestClient = client; return json; }}
+      }} catch (e) {{}}
+    }}
+    return null;
+  }}
+  async function signedFetch(path, options, bodyText) {{
+    try {{
+      var viaOfficialApi = await requestThroughOfficialApi(options, bodyText);
+      if (viaOfficialApi) return viaOfficialApi;
+    }} catch (e) {{
+      hud('warn', '小红书官方请求封装失败，正在切换兼容通道');
+    }}
+    var viaClient = await requestThroughSiteClient(path, options, bodyText);
+    if (viaClient) return viaClient;
+    var headers = sign(path, bodyText);
+    if (!headers) throw new Error('signer-unavailable');
+    headers['Accept'] = 'application/json, text/plain, */*';
+    if (bodyText) headers['Content-Type'] = 'application/json;charset=UTF-8';
+    var response = await fetch('https://edith.xiaohongshu.com' + path, {{
+      method: options.method,
+      credentials: 'include',
+      cache: 'no-store',
+      headers: headers,
+      body: bodyText || undefined
+    }});
+    var text = await response.text();
+    var json;
+    try {{ json = JSON.parse(text); }} catch (e) {{ throw new Error('non-json-' + response.status); }}
+    if (!response.ok || !accepted(json)) {{
+      throw new Error('api-rejected-' + response.status + '-' + String(json.code == null ? '' : json.code));
+    }}
+    return json;
+  }}
+  async function fetchDetail() {{
+    var path = '/api/sns/web/v1/feed';
+    var officialData = {{
+      sourceNoteId: CFG.noteId,
+      imageFormats: ['jpg', 'webp', 'avif'],
+      extra: {{ needBodyTopic: '1' }},
+      xsecSource: 'pc_search',
+      xsecToken: CFG.xsecToken
+    }};
+    var body = JSON.stringify({{
+      source_note_id: CFG.noteId,
+      image_formats: ['jpg', 'webp', 'avif'],
+      extra: {{ need_body_topic: '1' }},
+      xsec_source: 'pc_search',
+      xsec_token: CFG.xsecToken
+    }});
+    var json = await signedFetch(path, {{ method: 'POST', officialKind: 'detail', officialData: officialData }}, body);
+    var detailData = responseData(json);
+    var items = detailData && detailData.items;
+    var hit = Array.isArray(items) && items.some(function (item) {{
+      var card = item && (item.note_card || item.noteCard || item);
+      return String((card && (card.note_id || card.noteId)) || item.id || '') === CFG.noteId;
+    }});
+    if (!hit) throw new Error('detail-not-found');
+    result.used = true;
+    result.pages = 1;
+  }}
+  async function fetchComments(job, jobResult, lane) {{
+    var cursor = '';
+    for (var page = 0; page < CFG.maxPages; page++) {{
+      if (window.__veltrixXhsApiAbort || window.__veltrixXhsApiGen !== GEN) throw new Error('aborted');
+      var params = {{
+        noteId: job.noteId,
+        cursor: cursor,
+        topCommentId: '',
+        imageFormats: 'jpg,webp,avif',
+        xsecToken: job.xsecToken || ''
+      }};
+      var query = new URLSearchParams();
+      query.set('note_id', params.noteId);
+      query.set('cursor', params.cursor);
+      query.set('top_comment_id', params.topCommentId);
+      query.set('image_formats', params.imageFormats);
+      query.set('xsec_token', params.xsecToken);
+      var path = '/api/sns/web/v2/comment/page?' + query.toString();
+      // 单页失败页内退避重试(3s/6s,最多 2 次):风控抖动一次就丢整 lane 太脆。
+      // 退避用可中断 sleep,中止/代际接管立即生效;三条请求通道顺序不变,仍在 signedFetch 内。
+      var json = null, lastError = null;
+      for (var attempt = 0; attempt <= 2; attempt++) {{
+        if (window.__veltrixXhsApiAbort || window.__veltrixXhsApiGen !== GEN) throw new Error('aborted');
+        try {{
+          json = await signedFetch(path, {{ method: 'GET', officialKind: 'comments', params: params }}, '');
+          lastError = null;
+          break;
+        }} catch (e) {{
+          lastError = e;
+          if (attempt < 2) {{
+            var backoff = (attempt + 1) * 3000;
+            hud('warn', '⏳ 并发' + lane + ' 第 ' + (page + 1) + ' 页请求失败(' + (e && e.message ? e.message : String(e)) + ')· ' + (backoff / 1000) + 's 后重试 ' + (attempt + 1) + '/2');
+            if (!(await interruptibleSleep(backoff))) throw new Error('aborted');
+          }}
+        }}
+      }}
+      if (!json) throw lastError || new Error('page-fetch-failed');
+      var data = responseData(json) || {{}};
+      var comments = Array.isArray(data.comments) ? data.comments : [];
+      var hasMore = data.has_more == null ? data.hasMore : data.has_more;
+      jobResult.used = true;
+      jobResult.pages += 1;
+      jobResult.comments += comments.length;
+      jobResult.noComments = jobResult.pages === 1 && comments.length === 0 && hasMore === false;
+      hud('info', '💬 并发' + lane + ' +' + comments.length + ' · 已采 ' + jobResult.comments + (CFG.limit ? '/' + CFG.limit : ''));
+      if ((CFG.limit > 0 && jobResult.comments >= CFG.limit) || hasMore === false) return;
+      var next = String(data.cursor || '');
+      if (!next || next === cursor) return;
+      cursor = next;
+      // 翻页节拍放缓到 1500~3000ms 随机 + lane 错开 400ms 基线:原 500~1000ms
+      // 双路并发瞬时密度太高易触发风控;可中断 sleep 保证节拍期间能响应中止。
+      var pace = 1500 + Math.floor(Math.random() * 1500) + (lane - 1) * 400;
+      if (!(await interruptibleSleep(pace))) throw new Error('aborted');
+    }}
+  }}
+  async function main() {{
+    try {{
+      // 官方评论页自身也允许 xsecToken 为空;只要有笔记 ID 就先尝试,失败再回退页面采集。
+      if (!CFG.noteId) throw new Error('missing-note-id');
+      if (CFG.kind === 'detail') await fetchDetail();
+      else {{
+        result.jobs = JOBS.map(function (job) {{
+          return {{ noteId: String(job.noteId || ''), used: false, error: null, pages: 0, comments: 0, noComments: false }};
+        }});
+        await Promise.all(JOBS.map(async function (job, index) {{
+          var jobResult = result.jobs[index];
+          try {{
+            if (!jobResult.noteId) throw new Error('missing-note-id');
+            await fetchComments(job, jobResult, index + 1);
+          }} catch (error) {{
+            jobResult.error = error && error.message ? error.message : String(error);
+            if (jobResult.error === 'aborted') jobResult.aborted = true;
+          }}
+        }}));
+        result.used = result.jobs.some(function (job) {{ return job.used; }});
+        result.aborted = result.jobs.some(function (job) {{ return job.aborted; }});
+        result.pages = result.jobs.reduce(function (sum, job) {{ return sum + job.pages; }}, 0);
+        result.comments = result.jobs.reduce(function (sum, job) {{ return sum + job.comments; }}, 0);
+        result.noComments = result.jobs.length > 0 && result.jobs.every(function (job) {{ return job.noComments; }});
+        if (!result.used) {{
+          var failed = result.jobs.find(function (job) {{ return job.error; }});
+          result.error = failed ? failed.error : 'empty';
+        }}
+      }}
+    }} catch (error) {{
+      result.error = error && error.message ? error.message : String(error);
+      if (result.error === 'aborted') result.aborted = true;
+    }}
+    // fetch hook 的 response.clone().text() 回传是异步任务,稍候再发完成信号防 Rust 先取空缓冲。
+    await sleep(250);
+    finish();
+  }}
+  main();
+}})();"#,
+        cfg_json = cfg_json
+    )
+}
+
+#[cfg(test)]
+mod xhs_api_tests {
+    use super::{
+        build_xhs_api_collect_eval, build_xhs_comment_batch_eval, XhsApiCollectSpec,
+        XhsCommentJob,
+    };
+
+    #[test]
+    fn direct_collect_script_contains_escaped_config_and_official_api_entries() {
+        let script = build_xhs_api_collect_eval(&XhsApiCollectSpec {
+            session_id: 7,
+            content_id: "note-'quoted",
+            xsec_token: "token-value",
+            limit: 30,
+            max_pages: 6,
+            kind: "comments",
+        });
+        assert!(script.contains("postApiSnsWebV1Feed"));
+        assert!(script.contains("getApiSnsWebV2CommentPage"));
+        assert!(script.contains("sourceNoteId: CFG.noteId"));
+        assert!(script.contains("window._webmsxyw"));
+        assert!(script.contains("/api/sns/web/v2/comment/page"));
+        assert!(script.contains("\"noteId\":\"note-'quoted\""));
+        assert!(script.contains("\"maxPages\":6"));
+    }
+
+    #[test]
+    fn comment_batch_script_keeps_cursor_order_inside_two_parallel_jobs() {
+        let script = build_xhs_comment_batch_eval(
+            9,
+            &[
+                XhsCommentJob {
+                    content_id: "note-a",
+                    xsec_token: "token-a",
+                },
+                XhsCommentJob {
+                    content_id: "note-b",
+                    xsec_token: "token-b",
+                },
+            ],
+            50,
+            8,
+        );
+        assert!(script.contains("Promise.all(JOBS.map"));
+        assert!(script.contains("\"noteId\":\"note-a\""));
+        assert!(script.contains("\"noteId\":\"note-b\""));
+        assert!(script.contains("query.set('cursor', params.cursor)"));
+    }
+}
+
 /// 构造「评论 API 直采」注入脚本(抖音):借页面自己的签名函数(`window.byted_acrawler`,
 /// webmssdk 挂载,跟随抖音改版自动是最新版,无需逆向 a_bogus 算法)对翻页请求签名,
 /// 在页面上下文直接 fetch 评论接口分页拉取。拉到的响应会被页内 fetch hook 按既有特征
@@ -1334,7 +1972,6 @@ pub fn build_comment_api_collect_eval(
         max_pages = max_pages,
     )
 }
-
 
 /// 激活右侧详情面板的「评论」tab。抖音「主页模态」详情(/user/{sec_uid}?modal_id=)默认可能停在
 /// 「详情」tab,评论列表与 comment/list 请求要切到「评论」tab 才加载。找文本以「评论」开头的短元素
@@ -1804,9 +2441,18 @@ pub fn emit_collect_log(app: &AppHandle, task_id: &str, level: &str, message: im
 /// 供 commands 在 pool collect 返回后(入库完成等)向 HUD 补充提示。
 /// task_id 非空时按任务级 label 定位(采集窗口按「平台+账号+任务」唯一);
 /// 素材下载阶段窗口已主动关闭,该阶段的 HUD 日志找不到窗口静默丢弃属预期(仍经 emit_collect_log 落库推前端)。
-pub fn hud_log(app: &AppHandle, platform: &str, account_id: &str, task_id: Option<&str>, level: &str, message: &str) {
+pub fn hud_log(
+    app: &AppHandle,
+    platform: &str,
+    account_id: &str,
+    task_id: Option<&str>,
+    level: &str,
+    message: &str,
+) {
     use tauri::Manager;
-    if let Some(win) = app.get_webview_window(&pool::task_window_label(platform, account_id, task_id)) {
+    if let Some(win) =
+        app.get_webview_window(&pool::task_window_label(platform, account_id, task_id))
+    {
         let _ = win.eval(build_hud_log_eval(level, message));
     }
 }
@@ -1877,6 +2523,9 @@ pub fn build_hud_task_eval(task_id: &str) -> String {
 /// 不干扰平台页面自身的交互与采集 hook。
 pub fn build_hud_init_script() -> String {
     r#"(function () {
+  // 浮层只在顶层帧建:initialization_script 会注入所有帧,字节系页面沙箱 iframe 多,
+  // 每个帧都解析执行整份 HUD 脚本纯属浪费
+  if (window !== window.top) return;
   if (window.__veltrixHudReady) return;
   window.__veltrixHudReady = true;
   var KEY = '__veltrix_hud_logs';

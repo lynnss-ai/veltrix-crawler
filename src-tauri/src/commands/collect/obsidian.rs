@@ -116,6 +116,11 @@ pub async fn sync_contents_to_obsidian(
     }
     let vault_path = std::path::PathBuf::from(&vault);
     let now = Utc::now().timestamp();
+    // 库存素材路径可能是相对 media_root 的相对路径(新口径),同步时 resolve 成绝对路径
+    let media_root = crate::media::media_root(
+        &state.config_dir,
+        &crate::commands::lock_config(&state)?.media.clone(),
+    );
     // 批量取内容,避免逐条 find_by_id 的 N+1;查不到的 id(含被删的)自然跳过
     let contents = content_entity::Entity::find()
         .filter(content_entity::Column::Id.is_in(ids))
@@ -159,7 +164,8 @@ pub async fn sync_contents_to_obsidian(
                 ind
             }
         };
-        if let Err(e) = crate::obsidian::sync_one(&vault_path, content, &comments, &industry).await
+        if let Err(e) =
+            crate::obsidian::sync_one(&vault_path, content, &comments, &industry, &media_root).await
         {
             tracing::warn!(content_id = %content.id, "同步 Obsidian 失败: {e}");
             continue;
@@ -181,6 +187,7 @@ pub(super) async fn sync_task_to_obsidian(
     db: &DatabaseConnection,
     task_id: &str,
     owner: &str,
+    media_root: &Path,
 ) -> usize {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     use veltrix_core::db::entity::{
@@ -236,6 +243,7 @@ pub(super) async fn sync_task_to_obsidian(
             let vault = vault.clone();
             let industry = industry.clone();
             let owner = owner.to_string();
+            let media_root = media_root.to_path_buf();
             async move {
                 let comments = match comment_entity::Entity::find()
                     .filter(comment_entity::Column::TaskId.eq(task_id))
@@ -252,7 +260,7 @@ pub(super) async fn sync_task_to_obsidian(
                     }
                 };
                 if let Err(e) =
-                    crate::obsidian::sync_one(&vault_path, &content, &comments, &industry).await
+                    crate::obsidian::sync_one(&vault_path, &content, &comments, &industry, &media_root).await
                 {
                     tracing::warn!(content_id = %content.id, "自动同步 Obsidian 写盘失败: {e}");
                     return false;

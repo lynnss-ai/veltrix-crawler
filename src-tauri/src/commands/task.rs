@@ -16,6 +16,10 @@ use tauri::State;
 use veltrix_core::db::entity::{account, collect_log, comment, content, task, task_run};
 use veltrix_core::error::{CrawlerError, Result};
 
+/// 单任务关键词数量上限:关键词越多单轮采集越久、同账号风控压力越集中,
+/// 前后端同口径限制(run_task 对存量超限任务同样拦截)。
+pub const MAX_TASK_KEYWORDS: usize = 10;
+
 /// 任务下单个关键词的采集统计(内容数 / 实际入库评论数),供任务列表按关键词分行展示。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +55,8 @@ pub struct TaskView {
     pub keep_video: bool,
     /// AI 文案提取开关(依赖音频提取)
     pub ai_extract: bool,
+    /// 封面文字识别开关(采集后对封面图做 OCR)
+    pub cover_ocr: bool,
     /// 评论采集开关
     pub collect_comments: bool,
     /// 评论发布时间范围:3d / 7d / 14d / any
@@ -120,6 +126,7 @@ impl From<task::Model> for TaskView {
             audio_extract: m.audio_extract,
             keep_video: m.keep_video,
             ai_extract: m.ai_extract,
+            cover_ocr: m.cover_ocr,
             collect_comments: m.collect_comments,
             comment_time_range: m.comment_time_range,
             comment_limit: m.comment_limit,
@@ -180,6 +187,9 @@ pub struct TaskInput {
     #[serde(default)]
     pub keep_video: bool,
     pub ai_extract: bool,
+    /// 封面文字识别开关(前端可能不传,默认关闭)
+    #[serde(default)]
+    pub cover_ocr: bool,
     /// 评论采集开关(前端可能不传,默认关闭)
     #[serde(default)]
     pub collect_comments: bool,
@@ -347,6 +357,13 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
     let now = Utc::now().timestamp();
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let owner = me.name.clone();
+    // 关键词数量上限(定向任务 keywords 只有占位词,天然不触发);前端表单同口径拦截
+    if input.keywords.len() > MAX_TASK_KEYWORDS {
+        return Err(CrawlerError::Config(format!(
+            "关键词最多 {MAX_TASK_KEYWORDS} 个,当前 {} 个",
+            input.keywords.len()
+        )));
+    }
     let keywords_json = serde_json::to_string(&input.keywords)
         .map_err(|e| CrawlerError::Config(format!("序列化关键词失败: {e}")))?;
     let target_urls_json = serde_json::to_string(&input.target_urls)
@@ -408,6 +425,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.audio_extract = Set(audio_extract);
             am.keep_video = Set(input.keep_video);
             am.ai_extract = Set(input.ai_extract);
+            am.cover_ocr = Set(input.cover_ocr);
             am.collect_comments = Set(input.collect_comments);
             am.comment_time_range = Set(input.comment_time_range);
             am.comment_limit = Set(input.comment_limit);
@@ -443,6 +461,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 audio_extract: Set(audio_extract),
                 keep_video: Set(input.keep_video),
                 ai_extract: Set(input.ai_extract),
+                cover_ocr: Set(input.cover_ocr),
                 collect_comments: Set(input.collect_comments),
                 comment_time_range: Set(input.comment_time_range),
                 comment_limit: Set(input.comment_limit),
@@ -569,6 +588,10 @@ pub struct ContentView {
     pub video_url: Option<String>,
     pub cover_url: Option<String>,
     pub image_urls: Vec<String>,
+    /// 与图片 URL 按下标对应,详情接口回填已下载的文件。
+    pub image_paths: Vec<Option<String>>,
+    /// 小红书原文导航参数,不暴露整份 extra。
+    pub xsec_token: Option<String>,
     /// 视频时长(秒);图文为 None
     pub duration: Option<i64>,
     /// 话题标签(# 开头)
@@ -592,6 +615,10 @@ pub struct ContentView {
     pub transcript: Option<String>,
     /// 转写失败原因(供前端区分未转写与失败)
     pub transcript_error: Option<String>,
+    /// 封面 OCR 识别文本;空串=已识别但无文字,None=未识别/识别失败
+    pub cover_ocr_text: Option<String>,
+    /// 封面 OCR 失败原因(供前端区分未识别与失败)
+    pub cover_ocr_error: Option<String>,
     /// 细粒度处理状态:视频下载 / 图文图片进度 / 评论采集 / 意向分析
     pub video_downloaded: Option<bool>,
     pub image_total: Option<i32>,
@@ -607,6 +634,10 @@ impl From<content::Model> for ContentView {
         // image_urls / topics 反序列化失败回退空数组,避免一条脏数据拖死整表
         let image_urls: Vec<String> = serde_json::from_str(&m.image_urls).unwrap_or_default();
         let topics: Vec<String> = serde_json::from_str(&m.topics).unwrap_or_default();
+        let xsec_token = serde_json::from_str::<serde_json::Value>(&m.extra)
+            .ok()
+            .and_then(|v| v.get("xsec_token").and_then(|t| t.as_str())
+                .filter(|t| !t.trim().is_empty()).map(str::to_string));
         // 头像在完整作者 JSON 里(实体只单列了 uid/nickname),按需解析出来
         let author_avatar = serde_json::from_str::<serde_json::Value>(&m.author_json)
             .ok()
@@ -633,6 +664,9 @@ impl From<content::Model> for ContentView {
             video_url: m.video_url,
             cover_url: m.cover_url,
             image_urls,
+            image_paths: m.image_paths.as_deref()
+                .and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default(),
+            xsec_token,
             duration: m.duration,
             topics,
             owner: m.owner,
@@ -645,6 +679,8 @@ impl From<content::Model> for ContentView {
             audio_path: m.audio_path,
             transcript: m.transcript,
             transcript_error: m.transcript_error,
+            cover_ocr_text: m.cover_ocr_text,
+            cover_ocr_error: m.cover_ocr_error,
             video_downloaded: m.video_downloaded,
             image_total: m.image_total,
             image_done: m.image_done,
@@ -653,6 +689,84 @@ impl From<content::Model> for ContentView {
             synced_by_me: false, // 由 fill_content_views 按当前用户回填
         }
     }
+}
+
+/// 列表专用瘦身视图(list_contents_page 专用):剔除 transcript / cover_ocr_text 全文、
+/// image_urls 全量数组、image_paths 等大块字段——瀑布流每批 48 条、表格单页可达 1000 条,
+/// 整文过 IPC 是大库列表卡顿的主因。文案与封面文字只保留三态 + 摘要;
+/// 全文仍由详情(get_content_detail)/ 导出(list_contents_full)等接口提供。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentListView {
+    pub id: String,
+    pub task_id: String,
+    pub platform: String,
+    /// 所属行业:content 表无此列,fill_content_list_views 关联 task.industry 填入
+    pub industry: String,
+    pub content_id: String,
+    /// 采集时命中的关键词
+    pub keyword: String,
+    /// video / image / article / unknown
+    pub kind: String,
+    pub title: Option<String>,
+    pub desc: Option<String>,
+    pub author_uid: String,
+    pub author_nickname: String,
+    /// 作者头像 URL(Rust 侧从 author_json 解析,author_json 本身不外发)
+    pub author_avatar: Option<String>,
+    pub like_count: Option<i64>,
+    pub comment_count: Option<i64>,
+    pub collect_count: Option<i64>,
+    pub share_count: Option<i64>,
+    pub play_count: Option<i64>,
+    pub published_at: Option<i64>,
+    pub video_url: Option<String>,
+    pub cover_url: Option<String>,
+    /// 图集首图 URL(封面缺失时的回退图源;替代旧 image_urls[0] 用法)
+    pub first_image_url: Option<String>,
+    /// 图集图片张数(瀑布流「N 图」角标等;替代旧 image_urls.length 用法)
+    pub image_count: i32,
+    /// 小红书原文导航参数(Rust 侧从 extra 解析,不暴露整份 extra)
+    pub xsec_token: Option<String>,
+    /// 视频时长(秒);图文为 None
+    pub duration: Option<i64>,
+    /// 话题标签(# 开头)
+    pub topics: Vec<String>,
+    pub owner: String,
+    pub collected_at: i64,
+    /// 素材下载状态:pending / success / failed;None=旧数据未跑过下载
+    pub media_status: Option<String>,
+    /// 音频是否提取成功(仅视频且开启提取时有意义)
+    pub audio_extracted: Option<bool>,
+    /// 素材失败原因(403 / ffmpeg 失败等)
+    pub media_error: Option<String>,
+    /// 封面本地路径(相对 media_root;旧数据可能为绝对路径),前端本地优先显示
+    pub cover_path: Option<String>,
+    /// 作者头像本地路径
+    pub avatar_path: Option<String>,
+    /// 视频转出音频本地路径;None=非视频/未提取/旧数据未记录
+    pub audio_path: Option<String>,
+    /// 转写三态:none=未转写/转写失败,empty=已转写但未识别到语音(空文案),has=有文案;
+    /// 列表不再传 transcript 全文,徽章逻辑改读此字段,语义与转写三态约定一一对应
+    pub transcript_state: String,
+    /// 文案摘要:仅 has 时有值,超出 LIST_PREVIEW_LEN 字符截断并补 …
+    pub transcript_preview: Option<String>,
+    /// 转写失败原因(供前端区分未转写与失败)
+    pub transcript_error: Option<String>,
+    /// 封面 OCR 三态(口径同 transcript_state)
+    pub cover_ocr_state: String,
+    /// 封面文字摘要:仅 has 时有值,截断口径同 transcript_preview
+    pub cover_ocr_preview: Option<String>,
+    /// 封面 OCR 失败原因
+    pub cover_ocr_error: Option<String>,
+    /// 细粒度处理状态:视频下载 / 图文图片进度 / 评论采集 / 意向分析
+    pub video_downloaded: Option<bool>,
+    pub image_total: Option<i32>,
+    pub image_done: Option<i32>,
+    pub comment_collected: Option<bool>,
+    pub intent_analyzed: Option<bool>,
+    /// 当前登录用户是否已把该内容同步到自己的 Obsidian(fill_content_list_views 回填)
+    pub synced_by_me: bool,
 }
 
 /// 内容详情里的作者扩展信息(从 author_json 解析)+ 该作者在库中的聚合统计。
@@ -849,6 +963,31 @@ pub async fn get_content_detail(
     content_view.industry = industry;
     content_view.synced_by_me = synced_by_me;
 
+    // 下载器将图集与封面放在同目录。用实际封面定位,兼容旧数据及跨日下载。
+    content_view.image_paths.resize(content_view.image_urls.len(), None);
+    // 库存 cover_path 可能是相对 media_root 的相对路径(新口径),先 resolve 成绝对路径做磁盘判断;
+    // 写回 view 的条目再经 to_media_rel 转回相对路径,保持视图输出口径一致
+    let root = crate::media::media_root(&state.config_dir, &crate::commands::lock_config(&state)?.media.clone());
+    let cover_abs = content_view
+        .cover_path
+        .as_deref()
+        .map(|p| crate::media::resolve_media_path(&root, p));
+    if let Some(cover) = cover_abs.as_deref() {
+        if let (Some(dir), Some(prefix)) = (cover.parent(), cover.file_stem()
+            .and_then(|s| s.to_str()).and_then(|s| s.strip_suffix("_cover"))) {
+            for index in 0..content_view.image_urls.len() {
+                if content_view.image_paths[index].is_some() {
+                    continue;
+                }
+                let path = dir.join(format!("{prefix}_img{index}.jpg"));
+                let exists = tokio::fs::metadata(&path).await
+                    .is_ok_and(|meta| meta.is_file() && meta.len() > 0);
+                content_view.image_paths[index] =
+                    exists.then(|| crate::media::to_media_rel(&root, &path));
+            }
+        }
+    }
+
     Ok(ContentDetailView {
         content: content_view,
         author,
@@ -865,6 +1004,8 @@ pub struct AuthorView {
     pub uid: String,
     pub nickname: String,
     pub avatar: Option<String>,
+    /// 作者头像本地路径(相对 media_root;按 media 模块落盘约定探测文件存在性,未下载过为 None)
+    pub avatar_path: Option<String>,
     /// 平台号(抖音号等)
     pub platform_id: Option<String>,
     pub signature: Option<String>,
@@ -968,9 +1109,29 @@ pub async fn list_authors(state: State<'_, AppState>) -> Result<Vec<AuthorView>>
         }
     }
 
+    // 头像本地路径:与 media 模块头像落盘约定一致({platform}/avatar/{uid}.jpg),
+    // 文件存在才回填,前端本地优先、缺失回退平台 CDN
+    let media_root = state
+        .config
+        .lock()
+        .map(|cfg| crate::media::media_root(&state.config_dir, &cfg.media))
+        .ok();
+
     Ok(rows
         .into_iter()
-        .map(|m| AuthorView {
+        .map(|m| {
+            let avatar_rel = format!(
+                "{}/{}/{}.jpg",
+                m.platform,
+                crate::media::avatar_dir_name(),
+                crate::media::sanitize_filename(&m.uid)
+            );
+            let avatar_path = media_root
+                .as_ref()
+                .filter(|root| root.join(&avatar_rel).is_file())
+                .map(|_| avatar_rel);
+            AuthorView {
+            avatar_path,
             content_count: count_map.get(&m.id).copied().unwrap_or(0),
             industries: author_industries
                 .get(&m.id)
@@ -992,6 +1153,7 @@ pub async fn list_authors(state: State<'_, AppState>) -> Result<Vec<AuthorView>>
             is_blacklisted: m.is_blacklisted,
             first_collected_at: m.first_collected_at,
             last_collected_at: m.last_collected_at,
+            }
         })
         .collect())
 }
@@ -1463,6 +1625,8 @@ pub struct ContentListQuery {
     pub image_source: Option<String>,
     /// 仅展示已转写文案的视频(内容库视频 tab 口径:转写未出的视频无浏览价值)
     pub require_transcript: Option<bool>,
+    /// 内容库额外纳入小红书图文。图文正文来自笔记详情,不依赖语音转写。
+    pub include_xhs_images: Option<bool>,
     /// 排序字段白名单:collectedAt / publishedAt / mediaStatus;None=collectedAt
     pub sort_by: Option<String>,
     /// asc / desc;None=desc
@@ -1502,7 +1666,7 @@ pub struct CommentListQuery {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentListResult {
-    pub items: Vec<ContentView>,
+    pub items: Vec<ContentListView>,
     pub total: i64,
 }
 
@@ -1528,6 +1692,16 @@ pub struct ContentLibraryStats {
 pub struct IndustryCount {
     pub industry: String,
     pub count: i64,
+}
+
+/// 侧栏行业角标聚合结果:各行业计数 + 「全部」总数。
+/// total 忽略行业筛选(含无行业内容),前端「全部行业」角标用它——
+/// 此前用列表 total(含行业过滤),选中某行业后「全部」角标会变成该行业的数量。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndustryCounts {
+    pub total: i64,
+    pub industries: Vec<IndustryCount>,
 }
 
 /// 批量处理种类(对应前端「提取文案 / 提取评论 / 采集音频」按钮)
@@ -1602,19 +1776,19 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
     let mut conds = String::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     if self_only {
-        and_cond(&mut conds, &mut values, "owner = ?", owner.to_string().into());
+        and_cond(&mut conds, &mut values, "contents.owner = ?", owner.to_string().into());
     }
     if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
-        and_cond(&mut conds, &mut values, "task_id = ?", tid.to_string().into());
+        and_cond(&mut conds, &mut values, "contents.task_id = ?", tid.to_string().into());
     }
     if let Some(kw) = query.keyword.as_deref().filter(|k| !k.is_empty()) {
-        and_cond(&mut conds, &mut values, "keyword = ?", kw.to_string().into());
+        and_cond(&mut conds, &mut values, "contents.keyword = ?", kw.to_string().into());
     }
     if let Some(start) = query.run_start {
-        and_cond(&mut conds, &mut values, "collected_at >= ?", start.into());
+        and_cond(&mut conds, &mut values, "contents.collected_at >= ?", start.into());
     }
     if let Some(end) = query.run_end {
-        and_cond(&mut conds, &mut values, "collected_at <= ?", end.into());
+        and_cond(&mut conds, &mut values, "contents.collected_at <= ?", end.into());
     }
     if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         let pattern = format!("%{}%", escape_like(q));
@@ -1622,18 +1796,24 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
         and_cond(
             &mut conds,
             &mut values,
-            "(lower(title) LIKE lower(?) ESCAPE '\\' OR lower(keyword) LIKE lower(?) ESCAPE '\\' OR lower(desc) LIKE lower(?) ESCAPE '\\')",
+            "(lower(contents.title) LIKE lower(?) ESCAPE '\\' OR lower(contents.keyword) LIKE lower(?) ESCAPE '\\' OR lower(contents.desc) LIKE lower(?) ESCAPE '\\')",
             pattern.clone().into(),
         );
         values.push(pattern.clone().into());
         values.push(pattern.into());
     }
     if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
-        and_cond(&mut conds, &mut values, "platform = ?", p.to_string().into());
+        and_cond(&mut conds, &mut values, "contents.platform = ?", p.to_string().into());
     }
     if !query.kinds.is_empty() {
         let placeholders = vec!["?"; query.kinds.len()].join(", ");
-        conds.push_str(&format!(" AND kind IN ({placeholders})"));
+        if query.include_xhs_images.unwrap_or(false) {
+            conds.push_str(&format!(
+                " AND (contents.kind IN ({placeholders}) OR (contents.platform = 'xhs' AND contents.kind = 'image'))"
+            ));
+        } else {
+            conds.push_str(&format!(" AND contents.kind IN ({placeholders})"));
+        }
         for k in &query.kinds {
             values.push(k.clone().into());
         }
@@ -1646,37 +1826,45 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
         and_cond(
             &mut conds,
             &mut values,
-            "task_id IN (SELECT id FROM tasks WHERE industry = ?)",
+            "contents.task_id IN (SELECT id FROM tasks WHERE industry = ?)",
             ind.to_string().into(),
         );
     }
     if let Some(from) = query.created_from {
-        and_cond(&mut conds, &mut values, "collected_at >= ?", from.into());
+        and_cond(&mut conds, &mut values, "contents.collected_at >= ?", from.into());
     }
     if let Some(to) = query.created_to {
-        and_cond(&mut conds, &mut values, "collected_at <= ?", to.into());
+        and_cond(&mut conds, &mut values, "contents.collected_at <= ?", to.into());
     }
     if let Some(from) = query.published_from {
-        and_cond(&mut conds, &mut values, "published_at >= ?", from.into());
+        and_cond(&mut conds, &mut values, "contents.published_at >= ?", from.into());
     }
     if let Some(to) = query.published_to {
-        and_cond(&mut conds, &mut values, "published_at <= ?", to.into());
+        and_cond(&mut conds, &mut values, "contents.published_at <= ?", to.into());
     }
     match query.image_source.as_deref() {
         // "image":本地封面路径非空(图片素材定位口径,内容选择弹窗用——远程 URL 无法定位本地素材)
         Some("image") => {
-            conds.push_str(" AND cover_path IS NOT NULL AND cover_path <> ''");
+            conds.push_str(" AND contents.cover_path IS NOT NULL AND contents.cover_path <> ''");
         }
         // "cover":本地或远程封面任一存在(内容库封面图源,远程封面也展示)
         Some("cover") => {
             conds.push_str(
-                " AND ((cover_path IS NOT NULL AND cover_path <> '') OR (cover_url IS NOT NULL AND cover_url <> ''))",
+                " AND ((contents.cover_path IS NOT NULL AND contents.cover_path <> '') OR (contents.cover_url IS NOT NULL AND contents.cover_url <> ''))",
             );
         }
         _ => {}
     }
     if query.require_transcript.unwrap_or(false) {
-        conds.push_str(" AND transcript IS NOT NULL AND trim(transcript) <> ''");
+        if query.include_xhs_images.unwrap_or(false) {
+            // 视频仍要求转写完成;小红书图文正文直接来自详情,无需经过音频转写。
+            conds.push_str(
+                " AND ((contents.platform = 'xhs' AND contents.kind = 'image') OR \
+                 (contents.kind = 'video' AND contents.transcript IS NOT NULL AND trim(contents.transcript) <> ''))",
+            );
+        } else {
+            conds.push_str(" AND contents.transcript IS NOT NULL AND trim(contents.transcript) <> ''");
+        }
     }
     if let Some(ids) = query.ids.as_deref() {
         if ids.is_empty() {
@@ -1684,7 +1872,7 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
             conds.push_str(" AND 1 = 0");
         } else {
             let placeholders = vec!["?"; ids.len().min(10000)].join(", ");
-            conds.push_str(&format!(" AND id IN ({placeholders})"));
+            conds.push_str(&format!(" AND contents.id IN ({placeholders})"));
             for id in ids.iter().take(10000) {
                 values.push(id.clone().into());
             }
@@ -1693,28 +1881,52 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
     FilterParts { conds, values }
 }
 
+#[cfg(test)]
+mod content_filter_tests {
+    use super::{content_filter, ContentListQuery};
+
+    #[test]
+    fn content_library_includes_xhs_images_without_weakening_video_transcript_filter() {
+        let query = ContentListQuery {
+            kinds: vec!["video".to_string()],
+            require_transcript: Some(true),
+            include_xhs_images: Some(true),
+            ..Default::default()
+        };
+        let filter = content_filter(&query, false, "");
+
+        assert!(filter.conds.contains(
+            "contents.kind IN (?) OR (contents.platform = 'xhs' AND contents.kind = 'image')"
+        ));
+        assert!(filter.conds.contains(
+            "(contents.platform = 'xhs' AND contents.kind = 'image') OR (contents.kind = 'video' AND contents.transcript IS NOT NULL"
+        ));
+        assert_eq!(filter.values.len(), 1);
+    }
+}
+
 /// 评论列表通用过滤(分页查询 / 计数 / 行业角标共用同一口径)
 fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> FilterParts {
     let mut conds = String::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     if self_only {
-        and_cond(&mut conds, &mut values, "owner = ?", owner.to_string().into());
+        and_cond(&mut conds, &mut values, "comments.owner = ?", owner.to_string().into());
     }
     if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
-        and_cond(&mut conds, &mut values, "task_id = ?", tid.to_string().into());
+        and_cond(&mut conds, &mut values, "comments.task_id = ?", tid.to_string().into());
     }
     if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         let pattern = format!("%{}%", escape_like(q));
         and_cond(
             &mut conds,
             &mut values,
-            "(lower(text) LIKE lower(?) ESCAPE '\\' OR lower(author_nickname) LIKE lower(?) ESCAPE '\\')",
+            "(lower(comments.text) LIKE lower(?) ESCAPE '\\' OR lower(comments.author_nickname) LIKE lower(?) ESCAPE '\\')",
             pattern.clone().into(),
         );
         values.push(pattern.into());
     }
     if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
-        and_cond(&mut conds, &mut values, "platform = ?", p.to_string().into());
+        and_cond(&mut conds, &mut values, "comments.platform = ?", p.to_string().into());
     }
     if !query.kinds.is_empty() {
         // 所属内容形态:相关 EXISTS(评论与内容按任务级三列关联,无物理外键)
@@ -1736,7 +1948,7 @@ fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> Fil
         and_cond(
             &mut conds,
             &mut values,
-            "task_id IN (SELECT id FROM tasks WHERE industry = ?)",
+            "comments.task_id IN (SELECT id FROM tasks WHERE industry = ?)",
             ind.to_string().into(),
         );
     }
@@ -1749,21 +1961,21 @@ fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> Fil
         let mut parts: Vec<String> = Vec::new();
         if !analyzed.is_empty() {
             let placeholders = vec!["?"; analyzed.len()].join(", ");
-            parts.push(format!("intent_level IN ({placeholders})"));
+            parts.push(format!("comments.intent_level IN ({placeholders})"));
             for l in &analyzed {
                 values.push((*l).clone().into());
             }
         }
         if analyzed.len() != query.intent_levels.len() {
-            parts.push("intent_level IS NULL".to_string());
+            parts.push("comments.intent_level IS NULL".to_string());
         }
         conds.push_str(&format!(" AND ({})", parts.join(" OR ")));
     }
     if let Some(from) = query.created_from {
-        and_cond(&mut conds, &mut values, "created_at >= ?", from.into());
+        and_cond(&mut conds, &mut values, "comments.created_at >= ?", from.into());
     }
     if let Some(to) = query.created_to {
-        and_cond(&mut conds, &mut values, "created_at <= ?", to.into());
+        and_cond(&mut conds, &mut values, "comments.created_at <= ?", to.into());
     }
     FilterParts { conds, values }
 }
@@ -1800,6 +2012,174 @@ fn comment_order(query: &CommentListQuery) -> String {
     format!(
         "{col} {dir}, CASE intent_level WHEN 'high' THEN 5 WHEN 'medium' THEN 4 WHEN 'low' THEN 3 WHEN 'none' THEN 2 ELSE 1 END DESC, id ASC"
     )
+}
+
+/// 列表摘要截断长度(字符):覆盖表格「文案片段」与瀑布流文字卡的展示量,全文看详情。
+/// 前端事件/重试回写摘要时用同一阈值(ContentLibraryPage 的 toPreview)。
+const LIST_PREVIEW_LEN: usize = 100;
+
+/// 列表瘦身查询的 SELECT:剔 transcript / cover_ocr_text / image_paths 等整文列,
+/// 三态与摘要在 SQL 内算好(substr/length 在 SQLite 与 PG 均按字符计),整文不出库也不过 IPC;
+/// author_json / image_urls / extra 仍需读出供 Rust 派生小字段(头像/首图/xsec_token),但不外发。
+fn content_list_select_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT id, task_id, platform, content_id, keyword, kind, title, desc, \
+         author_uid, author_nickname, author_json, \
+         like_count, comment_count, collect_count, share_count, play_count, published_at, \
+         video_url, cover_url, image_urls, extra, duration, topics, owner, collected_at, \
+         media_status, audio_extracted, media_error, cover_path, avatar_path, audio_path, \
+         transcript_error, cover_ocr_error, \
+         video_downloaded, image_total, image_done, comment_collected, intent_analyzed, \
+         CASE WHEN transcript IS NULL THEN 'none' WHEN transcript = '' THEN 'empty' ELSE 'has' END AS transcript_state, \
+         CASE WHEN transcript IS NULL OR transcript = '' THEN NULL \
+              WHEN length(transcript) > {n} THEN substr(transcript, 1, {n}) || '…' \
+              ELSE transcript END AS transcript_preview, \
+         CASE WHEN cover_ocr_text IS NULL THEN 'none' WHEN cover_ocr_text = '' THEN 'empty' ELSE 'has' END AS cover_ocr_state, \
+         CASE WHEN cover_ocr_text IS NULL OR cover_ocr_text = '' THEN NULL \
+              WHEN length(cover_ocr_text) > {n} THEN substr(cover_ocr_text, 1, {n}) || '…' \
+              ELSE cover_ocr_text END AS cover_ocr_preview \
+         FROM contents WHERE id IN ({placeholders})",
+        n = LIST_PREVIEW_LEN,
+    )
+}
+
+/// 单行手工映射:列与 content_list_select_sql 的清单一一对应;
+/// author_json / image_urls / extra / topics 的 JSON 脏数据回退默认,避免一条脏数据拖死整页。
+fn map_content_list_row(r: &sea_orm::QueryResult) -> Result<ContentListView> {
+    let col_err = |col: &'static str| {
+        move |e: sea_orm::DbErr| CrawlerError::Config(format!("读取内容列表列 {col} 失败: {e}"))
+    };
+    let author_json: String = r.try_get("", "author_json").map_err(col_err("author_json"))?;
+    let image_urls_raw: String = r.try_get("", "image_urls").map_err(col_err("image_urls"))?;
+    let extra: String = r.try_get("", "extra").map_err(col_err("extra"))?;
+    let topics_raw: String = r.try_get("", "topics").map_err(col_err("topics"))?;
+    // 头像在完整作者 JSON 里(实体只单列了 uid/nickname),按需解析出来
+    let author_avatar = serde_json::from_str::<serde_json::Value>(&author_json)
+        .ok()
+        .and_then(|v| v.get("avatar").and_then(|a| a.as_str()).map(str::to_string));
+    // 图集只取首图(封面回退图源)与张数(「N 图」角标),整串不外发
+    let image_urls: Vec<String> = serde_json::from_str(&image_urls_raw).unwrap_or_default();
+    let first_image_url = image_urls.first().filter(|u| !u.is_empty()).cloned();
+    let image_count = image_urls.len() as i32;
+    let xsec_token = serde_json::from_str::<serde_json::Value>(&extra)
+        .ok()
+        .and_then(|v| {
+            v.get("xsec_token")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_string)
+        });
+    let topics: Vec<String> = serde_json::from_str(&topics_raw).unwrap_or_default();
+    Ok(ContentListView {
+        id: r.try_get("", "id").map_err(col_err("id"))?,
+        task_id: r.try_get("", "task_id").map_err(col_err("task_id"))?,
+        platform: r.try_get("", "platform").map_err(col_err("platform"))?,
+        industry: String::new(), // 由 fill_content_list_views 关联 task 后填充
+        content_id: r.try_get("", "content_id").map_err(col_err("content_id"))?,
+        keyword: r.try_get("", "keyword").map_err(col_err("keyword"))?,
+        kind: r.try_get("", "kind").map_err(col_err("kind"))?,
+        title: r.try_get("", "title").map_err(col_err("title"))?,
+        desc: r.try_get("", "desc").map_err(col_err("desc"))?,
+        author_uid: r.try_get("", "author_uid").map_err(col_err("author_uid"))?,
+        author_nickname: r.try_get("", "author_nickname").map_err(col_err("author_nickname"))?,
+        author_avatar,
+        like_count: r.try_get("", "like_count").map_err(col_err("like_count"))?,
+        comment_count: r.try_get("", "comment_count").map_err(col_err("comment_count"))?,
+        collect_count: r.try_get("", "collect_count").map_err(col_err("collect_count"))?,
+        share_count: r.try_get("", "share_count").map_err(col_err("share_count"))?,
+        play_count: r.try_get("", "play_count").map_err(col_err("play_count"))?,
+        published_at: r.try_get("", "published_at").map_err(col_err("published_at"))?,
+        video_url: r.try_get("", "video_url").map_err(col_err("video_url"))?,
+        cover_url: r.try_get("", "cover_url").map_err(col_err("cover_url"))?,
+        first_image_url,
+        image_count,
+        xsec_token,
+        duration: r.try_get("", "duration").map_err(col_err("duration"))?,
+        topics,
+        owner: r.try_get("", "owner").map_err(col_err("owner"))?,
+        collected_at: r.try_get("", "collected_at").map_err(col_err("collected_at"))?,
+        media_status: r.try_get("", "media_status").map_err(col_err("media_status"))?,
+        audio_extracted: r.try_get("", "audio_extracted").map_err(col_err("audio_extracted"))?,
+        media_error: r.try_get("", "media_error").map_err(col_err("media_error"))?,
+        cover_path: r.try_get("", "cover_path").map_err(col_err("cover_path"))?,
+        avatar_path: r.try_get("", "avatar_path").map_err(col_err("avatar_path"))?,
+        audio_path: r.try_get("", "audio_path").map_err(col_err("audio_path"))?,
+        transcript_state: r.try_get("", "transcript_state").map_err(col_err("transcript_state"))?,
+        transcript_preview: r.try_get("", "transcript_preview").map_err(col_err("transcript_preview"))?,
+        transcript_error: r.try_get("", "transcript_error").map_err(col_err("transcript_error"))?,
+        cover_ocr_state: r.try_get("", "cover_ocr_state").map_err(col_err("cover_ocr_state"))?,
+        cover_ocr_preview: r.try_get("", "cover_ocr_preview").map_err(col_err("cover_ocr_preview"))?,
+        cover_ocr_error: r.try_get("", "cover_ocr_error").map_err(col_err("cover_ocr_error"))?,
+        video_downloaded: r.try_get("", "video_downloaded").map_err(col_err("video_downloaded"))?,
+        image_total: r.try_get("", "image_total").map_err(col_err("image_total"))?,
+        image_done: r.try_get("", "image_done").map_err(col_err("image_done"))?,
+        comment_collected: r.try_get("", "comment_collected").map_err(col_err("comment_collected"))?,
+        intent_analyzed: r.try_get("", "intent_analyzed").map_err(col_err("intent_analyzed"))?,
+        synced_by_me: false, // 由 fill_content_list_views 按当前用户回填
+    })
+}
+
+/// 列表瘦身查询:按 id 集取回裁剪后的行(IN 查询不保证顺序,由 reorder_content_list_rows 还原)
+async fn query_content_list_rows(
+    db: &sea_orm::DatabaseConnection,
+    backend: sea_orm::DatabaseBackend,
+    ids: &[String],
+) -> Result<Vec<ContentListView>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let values: Vec<sea_orm::Value> = ids.iter().cloned().map(Into::into).collect();
+    let rows = db
+        .query_all(raw_statement(backend, content_list_select_sql(&placeholders), values))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    rows.iter().map(map_content_list_row).collect()
+}
+
+/// 按 id 顺序重排列表行(同 reorder_content_rows 的原因:raw SQL 只保证 id 列表的顺序/分页)
+fn reorder_content_list_rows(ids: &[String], rows: Vec<ContentListView>) -> Vec<ContentListView> {
+    let by_id: HashMap<String, ContentListView> =
+        rows.into_iter().map(|m| (m.id.clone(), m)).collect();
+    ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
+}
+
+/// 列表视图回填:行业(逻辑外键)+ 当前用户 Obsidian 已同步标记(与 fill_content_views 同口径)
+async fn fill_content_list_views(
+    db: &sea_orm::DatabaseConnection,
+    me_name: &str,
+    rows: Vec<ContentListView>,
+) -> Result<Vec<ContentListView>> {
+    let task_ids: HashSet<String> = rows.iter().map(|r| r.task_id.clone()).collect();
+    let industry_map: HashMap<String, String> = task::Entity::find()
+        .filter(task::Column::Id.is_in(task_ids))
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务行业失败: {e}")))?
+        .into_iter()
+        .map(|t| (t.id, t.industry))
+        .collect();
+    let synced: HashSet<String> = {
+        use veltrix_core::db::entity::content_synced_user as csu;
+        let content_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+        csu::Entity::find()
+            .filter(csu::Column::SyncedUser.eq(me_name.to_string()))
+            .filter(csu::Column::ContentId.is_in(content_ids))
+            .all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.content_id)
+            .collect()
+    };
+    Ok(rows
+        .into_iter()
+        .map(|mut view| {
+            view.industry = industry_map.get(&view.task_id).cloned().unwrap_or_default();
+            view.synced_by_me = synced.contains(&view.id);
+            view
+        })
+        .collect())
 }
 
 /// 内容视图回填:行业(逻辑外键)+ 当前用户 Obsidian 已同步标记(照旧 list_contents 口径)
@@ -1979,13 +2359,37 @@ pub async fn list_contents_page(
             .and_then(|r| r.try_get("", "cnt").ok())
             .unwrap_or(0)
     };
+    let rows = query_content_list_rows(&state.db, backend, &ids).await?;
+    let items =
+        fill_content_list_views(&state.db, &me.name, reorder_content_list_rows(&ids, rows)).await?;
+    Ok(ContentListResult { items, total })
+}
+
+/// 按 id 集取完整内容视图:导出 Excel / 对话插入文案等需要转写全文的场景用;
+/// 列表页一律走瘦身的 list_contents_page。按入参 id 顺序返回。
+#[tauri::command]
+pub async fn list_contents_full(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<Vec<ContentView>> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    // 防御上限:与分页 limit clamp 同级,避免误传超大 id 集拖垮 IPC
+    let ids: Vec<String> = ids.into_iter().take(2000).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
     let models = content::Entity::find()
         .filter(content::Column::Id.is_in(ids.iter().cloned()))
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
-    let items = fill_content_views(&state.db, &me.name, reorder_content_rows(&ids, models)).await?;
-    Ok(ContentListResult { items, total })
+    // dataScope=self 只放行本人的内容:列表已按 scope 过滤,这里兜底防直接调用越权
+    let models: Vec<content::Model> = if me.scope == "self" {
+        models.into_iter().filter(|m| m.owner == me.name).collect()
+    } else {
+        models
+    };
+    fill_content_views(&state.db, &me.name, reorder_content_rows(&ids, models)).await
 }
 
 /// 评论库分页列表(同 list_contents_page 结构)。
@@ -2040,6 +2444,147 @@ pub async fn list_comments_page(
         .map_err(|e| CrawlerError::Config(format!("查询评论失败: {e}")))?;
     let items = fill_comment_views(&state.db, reorder_comment_rows(&ids, models)).await?;
     Ok(CommentListResult { items, total })
+}
+
+// ===================== 评论库瀑布流(按来源分组) =====================
+
+/// 评论来源分组(评论库瀑布流):来源元信息(标题/封面/作者)由组内评论行的关联字段携带,
+/// comment_count 是当前筛选口径下该来源的评论总数(卡片「查看全部 N 条」用),
+/// comments 为后端截好的预览(点赞倒序前 N 条),前端不再自行分组/截断。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentSourceGroup {
+    pub platform: String,
+    pub content_id: String,
+    pub comment_count: i64,
+    pub comments: Vec<CommentView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentSourcePageResult {
+    pub items: Vec<CommentSourceGroup>,
+    /// 来源总数(distinct platform + content_id),分页推导用
+    pub total: i64,
+}
+
+/// 评论库瀑布流:与 list_comments_page 同一筛选口径(comment_filter),按来源(所属内容)
+/// 分组返回;来源排序 = 最新采集时间倒序(与表格默认序一致),每组预览评论点赞倒序。
+#[tauri::command]
+pub async fn list_comment_sources_page(
+    state: State<'_, AppState>,
+    query: CommentListQuery,
+    preview_limit: Option<u64>,
+) -> Result<CommentSourcePageResult> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let filter = comment_filter(&query, me.scope == "self", &me.name);
+    let backend = state.db.get_database_backend();
+    let limit = query.limit.clamp(1, 100);
+    let preview = preview_limit.unwrap_or(6).clamp(1, 20);
+
+    // 1) 当前筛选下的来源总数(distinct platform + content_id)
+    let count_sql = format!(
+        "SELECT COUNT(*) AS cnt FROM (SELECT 1 FROM comments WHERE 1=1 {} GROUP BY platform, content_id)",
+        filter.conds
+    );
+    let count_rows = state
+        .db
+        .query_all(raw_statement(backend, count_sql, filter.values.clone()))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计评论来源失败: {e}")))?;
+    let total = count_rows
+        .first()
+        .and_then(|r| r.try_get("", "cnt").ok())
+        .unwrap_or(0);
+    if total == 0 {
+        return Ok(CommentSourcePageResult {
+            items: vec![],
+            total: 0,
+        });
+    }
+
+    // 2) 来源分页:最新采集倒序;组内评论数一并聚合(卡片「查看全部 N 条」用)
+    let group_sql = format!(
+        "SELECT platform, content_id, COUNT(*) AS cnt, MAX(collected_at) AS latest          FROM comments WHERE 1=1 {} GROUP BY platform, content_id          ORDER BY latest DESC, platform ASC, content_id ASC LIMIT {limit} OFFSET {}",
+        filter.conds, query.offset
+    );
+    let group_rows = state
+        .db
+        .query_all(raw_statement(backend, group_sql, filter.values.clone()))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询评论来源失败: {e}")))?;
+    struct GroupKey {
+        platform: String,
+        content_id: String,
+        count: i64,
+    }
+    let groups: Vec<GroupKey> = group_rows
+        .iter()
+        .map(|r| GroupKey {
+            platform: r.try_get("", "platform").unwrap_or_default(),
+            content_id: r.try_get("", "content_id").unwrap_or_default(),
+            count: r.try_get("", "cnt").unwrap_or(0),
+        })
+        .collect();
+    if groups.is_empty() {
+        return Ok(CommentSourcePageResult {
+            items: vec![],
+            total,
+        });
+    }
+
+    // 3) 预览评论:窗口函数按点赞倒序每组截前 N 条
+    //    (复合键 IN 用 OR 链;页内 ≤100 组,条件长度可接受)
+    let mut key_conds = String::new();
+    let mut key_values: Vec<sea_orm::Value> = Vec::new();
+    for g in &groups {
+        key_conds.push_str(" OR (platform = ? AND content_id = ?)");
+        key_values.push(g.platform.clone().into());
+        key_values.push(g.content_id.clone().into());
+    }
+    let preview_sql = format!(
+        "SELECT id FROM (SELECT id, platform, content_id,          ROW_NUMBER() OVER (PARTITION BY platform, content_id              ORDER BY COALESCE(like_count, 0) DESC, id ASC) AS rn          FROM comments WHERE 1=1 {} AND (1=0 {})) t          WHERE rn <= {preview} ORDER BY platform, content_id, rn",
+        filter.conds, key_conds
+    );
+    let mut preview_values = filter.values.clone();
+    preview_values.extend(key_values);
+    let id_rows = state
+        .db
+        .query_all(raw_statement(backend, preview_sql, preview_values))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询来源预览评论失败: {e}")))?;
+    let ids: Vec<String> = id_rows
+        .iter()
+        .map(|r| r.try_get("", "id").unwrap_or_default())
+        .collect();
+    let models = comment::Entity::find()
+        .filter(comment::Column::Id.is_in(ids.iter().cloned()))
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询来源预览评论失败: {e}")))?;
+    let views = fill_comment_views(&state.db, reorder_comment_rows(&ids, models)).await?;
+
+    // 4) 组装:保持第 2 步的分页顺序归组;组内即窗口序(点赞倒序)
+    let mut by_key: HashMap<(String, String), Vec<CommentView>> = HashMap::new();
+    for v in views {
+        by_key
+            .entry((v.platform.clone(), v.content_id.clone()))
+            .or_default()
+            .push(v);
+    }
+    let items = groups
+        .into_iter()
+        .map(|g| {
+            let key = (g.platform.clone(), g.content_id.clone());
+            CommentSourceGroup {
+                platform: g.platform,
+                content_id: g.content_id,
+                comment_count: g.count,
+                comments: by_key.remove(&key).unwrap_or_default(),
+            }
+        })
+        .collect();
+    Ok(CommentSourcePageResult { items, total })
 }
 
 /// 全量库「待转写 / 待提取评论 / 待采集音频」计数(与前端 needsTranscript / needsComments 逐条口径一致,
@@ -2137,12 +2682,36 @@ pub async fn list_batch_content_ids(
         .collect())
 }
 
+/// 「全部行业」总数查询:复用已构造的筛选(调用方已把 industry 置 None),
+/// 不加行业非空条件——无行业内容也计入「全部」。table 仅允许 contents / comments 两个字面量。
+async fn count_industry_total(
+    state: &State<'_, AppState>,
+    table: &str,
+    filter: &FilterParts,
+) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM {table} JOIN tasks t ON t.id = {table}.task_id WHERE 1=1 {}",
+        filter.conds
+    );
+    let row = state
+        .db
+        .query_one(raw_statement(
+            state.db.get_database_backend(),
+            sql,
+            filter.values.clone(),
+        ))
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计全部行业总数失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("统计全部行业总数失败: 无结果行".into()))?;
+    Ok(row.try_get("", "cnt").unwrap_or(0))
+}
+
 /// 全量库各行业内容数(侧栏角标)。忽略行业筛选自身(否则当前行业计数恒 0),其余筛选同列表口径。
 #[tauri::command]
 pub async fn content_industry_counts(
     state: State<'_, AppState>,
     query: ContentListQuery,
-) -> Result<Vec<IndustryCount>> {
+) -> Result<IndustryCounts> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let mut query = query;
     query.industry = None;
@@ -2159,17 +2728,20 @@ pub async fn content_industry_counts(
         .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
-            filter.values,
+            filter.values.clone(),
         ))
         .await
         .map_err(|e| CrawlerError::Config(format!("统计行业内容失败: {e}")))?;
-    Ok(rows
+    let industries = rows
         .iter()
         .map(|r| IndustryCount {
             industry: r.try_get("", "industry").unwrap_or_default(),
             count: r.try_get("", "cnt").unwrap_or(0),
         })
-        .collect())
+        .collect();
+    // 「全部行业」总数:与上方同一筛选(已忽略行业),但含无行业内容
+    let total = count_industry_total(&state, "contents", &filter).await?;
+    Ok(IndustryCounts { total, industries })
 }
 
 /// 评论库各行业评论数(侧栏角标,口径同 content_industry_counts)。
@@ -2177,7 +2749,7 @@ pub async fn content_industry_counts(
 pub async fn comment_industry_counts(
     state: State<'_, AppState>,
     query: CommentListQuery,
-) -> Result<Vec<IndustryCount>> {
+) -> Result<IndustryCounts> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let mut query = query;
     query.industry = None;
@@ -2194,17 +2766,20 @@ pub async fn comment_industry_counts(
         .query_all(raw_statement(
             state.db.get_database_backend(),
             sql,
-            filter.values,
+            filter.values.clone(),
         ))
         .await
         .map_err(|e| CrawlerError::Config(format!("统计行业评论失败: {e}")))?;
-    Ok(rows
+    let industries = rows
         .iter()
         .map(|r| IndustryCount {
             industry: r.try_get("", "industry").unwrap_or_default(),
             count: r.try_get("", "cnt").unwrap_or(0),
         })
-        .collect())
+        .collect();
+    // 「全部行业」总数:与上方同一筛选(已忽略行业),但含无行业内容
+    let total = count_industry_total(&state, "comments", &filter).await?;
+    Ok(IndustryCounts { total, industries })
 }
 
 /// 采集日志视图(任务详情页加载历史)。entry 从 entry_json 解析回对象,与实时 collect-log 事件结构一致。
@@ -2516,38 +3091,72 @@ fn parse_comment_cursor(cursor: &str) -> Result<(i64, String)> {
     Ok((likes, id.to_string()))
 }
 
-/// 单条内容的评论列表(全量库详情右侧评论栏):按内容行精确匹配
-/// (task_id + platform + content_id),按点赞数倒序(热评在前)。
-/// 游标分页:首页不带 cursor;has_more 时返回 nextCursor,前端「加载更多」续拉。
+/// 单条内容的评论列表(全量库详情右侧评论栏 / 评论库瀑布流来源抽屉):
+/// content_id 先按内容行主键精确匹配(详情页场景);未命中则按平台原生
+/// content_id(+platform 消歧)兜底——瀑布流分组来自 comments 表,评论可能
+/// 没有对应内容行(内容未入库或已删),不能因此报错,退化为纯评论查询。
+/// 按点赞数倒序(热评在前)。游标分页:首页不带 cursor;has_more 时返回 nextCursor,前端「加载更多」续拉。
 #[tauri::command]
 pub async fn list_content_comments(
     state: State<'_, AppState>,
     content_id: String,
     cursor: Option<String>,
     limit: Option<u32>,
+    platform: Option<String>,
 ) -> Result<CommentPageView> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let row = content::Entity::find_by_id(content_id)
+    let by_pk = content::Entity::find_by_id(content_id.clone())
         .one(&state.db)
         .await
-        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
-        .ok_or_else(|| CrawlerError::Config("内容不存在".into()))?;
-    if me.scope == "self" && row.owner != me.name {
-        return Err(CrawlerError::Config("无权查看该内容".into()));
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
+    let row = match by_pk {
+        Some(r) => Some(r),
+        None => {
+            let mut cq = content::Entity::find()
+                .filter(content::Column::ContentId.eq(content_id.clone()));
+            if let Some(p) = platform.as_deref().filter(|p| !p.is_empty()) {
+                cq = cq.filter(content::Column::Platform.eq(p));
+            }
+            cq.one(&state.db).await.ok().flatten()
+        }
+    };
+    if me.scope == "self" {
+        if let Some(r) = &row {
+            if r.owner != me.name {
+                return Err(CrawlerError::Config("无权查看该内容".into()));
+            }
+        }
     }
-    let industry = task::Entity::find_by_id(row.task_id.clone())
-        .one(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| t.industry)
-        .unwrap_or_default();
+    let industry = match &row {
+        Some(r) => task::Entity::find_by_id(r.task_id.clone())
+            .one(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.industry)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
     // 点赞数 NULL 按 0 参与排序与游标比较(排序/过滤口径一致,否则 NULL 行翻页会漏)
     let likes = Expr::col(comment::Column::LikeCount).if_null(0);
-    let mut q = comment::Entity::find()
-        .filter(comment::Column::TaskId.eq(row.task_id.clone()))
-        .filter(comment::Column::Platform.eq(row.platform.clone()))
-        .filter(comment::Column::ContentId.eq(row.content_id.clone()));
+    let mut q = comment::Entity::find();
+    q = match &row {
+        Some(r) => q
+            .filter(comment::Column::TaskId.eq(r.task_id.clone()))
+            .filter(comment::Column::Platform.eq(r.platform.clone()))
+            .filter(comment::Column::ContentId.eq(r.content_id.clone())),
+        None => {
+            let mut cq = q.filter(comment::Column::ContentId.eq(content_id.clone()));
+            if let Some(p) = platform.as_deref().filter(|p| !p.is_empty()) {
+                cq = cq.filter(comment::Column::Platform.eq(p));
+            }
+            // 无内容行可鉴权时退化为按评论 owner 过滤
+            if me.scope == "self" {
+                cq = cq.filter(comment::Column::Owner.eq(me.name.clone()));
+            }
+            cq
+        }
+    };
     let total = q
         .clone()
         .count(&state.db)
@@ -2575,7 +3184,7 @@ pub async fn list_content_comments(
     let items: Vec<CommentView> = rows
         .into_iter()
         .take(limit as usize)
-        .map(|m| build_comment_view(m, Some(&row), &industry))
+        .map(|m| build_comment_view(m, row.as_ref(), &industry))
         .collect();
     // 游标取本页末行的 (点赞数, 行 id);与排序/过滤同口径(NULL 按 0)
     let next_cursor = has_more

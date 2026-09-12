@@ -1,5 +1,5 @@
 // 作者库:采集到的作者档案(authors 表)。画像 + 已采内容聚合 + 监控开关。
-// 筛选:左侧行业栏(作者跨行业按其内容所属任务聚合)+ 平台 chip + 仅看监控 + 关键字。
+// 筛选:左侧行业栏(作者跨行业按其内容所属任务聚合)+ 平台 chip + 监控状态下拉(筛选区)+ 关键字。
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Eye, RefreshCw, Search, UserRound, X } from "lucide-react";
@@ -14,7 +14,10 @@ import { FORM_CONTROL_SIZING } from "@/lib/form-sizing";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { FacetedFilter } from "@/components/FacetedFilter";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
+import { LocalFirstImage } from "@/components/LocalFirstImage";
+import { mediaThumbPath } from "@/lib/media-file-url";
 import { FilterSidebar, IndustryFilterToggle } from "@/components/library-filters";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import {
@@ -339,7 +342,7 @@ export function AuthorLibraryPage() {
   if (loading && authors.length === 0) return <PageLoading />;
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 gap-4">
+    <div className="flex min-h-0 min-w-0 flex-1 gap-2.5">
       {/* 左侧:行业筛选(可折叠);作者行业由其内容所属任务聚合 */}
       {!sidebarCollapsed && (
         <FilterSidebar
@@ -352,13 +355,20 @@ export function AuthorLibraryPage() {
       )}
 
       <div
-        className={`flex min-h-0 min-w-0 flex-1 flex-col gap-3 ${FORM_CONTROL_SIZING}`}
+        className={`flex min-h-0 min-w-0 flex-1 flex-col gap-2.5 ${FORM_CONTROL_SIZING}`}
       >
         {/* 第一行:行业按钮(收起态)+ 关键字搜索 + 重置 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {sidebarCollapsed && (
             <IndustryFilterToggle onExpand={() => setSidebarCollapsed(false)} />
           )}
+          {/* 监控状态:同全量库「内容形式」的下拉筛选样式(放在搜索框左侧) */}
+          <FacetedFilter
+            title="监控状态"
+            options={[{ value: "monitored", label: "监控中" }]}
+            selected={monitoredOnly ? ["monitored"] : []}
+            onChange={(v) => setMonitoredOnly(v.includes("monitored"))}
+          />
           <div className="relative w-full sm:w-72 lg:w-80">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
@@ -384,7 +394,7 @@ export function AuthorLibraryPage() {
             </Button>
           )}
         </div>
-        {/* 第二行:平台筛选 + 仅看监控,移到搜索框下方 */}
+        {/* 第二行:平台筛选(不选即全部,点已选取消) */}
         <div className="flex flex-wrap items-center gap-2">
           {platformOptions.map((id) => (
             <button
@@ -398,10 +408,6 @@ export function AuthorLibraryPage() {
               {platformName(id)}
             </button>
           ))}
-          <label className="ml-2 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-            <Switch checked={monitoredOnly} onCheckedChange={setMonitoredOnly} />
-            仅看监控中
-          </label>
           {/* 画像补采:对当前筛选下支持的作者打开主页拦截画像接口刷新档案 */}
           <SimpleTooltip content="对当前筛选下「抖音 / 小红书 / 快手 / B站 / YouTube」的作者打开主页,补全粉丝 / 签名等画像(逐个开窗,较慢)">
             <Button
@@ -423,7 +429,7 @@ export function AuthorLibraryPage() {
           loading={loading}
           itemLabel="作者"
           getRowId={(a) => a.id}
-          defaultPageSize={50}
+          defaultPageSize={20}
           emptyState={
             <EmptyState
               title="暂无作者"
@@ -443,12 +449,12 @@ const AuthorCell = memo(function AuthorCell({ a }: { a: AuthorView }) {
   const homeUrl = authorProfileUrl(a.platform, a.uid, a.platformId);
   return (
     <div className="flex w-[26rem] max-w-full items-center gap-3 py-1">
-      {a.avatar ? (
+      {a.avatar || a.avatarPath ? (
         <SimpleTooltip content={homeUrl ? "打开作者主页" : "暂无主页链接"}>
-          <img
-            src={a.avatar}
-            alt=""
-            loading="lazy"
+          {/* 本地头像(缩略图)优先,未下载 / 加载失败由 LocalFirstImage 回退 CDN */}
+          <LocalFirstImage
+            localPath={a.avatarPath ? mediaThumbPath(a.avatarPath) : null}
+            externalUrl={a.avatar ?? ""}
             onClick={
               homeUrl
                 ? () =>
@@ -457,9 +463,6 @@ const AuthorCell = memo(function AuthorCell({ a }: { a: AuthorView }) {
                     )
                 : undefined
             }
-            onError={(e) => {
-              e.currentTarget.style.display = "none";
-            }}
             className={`size-10 shrink-0 rounded-full border object-cover transition ${
               homeUrl
                 ? "cursor-pointer hover:ring-2 hover:ring-primary hover:ring-offset-1"

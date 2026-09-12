@@ -2,7 +2,7 @@
 // 工具集:桌面(desktop:鼠标键盘/窗口/剪贴板/启程序)+ OCR 读屏 + UIA 控件 + 看屏(capture_screen)。
 // 文件 / 进程 / 终端已拆到「本机助手(local)」,直发 HTTP 在「rpa」。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl } from "@/lib/media-file-url";
 import { listen } from "@tauri-apps/api/event";
 import { ChevronDown, Loader2, Monitor, Pencil, Plus, Send, Trash2, Video } from "lucide-react";
 import { toast } from "sonner";
@@ -622,6 +622,7 @@ export function ComputerLayout() {
 
 // 单条消息:user 气泡 / assistant 文本+工具调用 / tool 结果行
 function ComputerMessage({ message: m }: { message: ChatMessageView }) {
+  const mediaFileUrl = useMediaFileUrl();
   if (m.role === "user") {
     // 视频附件(如屏幕录制):内联播放器;有正文才渲染气泡
     const videos = (m.attachments ?? []).filter((a) =>
@@ -632,7 +633,7 @@ function ComputerMessage({ message: m }: { message: ChatMessageView }) {
         {videos.map((a, i) => (
           <video
             key={i}
-            src={a.path ? convertFileSrc(a.path) : ""}
+            src={a.path ? mediaFileUrl(a.path) : ""}
             controls
             preload="metadata"
             className="max-h-72 w-full max-w-md rounded-lg border border-border/60 bg-black"

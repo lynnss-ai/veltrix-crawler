@@ -35,7 +35,8 @@ import {
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { useMediaFileUrl } from "@/lib/media-file-url";
 import { toast } from "sonner";
 
 import {
@@ -415,7 +416,7 @@ function buildCopyBlock(c: ContentView, index: number, total: number): string {
   lines.push(
     `点赞数量:${num(c.likeCount)}  评论数量:${num(c.commentCount)}  转发数量:${num(c.shareCount)}  收藏数量:${num(c.collectCount)}`,
   );
-  const contentUrl = contentDetailUrl(c.platform, c.contentId);
+  const contentUrl = contentDetailUrl(c.platform, c.contentId, c.xsecToken);
   if (contentUrl) lines.push(`文案地址:${contentUrl}`);
   const authorUrl = authorProfileUrl(c.platform, c.authorUid);
   if (authorUrl) lines.push(`作者地址:${authorUrl}`);
@@ -1043,8 +1044,21 @@ export function ChatPage() {
   async function handleAssetPick(result: AssetPickResult) {
     if (result.mode === "copy") {
       // 结构化插入:每条 = 标题 / 文案 / 互动数据 / 文案地址 / 作者地址;多条时加序号区隔。
-      const total = result.contents.length;
-      const blocks = result.contents.map((c, i) =>
+      // 资产弹窗用的是列表瘦身视图(无转写全文):确认后按选中 id 拉回完整视图再拼接
+      let full: ContentView[];
+      try {
+        full = await api.listContentsFull(result.contents.map((c) => c.id));
+      } catch (e) {
+        toast.error(`读取资产文案失败: ${e}`);
+        return;
+      }
+      // 接口按 id 集返回,顺序不一定与勾选一致,按勾选顺序重排
+      const byId = new Map(full.map((c) => [c.id, c]));
+      const ordered = result.contents
+        .map((c) => byId.get(c.id))
+        .filter((c): c is ContentView => !!c);
+      const total = ordered.length;
+      const blocks = ordered.map((c, i) =>
         buildCopyBlock(c, i, total),
       );
       if (blocks.length === 0) {
@@ -2662,8 +2676,8 @@ export function ChatPage() {
 // 单条消息:用户右侧气泡(纯文本),助手左侧全宽(Markdown);各带时间 + 操作栏。
 // memo + 稳定回调:流式时已完成消息不重渲染(性能)。
 // 历史附件取显示 src:有本地 path 走 asset 协议;否则用乐观消息的内联 base64;都没有返回空。
-function messageAttachmentSrc(a: MessageAttachment): string {
-  if (a.path) return convertFileSrc(a.path);
+function messageAttachmentSrc(a: MessageAttachment, mediaFileUrl: (path: string) => string): string {
+  if (a.path) return mediaFileUrl(a.path);
   if (a.data) return `data:${a.mime};base64,${a.data}`;
   return "";
 }
@@ -2685,6 +2699,7 @@ const MessageBubble = memo(function MessageBubble({
   onToggleFeedback: (id: number, v: "like" | "dislike") => void;
   onPreviewImage: (src: string) => void;
 }) {
+  const mediaFileUrl = useMediaFileUrl();
   const isUser = message.role === "user";
   const time = fmtMsgTime(message.createdAt);
 
@@ -2701,7 +2716,7 @@ const MessageBubble = memo(function MessageBubble({
         {images.length > 0 && (
           <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
             {images.map((a, i) => {
-              const src = messageAttachmentSrc(a);
+              const src = messageAttachmentSrc(a, mediaFileUrl);
               return (
                 <img
                   key={i}
@@ -2720,7 +2735,7 @@ const MessageBubble = memo(function MessageBubble({
             {videos.map((a, i) => (
               <video
                 key={i}
-                src={messageAttachmentSrc(a)}
+                src={messageAttachmentSrc(a, mediaFileUrl)}
                 controls
                 preload="metadata"
                 className="max-h-72 w-full max-w-md rounded-lg border border-border/60 bg-black"

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Loader2 } from "lucide-react";
-import type { ContentView } from "@/lib/api";
+import type { ContentListView } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { WaterfallCard } from "@/components/WaterfallCard";
 
@@ -11,6 +11,7 @@ export function ImageWaterfall({
   items,
   total,
   loading,
+  contentMode,
   onLoadMore,
   platformName,
   retrying,
@@ -18,15 +19,17 @@ export function ImageWaterfall({
   onRetry,
   onDelete,
 }: {
-  items: ContentView[];
+  items: ContentListView[];
   /// 服务端总数(同筛选口径);不传则视为已全部加载
   total?: number;
   loading: boolean;
+  /** 内容库以正文为主;图片库才展示大图卡片。 */
+  contentMode: boolean;
   onLoadMore: () => void;
   platformName: (id: string) => string;
   retrying: Set<string>;
   onOpenDetail: (id: string) => void;
-  onRetry: (c: ContentView) => void;
+  onRetry: (c: ContentListView) => void;
   onDelete: (id: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -69,9 +72,11 @@ export function ImageWaterfall({
     count: items.length,
     getScrollElement: () => scrollRef.current,
     getItemKey: (index) => items[index]?.id ?? index,
-    // 图片卡高度随列宽变化;视频卡主要是文字。首次估算后由 ResizeObserver 实测校正。
+    // 图片库卡片高度随列宽变化;内容库卡片主要是文字。首次估算后由 ResizeObserver 实测校正。
     estimateSize: (index) =>
-      items[index]?.kind === "video" ? 250 : estimatedCardWidth * (4 / 3) + 135,
+      contentMode || items[index]?.kind === "video"
+        ? 250
+        : estimatedCardWidth * (4 / 3) + 135,
     lanes: layout.columns,
     gap,
     overscan: layout.columns * 2,
@@ -148,6 +153,7 @@ export function ImageWaterfall({
               >
                 <WaterfallCard
                   c={c}
+                  contentMode={contentMode}
                   platformName={platformName}
                   retrying={retrying.has(c.id)}
                   onOpenDetail={onOpenDetail}

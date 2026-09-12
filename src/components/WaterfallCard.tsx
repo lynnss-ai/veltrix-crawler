@@ -10,7 +10,8 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import type { ContentView } from "@/lib/api";
+import type { ContentListView } from "@/lib/api";
+import { mediaThumbPath } from "@/lib/media-file-url";
 import { LocalFirstImage } from "@/components/LocalFirstImage";
 import { Button } from "@/components/ui/button";
 import {
@@ -51,28 +52,40 @@ function formatDuration(sec?: number | null): string {
 
 export const WaterfallCard = memo(function WaterfallCard({
   c,
+  contentMode,
   platformName,
   retrying,
   onOpenDetail,
   onRetry,
   onDelete,
 }: {
-  c: ContentView;
+  c: ContentListView;
+  /** true=内容库文字卡;false=图片库图像卡。 */
+  contentMode: boolean;
   platformName: (id: string) => string;
   retrying: boolean;
   onOpenDetail: (id: string) => void;
-  onRetry: (c: ContentView) => void;
+  onRetry: (c: ContentListView) => void;
   onDelete: (id: string) => void;
 }) {
-  const coverExternal = c.coverUrl || c.imageUrls[0] || "";
+  const coverExternal = c.coverUrl || c.firstImageUrl || "";
   const hasCover = Boolean(c.coverPath || coverExternal);
   const hasAvatar = Boolean(c.avatarPath || c.authorAvatar);
   const titleText = c.title || c.desc || "(无文案)";
-  const imageCount = c.imageUrls.length;
+  const imageCount = c.imageCount;
   const isVideo = c.kind === "video";
+  const textCard = contentMode || isVideo;
+  // 列表只带转写摘要:有文案显摘要;未转写/空文案沿用示例文案占位(徽标提示不变)
+  const bodyText = isVideo
+    ? c.transcriptState === "has"
+      ? (c.transcriptPreview ?? "")
+      : mockTranscript(c.contentId)
+    : c.desc && c.desc !== c.title
+      ? c.desc
+      : "";
   return (
     <div className="group relative break-inside-avoid overflow-hidden rounded-xl border border-border bg-card transition duration-200 hover:-translate-y-0.5 hover:shadow-md">
-      {isVideo ? (
+      {textCard ? (
         <div className="flex flex-wrap items-center gap-1.5 px-2.5 pt-2.5">
           <span
             className={`rounded px-2 py-0.5 text-[11px] font-medium ${platformClass(c.platform)}`}
@@ -99,7 +112,7 @@ export const WaterfallCard = memo(function WaterfallCard({
         >
           {hasCover ? (
             <LocalFirstImage
-              localPath={c.coverPath}
+              localPath={c.coverPath ? mediaThumbPath(c.coverPath) : null}
               externalUrl={coverExternal}
               className="size-full object-cover transition duration-300 group-hover:scale-[1.03]"
             />
@@ -183,12 +196,12 @@ export const WaterfallCard = memo(function WaterfallCard({
         >
           {titleText}
         </p>
-        {c.kind === "video" && (
+        {textCard && bodyText && (
           <div className="space-y-1">
             <p className="line-clamp-5 text-xs leading-relaxed text-muted-foreground">
-              {c.transcript || mockTranscript(c.contentId)}
+              {bodyText}
             </p>
-            {!c.transcript && (
+            {isVideo && c.transcriptState !== "has" && (
               <span className="inline-block rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
                 示例文案 · 转写完成后自动替换
               </span>
@@ -199,7 +212,7 @@ export const WaterfallCard = memo(function WaterfallCard({
           <div className="flex min-w-0 items-center gap-1.5">
             {hasAvatar ? (
               <LocalFirstImage
-                localPath={c.avatarPath}
+                localPath={c.avatarPath ? mediaThumbPath(c.avatarPath) : null}
                 externalUrl={c.authorAvatar ?? ""}
                 className="size-5 shrink-0 rounded-full object-cover"
               />

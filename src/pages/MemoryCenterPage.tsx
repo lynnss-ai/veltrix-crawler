@@ -132,7 +132,7 @@ function GlobalMemorySection() {
   const [embedKey, setEmbedKey] = useState("");
   const [savingEmbed, setSavingEmbed] = useState(false);
   const [pageIndex, setPageIndex] = useState(0);
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(20);
   const deferredSearch = useDeferredValue(search);
 
   function reload() {
@@ -770,7 +770,7 @@ function GlobalMemorySection() {
                 totalCount={filtered.length}
                 itemLabel="条记忆"
                 pageSize={pageSize}
-                pageSizeOptions={[50, 100, 200]}
+                pageSizeOptions={[20, 50, 100, 200]}
                 onPageSizeChange={setPageSize}
               />
             </div>

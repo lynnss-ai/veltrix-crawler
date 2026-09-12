@@ -33,6 +33,8 @@ veltrix-crawler 是抖音 / 小红书 / 快手 / Bilibili / TikTok / YouTube 等
 
 构建辅助:`.cargo/config.toml` 在 Windows 下用 `rust-lld.exe` 替代 MSVC link.exe 加速增量链接;根 `Cargo.toml` 的 dev profile 为 `debug = "line-tables-only"`(保留行号级调试信息,加速 codegen 与链接)。
 
+**OpenCV 构建环境(智能剪辑-场景检测,仅 Windows)**:预编译包在 `third_party/opencv/`(不进 git,首次需下载 opencv-4.10.0-windows.exe 自解压);`.cargo/config.toml [env]` 已配 `OPENCV_*`。绑定生成依赖 clang 工具链(全部走 scripts/.venv 的 pip 包,无需管理员):`CLANG_PATH` 指向 `third_party/clang-shim/clang.cmd`(ziglang 的 zig cc -target x86_64-windows-msvc 充当 clang 驱动;**`ziglang/lib/include` 已替换为 llvmorg-18.1.1 的 clang 内建头**,与 pip libclang 18.1.1 版本对齐,源包抽自 `third_party/llvm-project-llvmorg-18.1.1/`);`LIBCLANG_PATH` 指向 libclang pip 包,链接期 `libclang.lib` 由 pefile 导符号 + `zig dlltool` 生成(已放 libclang.dll 同目录,dll 另拷 target/debug 与 deps 供构建脚本加载);`OPENCV_CLANG_ARGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`(pip libclang 18 过本机 VS 18 STL 的 clang≥20 版本检查)。运行时依赖 `opencv_world4100.dll` 等 3 个 DLL(dev 已拷 target/debug;打包走 `src-tauri/resources/`,tauri.conf bundle.resources 已含)。
+
 ## 仓库结构与模块划分
 
 ```
@@ -71,7 +73,7 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 2. `webview::pool` 复用该账号的 WebView 窗口(**per-account 数据目录隔离** = 多账号互不串登录态),导航到搜索页,注入脚本 hook fetch/XHR。
 3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底 / 网络无响应 / 手动停 即结束。计数排除库中已有 content_id;**去重跳过**:本任务已采 ∪ 去重台账 `collect_records`(同平台、近 90 天)的内容整体跳过,删单条内容不清台账,「清空业务数据」连带清台账。
 4. adapter(`DouyinAdapter` / `XhsAdapter` 等,注册在 `lib.rs`)把响应解析为统一 `Content` / `Comment`,**只解析、不发请求**。
-5. 边采边入库(on-conflict upsert)。阶段顺序:内容采集 → 作者画像补采 → 评论采集 → 直链补取(开「音频提取」时;刻意排在评论后)→ 素材下载(并发 15 路;**采集窗口保活、账号锁延后到下载结束才释放**——每个并发批从存活窗口取一次轮换后的新会话 Cookie,用户关窗即终止)→ 关窗放锁 → 语音转写 → 评论意向分析 → Obsidian 同步 → 落 `completed`。
+5. 边采边入库(on-conflict upsert)。阶段顺序:内容采集 → 作者画像补采 → 评论采集 → 直链补取(开「音频提取」时;刻意排在评论后)→ 素材下载(并发 10 路;**采集窗口保活、账号锁延后到下载结束才释放**——每个并发批从存活窗口取一次轮换后的新会话 Cookie,用户关窗即终止)→ 关窗放锁 → 语音转写 → 封面文字识别(开「封面 OCR」时;智谱 files/ocr,图源为已落盘封面/图集首图,结果落 `contents.cover_ocr_text`,三态同转写:NULL=未识别/失败、空串=无文字)→ 评论意向分析 → Obsidian 同步 → 落 `completed`。
 
 **新增平台** = 加平台配置 + 实现 `PlatformAdapter` trait + 在 `lib.rs` 注册,不改调度/模型/上报。
 
@@ -85,11 +87,14 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 - **桌面鉴权**:桌面端登录**不发 token**,登录态存前端 localStorage + 后端 `AppState.current_user`;JWT 仅用于对外 HTTP API(`/api/v1`)。密码哈希用 argon2。
 - **任务状态机**:pending → running → downloading_media → completed(失败/手动停为 failed/cancelled)。**completed 算活跃、留在任务列表**,只有 failed/cancelled 进归档 tab。进度靠后端 `task-progress` 事件实时推送 + 前端 2s 轮询兜底(轮询条件必须含 running 与 downloading_media)。
 - **转写三态**:`contents.transcript` NULL=未转写/转写失败(可重试,`transcript_error` 存原因),**空串=已转写但未识别到语音**(空文案标记,前端显「空文案」徽章,不再进「待转写」统计与批量重试),非空=文案。「有文案」口径(`require_transcript` 筛选、导出、Obsidian 同步)仍排除空串。
+- **列表瘦身视图**:内容库列表(`list_contents_page`)返回 `ContentListView`——不携带 transcript / cover_ocr_text / image_urls / image_paths 等大字段,改由 SQL 端派生 `transcriptState` / `coverOcrState`(`"none"|"empty"|"has"`,与转写三态一一对应)、`transcriptPreview` / `coverOcrOcrPreview`(约 100 字摘要)、`firstImageUrl` / `imageCount`;需要全文的场景(详情、导出 Excel、对话插入文案)走 `getContentDetail` / `list_contents_full`。新增列表字段时同步 `src/lib/api-types.ts` 的 `ContentListView`。
 - **平台配置是抓包起点**:`crates/core/src/config/mod.rs` 的 `builtin_default` 里 `search_url_template` / `intercept_patterns` 只是开箱骨架,真实接口路径需本机 `bun run tauri dev` 抓包核对后调整(代码注释已标注)。
 - **Tauri 命令注册**:每个新 `#[tauri::command]` 都要加进 `lib.rs` 的 `invoke_handler![]` 列表才能被前端 invoke。
 - **采集 WebView 的远程权限**:`src-tauri/capabilities/collect-remote.json` 显式授权小红书/抖音/快手域名 invoke(回传拦截响应与 RPA 结果),新增平台域名要同步加这里。
-- **发布账号池独立于采集账号池**:发布账号存 `publish_accounts`,按 CRM 客户分组(`category_id` 存 customers.id,客户在运营 > 客户管理维护,发布侧只读、不再单独建分类表;悬空账号在前端「未关联客户」兜底分组可见),不复用 cookie/ 的轮换/acquire。发布窗口 label 为 `veltrix-pub-{platform}-{accountId}`(保留 `veltrix-` 前缀吃 capabilities 通配,数据目录与采集账号隔离);登录检测脚本 account_id 带 `pub:` 前缀,`login_status_report` 按前缀路由到 `publish::PublishAccounts`,状态机 active / invalid / limited / disabled。
+- **发布账号池独立于采集账号池**:发布账号存 `publish_accounts`,按 CRM 客户分组(`category_id` 存 customers.id,客户在创作 > 客户管理维护,发布侧只读、不再单独建分类表;悬空账号在前端「未关联客户」兜底分组可见),不复用 cookie/ 的轮换/acquire。发布窗口 label 为 `veltrix-pub-{platform}-{accountId}`(保留 `veltrix-` 前缀吃 capabilities 通配,数据目录与采集账号隔离);登录检测脚本 account_id 带 `pub:` 前缀,`login_status_report` 按前缀路由到 `publish::PublishAccounts`,状态机 active / invalid / limited / disabled。
 - **视频落盘**:任务开 `keep_video`(TaskFormSheet「保留视频」)时媒体阶段把 mp4 落盘到 `{media_root}/{platform}/{date}/video/{content_id}.mp4` 并回写 `contents.video_path`(默认只抽音频不留视频);发布服务复用此素材。
+- **素材路径入库口径**:contents 表本地素材路径列(cover_path/avatar_path/audio_path/video_path/image_paths)统一存相对 media_root 的正斜杠相对路径;读端用 `media::resolve_media_path` 还原为绝对路径(兼容存量绝对路径);写端在回写边界用 `media::to_media_rel` 转换(内存中 MediaOutcome 仍是绝对路径);启动时 `migrate_media_paths_to_relative` 幂等迁移旧数据;前端统一经本地文件服务(端口 8788,/files 前缀,`mediaFileUrl`)访问;本机渲染前缀走 `get_local_file_server_prefix`(恒 `127.0.0.1:8788`,不识别网卡),LAN 前缀 `get_file_server_prefix` 仅留给设置页内网分享展示。
+- **素材缩略图**:与源文件同目录,命名 = 源文件名去扩展名 + `_thumb.jpg`(宽 480px 等比、JPEG q80,`thumbnail.rs` 统一实现,纯 Rust image crate 不走 ffmpeg);封面 / 图集 / 头像落盘成功即同步生成(头像换新时旧 thumb 一并作废),文件服务对不存在的 `_thumb.jpg` 请求惰性现生成(生成失败或源图 >20MB 回源),启动时 `thumbnail::backfill_missing` 后台限流回填存量(4 路并发);前端列表 / 卡片 / 作者库头像只加载缩略图,作者库头像本地路径由 AuthorView.avatarPath 按落盘约定({platform}/avatar/{uid}.jpg)探测回填,缺失回退 CDN。文件服务(8788)带协商缓存:弱 ETag `W/"{len:x}-{mtime_secs:x}"` + Last-Modified,命中回 304。
 
 ## 代码风格
 

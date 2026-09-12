@@ -9,7 +9,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useResponsiveCollapse } from "@/hooks/use-responsive-collapse";
 import { api } from "@/lib/api";
 import type { CollectLogEntry, IndustryView, PlatformConfig, TaskInput, TaskView } from "@/lib/api";
-import { sortLabelOf, timeLabelOf, extraFilterChipsOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime, displayKeyword, type TaskContentFilter } from "./collect-meta";
+import { sortLabelOf, timeLabelOf, extraFilterChipsOf, COMMENT_TIME_RANGE_META, isTerminal, isInProgress, isInWatchingList, isInQuickList, isInScheduledQueue, isInWatchingTasks, nextRunTs, formatCountdown, STATUS_META, KEYWORD_STATE_META, keywordRowStates, keywordRowProgress, TRIGGER_META, formatTime, displayKeyword, MAX_TASK_KEYWORDS, type TaskContentFilter } from "./collect-meta";
 import type { PageKey } from "@/components/app-sidebar";
 import type { TaskItem, PlatformOption, KeywordState } from "./collect-meta";
 import { TaskDetailPage } from "@/pages/TaskDetailPage";
@@ -433,6 +433,19 @@ export function CollectPage({
 
   // 启动采集:接后端 run_task(选账号 → 后台开窗 + 拟人 RPA 采集),启动后轮询看进度
   function runTask(id: string) {
+    // 关键词数量上限:存量超限任务在此拦截(后端 run_task 同口径兜底);
+    // 定向任务 keywords 只是占位词,看 targetUrls 区分
+    const task = tasks.find((t) => t.id === id);
+    if (
+      task &&
+      task.targetUrls.length === 0 &&
+      task.keywords.length > MAX_TASK_KEYWORDS
+    ) {
+      toast.error(
+        `关键词最多 ${MAX_TASK_KEYWORDS} 个,当前 ${task.keywords.length} 个,请编辑任务删减后再执行`,
+      );
+      return Promise.resolve();
+    }
     return api
       .runTask(id)
       .then(() => {
@@ -634,6 +647,11 @@ export function CollectPage({
                 {t.audioExtract && !t.aiExtract && (
                   <span className="whitespace-nowrap rounded bg-teal-500/10 px-1.5 py-0.5 text-teal-600 dark:text-teal-400">
                     音频
+                  </span>
+                )}
+                {t.coverOcr && (
+                  <span className="whitespace-nowrap rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
+                    封面文案
                   </span>
                 )}
                 {t.collectComments && (
@@ -994,8 +1012,8 @@ export function CollectPage({
   );
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
-      <div className="flex min-h-0 min-w-0 flex-1 gap-4">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2.5">
+      <div className="flex min-h-0 min-w-0 flex-1 gap-2.5">
         {/* 左侧:行业筛选(展开态显示完整面板) */}
         {!sidebarCollapsed && (
           <IndustryFilterSidebar

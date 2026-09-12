@@ -36,15 +36,20 @@ export function inDateRange(
   return ms >= from && ms <= to;
 }
 
-// 筛选 chip:常规圆角矩形,选中高亮(与采集任务页平台筛选一致)
+// 筛选 chip:常规圆角矩形,选中高亮(与采集任务页平台筛选一致);
+// activeClassName / inactiveClassName 可覆盖默认配色(如意向分级彩色 chip)
 export function FilterChip({
   label,
   active,
   onClick,
+  activeClassName,
+  inactiveClassName,
 }: {
   label: string;
   active: boolean;
   onClick: () => void;
+  activeClassName?: string;
+  inactiveClassName?: string;
 }) {
   return (
     <button
@@ -52,8 +57,9 @@ export function FilterChip({
       onClick={onClick}
       className={`cursor-pointer rounded-md border px-3 py-1 text-xs transition-colors ${
         active
-          ? "border-primary bg-primary text-primary-foreground"
-          : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
+          ? (activeClassName ?? "border-primary bg-primary text-primary-foreground")
+          : (inactiveClassName ??
+            "border-border text-muted-foreground hover:bg-accent hover:text-foreground")
       }`}
     >
       {label}

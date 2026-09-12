@@ -4,7 +4,7 @@
 // 素材点开看大图、方向键浏览,看完可续看下一个。
 // 键盘:大图未开时 ←/→ 切上一篇/下一篇;大图打开时 ←/→ 翻图(可跨内容续看)。
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl, mediaThumbPath } from "@/lib/media-file-url";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AudioLines,
@@ -19,6 +19,7 @@ import {
   LayoutGrid,
   Loader2,
   MessagesSquare,
+  ScanText,
   ThumbsUp,
   User,
   X,
@@ -31,7 +32,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
-import { api, type CommentView, type ContentDetailView, type ContentView } from "@/lib/api";
+import { api, type CommentView, type ContentDetailView, type ContentListView, type ContentView } from "@/lib/api";
 import {
   authorProfileUrl,
   contentDetailUrl,
@@ -85,18 +86,21 @@ interface ImageEntry {
 
 // 取某条内容的全部图片显示源:优先 image_urls,为空回退 cover_url / 本地封面;
 // 第一张本地优先(cover_path 下载成功),失败再回退原外链。
-function imageEntries(c: ContentView): ImageEntry[] {
+function imageEntries(c: ContentView, mediaFileUrl: (path: string) => string): ImageEntry[] {
   const ext = c.imageUrls.filter((u) => !!u);
   const list: ImageEntry[] =
     ext.length > 0
-      ? ext.map((u) => ({ src: u }))
+      ? c.imageUrls.flatMap((u, index) => {
+          const path = c.imagePaths?.[index];
+          return path ? [{ src: mediaFileUrl(path), fallback: u || undefined }] : u ? [{ src: u }] : [];
+        })
       : c.coverUrl
         ? [{ src: c.coverUrl }]
         : c.coverPath
-          ? [{ src: convertFileSrc(c.coverPath) }]
+          ? [{ src: mediaFileUrl(c.coverPath) }]
           : [];
-  if (list.length > 0 && c.coverPath) {
-    list[0] = { src: convertFileSrc(c.coverPath), fallback: list[0].src };
+  if (list.length > 0 && c.coverPath && !c.imagePaths?.[0]) {
+    list[0] = { src: mediaFileUrl(c.coverPath), fallback: list[0].src };
   }
   return list;
 }
@@ -124,11 +128,16 @@ function FallbackImage({
   useEffect(() => {
     setStage("primary");
   }, [src, fallback]);
-  if (stage === "hidden") return null;
+  if (stage === "hidden") return (
+    <div className={`${className} flex min-h-32 items-center justify-center bg-muted text-sm text-muted-foreground`}>
+      图片加载失败
+    </div>
+  );
   const current = stage === "primary" ? src : (fallback ?? src);
   return (
     <img
       src={current}
+      referrerPolicy="no-referrer"
       alt=""
       loading="lazy"
       // 异步解码:大图(瀑布全图 / 大图浏览)在后台线程解码,不阻塞翻图与切换的主线程
@@ -284,12 +293,13 @@ export function ContentDetailDialog({
   onActiveIdChange,
 }: {
   // 当前筛选后的内容列表:用于「上一篇/下一篇」与大图跨内容续看
-  items: ContentView[];
+  items: ContentListView[];
   // 当前打开的内容 id(null=关闭)
   activeId: string | null;
   // 切换内容 / 关闭(传 null)
   onActiveIdChange: (id: string | null) => void;
 }) {
+  const mediaFileUrl = useMediaFileUrl();
   const [detail, setDetail] = useState<ContentDetailView | null>(null);
   const [loading, setLoading] = useState(false);
   const [monitoring, setMonitoring] = useState(false);
@@ -387,9 +397,28 @@ export function ContentDetailDialog({
 
   const content = detail?.content;
   const author = detail?.author;
+  // 大图跨内容续看需要完整图集,但列表行已是瘦身视图(无 imageUrls/imagePaths):
+  // 按内容 id 缓存详情接口的完整视图,首次跨入某内容时拉取一次
+  const detailCache = useRef(new Map<string, ContentView>());
+  const detailForItem = useCallback(
+    async (id: string): Promise<ContentView | null> => {
+      if (content?.id === id) return content;
+      const cached = detailCache.current.get(id);
+      if (cached) return cached;
+      try {
+        const d = await api.getContentDetail(id);
+        detailCache.current.set(id, d.content);
+        return d.content;
+      } catch (e) {
+        console.warn("加载大图内容详情失败:", e);
+        return null;
+      }
+    },
+    [content],
+  );
   // 作者头像:本地优先(下载成功用 asset 协议),失败回退外链
   const avatarSrc = author?.avatarPath
-    ? convertFileSrc(author.avatarPath)
+    ? mediaFileUrl(mediaThumbPath(author.avatarPath))
     : (author?.avatar ?? "");
   const avatarFallback = author?.avatarPath ? (author.avatar ?? "") : undefined;
 
@@ -408,14 +437,37 @@ export function ContentDetailDialog({
     if (hasNext) onActiveIdChange(items[currentIndex + 1].id);
   }, [hasNext, items, currentIndex, onActiveIdChange]);
 
+  // 当前内容的大图必须使用详情接口返回的完整图集。列表项只是搜索摘要,小红书通常
+  // 只有一张封面;此前瀑布流虽显示详情图,点开后又退回列表项,导致预览只剩第一张。
+  const entriesForItem = useCallback(
+    (itemIndex: number) => {
+      const item = items[itemIndex];
+      if (!item) return [];
+      // 列表行是瘦身视图(无完整图集):优先用详情缓存,未缓存时封面兜底一帧;
+      // stepLightbox 跨入前会 await 详情落缓存,正常浏览不会停在这一帧
+      const view = content?.id === item.id ? content : detailCache.current.get(item.id);
+      if (!view) {
+        const cover = item.coverPath
+          ? mediaFileUrl(item.coverPath)
+          : item.coverUrl || item.firstImageUrl || "";
+        return cover ? [{ src: cover }] : [];
+      }
+      return imageEntries(view, mediaFileUrl);
+    },
+    [content, items, mediaFileUrl],
+  );
+
   // 大图翻页:在当前内容图片间走;越过边界则顺延到上/下一个内容并同步右侧详情。
   const stepLightbox = useCallback(
-    (dir: 1 | -1) => {
+    async (dir: 1 | -1) => {
       if (!lightbox) return;
       let it = lightbox.itemIndex;
       let im = lightbox.imgIndex + dir;
       while (it >= 0 && it < items.length) {
-        const imgs = imageEntries(items[it]);
+        // 跨内容续看需要完整图集:瘦身列表行只有封面,先拉详情(带缓存)再判定落点
+        const view = await detailForItem(items[it].id);
+        const imgs = view ? imageEntries(view, mediaFileUrl) : entriesForItem(it);
+        if (im < 0) im = imgs.length - 1; // 从右端进入上一内容
         if (im >= 0 && im < imgs.length) {
           setLightbox({ itemIndex: it, imgIndex: im });
           if (items[it].id !== activeId) onActiveIdChange(items[it].id);
@@ -423,10 +475,10 @@ export function ContentDetailDialog({
         }
         it += dir;
         if (it < 0 || it >= items.length) return; // 到整个序列两端,停住
-        im = dir === 1 ? 0 : imageEntries(items[it]).length - 1;
+        im = dir === 1 ? 0 : -1;
       }
     },
-    [lightbox, items, activeId, onActiveIdChange],
+    [lightbox, items, activeId, onActiveIdChange, entriesForItem, detailForItem, mediaFileUrl],
   );
 
   // 大图打开时:← → 翻图(可跨内容续看)。Esc 由嵌套 Dialog(Radix)自行关闭,不在此处理。
@@ -465,11 +517,11 @@ export function ContentDetailDialog({
     ? authorProfileUrl(content.platform, author?.uid, author?.platformId)
     : null;
   const originUrl = content
-    ? contentDetailUrl(content.platform, content.contentId) || content.videoUrl
+    ? contentDetailUrl(content.platform, content.contentId, content.xsecToken) || content.videoUrl
     : null;
 
   // 左栏图片:以已加载详情为准
-  const entries = content ? imageEntries(content) : [];
+  const entries = content ? imageEntries(content, mediaFileUrl) : [];
   const openLightbox = (imgIndex: number) => {
     if (currentIndex < 0) return;
     setLightbox({ itemIndex: currentIndex, imgIndex });
@@ -477,7 +529,7 @@ export function ContentDetailDialog({
 
   // 大图当前帧
   const lbItem = lightbox ? items[lightbox.itemIndex] : null;
-  const lbEntries = lbItem ? imageEntries(lbItem) : [];
+  const lbEntries = lightbox ? entriesForItem(lightbox.itemIndex) : [];
   const lbEntry = lightbox ? lbEntries[lightbox.imgIndex] : null;
 
   function toggleMonitor(next: boolean) {
@@ -497,9 +549,23 @@ export function ContentDetailDialog({
       .finally(() => setMonitoring(false));
   }
 
-  // 文案栏:转写文案;withAudio(视频三栏左栏)时不套卡片、文案直接铺开,底部钉本地音频
+  // 文案栏:按内容形式显示对应文案——视频=语音转写文案,图文/文章=封面 OCR 文字。
+  // withAudio(视频三栏左栏)时不套卡片、文案直接铺开,底部钉本地音频
   // 播放器(旧数据已提取但未记录路径时给出指引);图文「文案与评论」页保留通栏卡片
-  const transcriptColumn = (withAudio: boolean) => (
+  const transcriptColumn = (withAudio: boolean) => {
+    const isVideo = content?.kind === "video";
+    // 图文没有语音文案,主文案位显示封面 OCR 文字;三态口径同转写
+    const text = isVideo ? content?.transcript : content?.coverOcrText;
+    const textError = isVideo ? content?.transcriptError : content?.coverOcrError;
+    const emptyText =
+      loading && !content
+        ? "加载中…"
+        : textError
+          ? `${isVideo ? "转写" : "识别"}失败:${textError}`
+          : isVideo
+            ? "暂无文案(未开启 AI 文案提取,或转写尚未完成)"
+            : "暂无封面文字(未开启封面 OCR,或识别尚未完成)";
+    return (
     <div className="flex min-h-0 flex-1 flex-col bg-muted/20 p-4">
       <div
         className={
@@ -511,17 +577,17 @@ export function ContentDetailDialog({
         <div
           className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-muted-foreground ${withAudio ? "" : "border-b"}`}
         >
-          <AudioLines className="size-4" />
-          {content?.kind === "video" ? "视频文案" : "文案"}
-          {content?.transcript && (
+          {isVideo ? <AudioLines className="size-4" /> : <ScanText className="size-4" />}
+          {isVideo ? "视频文案" : "封面文字"}
+          {text && (
             <SimpleTooltip content="复制全文">
               <button
                 type="button"
                 className="ml-auto cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
                 onClick={() => {
                   navigator.clipboard
-                    ?.writeText(content.transcript ?? "")
-                    .then(() => toast.success("已复制视频文案"))
+                    ?.writeText(text ?? "")
+                    .then(() => toast.success(isVideo ? "已复制视频文案" : "已复制封面文字"))
                     .catch(() => toast.error("复制失败"));
                 }}
               >
@@ -533,31 +599,42 @@ export function ContentDetailDialog({
         <div
           className={`veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed ${withAudio ? "px-3 pb-4" : "p-4"}`}
         >
-          {content?.transcript ? (
-            content.transcript
-          ) : content?.transcript === "" ? (
+          {text ? (
+            text
+          ) : text === "" ? (
             <span className="text-muted-foreground">
-              转写完成,未识别到语音(空文案)
+              {isVideo
+                ? "转写完成,未识别到语音(空文案)"
+                : "识别完成,封面上没有可识别的文字"}
             </span>
           ) : (
-            <span className="text-muted-foreground">
-              {loading && !content
-                ? "加载中…"
-                : content?.transcriptError
-                  ? `转写失败:${content.transcriptError}`
-                  : content?.kind === "video"
-                    ? "暂无文案(未开启 AI 文案提取,或转写尚未完成)"
-                    : "该内容形式没有语音文案"}
-            </span>
+            <span className="text-muted-foreground">{emptyText}</span>
           )}
         </div>
       </div>
+      {/* 封面文字补充块仅视频显示(图文的封面文字即主文案,避免重复);
+          OCR 三态:非空=识别文本 / 空串=封面无文字 / null+error=识别失败;未跑过识别(全 null)不占位 */}
+      {isVideo && (content?.coverOcrText != null || content?.coverOcrError) && (
+        <div className="mt-3 w-full shrink-0 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+          <div className="flex items-center gap-1 font-medium text-muted-foreground">
+            <ScanText className="size-3.5" />
+            封面文字
+          </div>
+          <p className="mt-1 whitespace-pre-wrap break-words text-foreground">
+            {content?.coverOcrText
+              ? content.coverOcrText
+              : content?.coverOcrText === ""
+                ? "识别完成,封面上没有可识别的文字"
+                : `识别失败:${content?.coverOcrError ?? ""}`}
+          </p>
+        </div>
+      )}
       {withAudio &&
         (content?.audioPath ? (
           <audio
             controls
             preload="metadata"
-            src={convertFileSrc(content.audioPath)}
+            src={mediaFileUrl(content.audioPath)}
             className="mt-3 w-full shrink-0"
           />
         ) : content?.audioExtracted ? (
@@ -566,7 +643,8 @@ export function ContentDetailDialog({
           </div>
         ) : null)}
     </div>
-  );
+    );
+  };
 
   // 评论栏:该内容的评论列表(点赞倒序,热评在前)
   const commentsColumn = (widthCls: string) => (

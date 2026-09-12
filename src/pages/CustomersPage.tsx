@@ -273,7 +273,7 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
   }));
 
   return (
-    <div className={`flex min-h-0 flex-1 flex-col gap-4 ${FORM_CONTROL_SIZING}`}>
+    <div className={`flex min-h-0 flex-1 flex-col gap-2.5 ${FORM_CONTROL_SIZING}`}>
       <ErrorBanner message={error} onClose={() => setError(null)} />
       <DataTable
         columns={columns}
@@ -285,6 +285,11 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
         renderToolbar={(table) => (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 flex-wrap items-center gap-2">
+              <DataTableFacetedFilter
+                column={table.getColumn("status")}
+                title="状态"
+                options={statusOptions}
+              />
               <div className="relative w-full sm:max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -294,11 +299,6 @@ export function CustomersPage({ currentUser }: { currentUser: string }) {
                   onChange={(e) => table.setGlobalFilter(e.target.value)}
                 />
               </div>
-              <DataTableFacetedFilter
-                column={table.getColumn("status")}
-                title="状态"
-                options={statusOptions}
-              />
             </div>
             <div className="flex items-center gap-2">
               <Button

@@ -15,6 +15,7 @@ import {
   MoreHorizontal,
   NotebookPen,
   RefreshCw,
+  ScanText,
   Search,
   Trash2,
   X,
@@ -69,6 +70,7 @@ import {
   api,
   type ContentLibraryStats,
   type ContentListQuery,
+  type ContentListView,
   type ContentView,
   type IndustryView,
   type PlatformConfig,
@@ -96,6 +98,17 @@ import { MediaStatusBadge } from "@/components/MediaStatusBadge";
 // 瀑布流每次加载的卡片数:与后端 offset 步进一致,避免一次性挂载海量图片
 const GRID_PAGE_SIZE = 48;
 
+// 列表行不再携带转写/封面文字全文(瘦身视图):事件与重试接口返回的是全文,
+// 就地折算成与后端一致的三态 + 摘要;截断阈值须与后端 LIST_PREVIEW_LEN 保持一致
+const PREVIEW_LEN = 100;
+function toPreview(text: string | null): string | null {
+  if (!text) return null;
+  return text.length > PREVIEW_LEN ? `${text.slice(0, PREVIEW_LEN)}…` : text;
+}
+function toTriState(text: string | null): "none" | "empty" | "has" {
+  return text == null ? "none" : text === "" ? "empty" : "has";
+}
+
 // 表格列 id → 后端排序字段(白名单;本页仅「素材」列可排序)
 const CONTENT_SORT_BY_MAP: Record<string, ContentListQuery["sortBy"]> = {
   media: "mediaStatus",
@@ -113,8 +126,8 @@ export function ContentLibraryPage({
 }: {
   // title 仅用于路由区分,页面内不再展示标题
   title?: string;
-  // 限定内容形态:image=图文(图片库)/ video=视频(内容库);不传=全部(全量库)
-  kindFilter?: ContentView["kind"];
+  // 限定内容形态:image=图文(图片库)/ video=视频文案 + 小红书图文(内容库);不传=全部
+  kindFilter?: ContentListView["kind"];
   // 数据穿透:按任务(及可选单次运行时间范围)过滤;来自任务列表/详情的"查看内容"
   taskFilter?: TaskContentFilter;
   // 数据穿透返回:从任务列表/详情穿透进来时提供,点「返回」回到来源页
@@ -123,13 +136,13 @@ export function ContentLibraryPage({
   // 任务穿透过滤开关:进来默认开;用户点"清除"后看全部
   const [taskFilterOn, setTaskFilterOn] = useState(true);
   // 服务端分页:contents 持有「当前已加载页/批」(表格=当前页,瀑布流=已 append 的各批)
-  const [contents, setContents] = useState<ContentView[]>([]);
+  const [contents, setContents] = useState<ContentListView[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   // 表格视图的服务端分页/排序状态
   const [serverState, setServerState] = useState<ServerTableState>({
     pageIndex: 0,
-    pageSize: 50,
+    pageSize: 20,
     sorting: [],
   });
   // 瀑布流已加载偏移(批起点;append 式,事件删行后不能从 contents.length 推导)
@@ -153,6 +166,8 @@ export function ContentLibraryPage({
   const [retryingTranscript, setRetryingTranscript] = useState<Set<string>>(
     new Set(),
   );
+  // 封面 OCR 重试中的内容 id 集合(与转写/素材重试分开,互不影响)
+  const [retryingOcr, setRetryingOcr] = useState<Set<string>>(new Set());
   // 批量导出 Obsidian 进行中(防重复点击)
   const [batchSyncing, setBatchSyncing] = useState(false);
   // 批量导出 Excel 进行中(防重复点击)
@@ -266,8 +281,9 @@ export function ContentLibraryPage({
           : null,
         // 图源仅图片库传:「封面」要全形态 + 有封面;「图文」不加封面条件(旧 base 口径)
         imageSource: isImageLibrary && imageSource === "cover" ? "cover" : null,
-        // 内容库(视频 tab)只展示已转写文案的视频
+        // 内容库的视频只展示已转写文案;小红书图文正文来自详情,由专用条件额外纳入。
         requireTranscript: kindFilter === "video" || null,
+        includeXhsImages: kindFilter === "video" || null,
         sortBy: sort ? (CONTENT_SORT_BY_MAP[sort.id] ?? null) : null,
         sortDir: sort ? (sort.desc ? "desc" : "asc") : null,
         limit: opts.limit,
@@ -405,7 +421,13 @@ export function ContentLibraryPage({
             return [];
           }
           return [
-            { ...x, transcript: p.transcript, transcriptError: p.transcriptError },
+            {
+              ...x,
+              // 事件带全文,列表行只存三态 + 摘要(口径同后端 LIST_PREVIEW_LEN)
+              transcriptState: toTriState(p.transcript),
+              transcriptPreview: toPreview(p.transcript),
+              transcriptError: p.transcriptError,
+            },
           ];
         }),
       );
@@ -416,6 +438,34 @@ export function ContentLibraryPage({
     });
     return () => {
       if (timer) clearTimeout(timer);
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // 封面 OCR 完成实时刷新:与 content-transcript-updated 同构,后端每写完一条发事件,
+  // 就地更新该行的封面文本三态(无需手动刷新);事件密度低,不合帧直接更新
+  useEffect(() => {
+    type Payload = {
+      id: string;
+      coverOcrText: string | null;
+      coverOcrError: string | null;
+    };
+    const unlisten = listen<Payload>("content-ocr-updated", (e) => {
+      const p = e.payload;
+      setContents((prev) =>
+        prev.map((x) =>
+          x.id === p.id
+            ? {
+                ...x,
+                coverOcrState: toTriState(p.coverOcrText),
+                coverOcrPreview: toPreview(p.coverOcrText),
+                coverOcrError: p.coverOcrError,
+              }
+            : x,
+        ),
+      );
+    });
+    return () => {
       unlisten.then((f) => f());
     };
   }, []);
@@ -482,19 +532,22 @@ export function ContentLibraryPage({
   const platformOptions = useMemo(() => platforms.map((p) => p.id), [platforms]);
 
   // 各行业内容数(侧栏角标):走后端聚合,跟随当前筛选(除行业自身——与列表口径一致)。
-  // 「全部」角标用列表 total,渲染时合并传入
+  // 「全部」角标用后端返回的 industryTotal(忽略行业筛选),不能复用列表 total——
+  // 列表 total 含行业过滤,选中某行业后「全部」会被错误显示成该行业的数量
   const [industryCounts, setIndustryCounts] = useState<Record<string, number>>({});
+  const [industryTotal, setIndustryTotal] = useState(0);
   const countsSeq = useRef(0);
   useEffect(() => {
     const query = buildQuery({ limit: 1, offset: 0 });
     const seq = ++countsSeq.current;
     api
       .contentIndustryCounts(query)
-      .then((list) => {
+      .then((res) => {
         if (seq !== countsSeq.current) return; // 过期响应丢弃
         const map: Record<string, number> = {};
-        for (const it of list) map[it.industry] = it.count;
+        for (const it of res.industries) map[it.industry] = it.count;
         setIndustryCounts(map);
+        setIndustryTotal(res.total);
       })
       .catch((e) => console.warn("加载行业角标失败:", e));
   }, [buildQuery]);
@@ -591,19 +644,26 @@ export function ContentLibraryPage({
     }
   }
 
-  // 批量导出 Excel:仅导出选中里「有文案」的内容;路径经系统保存对话框选定
-  async function handleBatchExportExcel(selected: ContentView[]) {
+  // 批量导出 Excel:视频取转写文案,小红书图文取详情正文;路径经系统保存对话框选定。
+  async function handleBatchExportExcel(selected: ContentListView[]) {
     if (batchExporting) return;
-    const withTranscript = selected.filter((c) => c.transcript?.trim());
-    if (withTranscript.length === 0) {
-      toast.error("所选内容均无文案,没有可导出的数据");
-      return;
-    }
     setBatchExporting(true);
     try {
+      // 列表瘦身行不含转写全文:按选中 id 拉回完整视图再导(全文只在这类按需场景过 IPC)
+      const fullRows = await api.listContentsFull(selected.map((c) => c.id));
+      const contentText = (c: ContentView) =>
+        c.transcript?.trim() ||
+        (c.platform === "xhs" && c.kind === "image"
+          ? c.desc?.trim() || c.title?.trim() || ""
+          : "");
+      const withContent = fullRows.filter((c) => contentText(c));
+      if (withContent.length === 0) {
+        toast.error("所选内容均无文案,没有可导出的数据");
+        return;
+      }
       // Excel 库体积较大,仅在用户实际导出时加载,避免拖慢内容库首屏。
       const XLSX = await import("xlsx");
-      const rows = withTranscript.map((c) => ({
+      const rows = withContent.map((c) => ({
         平台: platformName(c.platform),
         行业: c.industry,
         // 抖音等平台无独立标题(正文在 desc):标题列回退用 desc,简介列此时留空不重复
@@ -615,8 +675,10 @@ export function ContentLibraryPage({
         收藏数: c.collectCount ?? 0,
         分享数: c.shareCount ?? 0,
         采集关键词: c.keyword,
-        文案: c.transcript ?? "",
-        内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
+        文案: contentText(c),
+        内容链接: contentDetailUrl(c.platform, c.contentId, c.xsecToken) ?? "",
+        封面图: c.coverUrl ?? "",
+        本地封面: c.coverPath ?? "",
         发布时间: formatTimestamp(c.publishedAt),
         采集时间: formatTimestamp(c.collectedAt),
       }));
@@ -649,6 +711,8 @@ export function ContentLibraryPage({
         { wch: 18 }, // 采集关键词
         { wch: 60 }, // 文案
         { wch: 46 }, // 内容链接
+        { wch: 46 }, // 封面图
+        { wch: 50 }, // 本地封面
         { wch: 20 }, // 发布时间
         { wch: 20 }, // 采集时间
       ];
@@ -677,11 +741,11 @@ export function ContentLibraryPage({
       recordDownload({ path, name: fileName, kind: "内容导出" });
       localStorage.setItem(SEQ_KEY, JSON.stringify({ date: ymd, seq }));
       // 部分选中无文案被跳过时在结果里说明
-      const skipped = selected.length - withTranscript.length;
+      const skipped = selected.length - withContent.length;
       toast.success(
         skipped > 0
-          ? `已导出 ${withTranscript.length} 条(跳过 ${skipped} 条无文案)`
-          : `已导出 ${withTranscript.length} 条`,
+          ? `已导出 ${withContent.length} 条(跳过 ${skipped} 条无文案)`
+          : `已导出 ${withContent.length} 条`,
       );
     } catch (e) {
       toast.error(`导出失败:${e instanceof Error ? e.message : String(e)}`);
@@ -693,7 +757,7 @@ export function ContentLibraryPage({
   // 重新拉取素材:重跑下载并就地刷新该行状态。
   // 视频直链可能已过期(403),重试不一定成功——失败时提示需重新采集。
   // useCallback 稳定引用:作为 prop 传给 memo 的瀑布流卡片;仅重试集合变化时重建
-  const handleRetry = useCallback(async (c: ContentView) => {
+  const handleRetry = useCallback(async (c: ContentListView) => {
     if (retrying.has(c.id)) return;
     setRetrying((prev) => new Set(prev).add(c.id));
     try {
@@ -706,7 +770,8 @@ export function ContentLibraryPage({
                 mediaStatus: res.mediaStatus,
                 audioExtracted: res.audioExtracted,
                 mediaError: res.mediaError,
-                transcript: res.transcript,
+                transcriptState: toTriState(res.transcript),
+                transcriptPreview: toPreview(res.transcript),
                 transcriptError: res.transcriptError,
               }
             : x,
@@ -731,7 +796,7 @@ export function ContentLibraryPage({
   }, [retrying]);
 
   // 重新转写文案:仅重跑语音转写(素材/音频不动),就地刷新该行文案状态
-  async function handleRetryTranscript(c: ContentView) {
+  async function handleRetryTranscript(c: ContentListView) {
     if (retryingTranscript.has(c.id)) return;
     setRetryingTranscript((prev) => new Set(prev).add(c.id));
     try {
@@ -739,7 +804,12 @@ export function ContentLibraryPage({
       setContents((prev) =>
         prev.map((x) =>
           x.id === res.id
-            ? { ...x, transcript: res.transcript, transcriptError: res.transcriptError }
+            ? {
+                ...x,
+                transcriptState: toTriState(res.transcript),
+                transcriptPreview: toPreview(res.transcript),
+                transcriptError: res.transcriptError,
+              }
             : x,
         ),
       );
@@ -757,6 +827,45 @@ export function ContentLibraryPage({
       toast.error(`转写重试失败: ${e}`);
     } finally {
       setRetryingTranscript((prev) => {
+        const next = new Set(prev);
+        next.delete(c.id);
+        return next;
+      });
+    }
+  }
+
+  // 识别封面文字:仅对已有本地封面的单条内容重跑 OCR,用返回值就地刷新该行三态
+  async function handleRetryOcr(c: ContentListView) {
+    if (retryingOcr.has(c.id)) return;
+    setRetryingOcr((prev) => new Set(prev).add(c.id));
+    try {
+      const res = await api.retryContentOcr(c.id);
+      setContents((prev) =>
+        prev.map((x) =>
+          x.id === res.id
+            ? {
+                ...x,
+                coverOcrState: toTriState(res.coverOcrText),
+                coverOcrPreview: toPreview(res.coverOcrText),
+                coverOcrError: res.coverOcrError,
+              }
+            : x,
+        ),
+      );
+      if (res.coverOcrText) {
+        toast.success("封面文字已识别");
+      } else if (res.coverOcrText === "") {
+        // 空串 = 识别完成但封面无文字,不是失败
+        toast.info("识别完成 · 封面上没有可识别的文字");
+      } else {
+        toast.error(
+          `识别仍失败${res.coverOcrError ? `: ${res.coverOcrError}` : ""}`,
+        );
+      }
+    } catch (e) {
+      toast.error(`封面识别重试失败: ${e}`);
+    } finally {
+      setRetryingOcr((prev) => {
         const next = new Set(prev);
         next.delete(c.id);
         return next;
@@ -891,7 +1000,7 @@ export function ContentLibraryPage({
     }
   }
 
-  const columns = useMemo<ColumnDef<ContentView>[]>(
+  const columns = useMemo<ColumnDef<ContentListView>[]>(
     () => [
       {
         id: "select",
@@ -978,13 +1087,24 @@ export function ContentLibraryPage({
                 )}
                 {/* 文案未转写(含当时缺 API Key 被跳过的)或转写失败,且有音频:只重跑语音转写;
                     空串「空文案」是已转写标记,不提供重试入口 */}
-                {c.transcript == null && c.audioPath && (
+                {c.transcriptState === "none" && c.audioPath && (
                   <DropdownMenuItem
                     disabled={retryingTranscript.has(c.id)}
                     onClick={() => handleRetryTranscript(c)}
                   >
                     <RefreshCw className="size-4" />
                     {c.transcriptError ? "重新转写文案" : "转写文案"}
+                  </DropdownMenuItem>
+                )}
+                {/* 封面未识别或识别失败,且有本地封面:只重跑 OCR;
+                    空串「无文字」是已识别标记,不提供重试入口 */}
+                {c.coverOcrState === "none" && c.coverPath && (
+                  <DropdownMenuItem
+                    disabled={retryingOcr.has(c.id)}
+                    onClick={() => handleRetryOcr(c)}
+                  >
+                    <ScanText className="size-4" />
+                    {c.coverOcrError ? "重新识别封面文字" : "识别封面文字"}
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuItem
@@ -1000,9 +1120,9 @@ export function ContentLibraryPage({
         },
       },
     ],
-    // 依赖 retrying/retryingTranscript:行级重试态变化时重建列,徽章 loading / 禁用态才能刷新
+    // 依赖 retrying/retryingTranscript/retryingOcr:行级重试态变化时重建列,徽章 loading / 禁用态才能刷新
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [platforms, platformName, retrying, retryingTranscript],
+    [platforms, platformName, retrying, retryingTranscript, retryingOcr],
   );
 
   return (
@@ -1057,12 +1177,12 @@ export function ContentLibraryPage({
           </div>
         </div>
       )}
-      <div className="flex min-h-0 min-w-0 flex-1 gap-4">
+      <div className="flex min-h-0 min-w-0 flex-1 gap-2.5">
       {/* 左侧:行业筛选(可折叠) */}
         {!sidebarCollapsed && (
           <FilterSidebar
             industries={industries}
-            industryCounts={{ ...industryCounts, __all: total }}
+            industryCounts={{ ...industryCounts, __all: industryTotal }}
             industryFilter={industryFilter}
             onIndustry={setIndustryFilter}
             onCollapse={() => setSidebarCollapsed(true)}
@@ -1071,7 +1191,7 @@ export function ContentLibraryPage({
 
         {/* 右侧:工具条 + 表格。min-h-0 让 DataTable 的 flex-1 正确约束高度,表格内部滚动 */}
         <div
-          className={`flex min-h-0 min-w-0 flex-1 flex-col gap-3 ${FORM_CONTROL_SIZING}`}
+          className={`flex min-h-0 min-w-0 flex-1 flex-col gap-2.5 ${FORM_CONTROL_SIZING}`}
         >
           {/* 行业按钮(收起态) + 日期区间 + 关键字搜索同排 */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -1281,6 +1401,7 @@ export function ContentLibraryPage({
               items={contents}
               total={total}
               loading={loading}
+              contentMode={kindFilter === "video"}
               onLoadMore={loadMoreGrid}
               platformName={platformName}
               retrying={retrying}
@@ -1294,8 +1415,8 @@ export function ContentLibraryPage({
               data={contents}
               itemLabel="内容"
               getRowId={(c) => c.id}
-              defaultPageSize={50}
-              pageSizeOptions={[50, 100, 200, 500, 1000]}
+              defaultPageSize={20}
+              pageSizeOptions={[20, 50, 100, 200, 500, 1000]}
               serverControl={{
                 total,
                 state: serverState,

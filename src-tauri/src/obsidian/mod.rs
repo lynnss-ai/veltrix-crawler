@@ -285,8 +285,8 @@ fn render_markdown(
 
 /// 复制本地文件到 assets 目录,成功返回文件名(供 wiki 嵌入 `![[文件名]]`,Obsidian 按 vault 内唯一文件名解析)。
 /// 源文件不存在 / 复制失败返回 None。
-async fn copy_asset(src: &str, assets: &Path, fname: &str) -> Option<String> {
-    if !Path::new(src).exists() {
+async fn copy_asset(src: &Path, assets: &Path, fname: &str) -> Option<String> {
+    if !src.exists() {
         return None;
     }
     if tokio::fs::copy(src, assets.join(fname)).await.is_ok() {
@@ -298,11 +298,14 @@ async fn copy_asset(src: &str, assets: &Path, fname: &str) -> Option<String> {
 
 /// 把单条内容同步到 vault:按「行业-采集日期」建目录,复制封面 / 音频 / 图文图片,写 Markdown。
 /// 媒体复制失败不阻断(仅不引用该媒体);Markdown 写失败返回错误。
+/// media_root 用于把库存相对路径 resolve 成绝对路径(参数超出 ≤4 约定:同步期上下文不好再封装,
+/// 与 vault 同为路径参数并列传入)。
 pub async fn sync_one(
     vault: &Path,
     c: &content_entity::Model,
     comments: &[comment_entity::Model],
     industry: &str,
+    media_root: &Path,
 ) -> Result<()> {
     // 三级目录:行业 / 平台 / 日期(日期 YYYYMMDD;行业空归「未分类」);缺失的各级由 create_dir_all 递归自动创建。
     // 媒体与 md 同放日期目录下的 assets/
@@ -327,26 +330,31 @@ pub async fn sync_one(
     // 文件 / 资源前缀用内容ID(平台已是目录层级);同 ID 即同一个 .md,写入覆盖=更新,不存在=新增
     let prefix = sanitize(&c.content_id);
 
-    // 封面
+    // 封面(库存路径可能是相对 media_root 的相对路径,先 resolve 成绝对路径)
     let cover = match c.cover_path.as_deref() {
-        Some(cp) => copy_asset(cp, &assets, &format!("{prefix}_cover.jpg")).await,
+        Some(cp) => {
+            let abs = crate::media::resolve_media_path(media_root, cp);
+            copy_asset(&abs, &assets, &format!("{prefix}_cover.jpg")).await
+        }
         None => None,
     };
     // 音频(视频转出的音频文件,保留原扩展名)
     let audio = match c.audio_path.as_deref() {
         Some(ap) => {
-            let ext = Path::new(ap)
+            let abs = crate::media::resolve_media_path(media_root, ap);
+            let ext = abs
                 .extension()
                 .and_then(|e| e.to_str())
-                .unwrap_or("mp3");
-            copy_asset(ap, &assets, &format!("{prefix}_audio.{ext}")).await
+                .unwrap_or("mp3")
+                .to_string();
+            copy_asset(&abs, &assets, &format!("{prefix}_audio.{ext}")).await
         }
         None => None,
     };
     // 图文本地图片:与封面同目录,media 侧文件名为 {封面前缀去 _cover}_img{idx}.jpg
     let mut images = Vec::new();
     if let Some(cp) = c.cover_path.as_deref() {
-        let cover_path = Path::new(cp);
+        let cover_path = crate::media::resolve_media_path(media_root, cp);
         if let (Some(dir), Some(stem)) = (
             cover_path.parent(),
             cover_path.file_stem().and_then(|s| s.to_str()),
@@ -355,12 +363,10 @@ pub async fn sync_one(
                 let count = c.image_done.or(c.image_total).unwrap_or(0).max(0);
                 for idx in 0..count {
                     let src = dir.join(format!("{media_prefix}_img{idx}.jpg"));
-                    if let Some(src_str) = src.to_str() {
-                        if let Some(rel) =
-                            copy_asset(src_str, &assets, &format!("{prefix}_img{idx}.jpg")).await
-                        {
-                            images.push(rel);
-                        }
+                    if let Some(rel) =
+                        copy_asset(&src, &assets, &format!("{prefix}_img{idx}.jpg")).await
+                    {
+                        images.push(rel);
                     }
                 }
             }

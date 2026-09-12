@@ -19,10 +19,11 @@ use sea_orm::{
     QueryOrder, Set, TransactionTrait,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use veltrix_core::error::{CrawlerError, Result};
 mod obsidian;
 mod enrich;
@@ -92,6 +93,17 @@ struct MediaDownloadParams<'a> {
     /// - 用户手动关窗即终止下载(与采集阶段「关窗即终止」语义一致)。
     /// false(补偿等窗口已关路径)两者都不做,行为与旧版一致
     window_open: bool,
+    /// 「疑似直链过期(4xx)」补偿上下文:经详情页刷新直链需要适配器注册表与平台配置。
+    /// 仅主链路(素材阶段窗口保活、账号锁仍持有)传入;补偿/内容库等窗口已关路径为 None,跳过补偿
+    refresh_ctx: Option<StreamRefreshCtx<'a>>,
+}
+
+/// download_media_core 末尾「直链过期补偿」所需的上下文。
+/// 聚成结构体而非平铺进 MediaDownloadParams:两个字段同属「仅刷新补偿用」一组
+#[derive(Clone, Copy)]
+struct StreamRefreshCtx<'a> {
+    registry: &'a crate::adapter::AdapterRegistry,
+    cfg: &'a veltrix_core::config::PlatformConfig,
 }
 
 /// 直链补取阶段的配置参数。
@@ -107,16 +119,20 @@ struct StreamRefreshParams<'a> {
 
 /// 页面内拦截 hook 调用本命令回传一条命中的接口响应。
 /// 字段命名与注入脚本中的 invoke 一致(camelCase: sessionId/url/body)。
+/// async 有意:采集高峰期 body 可达数百 KB~MB,同步命令在主线程执行(含参数处理),
+/// 洪峰会卡住窗口创建等 UI 操作(表现为采集中点录屏等按钮无响应)。下同。
 #[tauri::command]
-pub fn intercept_push(state: State<'_, AppState>, session_id: u64, url: String, body: String) {
-    state.intercept_channel.push(session_id, url, body);
+pub async fn intercept_push(app: AppHandle, session_id: u64, url: String, body: String) {
+    app.state::<AppState>()
+        .intercept_channel
+        .push(session_id, url, body);
 }
 
 /// 空 stream 页内重取 / SSR 直读的回传通道:按窗口 label 推入该窗口的原生拦截缓冲。
 /// 为什么不用页内信号桥(chrome.webview.postMessage):实测采集窗口上 WebMessageReceived
 /// 收不到(评论直采的 api_done 走的也是 invoke 兜底),故与 intercept_push 同走 invoke。
 #[tauri::command]
-pub fn intercept_sink_push(state: State<'_, AppState>, label: String, url: String, body: String) {
+pub async fn intercept_sink_push(app: AppHandle, label: String, url: String, body: String) {
     if url.is_empty() {
         return;
     }
@@ -125,7 +141,7 @@ pub fn intercept_sink_push(state: State<'_, AppState>, label: String, url: Strin
         return;
     }
     let len = body.len();
-    if state.webviews.push_window_sink(&label, url.clone(), body) {
+    if app.state::<AppState>().webviews.push_window_sink(&label, url.clone(), body) {
         tracing::info!(url = %url, len, "空 stream 兜底:页内回传成功,已补入拦截缓冲");
     } else {
         tracing::warn!(label = %label, url = %url, "页内回传找不到窗口拦截缓冲,已丢弃");
@@ -135,8 +151,10 @@ pub fn intercept_sink_push(state: State<'_, AppState>, label: String, url: Strin
 /// 抖音评论 API 直采的页内脚本完成回调:回传本次直采结果(JSON 字符串),
 /// 存 collect_control 由 pool 侧轮询取走(与 intercept_push 同属页面 → Rust 回传通道)。
 #[tauri::command]
-pub fn comment_api_done(state: State<'_, AppState>, session_id: u64, result: String) {
-    state.collect_control.set_api_done(session_id, result);
+pub async fn comment_api_done(app: AppHandle, session_id: u64, result: String) {
+    app.state::<AppState>()
+        .collect_control
+        .set_api_done(session_id, result);
 }
 
 /// HUD「结束」按钮回传:请求停止采集。任务采集传 task_id(跨关键词稳定),联调单采传 session_id。
@@ -168,15 +186,16 @@ pub fn cancel_library_extract(state: State<'_, AppState>) {
 /// 采集窗口验证弹窗自检回传:页面检测到 / 解除安全验证弹窗时上报。
 /// 采集循环据此暂停 / 恢复滚动;并向前端推送 `collect-verify` 事件,便于主界面提示用户去窗口手动验证。
 #[tauri::command]
-pub fn report_collect_verify(
+pub async fn report_collect_verify(
     app: AppHandle,
-    state: State<'_, AppState>,
     session_id: u64,
     present: bool,
 ) {
     use tauri::Emitter;
     tracing::info!("验证检测:report_collect_verify session={session_id} present={present}");
-    state.collect_control.set_verifying(session_id, present);
+    app.state::<AppState>()
+        .collect_control
+        .set_verifying(session_id, present);
     // 推送状态 + sessionId;前端按 session 维护「待验证」集合,任一存在即显示全局提示条
     let _ = app.emit(
         "collect-verify",
@@ -187,14 +206,14 @@ pub fn report_collect_verify(
 /// 拟人 RPA 执行器跑完(或某步失败)时回传结果。
 /// 字段与注入脚本一致(camelCase: runId/ok/failedStep/message)。
 #[tauri::command]
-pub fn rpa_done(
-    state: State<'_, AppState>,
+pub async fn rpa_done(
+    app: AppHandle,
     run_id: u64,
     ok: bool,
     failed_step: i64,
     message: String,
 ) {
-    state.rpa_channel.complete(
+    app.state::<AppState>().rpa_channel.complete(
         run_id,
         RpaOutcome {
             ok,
@@ -325,14 +344,45 @@ pub async fn run_task(
 
     let platform = model.platform.clone();
     let owner = model.owner.clone();
+    // 启动前校验失败不能裸 return:调度器按 next_retry_at 拉起的 failed 任务若启动即败
+    // 且不写库,next_retry_at 恒在过去、retry_count 永不递增,会被每 30s 无退避重新拉起
+    // (风控期「该平台账号全部 invalid」正是这条路径)——统一走 write_startup_failed 消耗
+    // 重试预算:按 1min/5min/15min 退避排期,耗尽落终态 failed。
     // JSON 解析失败按空处理会误报「未配置关键词」,掩盖数据损坏——单独报错
-    let keywords: Vec<String> = serde_json::from_str(&model.keywords)
-        .map_err(|e| CrawlerError::Config(format!("任务关键词数据损坏: {e}")))?;
+    let keywords: Vec<String> = match serde_json::from_str(&model.keywords) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("任务关键词数据损坏: {e}");
+            write_startup_failed(&app, &state.db, &model, &msg).await;
+            return Err(CrawlerError::Config(msg));
+        }
+    };
     // 定向采集目标链接(视频/主页链接);定向任务 keywords 只存占位词「定向采集」,故非空校验要看两者
-    let target_urls: Vec<String> = serde_json::from_str(&model.target_urls)
-        .map_err(|e| CrawlerError::Config(format!("任务定向目标数据损坏: {e}")))?;
+    let target_urls: Vec<String> = match serde_json::from_str(&model.target_urls) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("任务定向目标数据损坏: {e}");
+            write_startup_failed(&app, &state.db, &model, &msg).await;
+            return Err(CrawlerError::Config(msg));
+        }
+    };
     if keywords.is_empty() && target_urls.is_empty() {
-        return Err(CrawlerError::Config("任务未配置关键词或定向目标".into()));
+        let msg = "任务未配置关键词或定向目标".to_string();
+        write_startup_failed(&app, &state.db, &model, &msg).await;
+        return Err(CrawlerError::Config(msg));
+    }
+
+    // 关键词数量上限(与 upsert_task 同口径):拦截存量超限任务与绕过前端的直调;
+    // 定向任务 keywords 只是占位词,不参与校验
+    if target_urls.is_empty() && keywords.len() > crate::commands::task::MAX_TASK_KEYWORDS {
+        let msg = format!(
+            "关键词最多 {} 个,当前 {} 个,请删减后再执行",
+            crate::commands::task::MAX_TASK_KEYWORDS,
+            keywords.len()
+        );
+        // 启动前失败也消耗重试预算(理由见上方关键词校验段注释),不能裸 return
+        write_startup_failed(&app, &state.db, &model, &msg).await;
+        return Err(CrawlerError::Config(msg));
     }
 
     // 选账号并占用(占用 = CAS 更新 last_used_at):
@@ -345,16 +395,25 @@ pub async fn run_task(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // 账号不可用同样消耗重试预算:账号稍后可能恢复(风控解除/重新登录),按退避排期重试合理;
+    // 耗尽落 failed 终止——此前裸 return 会让「账号整池 invalid」的任务每 30s 无退避撞账号池
     let account = match &bound_account_id {
-        Some(aid) => state.cookies.acquire_by_id(aid, &platform).await.map_err(|e| {
-            CrawlerError::Config(format!("任务指定账号不可用: {e}"))
-        })?,
+        Some(aid) => state
+            .cookies
+            .acquire_by_id(aid, &platform)
+            .await
+            .map_err(|e| format!("任务指定账号不可用: {e}")),
         None => state.cookies.acquire(&platform).await.map_err(|e| {
             // 保留底层原因:并发争用/账号冷却等与「无可用账号」是不同问题,吞掉会误导排查
-            CrawlerError::Config(format!(
-                "平台 {platform} 获取可用账号失败: {e}(若无账号请先在账号管理添加并登录)"
-            ))
-        })?,
+            format!("平台 {platform} 获取可用账号失败: {e}(若无账号请先在账号管理添加并登录)")
+        }),
+    };
+    let account = match account {
+        Ok(a) => a,
+        Err(msg) => {
+            write_startup_failed(&app, &state.db, &model, &msg).await;
+            return Err(CrawlerError::Config(msg));
+        }
     };
     let account_id = account.id;
 
@@ -377,6 +436,8 @@ pub async fn run_task(
     let intent_cfg = { lock_config(&state)?.intent.clone() };
     // 语音转写配置(厂商引用 + 模型);clone 出来 move 进后台任务,采集结束后转写用
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
+    // 封面 OCR 配置(厂商 + 地址 + 并发);clone 出来 move 进后台任务,采集结束后识别封面用
+    let ocr_cfg = { lock_config(&state)?.ocr.clone() };
 
     // 每关键词目标数量:作为滚动「按量停止」的依据(<=0 视为不限,退回固定轮数盲滚)
     let per_keyword_limit = model.per_keyword_limit.max(0) as usize;
@@ -395,6 +456,8 @@ pub async fn run_task(
     let keep_video = model.keep_video;
     // AI 文案提取:开 → 素材阶段结束后对音频做语音转写;关 → 只留音频不转写
     let ai_extract = model.ai_extract;
+    // 封面文字识别:开 → 素材阶段结束后对封面图做 OCR(智谱);关 → 跳过
+    let cover_ocr = model.cover_ocr;
     // 采集完成后是否自动同步到发起者(owner)的 Obsidian vault
     let auto_sync_obsidian = model.auto_sync_obsidian;
     // 排序方式 / 发布时间:采集时在结果页做 RPA 文案点击筛选
@@ -542,6 +605,7 @@ pub async fn run_task(
             audio_extract,
             keep_video,
             ai_extract,
+            cover_ocr,
             auto_sync_obsidian,
             sort_mode,
             time_range,
@@ -550,6 +614,7 @@ pub async fn run_task(
             config_dir,
             intent_cfg,
             transcription_cfg,
+            ocr_cfg,
             run_started_at: now,
         }));
         if body.catch_unwind().await.is_err() {
@@ -600,6 +665,8 @@ struct RunTaskCtx {
     keep_video: bool,
     /// AI 文案提取(语音转写);依赖 audio_extract
     ai_extract: bool,
+    /// 封面文字识别(智谱 OCR);素材阶段落盘封面后统一识别
+    cover_ocr: bool,
     auto_sync_obsidian: bool,
     sort_mode: String,
     time_range: String,
@@ -609,6 +676,7 @@ struct RunTaskCtx {
     config_dir: PathBuf,
     intent_cfg: veltrix_core::config::CommentIntentConfig,
     transcription_cfg: veltrix_core::config::TranscriptionConfig,
+    ocr_cfg: veltrix_core::config::OcrConfig,
     run_started_at: i64,
 }
 
@@ -1333,18 +1401,8 @@ async fn collect_comments_phase(
         .filter(|c| id_seen.insert(c.content_id.clone()))
         .filter(|c| c.stats.comment_count != Some(0))
         .map(|c| {
-            // 详情页导航所需的第二参数({token} 占位):
-            // 抖音走「主页模态」/user/{sec_uid}?modal_id=,用作者 sec_uid(author.uid 存的就是 sec_uid);
-            // 其他平台(小红书)详情导航用内容自带的 xsec_token。
-            let token = if cfg.id == "douyin" {
-                c.author.uid.clone()
-            } else {
-                c.extra
-                    .get("xsec_token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            };
+            // 按平台取详情导航占位参数:抖音 sec_uid、小红书 xsec_token、TikTok @handle。
+            let token = detail_navigation_token(&cfg.id, c);
             let keyword = keyword_map.get(&c.content_id).cloned().unwrap_or_default();
             (c.content_id.clone(), token, log_content_title(c), keyword)
         })
@@ -1369,9 +1427,9 @@ async fn collect_comments_phase(
     // 评论采集成功(拿到非空响应)的视频 id:仅这些在阶段末标 comment_collected=true;
     // 采集失败 / 零响应的留 false,下次运行可重采(此前全量标记,失败视频永久失去重采机会)
     let mut comment_done_ids: Vec<String> = Vec::new();
-    // 抖音:两两分组,一批 2 个视频双路并发直采(同账号窗口开不出第二个窗口,
-    // 页内脚本多路 fetch 是唯一并发姿势);其他平台滚动路径按视频串行,批大小恒 1
-    let is_douyin = cfg.id == "douyin";
+    // 抖音/小红书:两两分组,一批 2 个内容双路并发直采(同账号窗口开不出第二个窗口,
+    // 页内脚本多路 fetch 是唯一安全并发姿势);其他平台滚动路径按内容串行,批大小恒 1。
+    let supports_parallel_comments = matches!(cfg.id.as_str(), "douyin" | "xhs");
     let mut vidx = 0usize;
     while vidx < video_ids.len() {
         // 与关键词 / 定向阶段一致的提前终止检查:点结束 / 关窗即停,不再为后续视频开新会话
@@ -1399,8 +1457,8 @@ async fn collect_comments_phase(
         if vidx > 0 {
             tokio::time::sleep(random_comment_video_interval()).await;
         }
-        // 批大小:抖音最多 2(最后一批收尾余数),其他平台 1
-        let batch_size = if is_douyin {
+        // 批大小:抖音/小红书最多 2(最后一批收尾余数),其他平台 1
+        let batch_size = if supports_parallel_comments {
             (video_ids.len() - vidx).min(2)
         } else {
             1
@@ -1434,7 +1492,7 @@ async fn collect_comments_phase(
                 &format!("💬 [{}/{}] 采集评论「{title}」{link_part}", abs_idx + 1, total_videos),
             );
         }
-        // 采集:批(抖音 2 路并发)或单视频(其他平台 / 尾批)
+        // 采集:批(抖音/小红书 2 路并发)或单内容(其他平台 / 尾批)
         let (responses, failed_with): (Vec<crate::webview::InterceptedResponse>, Option<String>) = if batch_size > 1 {
             let reqs: Vec<CommentCollectRequest<'_>> = group
                 .iter()
@@ -1482,14 +1540,21 @@ async fn collect_comments_phase(
                 Err(e) => (Vec::new(), Some(e.to_string())),
             }
         };
-        // 批内逐视频:拆分响应(批路径按 URL 里的 aweme_id 归属)后各自解析入库,
+        // 批内逐内容:按平台请求参数拆分响应后各自解析入库,
         // 与单视频路径完全同口径;某视频零响应不解析、不标记,留 false 供下次重采
         for (g, (content_id, _xsec_token, title, _keyword)) in group.iter().enumerate() {
             let abs_idx = vidx + g;
             let video_responses: Vec<crate::webview::InterceptedResponse> = if batch_size > 1 {
                 responses
                     .iter()
-                    .filter(|r| r.url.contains(&format!("aweme_id={content_id}")))
+                    .filter(|r| {
+                        if cfg.id == "xhs" {
+                            r.url.contains(&format!("note_id={content_id}"))
+                                || r.url.contains(&format!("noteId={content_id}"))
+                        } else {
+                            r.url.contains(&format!("aweme_id={content_id}"))
+                        }
+                    })
                     .cloned()
                     .collect()
             } else {
@@ -1905,6 +1970,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
         audio_extract,
         keep_video,
         ai_extract,
+        cover_ocr,
         auto_sync_obsidian,
         sort_mode,
         time_range,
@@ -1913,6 +1979,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
         config_dir,
         intent_cfg,
         transcription_cfg,
+        ocr_cfg,
         run_started_at: now,
     } = ctx;
     {
@@ -2103,6 +2170,34 @@ async fn run_task_body(ctx: RunTaskCtx) {
             bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
         }
 
+        // 阶段1.5:小红书搜索卡只是摘要,复用当前窗口逐条打开详情页,补齐正文、话题、
+        // 完整图集和视频流。视频流会直接进入后续通用素材流程,与抖音一样按任务开关转音频。
+        let detail_start = std::time::Instant::now();
+        if cfg.id == "xhs" && !shared.user_ended && !shared.window_closed {
+            // 重跑任务时搜索命中去重台账不会再进入本次清单;把本任务尚未完整解析详情的
+            // 历史行补回来,用户直接重跑即可修复存量数据,无需清库。
+            backfill_xhs_incomplete_contents(
+                &db,
+                &task_id,
+                &mut shared.contents_for_media,
+            )
+            .await;
+            let detail_params = StreamRefreshParams {
+                app: &app,
+                bridge: &bridge,
+                registry: &registry,
+                db: &db,
+                cfg: &cfg,
+                account_id: &account_id,
+                task_id: &task_id,
+            };
+            enrich_xhs_content_details(&detail_params, &mut shared.contents_for_media).await;
+        }
+        metrics.stages_ms.insert(
+            "details".to_string(),
+            detail_start.elapsed().as_millis() as u64,
+        );
+
         // 阶段2:作者画像自动补采(粉丝/关注/获赞/属地缺失的作者,复用采集窗口开主页补齐;
         // 手动结束 / 关窗后跳过,避免重开窗口)。评论采集同在窗口占用阶段内(见阶段3)。
         let enrich_start = std::time::Instant::now();
@@ -2167,8 +2262,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
         // 权衡:评论阶段耗时长会老化补取的签名直链,故新采内容仅补「缺直链」的(抖音/快手
         // 初采已含直链会整体跳过,实际只影响小红书等无直链平台);重跑补音频并入的旧内容
         // 直链按疑似过期强制重取。手动结束 / 关窗后跳过(缺直链按失败落库,可日后重试)。
-        // 需要下载视频(音频提取含 AI 文案提取)才补直链;不下载视频则无需刷新
-        if audio_extract
+        // 音频提取或保留视频任一开启都需要可下载直链。
+        if (audio_extract || keep_video)
             && !to_download.is_empty()
             && !shared.user_ended
             && !shared.window_closed
@@ -2303,6 +2398,11 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 session_cookie,
                 bridge: &bridge,
                 window_open: window_kept_open,
+                // 主链路素材阶段窗口保活、账号锁未释放,末尾可做「4xx → 刷新直链重下」补偿
+                refresh_ctx: Some(StreamRefreshCtx {
+                    registry: &registry,
+                    cfg: &cfg,
+                }),
             };
             download_media_core(&media_params, to_download).await
         };
@@ -2340,6 +2440,27 @@ async fn run_task_body(ctx: RunTaskCtx) {
             .await;
         }
 
+        // 阶段6.5:封面文字识别(OCR,不占窗口):素材阶段已落盘封面,统一在转写后识别;
+        // 失败仅告警不影响任务终态
+        if cover_ocr && !task_failed && !bridge.is_task_stopping(&task_id) {
+            let ocr_root = crate::media::media_root(&config_dir, &media_cfg);
+            let items = pending_cover_ocr_items(&db, &task_id, &ocr_root).await;
+            ocr_for_contents(
+                &OcrPhaseParams {
+                    app: &app,
+                    db: &db,
+                    task_id: &task_id,
+                    platform: &cfg.id,
+                    account_id: &account_id,
+                    ocr_cfg: &ocr_cfg,
+                    bridge: Some(&bridge),
+                    skip_precheck: false,
+                },
+                items,
+            )
+            .await;
+        }
+
         // 阶段7:评论意向分析(LLM,不占窗口):排在评论采集之后,分析本次最新采到的评论
         analyze_intent_phase(
             &app,
@@ -2354,7 +2475,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
 
         // Obsidian 同步:排在转写 / 意向之后,同步出去的文案与意向最全
         if auto_sync_obsidian {
-            let synced = obsidian::sync_task_to_obsidian(&db, &task_id, &owner).await;
+            let obsidian_root = crate::media::media_root(&config_dir, &media_cfg);
+            let synced = obsidian::sync_task_to_obsidian(&db, &task_id, &owner, &obsidian_root).await;
             emit_collect_log(
                 &app,
                 &task_id,
@@ -2642,14 +2764,284 @@ fn content_kind_label(kind: &ContentKind) -> &'static str {
     }
 }
 
+/// 详情 URL `{token}` 的平台差异统一收口,评论采集与视频直链刷新必须使用同一口径。
+fn detail_navigation_token(platform: &str, content: &Content) -> String {
+    match platform {
+        "douyin" => content.author.uid.clone(),
+        "tiktok" => content.author.extra
+            .get("unique_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => content.extra
+            .get("xsec_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// 小红书搜索卡只是摘要,只有成功解析过详情响应才算完整。
+/// 不能用「有正文/话题/一张封面」判断完成:搜索卡也可能带这些字段,却仍缺其余图片和视频流。
+fn xhs_detail_enriched(content: &Content) -> bool {
+    content
+        .extra
+        .get("detail_enriched")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 把当前任务中尚未成功解析完整详情的小红书行补进详情清单,使任务重跑能原地修复
+/// 历史单图、正文/话题缺失以及视频无直链的数据。
+async fn backfill_xhs_incomplete_contents(
+    db: &DatabaseConnection,
+    task_id: &str,
+    contents: &mut Vec<Content>,
+) {
+    use veltrix_core::db::entity::content as content_entity;
+    let rows = match content_entity::Entity::find()
+        .filter(content_entity::Column::TaskId.eq(task_id))
+        .filter(content_entity::Column::Platform.eq("xhs"))
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(task_id, "查询小红书待补全内容失败: {error}");
+            return;
+        }
+    };
+    let mut existing: HashSet<String> = contents
+        .iter()
+        .map(|content| content.content_id.clone())
+        .collect();
+    for row in rows {
+        let content = content_from_model(&row);
+        if !xhs_detail_enriched(&content) && existing.insert(row.content_id.clone()) {
+            contents.push(content);
+        }
+    }
+}
+
+/// 小红书搜索结果只是一张摘要卡;逐条打开详情页后把完整字段合回原内容并更新数据库。
+/// 同一 note_id 在多页响应里重复出现时仅请求一次;成功落标记后后续重跑不再重复导航。
+async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: &mut [Content]) {
+    if params.cfg.id != "xhs"
+        || params.cfg.collect.detail_url_template.trim().is_empty()
+        || contents.is_empty()
+    {
+        return;
+    }
+    let adapter = match params.registry.get(&params.cfg.id) {
+        Ok(adapter) if adapter.supports(&TaskKind::ContentDetail) => adapter,
+        _ => return,
+    };
+    let total = contents
+        .iter()
+        .filter(|content| !xhs_detail_enriched(content))
+        .map(|content| content.content_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if total == 0 {
+        return;
+    }
+    emit_collect_log(
+        params.app,
+        params.task_id,
+        "info",
+        format!("📝 开始补全小红书正文、话题与完整素材 · 共 {total} 条"),
+    );
+
+    let mut visited = HashSet::new();
+    let mut attempted = 0usize;
+    let mut updated = 0usize;
+    for content in contents.iter_mut() {
+        if !visited.insert(content.content_id.clone()) {
+            continue;
+        }
+        if xhs_detail_enriched(content) {
+            continue;
+        }
+        if params.bridge.is_task_stopping(params.task_id)
+            || params.bridge.is_collect_window_closed(
+                &params.cfg.id,
+                params.account_id,
+                Some(params.task_id),
+            )
+        {
+            emit_collect_log(
+                params.app,
+                params.task_id,
+                "warn",
+                "🛑 已停止采集 · 终止小红书详情补全".to_string(),
+            );
+            break;
+        }
+        if attempted > 0 {
+            tokio::time::sleep(random_comment_video_interval()).await;
+        }
+        attempted += 1;
+        let token = content
+            .extra
+            .get("xsec_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            tracing::warn!(content_id = %content.content_id, "小红书详情补全跳过:缺少 xsec_token");
+            continue;
+        }
+        let responses = match params.bridge
+            .fetch_content_detail(
+                params.app,
+                DetailFetchRequest {
+                    account_id: params.account_id,
+                    content_id: &content.content_id,
+                    xsec_token: &token,
+                    platform_cfg: params.cfg,
+                    task_id: Some(params.task_id),
+                },
+            )
+            .await
+        {
+            Ok(responses) => responses,
+            Err(error) => {
+                tracing::warn!(content_id = %content.content_id, "小红书详情补全导航失败: {error}");
+                continue;
+            }
+        };
+        let ctx = FetchContext {
+            keyword: content.content_id.clone(),
+            responses,
+        };
+        let detail = match adapter.parse(&TaskKind::ContentDetail, &ctx).await {
+            Ok(output) => output
+                .contents
+                .into_iter()
+                .find(|item| item.content_id == content.content_id),
+            Err(error) => {
+                tracing::warn!(content_id = %content.content_id, "小红书详情解析失败: {error}");
+                None
+            }
+        };
+        let Some(detail) = detail else {
+            tracing::warn!(content_id = %content.content_id, "小红书详情响应未找到目标笔记");
+            continue;
+        };
+        merge_content_detail(content, detail);
+        // 只有详情响应确实命中目标 note_id 后才落标记。失败笔记在后续重跑会继续补齐。
+        if !content.extra.is_object() {
+            content.extra = serde_json::json!({});
+        }
+        content.extra["detail_enriched"] = Value::Bool(true);
+        let row_id = format!(
+            "{}-{}-{}",
+            params.task_id, content.platform, content.content_id
+        );
+        update_content_detail(params.db, &row_id, content).await;
+        updated += 1;
+        if updated % 10 == 0 || attempted == total {
+            emit_collect_log(
+                params.app,
+                params.task_id,
+                "info",
+                format!("📝 小红书详情补全进度 · {attempted}/{total}"),
+            );
+        }
+    }
+    emit_collect_log(
+        params.app,
+        params.task_id,
+        "info",
+        format!("✅ 小红书完整详情补全完成 · 成功 {updated}/{attempted}"),
+    );
+}
+
+/// 详情字段仅在有有效值时覆盖摘要卡,避免平台降级响应把已采作者/封面/互动数抹空。
+fn merge_content_detail(base: &mut Content, detail: Content) {
+    base.kind = detail.kind;
+    if detail.title.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+        base.title = detail.title;
+    }
+    if detail.desc.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+        base.desc = detail.desc;
+    }
+    if !detail.author.uid.is_empty() {
+        base.author.uid = detail.author.uid;
+    }
+    if !detail.author.nickname.is_empty() {
+        base.author.nickname = detail.author.nickname;
+    }
+    if detail.author.avatar.is_some() {
+        base.author.avatar = detail.author.avatar;
+    }
+    base.stats.like_count = detail.stats.like_count.or(base.stats.like_count);
+    base.stats.comment_count = detail.stats.comment_count.or(base.stats.comment_count);
+    base.stats.collect_count = detail.stats.collect_count.or(base.stats.collect_count);
+    base.stats.share_count = detail.stats.share_count.or(base.stats.share_count);
+    base.stats.play_count = detail.stats.play_count.or(base.stats.play_count);
+    base.published_at = detail.published_at.or(base.published_at);
+    base.video_url = detail.video_url.or(base.video_url.take());
+    base.cover_url = detail.cover_url.or(base.cover_url.take());
+    if !detail.image_urls.is_empty() {
+        base.image_urls = detail.image_urls;
+    }
+    base.duration = detail.duration.or(base.duration);
+    if !detail.topics.is_empty() {
+        base.topics = detail.topics;
+    }
+    if let Some(fields) = detail.extra.as_object() {
+        if !base.extra.is_object() {
+            base.extra = serde_json::json!({});
+        }
+        if let Some(target) = base.extra.as_object_mut() {
+            for (key, value) in fields {
+                if !value.is_null() {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// 详情补全只更新内容元数据,不触碰关键词、归属、采集时间与后处理状态。
+async fn update_content_detail(db: &DatabaseConnection, id: &str, content: &Content) {
+    use veltrix_core::db::entity::content as content_entity;
+    let model = content_entity::ActiveModel {
+        id: Set(id.to_string()),
+        kind: Set(content_kind_label(&content.kind).to_string()),
+        title: Set(content.title.clone()),
+        desc: Set(content.desc.clone()),
+        author_uid: Set(content.author.uid.clone()),
+        author_nickname: Set(content.author.nickname.clone()),
+        author_json: Set(to_json_text(&content.author)),
+        like_count: Set(content.stats.like_count),
+        comment_count: Set(content.stats.comment_count),
+        collect_count: Set(content.stats.collect_count),
+        share_count: Set(content.stats.share_count),
+        play_count: Set(content.stats.play_count),
+        published_at: Set(content.published_at),
+        video_url: Set(content.video_url.clone()),
+        cover_url: Set(content.cover_url.clone()),
+        image_urls: Set(to_json_text(&content.image_urls)),
+        duration: Set(content.duration),
+        topics: Set(to_json_text(&content.topics)),
+        extra: Set(to_json_text(&content.extra)),
+        ..Default::default()
+    };
+    if let Err(error) = model.update(db).await {
+        tracing::warn!(content_id = %id, "回写小红书完整详情失败: {error}");
+    }
+}
+
 /// 为视频内容补取/刷新视频直链:对缺直链(典型:小红书搜索不含直链)或需刷新(签名过期)的
-/// 视频内容,经「详情页拦截」拿到新鲜直链,回写到内存 `Content` 与 DB(content.video_url)。
+/// 视频内容,经「详情页拦截」拿到新鲜直链,回写到内存 `Content` 与 DB。
 ///
 /// - `force=false`:仅补「缺直链」的内容(初采:抖音/快手搜索已含直链不动;小红书搜索无直链 → 补)。
 /// - `force=true`:即使已有直链也重取(单条重试:直链短期签名过期后刷新)。
 ///
 /// 串行执行(共用同一账号窗口,导航不能并发);任一条失败仅告警跳过,不中断。
-/// 平台无 `detail_url_template` 或适配器不支持 `ContentDetail` 解析时整体跳过(B站/TikTok/YouTube 等)。
+/// 平台无 `detail_url_template` 或适配器不支持 `ContentDetail` 解析时整体跳过。
 async fn refresh_stream_urls(
     params: &StreamRefreshParams<'_>,
     contents: &mut [Content],
@@ -2708,17 +3100,11 @@ async fn refresh_stream_urls(
         if has_url && !force {
             continue; // 已有直链且非强制刷新 → 不动(抖音/快手初采路径)
         }
-        // 详情页导航的第二参数({token} 占位):抖音 /video/{id} 模板无此占位,传空;
-        // 小红书模板需要内容自带的 xsec_token。
+        // 抖音刷新覆盖为 /video/{id},无需 token;其余平台与评论导航复用同一口径。
         let token = if cfg.id == "douyin" {
             String::new()
         } else {
-            content
-                .extra
-                .get("xsec_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+            detail_navigation_token(&cfg.id, content)
         };
         // 模板含 {token} 而 token 为空:导航必 404,不白费一次开窗,跳过并留痕
         if token.is_empty() && cfg.collect.detail_url_template.contains("{token}") {
@@ -2727,7 +3113,7 @@ async fn refresh_stream_urls(
                 params.task_id,
                 "warn",
                 format!(
-                    "跳过直链补取 · {} · 缺少详情页鉴权参数(作者 sec_uid / xsec_token)",
+                    "跳过直链补取 · {} · 缺少详情页参数(xsec_token / TikTok 用户名)",
                     content.content_id
                 ),
             );
@@ -2773,9 +3159,11 @@ async fn refresh_stream_urls(
             keyword: content.content_id.clone(),
             responses,
         };
-        // 从解析结果捞目标条:(新鲜视频直链, 原声音频直链)。audio_url 一并带回内存 Content,
-        // 媒体阶段对 mp3 目标可直接下载音轨,免 ffmpeg 拉视频流转码
-        fn pick_fresh(out: FetchOutput, target: &str) -> Option<(String, Option<String>)> {
+        // 从解析结果捞目标条:视频直链、可直接下载的 MP3 原声、需 ffmpeg 转码的独立音轨。
+        fn pick_fresh(
+            out: FetchOutput,
+            target: &str,
+        ) -> Option<(String, Option<String>, Option<String>)> {
             out.contents
                 .into_iter()
                 .find(|c| c.content_id == target)
@@ -2789,7 +3177,13 @@ async fn refresh_stream_urls(
                                 .and_then(|v| v.as_str())
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string);
-                            (u, audio)
+                            let audio_source = c
+                                .extra
+                                .get("audio_source_url")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            (u, audio, audio_source)
                         })
                 })
         }
@@ -2817,14 +3211,20 @@ async fn refresh_stream_urls(
             None => None,
         };
         match fresh {
-            Some((url, audio_url)) => {
+            Some((url, audio_url, audio_source_url)) => {
                 content.video_url = Some(url.clone());
-                let has_audio = audio_url.is_some();
+                let has_audio = audio_url.is_some() || audio_source_url.is_some();
                 if let Some(a) = audio_url {
                     if !content.extra.is_object() {
                         content.extra = serde_json::json!({});
                     }
                     content.extra["audio_url"] = serde_json::Value::String(a);
+                }
+                if let Some(a) = audio_source_url {
+                    if !content.extra.is_object() {
+                        content.extra = serde_json::json!({});
+                    }
+                    content.extra["audio_source_url"] = serde_json::Value::String(a);
                 }
                 // 成功留痕(双写 HUD):确认详情响应落到了解析器、音频直链是否拿到。
                 // 没看到此行而只有「补取直链未果」= 详情响应在拦截链路丢失(空 stream 且兜底未补回)
@@ -2838,7 +3238,7 @@ async fn refresh_stream_urls(
                         "补取直链成功 · {} · {}",
                         content.content_id,
                         if has_audio {
-                            "含原声音频直链(直接下载,免转码)"
+                            "含可用音轨"
                         } else {
                             "无音频直链(非原声或未下发,走视频转码)"
                         }
@@ -2846,7 +3246,7 @@ async fn refresh_stream_urls(
                 );
                 // 回写 DB:content 行 id = "{task_id}-{platform}-{content_id}"(与落库口径一致)
                 let row_id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
-                update_content_video_url(params.db, &row_id, &url).await;
+                update_content_video_streams(params.db, &row_id, &url, &content.extra).await;
             }
             None => {
                 // 逐条响应诊断:路径 + 体长 + 是否含目标 content_id。
@@ -2888,12 +3288,18 @@ async fn refresh_stream_urls(
     }
 }
 
-/// 仅更新 content.video_url 一列(补取/刷新直链后回写,不触碰其它字段)。
-async fn update_content_video_url(db: &DatabaseConnection, id: &str, video_url: &str) {
+/// 回写视频直链与播放附加信息(独立音轨地址放在 extra,供失败重试继续使用)。
+async fn update_content_video_streams(
+    db: &DatabaseConnection,
+    id: &str,
+    video_url: &str,
+    extra: &serde_json::Value,
+) {
     use veltrix_core::db::entity::content as content_entity;
     let am = content_entity::ActiveModel {
         id: Set(id.to_string()),
         video_url: Set(Some(video_url.to_string())),
+        extra: Set(to_json_text(extra)),
         ..Default::default()
     };
     if let Err(e) = am.update(db).await {
@@ -2999,7 +3405,7 @@ async fn fetch_platform_cookie(db: &DatabaseConnection, platform: &str) -> Optio
         .filter(|cookie| !cookie.is_empty())
 }
 
-/// 采集落库后下载内容素材。并发处理(限 15 路、不再限速),按 content_id 去重避免重复下载;
+/// 采集落库后下载内容素材。并发处理(限 10 路、不再限速),按 content_id 去重避免重复下载;
 /// 副产品失败已在 media::process_content 内部吞为告警,主素材成败回写到 contents 表。
 /// `platform`/`account_id` 用于把素材下载日志写进该账号采集窗口的 HUD 浮层。
 /// 本 wrapper 保持「下载 → 语音转写 → 写终态」的旧行为,供补偿 / 重试路径使用;
@@ -3044,6 +3450,8 @@ async fn download_media_core(
     };
     // 收集视频转出的音频(content row id, mp3 路径),供素材下载结束后统一转写
     let mut audios: Vec<(String, String)> = Vec::new();
+    // 失败且疑似直链过期(4xx)的视频内容:阶段末窗口仍保活时统一刷新直链、补下一轮
+    let mut stale_link_retry: Vec<Content> = Vec::new();
     // 跨关键词同一内容只下一次(取 owned,move 进并发任务,避免 async 闭包借用的生命周期问题)
     let mut downloaded: HashSet<String> = HashSet::new();
     let targets: Vec<Content> = contents
@@ -3064,7 +3472,7 @@ async fn download_media_core(
     // 素材进度回写节流:≤600ms 合并,最后一条必写
     let mut last_media_write =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
-    // 并发下载(限 15 路并发,不再串行限速),边完成边回写结果与进度。
+    // 并发下载(限 10 路并发,不再串行限速),边完成边回写结果与进度。
     // 按批(=并发路数)推进:窗口保活时每批开工取一次窗口实时 Cookie——
     // 会话令牌(tt_chain_token 等)随页面活动轮换,批与批之间自动切到最新一份;
     // 窗口已关(补偿/重试路径)则整阶段用上面解析的兜底 Cookie
@@ -3121,12 +3529,13 @@ async fn download_media_core(
             )
             .await;
             let id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
-            (id, title, tag, outcome)
+            // content 一并带出:失败且疑似直链过期的条目要进末尾的刷新补偿
+            (id, title, tag, content, outcome)
             }
         }))
         .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
-        while let Some((id, title, tag, outcome)) = stream.next().await {
-            // 任务被手动结束:不再启动新下载(stream 随 break 丢弃,未开始的条目不执行;在飞 ≤15 条跑完即弃)
+        while let Some((id, title, tag, content, outcome)) = stream.next().await {
+            // 任务被手动结束:不再启动新下载(stream 随 break 丢弃,未开始的条目不执行;在飞 ≤10 条跑完即弃)
             if params.bridge.is_task_stopping(params.task_id) {
                 emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 已手动结束 · 停止素材下载(已完成 {count}/{total} 条保留)"));
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3147,6 +3556,11 @@ async fn download_media_core(
         let ok = is_media_ok(&outcome);
         if !ok {
             failed += 1;
+            // 仅视频可经详情页刷新直链(refresh_stream_urls 跳过非视频);疑似 4xx 才收编,
+            // 其它失败(网络中断/手动停止)刷新直链无意义
+            if content.kind == ContentKind::Video && is_suspected_stale_link(&outcome) {
+                stale_link_retry.push(content);
+            }
         }
         // 视频转出音频的,记下供采集结束后统一转写(不占采集通道)
         if let Some(audio_path) = &outcome.audio_path {
@@ -3189,12 +3603,26 @@ async fn download_media_core(
         // 素材结果攒批:满一批事务性回写,减少 SQLite 锁获取与提交次数
         pending_outcomes.push((id, outcome));
         if pending_outcomes.len() >= MEDIA_OUTCOME_FLUSH_SIZE {
-            flush_media_outcomes(params.db, &mut pending_outcomes).await;
+            flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
         }
         }
     }
     // 收尾 flush 剩余素材回写
-    flush_media_outcomes(params.db, &mut pending_outcomes).await;
+    flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
+
+    // 「疑似直链过期(4xx)」补偿:主链路此刻采集窗口仍保活、账号锁仍持有
+    // (关窗放锁在本函数返回之后,见 run_task_body 阶段5 之后),复用本任务窗口
+    // 经详情页刷新直链后重下一轮;只补一轮,再失败维持失败终态不再循环。
+    // 补回条数从失败计数扣除,让收尾汇总反映补偿后口径
+    let recovered = {
+        let mut stale_out = StaleRetryOut {
+            root: &root,
+            cancel: cancel.clone(),
+            audios: &mut audios,
+        };
+        refresh_and_retry_stale_media(params, stale_link_retry, &mut stale_out).await
+    };
+    failed = failed.saturating_sub(recovered);
     emit_media_log(
         params.app,
         params.task_id,
@@ -3207,6 +3635,206 @@ async fn download_media_core(
         ),
     );
     audios
+}
+
+/// 判定素材失败是否疑似「直链过期 / 防盗链 4xx」(决定是否进 download_media_core 末尾的刷新补偿)。
+/// 覆盖两类错误串:ffmpeg 拉流退出码的译文(media::describe_ffmpeg_exit 的 "HTTP 401/403/404/4xx")
+/// 与 reqwest error_for_status 的英文串("403 Forbidden" 等);只匹配带 HTTP 语义的子串,
+/// 不匹配裸数字,避免 URL / 文件名里恰好出现 403 之类的误判。
+fn is_suspected_stale_link(outcome: &crate::media::MediaOutcome) -> bool {
+    let Some(err) = outcome.error.as_deref() else {
+        return false;
+    };
+    const PATTERNS: &[&str] = &[
+        "HTTP 401",
+        "HTTP 403",
+        "HTTP 404",
+        "HTTP 4xx",
+        "401 Unauthorized",
+        "403 Forbidden",
+        "404 Not Found",
+    ];
+    PATTERNS.iter().any(|p| err.contains(p))
+}
+
+/// refresh_and_retry_stale_media 的产出汇聚:回写根目录、取消标志、补出音频清单的追加目标。
+/// 聚成结构体:三者都是补偿段的「环境」,平铺会让函数签名超过 4 参数上限
+struct StaleRetryOut<'a> {
+    root: &'a std::path::Path,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    audios: &'a mut Vec<(String, String)>,
+}
+
+/// 「疑似直链过期(4xx)」补偿:复用仍保活的采集窗口经详情页刷新直链后重下一轮。
+/// 仅主链路调用(窗口保活 + 账号锁仍持有——关窗放锁在 download_media_core 返回之后,
+/// 见 run_task_body),故不重复 acquire 账号、不开新窗口;只补一轮,再失败维持失败终态。
+/// 返回补回成功的条数(供调用方修正失败计数)。窗口已关路径(refresh_ctx=None)、
+/// 任务被手动结束、用户已关窗时都直接跳过——由单条重试 / 内容库批量补音频兜底。
+async fn refresh_and_retry_stale_media(
+    params: &MediaDownloadParams<'_>,
+    stale: Vec<Content>,
+    out: &mut StaleRetryOut<'_>,
+) -> usize {
+    use futures_util::StreamExt;
+    let (Some(refresh), true) = (params.refresh_ctx, params.window_open) else {
+        return 0;
+    };
+    if stale.is_empty()
+        || params.bridge.is_task_stopping(params.task_id)
+        || params
+            .bridge
+            .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+    {
+        return 0;
+    }
+    let total_stale = stale.len();
+    emit_media_log(
+        params.app,
+        params.task_id,
+        params.platform,
+        params.account_id,
+        "info",
+        format!("🔗 {total_stale} 条素材疑似直链过期(4xx)· 经详情页刷新直链后补下一轮"),
+    );
+    let stream_params = StreamRefreshParams {
+        app: params.app,
+        bridge: params.bridge,
+        registry: refresh.registry,
+        db: params.db,
+        cfg: refresh.cfg,
+        account_id: params.account_id,
+        task_id: params.task_id,
+    };
+    // 逐条强制刷新(force=true;串行:共用同一窗口,导航不能并发),直链确有变化才重下——
+    // 拿同一过期链接再试只会再失败一次。新直链会回写 DB(见 refresh_stream_urls)
+    let mut redownload: Vec<Content> = Vec::new();
+    for mut content in stale {
+        if params.bridge.is_task_stopping(params.task_id)
+            || params
+                .bridge
+                .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+        {
+            break;
+        }
+        let before = (
+            content.video_url.clone(),
+            content.extra.get("audio_url").cloned(),
+            content.extra.get("audio_source_url").cloned(),
+        );
+        refresh_stream_urls(&stream_params, std::slice::from_mut(&mut content), true).await;
+        if (
+            content.video_url.clone(),
+            content.extra.get("audio_url").cloned(),
+            content.extra.get("audio_source_url").cloned(),
+        ) != before
+        {
+            redownload.push(content);
+        }
+    }
+    if redownload.is_empty() {
+        emit_media_log(
+            params.app,
+            params.task_id,
+            params.platform,
+            params.account_id,
+            "warn",
+            format!("直链刷新补偿结束 · {total_stale} 条均未能取到新鲜直链,维持失败"),
+        );
+        return 0;
+    }
+    // 重下:与主下载同口径 10 路并发;逐条取窗口实时 Cookie——新直链与刷新时的窗口会话绑定。
+    // 闭包所需全部转 owned 再 move(借用局部变量跨 await 会触发 rustc
+    // 「Send is not general enough」推断问题,与主下载循环同一处理)
+    let switches = crate::media::MediaSwitches {
+        audio_extract: params.audio_extract,
+        keep_video: params.keep_video,
+    };
+    let cancel = out.cancel.clone();
+    let root_c = out.root.to_path_buf();
+    let app_c = params.app.clone();
+    let db_c = params.db.clone();
+    let platform_c = params.platform.to_string();
+    let account_c = params.account_id.to_string();
+    let task_c = params.task_id.to_string();
+    let media_c = params.media_cfg.clone();
+    let mut recovered = 0usize;
+    let mut retry_outcomes: Vec<(String, crate::media::MediaOutcome)> = Vec::new();
+    let mut stream = futures_util::stream::iter(redownload.into_iter().map(|content| {
+        let cancel_i = cancel.clone();
+        let app_i = app_c.clone();
+        let db_i = db_c.clone();
+        let platform_i = platform_c.clone();
+        let account_i = account_c.clone();
+        let task_i = task_c.clone();
+        let root_i = root_c.clone();
+        let media_i = media_c.clone();
+        // Copy 类型先落一份本调用独占的副本,再 move 进 async(避免从闭包借用里 move)
+        let switches_i = switches;
+        async move {
+            // 逐条取窗口实时 Cookie(与刷新后的新会话匹配;窗口已关退回 DB)
+            let cookie =
+                resolve_session_cookie_owned(app_i, db_i, platform_i, account_i, Some(task_i))
+                    .await;
+            let outcome = crate::media::process_content(
+                &content,
+                &root_i,
+                &media_i,
+                switches_i,
+                cookie.as_deref(),
+                Some(cancel_i),
+            )
+            .await;
+            (content, outcome)
+        }
+    }))
+    .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
+    while let Some((content, outcome)) = stream.next().await {
+        // 任务被手动结束 / 用户关窗:不再启动新下载,在飞条目跑完即弃(与主下载循环同语义)
+        if params.bridge.is_task_stopping(params.task_id)
+            || params
+                .bridge
+                .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+        {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+        let ok = is_media_ok(&outcome);
+        if ok {
+            recovered += 1;
+        }
+        let id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
+        // 补偿补出的音频同样进转写清单,AI 文案提取不漏
+        if let Some(audio_path) = &outcome.audio_path {
+            out.audios.push((id.clone(), audio_path.clone()));
+        }
+        let title = log_content_title(&content);
+        emit_media_log(
+            params.app,
+            params.task_id,
+            params.platform,
+            params.account_id,
+            if ok { "info" } else { "warn" },
+            if ok {
+                format!("直链刷新补偿 · {title} · 完成")
+            } else {
+                format!(
+                    "直链刷新补偿 · {title} · 失败:{}",
+                    outcome.error.as_deref().unwrap_or("未知原因")
+                )
+            },
+        );
+        retry_outcomes.push((id, outcome));
+    }
+    flush_media_outcomes(params.db, &mut retry_outcomes, out.root).await;
+    emit_media_log(
+        params.app,
+        params.task_id,
+        params.platform,
+        params.account_id,
+        if recovered == 0 { "warn" } else { "info" },
+        format!("直链刷新补偿结束 · 过期 {total_stale} 条 · 补回 {recovered} 条"),
+    );
+    recovered
 }
 
 /// 采集结束后统一语音转写:把每条视频转出的音频逐条调 ASR 厂商,回写 content.transcript。
@@ -3400,6 +4028,242 @@ async fn record_transcript(
     }
 }
 
+/// 封面 OCR 阶段参数(遵守「参数 ≤ 4」封装为结构体;语义同 MediaDownloadParams)。
+struct OcrPhaseParams<'a> {
+    app: &'a AppHandle,
+    db: &'a DatabaseConnection,
+    task_id: &'a str,
+    platform: &'a str,
+    account_id: &'a str,
+    ocr_cfg: &'a veltrix_core::config::OcrConfig,
+    // 任务停止标记;None 表示不检查(内容库单条重试等无任务上下文的调用方)
+    bridge: Option<&'a CollectBridge>,
+    // 跳过本地预判:单条重试是用户显式要求,直接走云端精识别,不被「本地判无文字」拦下
+    skip_precheck: bool,
+}
+
+/// 待识别封面清单:本任务内、尚未识别(cover_ocr_text IS NULL)且有本地图的内容。
+/// 图源优先本地封面 cover_path,图文内容封面未单独下载时回退图集首张本地图(image_paths[0])。
+/// 库存路径可能是相对 media_root 的相对路径(新口径),统一 resolve 成绝对路径返回。
+async fn pending_cover_ocr_items(db: &DatabaseConnection, task_id: &str, root: &std::path::Path) -> Vec<(String, String)> {
+    use sea_orm::{ColumnTrait, QueryFilter};
+    use veltrix_core::db::entity::content as content_entity;
+    let rows = match content_entity::Entity::find()
+        .filter(content_entity::Column::TaskId.eq(task_id))
+        .filter(content_entity::Column::CoverOcrText.is_null())
+        .all(db)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(task_id, "查询待识别封面失败: {e}");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|m| {
+            let path = local_cover_path(&m.cover_path, m.image_paths.as_deref())?;
+            Some((m.id, crate::media::resolve_media_path(root, &path).to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+/// 取内容可用的本地识别图:优先封面,其次图集首张已下载图;都没有返回 None(跳过识别)。
+fn local_cover_path(cover_path: &Option<String>, image_paths: Option<&str>) -> Option<String> {
+    cover_path
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| {
+            image_paths
+                .and_then(|t| serde_json::from_str::<Vec<Option<String>>>(t).ok())
+                .and_then(|v| v.into_iter().flatten().find(|p| !p.trim().is_empty()))
+        })
+}
+
+/// 对一组内容做封面文字识别(智谱 OCR):并发调 API,逐条回写 cover_ocr_text / cover_ocr_error。
+/// 与转写三态约定一致:识别成功但无文字 → 空串(不再重试);失败 → text=None + error(可重试)。
+async fn ocr_for_contents(p: &OcrPhaseParams<'_>, items: Vec<(String, String)>) {
+    if items.is_empty() {
+        return;
+    }
+    use tauri::Emitter;
+    let (app, db, task_id, platform, account_id) =
+        (p.app, p.db, p.task_id, p.platform, p.account_id);
+    // 任务已被手动结束:不再发起任何 OCR 请求
+    if p.bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
+        emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 跳过封面文字识别".to_string());
+        return;
+    }
+    let api_key = get_secret(db, "ocr_api_key").await;
+    if api_key.trim().is_empty() {
+        emit_media_log(
+            app,
+            task_id,
+            platform,
+            account_id,
+            "warn",
+            "未配置封面 OCR API Key,跳过识别 · 请到「系统设置 → 封面文字识别」填写 API Key".to_string(),
+        );
+        return;
+    }
+
+    let total = items.len();
+    // 并发调 OCR API:并发数取系统设置「封面文字识别」配置(0 兜底默认);buffer_unordered 滚动补位
+    let concurrency = if p.ocr_cfg.concurrency == 0 {
+        veltrix_core::config::DEFAULT_OCR_CONCURRENCY
+    } else {
+        p.ocr_cfg.concurrency
+    } as usize;
+    emit_media_log(app, task_id, platform, account_id, "info", format!("开始封面文字识别 · 共 {total} 条 · 并发 {concurrency} 路"));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // SQLite 写串行化:并发 OCR 完成后的 DB 写入经此 Mutex 串行,避免 database is locked 丢结果
+    let db_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    use futures_util::StreamExt;
+    let mut stream = futures_util::stream::iter(items.into_iter().map(|(id, image_path)| {
+        let api_key = api_key.clone();
+        let cfg_provider = p.ocr_cfg.provider.clone();
+        let cfg_url = p.ocr_cfg.api_url.clone();
+        let db = db.clone();
+        let app = app.clone();
+        let task_id = task_id.to_string();
+        let platform = platform.to_string();
+        let account_id = account_id.to_string();
+        let done = done.clone();
+        let total_s = total.to_string();
+        let db_write_lock = db_write_lock.clone();
+        let precheck = p.ocr_cfg.local_precheck;
+        let skip_precheck = p.skip_precheck;
+        async move {
+            // 本地预判(系统设置「封面文字识别」可关):离线零成本先判有无文字,
+            // 判定无文字直接落空文本标记,省下 0.01 元/次的云端调用;
+            // 预判失败(非 Windows / 缺语言包 / 图片损坏)照常走云端,不错杀
+            if !skip_precheck && precheck {
+                match crate::agent::ocr::recognize_image_text(std::path::Path::new(&image_path)).await {
+                    Ok(local) if local.trim().is_empty() => {
+                        tracing::info!(content_id = %id, "本地预判封面无文字,跳过云端 OCR,标记空文本");
+                        let _guard = db_write_lock.lock().await;
+                        record_cover_ocr(&db, &id, Some(String::new()), None).await;
+                        drop(_guard);
+                        let _ = app.emit(
+                            "content-ocr-updated",
+                            serde_json::json!({ "id": id, "coverOcrText": "", "coverOcrError": null }),
+                        );
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        emit_media_log(&app, &task_id, &platform, &account_id, "info", format!("封面识别进度 {n}/{total_s} · 本地判无文字"));
+                        return;
+                    }
+                    Ok(_) => tracing::debug!(content_id = %id, "本地预判封面有文字,走云端精识别"),
+                    Err(e) => tracing::debug!(content_id = %id, "本地预判不可用({e}),直接走云端 OCR"),
+                }
+            }
+            let result = crate::llm::ocr_recognize(&crate::llm::OcrRequest {
+                provider: &cfg_provider,
+                api_url: &cfg_url,
+                api_key: &api_key,
+                image_path: std::path::Path::new(&image_path),
+            })
+            .await;
+            match result {
+                Ok(text) => {
+                    if text.trim().is_empty() {
+                        tracing::info!(content_id = %id, "封面 OCR 完成:未识别到文字,标记空文本");
+                    }
+                    // SQLite 写需串行:并发 OCR 结果回写时持锁,防止 database is locked
+                    let _guard = db_write_lock.lock().await;
+                    record_ocr_usage(&db, &id, &cfg_provider).await;
+                    record_cover_ocr(&db, &id, Some(text.clone()), None).await;
+                    drop(_guard);
+                    // 通知前端就地刷新该行封面文本
+                    let _ = app.emit(
+                        "content-ocr-updated",
+                        serde_json::json!({ "id": id, "coverOcrText": text, "coverOcrError": null }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(content_id = %id, "封面 OCR 识别失败: {e}");
+                    let err = format!("{e}");
+                    let _guard = db_write_lock.lock().await;
+                    record_cover_ocr(&db, &id, None, Some(err.clone())).await;
+                    drop(_guard);
+                    let _ = app.emit(
+                        "content-ocr-updated",
+                        serde_json::json!({ "id": id, "coverOcrText": null, "coverOcrError": err }),
+                    );
+                }
+            }
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            emit_media_log(&app, &task_id, &platform, &account_id, "info", format!("封面识别进度 {n}/{total_s}"));
+        }
+    }))
+    .buffer_unordered(concurrency);
+    while stream.next().await.is_some() {
+        // 任务被手动结束:停止拉取后续识别(在飞条目跑完即弃,已完成结果已回写保留)
+        if p.bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
+            emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 停止后续封面识别(已完成条目保留)".to_string());
+            break;
+        }
+    }
+    emit_media_log(app, task_id, platform, account_id, "info", format!("封面文字识别完成 · {total}/{total}"));
+}
+
+/// 回写单条内容的封面 OCR 结果(只更新 cover_ocr_text / cover_ocr_error 两列,不触碰其它字段)。
+/// text 传 Some("") 表示「已识别但无文字」;None 表示失败/未识别。
+async fn record_cover_ocr(db: &DatabaseConnection, id: &str, text: Option<String>, err: Option<String>) {
+    use veltrix_core::db::entity::content as content_entity;
+    let am = content_entity::ActiveModel {
+        id: Set(id.to_string()),
+        cover_ocr_text: Set(text),
+        cover_ocr_error: Set(err),
+        ..Default::default()
+    };
+    if let Err(e) = am.update(db).await {
+        tracing::warn!(content_id = %id, "回写封面 OCR 文本失败: {e}");
+    }
+}
+
+/// 记录一次封面 OCR 用量到账单(model_usage_records):接口按次计费、响应无 token 字段,
+/// token 记 0、每次请求一条记录(source=cover_ocr)。归属取内容行 owner;写库失败仅告警。
+async fn record_ocr_usage(db: &DatabaseConnection, content_id: &str, provider: &str) {
+    use veltrix_core::db::entity::{content as content_entity, model_usage_record};
+    let owner = match content_entity::Entity::find_by_id(content_id.to_string())
+        .one(db)
+        .await
+    {
+        Ok(Some(row)) => row.owner,
+        Ok(None) => {
+            tracing::warn!(content_id, "封面 OCR 记账跳过:内容不存在");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(content_id, "封面 OCR 记账跳过:查询内容归属失败: {e}");
+            return;
+        }
+    };
+    if let Err(e) = model_usage_record::Model::record(
+        db,
+        "files/ocr",
+        provider,
+        0,
+        0,
+        "cover_ocr",
+        &owner,
+    )
+    .await
+    {
+        tracing::warn!(content_id, "封面 OCR 账单记录写入失败: {e}");
+    }
+}
+
+/// 单条内容封面 OCR 状态视图:retry_content_ocr 返回最新结果,前端就地刷新该行。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverOcrView {
+    pub id: String,
+    /// 最新封面 OCR 文本(空串=已识别但无文字) / 失败原因
+    pub cover_ocr_text: Option<String>,
+    pub cover_ocr_error: Option<String>,
+}
+
 /// 加载任务已采内容的 content_id 集合:智能停止「只数新增」(重复不占目标配额)的依据。
 /// 并入采集去重台账(同平台)的 content_id:本任务已采 ∪ 台账已登记的内容构成「去重跳过集」,
 /// 采集时整体跳过(不再入库刷新,评论 / 素材阶段也不处理),避免重复采集。
@@ -3577,12 +4441,14 @@ const MEDIA_OUTCOME_FLUSH_SIZE: usize = 20;
 
 /// 素材下载并发路数;窗口保活时也作为「一批」的粒度——每批开工取一次实时 Cookie,
 /// 批间自动切到轮换后的新会话 Cookie(逐条取太密、整阶段取一次又可能全程用旧 Cookie)。
-const MEDIA_DOWNLOAD_CONCURRENCY: usize = 15;
+const MEDIA_DOWNLOAD_CONCURRENCY: usize = 10;
 
 /// 构造素材处理结果回写的 ActiveModel(仅更新状态相关列,不触碰其它字段)。
+/// 本地路径列入库前经 to_media_rel 转相对 root 的相对路径(outcome 内存中为绝对路径)。
 fn media_outcome_active(
     id: &str,
     outcome: &crate::media::MediaOutcome,
+    root: &std::path::Path,
 ) -> veltrix_core::db::entity::content::ActiveModel {
     use veltrix_core::db::entity::content as content_entity;
     let status = if is_media_ok(outcome) { "success" } else { "failed" };
@@ -3595,19 +4461,19 @@ fn media_outcome_active(
     };
     // 下载成功才回写本地路径;失败/未下不覆盖旧值(NotSet),便于重试后保留上次成功路径
     if let Some(p) = &outcome.cover_path {
-        am.cover_path = Set(Some(p.clone()));
+        am.cover_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
     }
     if let Some(p) = &outcome.avatar_path {
-        am.avatar_path = Set(Some(p.clone()));
+        am.avatar_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
     }
     // 音频路径回写:详情页播放音频用(仅视频 + 提取成功时有值)
     if let Some(p) = &outcome.audio_path {
-        am.audio_path = Set(Some(p.clone()));
+        am.audio_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
     }
     // 视频落盘路径回写:自动发布读本地视频用(仅 keep_video 下载成功时有值);
     // 失败/未开不覆盖旧值(NotSet),便于重试后保留上次成功路径
     if let Some(p) = &outcome.video_path {
-        am.video_path = Set(Some(p.clone()));
+        am.video_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
     }
     if let Some(v) = outcome.video_downloaded {
         am.video_downloaded = Set(Some(v));
@@ -3618,12 +4484,28 @@ fn media_outcome_active(
     if let Some(v) = outcome.image_done {
         am.image_done = Set(Some(v));
     }
+    if !outcome.image_paths.is_empty() {
+        let rel_paths: Vec<Option<String>> = outcome
+            .image_paths
+            .iter()
+            .map(|p| {
+                p.as_ref()
+                    .map(|s| crate::media::to_media_rel(root, std::path::Path::new(s)))
+            })
+            .collect();
+        am.image_paths = Set(Some(to_json_text(&rel_paths)));
+    }
     am
 }
 
 /// 把单条素材处理结果回写到 contents 表(补偿 / 重试等低频路径)。
-async fn record_media_outcome(db: &DatabaseConnection, id: &str, outcome: &crate::media::MediaOutcome) {
-    let am = media_outcome_active(id, outcome);
+async fn record_media_outcome(
+    db: &DatabaseConnection,
+    id: &str,
+    outcome: &crate::media::MediaOutcome,
+    root: &std::path::Path,
+) {
+    let am = media_outcome_active(id, outcome, root);
     if let Err(e) = am.update(db).await {
         tracing::warn!(content_id = %id, "回写素材状态失败: {e}");
     }
@@ -3634,6 +4516,7 @@ async fn record_media_outcome(db: &DatabaseConnection, id: &str, outcome: &crate
 async fn flush_media_outcomes(
     db: &DatabaseConnection,
     batch: &mut Vec<(String, crate::media::MediaOutcome)>,
+    root: &std::path::Path,
 ) {
     if batch.is_empty() {
         return;
@@ -3642,7 +4525,7 @@ async fn flush_media_outcomes(
     match db.begin().await {
         Ok(tx) => {
             for (id, outcome) in &items {
-                let am = media_outcome_active(id, outcome);
+                let am = media_outcome_active(id, outcome, root);
                 if let Err(e) = am.update(&tx).await {
                     tracing::warn!(content_id = %id, "回写素材状态失败: {e}");
                 }
@@ -3654,7 +4537,7 @@ async fn flush_media_outcomes(
         Err(e) => {
             tracing::warn!("开启素材状态回写事务失败,退回逐条写: {e}");
             for (id, outcome) in &items {
-                let am = media_outcome_active(id, outcome);
+                let am = media_outcome_active(id, outcome, root);
                 if let Err(e) = am.update(db).await {
                     tracing::warn!(content_id = %id, "回写素材状态失败: {e}");
                 }
@@ -3709,9 +4592,16 @@ fn content_from_model(m: &veltrix_core::db::entity::content::Model) -> Content {
         _ => ContentKind::Unknown,
     };
     let image_urls: Vec<String> = serde_json::from_str(&m.image_urls).unwrap_or_default();
-    let avatar = serde_json::from_str::<serde_json::Value>(&m.author_json)
-        .ok()
-        .and_then(|v| v.get("avatar").and_then(|a| a.as_str()).map(str::to_string));
+    let author_snapshot = serde_json::from_str::<serde_json::Value>(&m.author_json).ok();
+    let avatar = author_snapshot.as_ref()
+        .and_then(|v| v.get("avatar"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // TikTok 详情导航需要 author.extra.unique_id(@handle);失败重试从 DB 回读时必须保留。
+    let author_extra = author_snapshot.as_ref()
+        .and_then(|v| v.get("extra"))
+        .cloned()
+        .unwrap_or(Value::Null);
     Content {
         platform: m.platform.clone(),
         content_id: m.content_id.clone(),
@@ -3723,6 +4613,7 @@ fn content_from_model(m: &veltrix_core::db::entity::content::Model) -> Content {
             uid: m.author_uid.clone(),
             nickname: m.author_nickname.clone(),
             avatar,
+            extra: author_extra,
             ..Default::default()
         },
         video_url: m.video_url.clone(),
@@ -3828,7 +4719,11 @@ pub async fn retry_content_media(
                 );
                 // 重置残留的「手动关窗」标记(理由同补偿路径)
                 bridge.reset_collect_window_closed(&row.platform, &acc.id, Some(&row.task_id));
-                let before = content.video_url.clone();
+                let before = (
+                    content.video_url.clone(),
+                    content.extra.get("audio_url").cloned(),
+                    content.extra.get("audio_source_url").cloned(),
+                );
                 let stream_params = StreamRefreshParams {
                     app: &app,
                     bridge: &bridge,
@@ -3847,7 +4742,11 @@ pub async fn retry_content_media(
                 // 直链确有刷新才重试,避免拿同一过期链接再失败一次。
                 // 直链与会话绑定,口径要一致:从刷新直链那个账号(acc)的存活窗口读实时 Cookie
                 // (含 httponly tt_chain_token;DB 里 acc.cookie 往往是空的,故必须读实时)
-                let changed = content.video_url != before;
+                let changed = (
+                    content.video_url.clone(),
+                    content.extra.get("audio_url").cloned(),
+                    content.extra.get("audio_source_url").cloned(),
+                ) != before;
                 if changed {
                     let session_cookie =
                         resolve_session_cookie(&app, &state.db, &row.platform, &acc.id, Some(&row.task_id)).await;
@@ -3878,7 +4777,7 @@ pub async fn retry_content_media(
             }
         }
     }
-    record_media_outcome(&state.db, &id, &outcome).await;
+    record_media_outcome(&state.db, &id, &outcome, &root).await;
 
     // 音频提取重试成功且任务开了「AI 文案提取」且尚无文案:顺带补一次语音转写,
     // 让「音频提取失败重试」一次修复全链路(只开音频提取的任务不自动转写,可手动单条转写)。
@@ -3951,7 +4850,10 @@ pub async fn retry_content_transcript(
         ));
     }
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
-    let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
+    let media_cfg = { lock_config(&state)?.media.clone() };
+    // 库存 audio_path 可能是相对 media_root 的相对路径(新口径),resolve 成绝对路径再转写
+    let root = crate::media::media_root(&state.config_dir, &media_cfg);
+    let audio_path = crate::media::resolve_media_path(&root, &audio_path).to_string_lossy().into_owned();
     transcribe_for_contents(
         &app,
         &state.db,
@@ -3959,7 +4861,7 @@ pub async fn retry_content_transcript(
         &row.platform,
         "",
         &transcription_cfg,
-        ffmpeg_path,
+        media_cfg.ffmpeg_path.clone(),
                 None, // 单条重试:无任务停止标记可查
         vec![(id.clone(), audio_path)],
     )
@@ -3978,6 +4880,70 @@ pub async fn retry_content_transcript(
         media_error: row.media_error,
         transcript,
         transcript_error,
+    })
+}
+
+/// 封面 OCR 失败重试:对已有本地封面的单条内容重跑文字识别并回写结果。
+/// 覆盖「识别失败 / 当时未配 API Key 被跳过」的内容——这类内容补偿与重跑都不会再碰。
+#[tauri::command]
+pub async fn retry_content_ocr(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<CoverOcrView> {
+    use veltrix_core::db::entity::content as content_entity;
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let row = content_entity::Entity::find_by_id(id.clone())
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?
+        .ok_or_else(|| CrawlerError::Config("内容不存在".into()))?;
+    // 数据归属:self 用户只能操作自己的内容
+    if me.scope == "self" && row.owner != me.name {
+        return Err(CrawlerError::Config("无权操作该内容".into()));
+    }
+    let Some(image_path) = local_cover_path(&row.cover_path, row.image_paths.as_deref()) else {
+        return Err(CrawlerError::Config(
+            "该内容没有本地封面图,请先重试素材下载".into(),
+        ));
+    };
+    // 库存路径可能是相对 media_root 的相对路径(新口径),resolve 成绝对路径再识别
+    let media_cfg = { lock_config(&state)?.media.clone() };
+    let root = crate::media::media_root(&state.config_dir, &media_cfg);
+    let image_path = crate::media::resolve_media_path(&root, &image_path).to_string_lossy().into_owned();
+    // 提前校验 API Key:OCR 缺少 Key 会被静默跳过,命令层应给用户明确反馈
+    let api_key = get_secret(&state.db, "ocr_api_key").await;
+    if api_key.trim().is_empty() {
+        return Err(CrawlerError::Config(
+            "未配置封面 OCR API Key,请到「系统设置 → 封面文字识别」填写".into(),
+        ));
+    }
+    let ocr_cfg = { lock_config(&state)?.ocr.clone() };
+    ocr_for_contents(
+        &OcrPhaseParams {
+            app: &app,
+            db: &state.db,
+            task_id: &row.task_id,
+            platform: &row.platform,
+            account_id: "",
+            ocr_cfg: &ocr_cfg,
+            bridge: None, // 单条重试:无任务停止标记可查
+            skip_precheck: true, // 用户显式重试:直接走云端,不被本地预判拦下
+        },
+        vec![(id.clone(), image_path)],
+    )
+    .await;
+    let (cover_ocr_text, cover_ocr_error) = content_entity::Entity::find_by_id(id.clone())
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| (r.cover_ocr_text, r.cover_ocr_error))
+        .unwrap_or((None, None));
+    Ok(CoverOcrView {
+        id,
+        cover_ocr_text,
+        cover_ocr_error,
     })
 }
 
@@ -4030,15 +4996,21 @@ pub async fn retry_failed_transcripts(
     // 重置取消标记:上一批的「取消」不能影响本批
     state.collect_control.clear_library_batch();
     let transcription_cfg = { lock_config(&state)?.transcription.clone() };
-    let ffmpeg_path = { lock_config(&state)?.media.ffmpeg_path.clone() };
+    let media_cfg = { lock_config(&state)?.media.clone() };
+    let ffmpeg_path = media_cfg.ffmpeg_path.clone();
+    // 库存 audio_path 可能是相对 media_root 的相对路径(新口径),入队前 resolve 成绝对路径
+    let root = crate::media::media_root(&state.config_dir, &media_cfg);
     // 按 (任务, 平台) 分组:逐组调 transcribe_for_contents,组内并发按配置,组间串行
     let mut by_task: std::collections::HashMap<(String, String), Vec<(String, String)>> =
         std::collections::HashMap::new();
     for r in rows {
+        let audio = crate::media::resolve_media_path(&root, &r.audio_path.clone().unwrap_or_default())
+            .to_string_lossy()
+            .into_owned();
         by_task
             .entry((r.task_id.clone(), r.platform.clone()))
             .or_default()
-            .push((r.id.clone(), r.audio_path.clone().unwrap_or_default()));
+            .push((r.id.clone(), audio));
     }
     // 分批推进 + 批间检查「取消」标记:转写无任务停止标记可查,取消只能靠批间
     // 检查实现。一批 8 条(并发默认 5 路,一批典型十几秒),取消延迟可接受
@@ -4101,7 +5073,7 @@ fn emit_content_media_updated(app: &AppHandle, id: &str, outcome: &crate::media:
 ///
 /// 流水线(边补边采):
 /// 1. 按 (平台, 任务) 分组,组内逐条经详情页拦截刷新直链——刷新出一条立刻投进下载通道,
-///    下载(reqwest/ffmpeg,不占窗口)与后续条目的窗口串行刷新并行,15 路并发;
+///    下载(reqwest/ffmpeg,不占窗口)与后续条目的窗口串行刷新并行,10 路并发;
 ///    直链过期 403 是音频失败的主因,故不再拿旧链接先试,全量直接刷新;
 ///    原声视频带 music.play_url 音频直链时直接下载 MP3,免转码;
 /// 2. 音频补成功且任务开「AI 文案提取」且尚无文案的,顺带补语音转写。
@@ -4155,7 +5127,7 @@ pub async fn batch_collect_audios(
 
     // 刷新直链:按 (平台, 任务) 分组,经详情页拦截强制刷新直链后重下。
     // 刷新 + 重下全程持同账号互斥锁、采集窗口保活(与单条重试同一取舍):
-    // 重下逐条从存活窗口取轮换后的新会话 Cookie,风控可在窗口人工解除;组间串行、组内 15 路并发
+    // 重下逐条从存活窗口取轮换后的新会话 Cookie,风控可在窗口人工解除;组间串行、组内 10 路并发
     let mut by_task: std::collections::HashMap<(String, String), Vec<content_entity::Model>> =
         std::collections::HashMap::new();
     for r in failed_rows {
@@ -4188,11 +5160,23 @@ pub async fn batch_collect_audios(
                 continue;
             }
         };
-        let items: Vec<(content_entity::Model, Option<String>, Content)> = group
+        let items: Vec<(
+            content_entity::Model,
+            (
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<serde_json::Value>,
+            ),
+            Content,
+        )> = group
             .into_iter()
             .map(|r| {
                 let c = content_from_model(&r);
-                let before = c.video_url.clone();
+                let before = (
+                    c.video_url.clone(),
+                    c.extra.get("audio_url").cloned(),
+                    c.extra.get("audio_source_url").cloned(),
+                );
                 (r, before, c)
             })
             .collect();
@@ -4270,7 +5254,7 @@ pub async fn batch_collect_audios(
                     })
                     .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
                 while let Some((row, outcome)) = stream.next().await {
-                    // 取消或用户手动关窗:不再处理后续(在飞 ≤15 条跑完即弃)
+                    // 取消或用户手动关窗:不再处理后续(在飞 ≤10 条跑完即弃)
                     if control_c.is_library_batch_stopping()
                         || bridge_c.is_collect_window_closed(
                             &platform_c,
@@ -4299,7 +5283,7 @@ pub async fn batch_collect_audios(
                         },
                     );
                     let audio_path = outcome.audio_path.clone();
-                    record_media_outcome(&db_c, &row.id, &outcome).await;
+                    record_media_outcome(&db_c, &row.id, &outcome, &root_c).await;
                     emit_content_media_updated(&app_c, &row.id, &outcome);
                     if ok_audio {
                         if let Some(p) = audio_path {
@@ -4323,7 +5307,7 @@ pub async fn batch_collect_audios(
         let mut refreshed = 0usize;
         let mut refresh_missed = 0usize;
         let group_total = items.len();
-        for (row, before_url, content) in items {
+        for (row, before_streams, content) in items {
             // 取消 / 用户关窗:停止刷新(下载侧同标记随即收尾);关窗语义与采集主链路一致
             if state.collect_control.is_library_batch_stopping()
                 || bridge.is_collect_window_closed(&platform, &acc.id, Some(&task_id))
@@ -4335,7 +5319,12 @@ pub async fn batch_collect_audios(
             let mut one = [content];
             refresh_stream_urls(&stream_params, &mut one, true).await;
             let [c] = one;
-            if c.video_url != before_url {
+            if (
+                c.video_url.clone(),
+                c.extra.get("audio_url").cloned(),
+                c.extra.get("audio_source_url").cloned(),
+            ) != before_streams
+            {
                 refreshed += 1;
                 let _ = tx.send((row, c));
             } else {
@@ -4356,6 +5345,7 @@ pub async fn batch_collect_audios(
                         video_downloaded: Some(false),
                         image_total: None,
                         image_done: None,
+                        image_paths: Vec::new(),
                     },
                 );
             }
@@ -4565,8 +5555,8 @@ pub async fn compensate_task(
             }
         }
 
-        // 素材下载 + 转写补做(音频提取 / AI 文案提取任一开即补;filter_pending_media 排除已成功的)
-        if audio_extract {
+        // 素材下载 + 转写补做;只开“保留视频”也需要进入该流程。
+        if audio_extract || keep_video {
             let contents: Vec<Content> = rows.iter().map(content_from_model).collect();
             let mut pending = filter_pending_media(&db, &id, contents).await;
             if !pending.is_empty() {
@@ -4642,6 +5632,8 @@ pub async fn compensate_task(
                     bridge: &bridge,
                     // 补偿在补取后已关窗,下载阶段无窗口可保活(行为同旧版)
                     window_open: false,
+                    // 窗口已关、无可导航的采集窗口,不做直链刷新补偿
+                    refresh_ctx: None,
                 };
                 download_media_for_contents(
                     &media_params,
@@ -4867,17 +5859,8 @@ pub async fn recollect_comments(
             summary.attempted += 1;
 
             let c = content_from_model(row);
-            // 详情页导航的第二参数({token} 占位)口径与任务评论阶段一致:
-            // 抖音走「主页模态」用作者 sec_uid;其他平台(小红书)用内容自带 xsec_token
-            let token = if cfg.id == "douyin" {
-                c.author.uid.clone()
-            } else {
-                c.extra
-                    .get("xsec_token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            };
+            // 与任务评论阶段一致:抖音 sec_uid、小红书 xsec_token、TikTok @handle。
+            let token = detail_navigation_token(&cfg.id, &c);
             let title = log_content_title(&c);
             crate::webview::hud_log(
                 &app,
@@ -5575,6 +6558,7 @@ fn content_to_active(
         video_url: Set(c.video_url.clone()),
         cover_url: Set(c.cover_url.clone()),
         image_urls: Set(to_json_text(&c.image_urls)),
+        image_paths: Set(None),
         duration: Set(c.duration),
         topics: Set(to_json_text(&c.topics)),
         extra: Set(to_json_text(&c.extra)),
@@ -5592,6 +6576,8 @@ fn content_to_active(
         // 转写文本采集时未知,语音转写后回写
         transcript: Set(None),
         transcript_error: Set(None),
+        cover_ocr_text: Set(None),
+        cover_ocr_error: Set(None),
         // 细粒度处理状态:媒体下载/评论采集/意向分析后回写
         video_downloaded: Set(None),
         image_total: Set(None),
@@ -6013,6 +6999,23 @@ async fn write_task_cancelled(app: &AppHandle, db: &DatabaseConnection, task_id:
     .await;
 }
 
+/// 启动阶段(原子状态翻转之前)失败的统一落库:与运行期失败同口径消耗重试预算——
+/// 递增 retry_count、按 1min/5min/15min 退避排期,耗尽落终态 failed(见 write_task_failed)。
+/// 为什么不能裸 return:调度器按 next_retry_at 拉起的 failed 任务若启动即败且不写库,
+/// next_retry_at 恒在过去,每 30s 无退避重撞(风控期「该平台账号全部 invalid」即此路径)。
+/// cancelled 任务跳过写库:用户已主动终止,不能复活成 failed 再被调度器拉起。
+async fn write_startup_failed(
+    app: &AppHandle,
+    db: &DatabaseConnection,
+    model: &veltrix_core::db::entity::task::Model,
+    message: &str,
+) {
+    if model.status == "cancelled" {
+        return;
+    }
+    write_task_failed(app, db, &model.id, message).await;
+}
+
 /// 标记任务失败(status=failed, finished_at, error_message)。
 /// 采集零产出且过程出错时调用,避免失败任务被误标「已完成」。
 /// 若任务开了自动重试(max_retries>0)且未达上限,按 1min / 5min / 15min 指数退避排期重试,
@@ -6269,6 +7272,7 @@ mod tests {
             video_downloaded: None,
             image_total: None,
             image_done: None,
+            image_paths: Vec::new(),
         }
     }
 
@@ -6278,6 +7282,16 @@ mod tests {
         assert!(is_media_ok(&outcome(true, None)), "主素材 ok + 未提取音频 → true");
         assert!(!is_media_ok(&outcome(true, Some(false))), "音频提取失败 → false");
         assert!(!is_media_ok(&outcome(false, Some(true))), "主素材失败 → false");
+    }
+
+    #[test]
+    fn image_paths_survive_missing_cover_and_partial_download() {
+        let mut result = outcome(false, None);
+        result.image_paths = vec![Some("first.jpg".into()), None, Some("third.jpg".into())];
+        let active = media_outcome_active("note", &result, std::path::Path::new(""));
+        assert_eq!(active.image_paths, Set(Some(r#"["first.jpg",null,"third.jpg"]"#.into())));
+        assert!(active.cover_path.is_not_set());
+        assert!(media_outcome_active("note", &outcome(false, None), std::path::Path::new("")).image_paths.is_not_set());
     }
 
     // ---------- content_from_model ----------
@@ -6294,7 +7308,7 @@ mod tests {
             desc: Some("正文".into()),
             author_uid: "u1".into(),
             author_nickname: "作者".into(),
-            author_json: r#"{"avatar":"https://a.b/c.png"}"#.into(),
+            author_json: r#"{"avatar":"https://a.b/c.png","extra":{"unique_id":"creator"}}"#.into(),
             like_count: None,
             comment_count: None,
             collect_count: None,
@@ -6304,6 +7318,7 @@ mod tests {
             video_url: Some("https://v.cdn/x.mp4".into()),
             cover_url: Some("https://a.b/cover.jpg".into()),
             image_urls: r#"["u1","u2"]"#.into(),
+            image_paths: None,
             duration: Some(12),
             topics: "[]".into(),
             extra: r#"{"xsec_token":"tok"}"#.into(),
@@ -6318,6 +7333,8 @@ mod tests {
             video_path: None,
             transcript: None,
             transcript_error: None,
+            cover_ocr_text: None,
+            cover_ocr_error: None,
             video_downloaded: None,
             image_total: None,
             image_done: None,
@@ -6349,6 +7366,11 @@ mod tests {
             c.author.avatar.as_deref(),
             Some("https://a.b/c.png"),
             "头像应从 author_json 提取"
+        );
+        assert_eq!(
+            c.author.extra.get("unique_id").and_then(Value::as_str),
+            Some("creator"),
+            "失败重试时应保留 TikTok 详情导航所需的作者用户名"
         );
         assert_eq!(c.image_urls, vec!["u1".to_string(), "u2".to_string()]);
     }
@@ -6439,6 +7461,7 @@ mod tests {
             audio_extract: false,
             keep_video: false,
             ai_extract: false,
+            cover_ocr: false,
             collect_comments: false,
             comment_time_range: "any".into(),
             comment_limit: 0,

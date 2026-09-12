@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl } from "@/lib/media-file-url";
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronDown,
@@ -734,6 +734,7 @@ function NetworkPanel({ activeId }: { activeId: string | null }) {
 
 // 单条消息:user 气泡 / assistant 文本+工具调用 / tool 结果行
 function RpaMessage({ message: m }: { message: ChatMessageView }) {
+  const mediaFileUrl = useMediaFileUrl();
   if (m.role === "user") {
     // 视频附件(如屏幕录制):内联播放器;有正文才渲染气泡
     const videos = (m.attachments ?? []).filter((a) =>
@@ -744,7 +745,7 @@ function RpaMessage({ message: m }: { message: ChatMessageView }) {
         {videos.map((a, i) => (
           <video
             key={i}
-            src={a.path ? convertFileSrc(a.path) : ""}
+            src={a.path ? mediaFileUrl(a.path) : ""}
             controls
             preload="metadata"
             className="max-h-72 w-full max-w-md rounded-lg border border-border/60 bg-black"

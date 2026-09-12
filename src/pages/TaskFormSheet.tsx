@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { api } from "@/lib/api";
 import type { AccountView, IndustryView, TaskInput } from "@/lib/api";
-import { filterMetaFor, extraFiltersFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY } from "./collect-meta";
+import { filterMetaFor, extraFiltersFor, COMMENT_TIME_RANGE_META, COMMENT_LIMIT_OPTIONS, TRIGGER_META, DEFAULT_STRATEGY, MAX_TASK_KEYWORDS } from "./collect-meta";
 import type { TaskTrigger, SortMode, TimeRange, TaskItem, CommentTimeRange, PlatformOption } from "./collect-meta";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { contentDetailUrl } from "@/lib/platforms";
@@ -111,6 +111,16 @@ export function TaskFormSheet({
         setAccounts([]);
       });
   }, [platform]);
+
+  // 封面文字识别仅小红书开放:切到小红书时新建任务默认开(编辑态保留原值,不覆盖用户设置);
+  // 切到其他平台强制关,避免开关残留到不支持的平台随 payload 提交
+  useEffect(() => {
+    if (platform === "xhs") {
+      if (!initial) setCoverOcr(true);
+    } else {
+      setCoverOcr(false);
+    }
+  }, [platform]);
   const [keywordsRaw, setKeywordsRaw] = useState(() => {
     if (!initial) return "";
     // 定向任务关键词存占位词「定向采集」(仅展示用),目标链接存 targetUrls;老数据可能没有该字段
@@ -167,6 +177,8 @@ export function TaskFormSheet({
   const [keepVideo, setKeepVideo] = useState(
     initial?.keepVideo ?? DEFAULT_STRATEGY.keepVideo,
   );
+  // 封面文字识别:与其他开关独立、无联动
+  const [coverOcr, setCoverOcr] = useState(initial?.coverOcr ?? false);
   const [aiExtract, setAiExtract] = useState(
     initial?.aiExtract ?? DEFAULT_STRATEGY.aiExtract,
   );
@@ -268,6 +280,13 @@ export function TaskFormSheet({
       );
       return;
     }
+    // 关键词数量上限(后端 upsert_task 同口径兜底);定向采集逐条抓取,不受此限
+    if (mode !== "targeted" && rawLines.length > MAX_TASK_KEYWORDS) {
+      toast.error(
+        `关键词最多 ${MAX_TASK_KEYWORDS} 个,当前 ${rawLines.length} 个,请删减后再保存`,
+      );
+      return;
+    }
     // 定向模式:每行是视频 ID、视频链接或作者主页链接;纯 ID 按平台拼详情链接(如抖音
     // 7665294148962580899 → https://www.douyin.com/video/7665294148962580899),
     // 平台不支持拼接时保留原值;已是链接(含主页链接)的原样保留。
@@ -306,6 +325,7 @@ export function TaskFormSheet({
       // AI 文案提取依赖音频提取:开文案提取时强制带上音频提取(后端 upsert 同样兜底)
       audioExtract: audioExtract || aiExtract,
       keepVideo,
+      coverOcr,
       aiExtract,
       autoSyncObsidian,
       collectComments,
@@ -333,22 +353,46 @@ export function TaskFormSheet({
     platformSort.length > 0 ||
     platformTime.length > 0 ||
     platformDims.length > 0;
-  // 表单是否已填值(名称 / 关键词 / 平台 / 行业 任一非空):有内容时点表单外不自动关闭,防误触丢失
-  const isDirty =
-    name.trim() !== "" ||
-    keywordsRaw.trim() !== "" ||
-    platform !== "" ||
-    industry !== "";
+  // 表单脏检查:与打开时的初始快照比对——编辑态未做任何修改不算脏(点表单外 / Esc 直接关闭);
+  // 新建态初始快照即空表单,任何输入都算脏(防误触丢内容)
+  const formSnapshot = JSON.stringify({
+    name: name.trim(),
+    industry,
+    platform,
+    accountId,
+    keywordsRaw: keywordsRaw.trim(),
+    trigger,
+    scheduledAt,
+    watchIntervalMin,
+    maxRetries,
+    sortMode,
+    timeRange,
+    perKeywordLimit,
+    minLikes,
+    audioExtract,
+    keepVideo,
+    coverOcr,
+    aiExtract,
+    autoSyncObsidian,
+    extraFilters,
+    collectComments,
+    commentTimeRange,
+    commentLimit,
+    analyzeCommentIntent,
+  });
+  // useState 惰性初始化:只在首次渲染(= 表单刚打开、各 state 初值就绪)时捕获快照
+  const [initialSnapshot] = useState(() => formSnapshot);
+  const isDirty = formSnapshot !== initialSnapshot;
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         className="flex w-full flex-col gap-0 sm:max-w-[820px]"
         onEscapeKeyDown={(e) => {
-          // 有内容时按 Esc 也不关闭(防误触丢内容),仅右上角 × 显式关闭
+          // 已修改时按 Esc 不关闭(防误触丢修改),仅右上角 × 显式关闭
           if (isDirty) {
             e.preventDefault();
-            toast.info("表单有内容,如需关闭请点右上角 ×");
+            toast.info("表单已修改,如需关闭请点右上角 ×");
           }
         }}
         onInteractOutside={(e) => {
@@ -358,10 +402,10 @@ export function TaskFormSheet({
             e.preventDefault();
             return;
           }
-          // 已填内容时,点击遮罩 / 表单外不自动关闭(防误触丢内容);用右上角 × 显式关闭
+          // 已修改时,点击遮罩 / 表单外不自动关闭(防误触丢修改);未修改则直接关闭
           if (isDirty) {
             e.preventDefault();
-            toast.info("表单有内容,如需关闭请点右上角 ×");
+            toast.info("表单已修改,如需关闭请点右上角 ×");
           }
         }}
       >
@@ -612,7 +656,7 @@ export function TaskFormSheet({
               <span className="text-xs text-muted-foreground">
                 {mode === "targeted"
                   ? "视频 ID、视频链接或作者主页链接,每行一个"
-                  : "多个关键词每行一个"}
+                  : `多个关键词每行一个,最多 ${MAX_TASK_KEYWORDS} 个`}
               </span>
             </div>
             <Textarea
@@ -702,6 +746,26 @@ export function TaskFormSheet({
               className="scale-125"
             />
           </div>
+          {/* 封面文字识别:仅小红书开放(封面带字是小红书图文笔记的典型形态);
+              采集完成后对封面图做 OCR,与音频/视频开关独立 */}
+          {platform === "xhs" && (
+          <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+            <div className="space-y-0.5">
+              <Label htmlFor="task-cover-ocr" className="cursor-pointer">
+                封面文字识别
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                采集完成后识别封面图上的文字(需先在系统设置配置智谱 OCR Key)
+              </p>
+            </div>
+            <Switch
+              id="task-cover-ocr"
+              checked={coverOcr}
+              onCheckedChange={setCoverOcr}
+              className="scale-125"
+            />
+          </div>
+          )}
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
               <div className="flex flex-wrap items-center gap-1">

@@ -67,6 +67,16 @@ export interface AppConfig {
     // 转写并发数(同时在飞的 ASR 请求数)
     concurrency: number;
   };
+  // 封面图片 OCR 配置(后端 snake_case,与 transcription 一致)
+  ocr: {
+    // 厂商 code(当前固定 glm,走智谱 files/ocr 工具接口)
+    provider: string;
+    api_url: string;
+    // OCR 并发数(同时在飞的识别请求数)
+    concurrency: number;
+    // 本地预判:调云端前先用系统 OCR 离线判断封面有无文字,无文字则跳过付费请求(仅 Windows 生效)
+    local_precheck: boolean;
+  };
 }
 
 export interface AccountInput {
@@ -397,6 +407,8 @@ export interface TaskView {
   audioExtract: boolean;
   // 保留视频文件:视频落盘到 video/ 目录供自动发布(与音频提取独立)
   keepVideo: boolean;
+  // 封面文字识别:采集完成后对封面图做 OCR,结果回写内容的 coverOcrText
+  coverOcr: boolean;
   // 评论采集:开启后按下列规则抓评论;关闭时其余字段无意义
   collectComments?: boolean;
   // 评论发布时间范围:3d / 7d / 14d / any(不限)
@@ -471,6 +483,8 @@ export interface TaskInput {
   audioExtract: boolean;
   // 保留视频文件:视频落盘供自动发布;省略 = 关闭(与音频提取独立)
   keepVideo?: boolean;
+  // 封面文字识别:采集完成后对封面图做 OCR;省略 = 关闭(需先在系统设置配置 OCR Key)
+  coverOcr?: boolean;
   // 评论采集相关(见 TaskView 同名字段说明)
   collectComments?: boolean;
   commentTimeRange?: "3d" | "7d" | "14d" | "any";
@@ -523,6 +537,8 @@ export interface ContentView {
   videoUrl: string | null;
   coverUrl: string | null;
   imageUrls: string[];
+  imagePaths?: (string | null)[];
+  xsecToken?: string | null;
   duration: number | null;
   topics: string[];
   owner: string;
@@ -544,6 +560,11 @@ export interface ContentView {
   transcript: string | null;
   // 转写失败原因(区分未转写与失败)
   transcriptError: string | null;
+  // 封面图片 OCR 识别文本(识别成功后回写),前端展示;
+  // 空串 "" = 已识别但封面无文字,null = 未识别/识别失败
+  coverOcrText: string | null;
+  // 封面 OCR 识别失败原因(区分未识别与失败)
+  coverOcrError: string | null;
   // 细粒度处理状态:视频下载 / 图文图片进度 / 评论采集 / 意向分析
   videoDownloaded: boolean | null;
   imageTotal: number | null;
@@ -551,6 +572,67 @@ export interface ContentView {
   commentCollected: boolean | null;
   intentAnalyzed: boolean | null;
   // 当前登录用户是否已把该内容同步到自己的 Obsidian
+  syncedByMe: boolean;
+}
+
+// 列表专用瘦身视图(对应后端 ContentListView,list_contents_page 返回):
+// 相比 ContentView 剔除 transcript / coverOcrText 全文、imageUrls、imagePaths 等大块字段
+// (瀑布流 48 条/批、表格单页可达 1000 条,整文过 IPC 是大库卡顿主因);
+// 文案/封面文字只留三态 + ~100 字摘要,图集只留首图与张数。
+// 需要全文的场景(详情弹窗 / 导出 Excel / 对话插入文案)走 getContentDetail / listContentsFull。
+export interface ContentListView {
+  id: string;
+  taskId: string;
+  platform: string;
+  industry: string;
+  contentId: string;
+  keyword: string;
+  kind: "video" | "image" | "article" | "unknown";
+  title: string | null;
+  desc: string | null;
+  authorUid: string;
+  authorNickname: string;
+  authorAvatar: string | null;
+  likeCount: number | null;
+  commentCount: number | null;
+  collectCount: number | null;
+  shareCount: number | null;
+  playCount: number | null;
+  publishedAt: number | null;
+  videoUrl: string | null;
+  coverUrl: string | null;
+  // 图集首图 URL(封面缺失时的回退图源;替代旧 imageUrls[0] 用法)
+  firstImageUrl: string | null;
+  // 图集图片张数(瀑布流「N 图」角标等;替代旧 imageUrls.length 用法)
+  imageCount: number;
+  xsecToken?: string | null;
+  duration: number | null;
+  topics: string[];
+  owner: string;
+  collectedAt: number;
+  // 素材下载状态:pending(待处理)/success(成功)/failed(失败);null=旧数据未跑过下载
+  mediaStatus: "pending" | "success" | "failed" | null;
+  audioExtracted: boolean | null;
+  mediaError: string | null;
+  coverPath: string | null;
+  avatarPath: string | null;
+  audioPath: string | null;
+  // 转写三态:none=未转写/转写失败(可重试),empty=已转写但未识别到语音(空文案标记),has=有文案;
+  // 语义与 ContentView.transcript 的 null/空串/非空 一一对应
+  transcriptState: "none" | "empty" | "has";
+  // 文案摘要(仅 has 时有值,超长截断补 …);全文走详情/导出接口
+  transcriptPreview: string | null;
+  transcriptError: string | null;
+  // 封面 OCR 三态(口径同 transcriptState)
+  coverOcrState: "none" | "empty" | "has";
+  coverOcrPreview: string | null;
+  coverOcrError: string | null;
+  // 细粒度处理状态:视频下载 / 图文图片进度 / 评论采集 / 意向分析
+  videoDownloaded: boolean | null;
+  imageTotal: number | null;
+  imageDone: number | null;
+  commentCollected: boolean | null;
+  intentAnalyzed: boolean | null;
   syncedByMe: boolean;
 }
 
@@ -562,6 +644,8 @@ export interface AuthorView {
   uid: string;
   nickname: string;
   avatar: string | null;
+  // 作者头像本地路径(相对 mediaRoot;未下载过为 null,前端本地优先、缺失回退 CDN)
+  avatarPath: string | null;
   // 平台号(抖音号等)
   platformId: string | null;
   signature: string | null;
@@ -703,6 +787,8 @@ export interface ContentListQuery {
   // image=本地封面路径非空(选择器口径);cover=本地/远程封面任一(内容库封面图源)
   imageSource?: "image" | "cover" | null;
   requireTranscript?: boolean | null;
+  // 内容库额外展示小红书图文;正文来自详情数据,不要求语音转写
+  includeXhsImages?: boolean | null;
   sortBy?: "collectedAt" | "publishedAt" | "mediaStatus" | null;
   sortDir?: "asc" | "desc" | null;
   limit: number;
@@ -726,9 +812,25 @@ export interface CommentListQuery {
   offset: number;
 }
 
+// 评论来源分组(评论库瀑布流;对应后端 CommentSourceGroup):
+// 来源元信息由组内评论行的 content* 字段携带,comments 为后端截好的预览(点赞倒序)
+export interface CommentSourceGroup {
+  platform: string;
+  contentId: string;
+  // 当前筛选口径下该来源的评论总数
+  commentCount: number;
+  comments: CommentView[];
+}
+
+export interface CommentSourcePageResult {
+  items: CommentSourceGroup[];
+  // 来源总数(distinct platform + contentId)
+  total: number;
+}
+
 // 分页列表返回包:条目 + 同筛选口径总数
 export interface ContentListResult {
-  items: ContentView[];
+  items: ContentListView[];
   total: number;
 }
 export interface CommentListResult {
@@ -747,6 +849,13 @@ export interface ContentLibraryStats {
 export interface IndustryCount {
   industry: string;
   count: number;
+}
+
+// 侧栏行业角标聚合结果(后端 content/comment_industry_counts):
+// total = 「全部行业」总数(忽略行业筛选、含无行业内容),选中行业后不再随列表 total 变化
+export interface IndustryCounts {
+  total: number;
+  industries: IndustryCount[];
 }
 
 // 采集日志条目(对应后端 collect-log 事件 / list_collect_logs)
@@ -881,14 +990,106 @@ export interface CloudPairView {
   base_url: string;
 }
 
+// 可录制的显示器(对应后端 ScreenInfo)
+export interface ScreenInfo {
+  // 枚举下标(开始录制时按它回选)
+  index: number;
+  // 系统显示器名,仅展示参考
+  name: string | null;
+  width: number;
+  height: number;
+  // 是否主屏
+  primary: boolean;
+}
+
+// 单屏预览缩略图(对应后端 ScreenPreview,平铺选屏用)
+export interface ScreenPreview {
+  index: number;
+  // PNG 的 base64 data URL;空串 = 编码失败,前端按「无预览」占位
+  dataUrl: string;
+}
+
+// 音频输入设备(对应后端 AudioDeviceInfo,录屏设置面板的音频选择器用)
+export interface AudioDeviceInfo {
+  // dshow 设备名(开始录制 / 音频测试按它回选)
+  name: string;
+  // 是否评分最高的推荐设备
+  recommended: boolean;
+}
+
 // 屏幕录制状态(对应后端 RecordingStatus)
 export interface RecordingStatus {
   // 是否正在录制
   recording: boolean;
+  // 本次录制的屏幕下标;null = 全部屏幕
+  screenIndex: number | null;
+  // 是否在采麦克风(录制中展示用;启动后不可改)
+  withMic: boolean;
   // 开始时间(Unix 秒);未录制为 null
   startedAt: number | null;
   // 输出 MP4 路径;未录制为 null
   outputPath: string | null;
+  // 是否处于暂停态(分段已收尾,等「继续」起新段)
+  paused: boolean;
+  // 已录制的活跃秒数(不含暂停时段);悬浮窗计时以此为基准本地走秒
+  elapsedSecs: number;
+}
+
+// ===================== 创作 =====================
+
+// 视频剪辑片段(秒;对应后端 ClipSegment)
+export interface ClipSegment {
+  start: number;
+  end: number;
+}
+
+// 剪辑轨道类型(对齐专业 NLE:视频 / 音频 / 字幕)
+export type TrackType = "video" | "audio" | "text";
+
+// 视频元信息(后端 ffmpeg -i 解析;<video> 元素拿不到的帧率 / 码率 / 编码走这里)
+export interface VideoInfo {
+  durationSecs: number;
+  width: number;
+  height: number;
+  fps: number;
+  videoCodec: string;
+  audioCodec: string;
+  bitrateKbps: number;
+}
+
+// 导出转场参数:kind = dissolve(叠化)/ fade(淡黑);不传 = 不加转场(流拷贝快路径)
+export interface TransitionInput {
+  kind: "dissolve" | "fade";
+  durationSecs: number;
+}
+
+// 轨道上的片段
+export interface TrackClip extends ClipSegment {
+  id: string;
+}
+
+// 剪辑轨道(草稿持久化用,前端模型,无后端表)
+export interface EditorTrack {
+  id: string;
+  type: TrackType;
+  name: string;
+  clips: TrackClip[];
+  // 轨道开关(随草稿持久化):锁定=禁增删片段/删轨;隐藏=不参与导出;静音=音频轨不混音
+  locked?: boolean;
+  hidden?: boolean;
+  muted?: boolean;
+}
+
+// 剪辑历史条目(对应后端 ExportItem;导出目录扫描,文件即记录)
+export interface ExportItem {
+  // 文件名(clip-<时间戳>.mp4)
+  name: string;
+  // 绝对路径
+  path: string;
+  // 文件大小(字节)
+  size: number;
+  // 导出时间(Unix 秒)
+  createdAt: number;
 }
 
 // ===================== 发布服务 =====================

@@ -101,6 +101,9 @@ const UserCenterPage = lazy(() =>
     default: m.UserCenterPage,
   })),
 );
+const CreationPage = lazy(() =>
+  import("@/pages/CreationPage").then((m) => ({ default: m.CreationPage })),
+);
 
 // 登录态持久化键:桌面端走 IPC、不发 token,登录用户存 localStorage,刷新 / 重开免登录
 const AUTH_STORAGE_KEY = "veltrix.auth.user";
@@ -198,11 +201,17 @@ function renderPage(
       return <ConversationsPage onNavigate={onNavigate} />;
     case "memory-center":
       return <MemoryCenterPage />;
-    case "cowork-space":
+    case "cowork-video":
+      return <CreationPage tool="video" />;
+    case "cowork-copy":
+      return <CreationPage tool="copy" />;
+    case "cowork-assets":
+      return <CreationPage tool="assets" />;
+    case "cowork-project":
       return (
         <PlaceholderPage
-          title="工作空间"
-          description="创作模块建设中。后续接入团队共享工作区。"
+          title="项目管理"
+          description="创作模块建设中。后续接入项目与任务协作管理。"
         />
       );
     case "cowork-team":
@@ -267,7 +276,11 @@ function App() {
   const [workspace, setWorkspace] = useState<Workspace>(
     storedNav?.workspace ?? "management",
   );
-  const [active, setActive] = useState<PageKey>(storedNav?.active ?? "dashboard");
+  // 旧版「工作空间」页(cowork-space)已拆成 视频剪辑/文案撰写/素材管理,存量导航记录映射到视频剪辑
+  const storedActive = storedNav?.active === ("cowork-space" as string)
+    ? ("cowork-video" as PageKey)
+    : storedNav?.active;
+  const [active, setActive] = useState<PageKey>(storedActive ?? "dashboard");
   // 记住进入脱离侧栏页面(系统设置/个人中心)前的来源页,供关闭返回
   const prevPageRef = useRef<PageKey>("dashboard");
   // 后端会话就绪标志:后端 set_current_user 完成后才允许各页面发 list 请求,
@@ -504,7 +517,9 @@ function App() {
                 </Suspense>
               </div>
             ) : (
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-4 md:p-6">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-2.5">
+                {/* 自带头部结构的页面不再重复显示标题:视频剪辑(工具页)、数据概览(页内自有标题区) */}
+                {active !== "cowork-video" && active !== "dashboard" && (
                 <div className="flex shrink-0 items-center justify-between gap-3">
                   {/* 关闭入口统一放在标题左侧、标题前面(脱离侧栏的单页面:系统设置/个人中心/对话记录等) */}
                   <div className="flex min-w-0 items-center gap-2">
@@ -525,6 +540,7 @@ function App() {
                     </h1>
                   </div>
                 </div>
+                )}
                 <Suspense fallback={<PageLoading />}>
                   {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
                 </Suspense>

@@ -4,11 +4,10 @@
 //! `data.items[]` 每项 `model_type=note` 含 `note_card`(笔记详情),抽取为统一 Content。
 //! `model_type=hot_query`(大家都在搜)等非笔记项跳过。
 //!
-//! 搜索接口的局限(联调须知):**只给**标题/封面/作者/互动数,**不含**正文、话题标签、视频时长,
-//! video 类型通常也只有封面。故 desc/topics/duration 均为空,需要时得另走笔记详情接口。
-//! 视频无水印直链按 `note_card.video.media.stream`(详情场景)解析(`parse_video_stream`),
-//! 搜索卡多半取不到则为空。互动数为字符串需转 i64,发布时间是 `corner_tag_info` 里
-//! `MM-DD`(当年)/`YYYY-MM-DD` 文本。
+//! 搜索卡通常只给标题/封面/作者/互动数,正文、话题与视频流需由详情接口补齐。
+//! 搜索解析仍按响应实际字段尽力提取;详情响应则解析完整 `note_card`,由采集流程逐条合并回库。
+//! 视频无水印直链按 `note_card.video.media.stream` 解析。互动数为字符串需转 i64,
+//! 发布时间兼容详情毫秒时间戳与搜索卡 `corner_tag_info` 日期文本。
 
 use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
 use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
@@ -37,17 +36,21 @@ impl XhsAdapter {
         Self
     }
 
-    /// 把单个 item 解析为 Content;非笔记(hot_query 等)或缺 id 返回 None。
-    fn parse_item(item: &Value, collected_at: i64) -> Option<Content> {
-        // 只认笔记卡;其余 model_type(hot_query/广告等)跳过
-        if item.get("model_type").and_then(Value::as_str) != Some("note") {
-            return None;
-        }
-        let content_id = item.get("id").and_then(Value::as_str)?.to_string();
-        if content_id.is_empty() {
+    /// 把搜索/详情 item 的 `note_card` 解析为完整 Content。
+    /// 搜索列表须校验 model_type,避免把 hot_query / 广告误当笔记;详情 feed 可不带该字段。
+    fn parse_item(item: &Value, collected_at: i64, require_note_type: bool) -> Option<Content> {
+        if require_note_type && item.get("model_type").and_then(Value::as_str) != Some("note") {
             return None;
         }
         let card = item.get("note_card")?;
+        let content_id = item
+            .get("id")
+            .or_else(|| card.get("note_id"))
+            .and_then(Value::as_str)?
+            .to_string();
+        if content_id.is_empty() {
+            return None;
+        }
 
         // type=video 为视频,其余(normal)按图文
         let kind = if card.get("type").and_then(Value::as_str) == Some("video") {
@@ -57,39 +60,47 @@ impl XhsAdapter {
         };
 
         let image_urls = Self::parse_images(card.get("image_list"));
-        // 封面:cover.url_default,缺失退回首图
+        // 封面:兼容搜索卡 url_default 与详情卡 info_list,缺失退回首图。
         let cover_url = card
             .get("cover")
-            .and_then(|c| c.get("url_default"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+            .and_then(Self::parse_image_url)
             .or_else(|| image_urls.first().cloned());
 
         Some(Content {
             platform: PLATFORM_ID.to_string(),
             content_id,
             kind,
-            // 小红书 display_title 即标题/摘要,放 title;搜索接口无正文 desc
+            // 搜索卡多为 display_title,详情卡多为 title。
             title: card
-                .get("display_title")
+                .get("title")
+                .or_else(|| card.get("display_title"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            desc: None,
+            desc: card
+                .get("desc")
+                .or_else(|| card.get("description"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             author: Self::parse_author(card.get("user")),
             stats: Self::parse_stats(card.get("interact_info")),
             published_at: Self::parse_published(card),
-            // 视频无水印直链:note_card 带 video.media.stream(详情场景)时解析,供后续拉流转音频;
-            // 搜索卡通常只给封面、不含直链,此时为 None。时长/话题搜索接口同样缺失。
+            // 搜索卡通常不含直链/正文/话题;字段为空时采集流程会打开详情页补全。
             video_url: Self::parse_video_stream(card),
             cover_url,
             image_urls,
-            duration: None,
-            topics: Vec::new(),
+            duration: Self::parse_duration(card),
+            topics: Self::parse_topics(card),
             collected_at,
             extra: serde_json::json!({
                 // 笔记/作者的 xsec_token:打开详情/主页需要,先留存
-                "xsec_token": item.get("xsec_token").and_then(Value::as_str),
+                "xsec_token": item.get("xsec_token").and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| card.get("xsec_token").and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())),
                 "author_xsec_token": card
                     .get("user")
                     .and_then(|u| u.get("xsec_token"))
@@ -143,26 +154,103 @@ impl XhsAdapter {
         }
     }
 
-    /// 取每张图的直链:优先 `WB_DFT`(默认大图),否则取 info_list 首个。
+    /// 单张图直链:优先 `WB_DFT`(默认大图),否则兼容 url_default / url_pre / info_list 首个。
+    fn parse_image_url(image: &Value) -> Option<String> {
+        let from_infos = || {
+            let infos = image.get("info_list").and_then(Value::as_array)?;
+                        infos
+                            .iter()
+                .find(|i| i.get("image_scene").and_then(Value::as_str) == Some("WB_DFT"))
+                            .or_else(|| infos.first())
+                            .and_then(|i| i.get("url").and_then(Value::as_str))
+        };
+        from_infos()
+            .or_else(|| image.get("url_default").and_then(Value::as_str))
+            .or_else(|| image.get("url_pre").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+    }
+
+    /// 取每张图的直链;详情图与搜索图字段形态不同,统一走 parse_image_url。
     fn parse_images(image_list: Option<&Value>) -> Vec<String> {
         image_list
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|img| {
-                        let infos = img.get("info_list").and_then(Value::as_array)?;
-                        infos
-                            .iter()
-                            .find(|i| {
-                                i.get("image_scene").and_then(Value::as_str) == Some("WB_DFT")
-                            })
-                            .or_else(|| infos.first())
-                            .and_then(|i| i.get("url").and_then(Value::as_str))
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(Self::parse_image_url).collect())
             .unwrap_or_default()
+    }
+
+    /// 详情卡话题在 tag_list/topic_list 中;少数响应只把 `#话题[话题]#` 写进正文,
+    /// 因此结构化字段为空时再从正文兜底,并统一成 `#名称` 去重。
+    fn parse_topics(card: &Value) -> Vec<String> {
+        let mut topics = Vec::new();
+        for key in ["tag_list", "topic_list"] {
+            let Some(items) = card.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("title"))
+                    .or_else(|| item.get("topic_name"))
+                    .and_then(Value::as_str);
+                Self::push_topic(&mut topics, name.unwrap_or_default());
+            }
+        }
+        if topics.is_empty() {
+            let desc = card
+                .get("desc")
+                .or_else(|| card.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for fragment in desc.split('#').skip(1) {
+                let raw: String = fragment
+                    .chars()
+                    .take_while(|c| {
+                        !c.is_whitespace()
+                            && !matches!(
+                                c,
+                                ',' | '，' | '。' | '！' | '!' | '？' | '?' | ';' | '；'
+                            )
+                    })
+                    .collect();
+                Self::push_topic(&mut topics, &raw);
+            }
+        }
+        topics
+    }
+
+    fn push_topic(topics: &mut Vec<String>, raw: &str) {
+        let name = raw
+            .trim()
+            .trim_matches('#')
+            .trim_end_matches("[话题]")
+            .trim();
+        if name.is_empty() {
+            return;
+        }
+        let topic = format!("#{name}");
+        if !topics.contains(&topic) {
+            topics.push(topic);
+        }
+    }
+
+    /// 视频时长字段随详情版本变化,兼容常见路径;大于一千按毫秒归一为秒。
+    fn parse_duration(card: &Value) -> Option<i64> {
+        let raw = [
+            "/video/capa/duration",
+            "/video/media/video/duration",
+            "/video/duration",
+            "/duration",
+        ]
+        .into_iter()
+        .find_map(|path| {
+            let value = card.pointer(path)?;
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+        })?;
+        Some(if raw >= 1_000 { raw / 1_000 } else { raw })
     }
 
     /// 视频无水印直链:`note_card.video.media.stream` 下按编码优先级 h264→h265→av1 取首个可用流,
@@ -197,6 +285,20 @@ impl XhsAdapter {
     /// 发布时间:`corner_tag_info` 里 `type=publish_time` 的 text,
     /// 形如 `MM-DD`(当年)或 `YYYY-MM-DD`,解析为当天 0 点的 Unix 秒。
     fn parse_published(card: &Value) -> Option<i64> {
+        if let Some(raw) = card
+            .get("time")
+            .or_else(|| card.get("create_time"))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|text| text.parse::<i64>().ok()))
+            })
+        {
+            return Some(if raw > 1_000_000_000_000 {
+                raw / 1_000
+            } else {
+                raw
+            });
+        }
         let text = card
             .get("corner_tag_info")
             .and_then(Value::as_array)?
@@ -248,7 +350,7 @@ impl XhsAdapter {
                 continue;
             };
             for item in items {
-                if let Some(content) = Self::parse_item(item, collected_at) {
+                if let Some(content) = Self::parse_item(item, collected_at, true) {
                     contents.push(content);
                 }
             }
@@ -350,9 +452,8 @@ impl XhsAdapter {
         }
     }
 
-    /// 解析笔记详情(feed)接口响应为内容列表,主要拿视频无水印直链(`video.media.stream`)。
-    /// 详情响应 `/api/sns/web/v1/feed`:`data.items[]` 每项 `note_card` 是**完整**卡(含 video.media),
-    /// 比搜索卡多出视频流。只为补直链,取不到 stream 的项跳过。
+    /// 解析笔记详情(feed)接口响应为完整内容。图文与视频都保留,正文、话题、图集、
+    /// 发布时间及视频流由调用方合并到搜索卡并回写数据库。
     fn parse_detail(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
         let mut contents = Vec::new();
@@ -371,27 +472,9 @@ impl XhsAdapter {
                 continue;
             };
             for item in items {
-                let Some(content_id) = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                else {
-                    continue;
-                };
-                let Some(card) = item.get("note_card") else {
-                    continue;
-                };
-                let Some(video_url) = Self::parse_video_stream(card) else {
-                    continue;
-                };
-                contents.push(Content {
-                    platform: PLATFORM_ID.to_string(),
-                    content_id: content_id.to_string(),
-                    kind: ContentKind::Video,
-                    video_url: Some(video_url),
-                    collected_at,
-                    ..Default::default()
-                });
+                if let Some(content) = Self::parse_item(item, collected_at, false) {
+                    contents.push(content);
+                }
             }
         }
         FetchOutput {
@@ -420,7 +503,7 @@ impl XhsAdapter {
                 continue;
             };
             for item in items {
-                if let Some(comment) = Self::parse_comment(item, collected_at) {
+                if let Some(comment) = Self::parse_comment(item, &ctx.keyword, collected_at) {
                     comments.push(comment);
                 }
             }
@@ -433,7 +516,11 @@ impl XhsAdapter {
     }
 
     /// 把单条评论解析为 Comment;缺 id 返回 None。只采一级评论,parent_id 恒为 None。
-    fn parse_comment(item: &Value, collected_at: i64) -> Option<Comment> {
+    fn parse_comment(
+        item: &Value,
+        fallback_content_id: &str,
+        collected_at: i64,
+    ) -> Option<Comment> {
         let comment_id = item.get("id").and_then(Value::as_str)?.to_string();
         if comment_id.is_empty() {
             return None;
@@ -441,7 +528,8 @@ impl XhsAdapter {
         let content_id = item
             .get("note_id")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_content_id)
             .to_string();
         // 互动数小红书多为字符串
         let num = |key: &str| {
@@ -524,5 +612,146 @@ impl PlatformAdapter for XhsAdapter {
             _ => Self::parse_search(ctx),
         };
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webview::InterceptedResponse;
+    use serde_json::json;
+
+    #[test]
+    fn parses_complete_note_detail() {
+        let ctx = FetchContext {
+            keyword: "note-1".into(),
+            responses: vec![InterceptedResponse {
+                url: "https://edith.xiaohongshu.com/api/sns/web/v1/feed".into(),
+                body: json!({
+                    "data": {
+                        "items": [{
+                            "id": "note-1",
+                            "note_card": {
+                                "type": "normal",
+                                "title": "完整标题",
+                                "desc": "完整正文 #正文兜底[话题]#",
+                                "time": 1_725_000_000_000_i64,
+                                "user": {
+                                    "user_id": "user-1",
+                                    "nickname": "作者",
+                                    "avatar": "https://img/avatar.jpg"
+                                },
+                                "interact_info": {
+                                    "liked_count": "123",
+                                    "comment_count": "8",
+                                    "collected_count": "16",
+                                    "shared_count": "2"
+                                },
+                                "image_list": [
+                                    {"url_default": "https://img/1.jpg"},
+                                    {"info_list": [
+                                        {"image_scene": "WB_PRV", "url": "https://img/2-small.jpg"},
+                                        {"image_scene": "WB_DFT", "url": "https://img/2.jpg"}
+                                    ]},
+                                    {"url_pre": "https://img/3.jpg"}
+                                ],
+                                "tag_list": [
+                                    {"name": "旅行"},
+                                    {"name": "云南"},
+                                    {"name": "旅行"}
+                                ]
+                            }
+                        }]
+                    }
+                })
+                .to_string(),
+            }],
+        };
+
+        let output = XhsAdapter::parse_detail(&ctx);
+        assert_eq!(output.contents.len(), 1);
+        let content = &output.contents[0];
+        assert_eq!(content.content_id, "note-1");
+        assert_eq!(content.title.as_deref(), Some("完整标题"));
+        assert_eq!(content.desc.as_deref(), Some("完整正文 #正文兜底[话题]#"));
+        assert_eq!(content.topics, vec!["#旅行", "#云南"]);
+        assert_eq!(
+            content.image_urls,
+            vec![
+                "https://img/1.jpg",
+                "https://img/2.jpg",
+                "https://img/3.jpg",
+            ]
+        );
+        assert_eq!(content.published_at, Some(1_725_000_000));
+    }
+
+    #[test]
+    fn parses_video_stream_for_shared_audio_pipeline() {
+        let ctx = FetchContext {
+            keyword: "video-1".into(),
+            responses: vec![InterceptedResponse {
+                url: "https://edith.xiaohongshu.com/api/sns/web/v1/feed".into(),
+                body: json!({
+                    "data": {
+                        "items": [{
+                            "id": "video-1",
+                            "note_card": {
+                                "type": "video",
+                                "title": "视频笔记",
+                                "video": {
+                                    "media": {
+                                        "stream": {
+                                            "h264": [{
+                                                "master_url": "https://sns-video-hw.xhscdn.com/video.mp4"
+                                            }]
+                                        }
+                                    }
+                                },
+                                "image_list": [{"url_default": "https://img/cover.jpg"}]
+                            }
+                        }]
+                    }
+                }).to_string(),
+            }],
+        };
+
+        let output = XhsAdapter::parse_detail(&ctx);
+        assert_eq!(output.contents.len(), 1);
+        let content = &output.contents[0];
+        assert!(matches!(content.kind, ContentKind::Video));
+        assert_eq!(
+            content.video_url.as_deref(),
+            Some("https://sns-video-hw.xhscdn.com/video.mp4")
+        );
+    }
+
+    #[test]
+    fn extracts_topics_from_description_when_structured_tags_are_absent() {
+        let card = json!({
+            "desc": "周末出发 #丽江[话题]# #旅行攻略[话题]#，走起"
+        });
+        assert_eq!(XhsAdapter::parse_topics(&card), vec!["#丽江", "#旅行攻略"]);
+    }
+
+    #[test]
+    fn comment_uses_context_note_id_when_response_omits_it() {
+        let ctx = FetchContext {
+            keyword: "note-from-context".into(),
+            responses: vec![InterceptedResponse {
+                url: "https://edith.xiaohongshu.com/api/sns/web/v2/comment/page".into(),
+                body: json!({
+                    "data": { "comments": [{
+                        "id": "comment-1",
+                        "content": "评论正文",
+                        "user_info": { "user_id": "user-1", "nickname": "用户" }
+                    }] }
+                })
+                .to_string(),
+            }],
+        };
+        let output = XhsAdapter::parse_comments(&ctx);
+        assert_eq!(output.comments.len(), 1);
+        assert_eq!(output.comments[0].content_id, "note-from-context");
     }
 }

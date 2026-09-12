@@ -8,6 +8,8 @@ import {
   Contact,
   Database,
   FileStack,
+  Clapperboard,
+  FileText,
   FolderKanban,
   Grip,
   Images,
@@ -96,7 +98,10 @@ export type PageKey =
   | "chat-assistant"
   | "chat-history"
   | "memory-center"
-  | "cowork-space"
+  | "cowork-video"
+  | "cowork-copy"
+  | "cowork-assets"
+  | "cowork-project"
   | "cowork-team";
 
 interface SubItem {
@@ -136,7 +141,6 @@ const MENU_GROUPS: MenuGroup[] = [
     items: [
       { key: "industry", label: "行业类别", icon: Tags },
       { key: "accounts", label: "平台账号", icon: Users },
-      { key: "customers", label: "客户管理", icon: Contact },
     ],
   },
   {
@@ -200,9 +204,14 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
   ],
   cowork: [
     {
-      title: "创作",
+      // 标题留空不渲染分组名(菜单项直接平铺)
+      title: "",
       items: [
-        { key: "cowork-space", label: "工作空间", icon: FolderKanban },
+        { key: "cowork-video", label: "视频剪辑", icon: Clapperboard },
+        { key: "cowork-copy", label: "文案撰写", icon: FileText },
+        { key: "cowork-assets", label: "素材管理", icon: Images },
+        { key: "cowork-project", label: "项目管理", icon: FolderKanban },
+        { key: "customers", label: "客户管理", icon: Contact },
         { key: "cowork-team", label: "团队成员", icon: Users },
       ],
     },
@@ -449,15 +458,9 @@ function ChatConversationList({
                 <ChevronRight className="size-3" />
               </button>
             </div>
-            {!recentCollapsed && (
+            {!recentCollapsed && recent.length > 0 && (
               <SidebarGroupContent>
-                {recent.length > 0 ? (
-                  <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
-                ) : (
-                  <div className="px-2 py-3 text-[11px] text-muted-foreground">
-                    最近对话已全部归档,点「查看更多」管理
-                  </div>
-                )}
+                <SidebarMenu>{recent.map(renderItem)}</SidebarMenu>
               </SidebarGroupContent>
             )}
           </SidebarGroup>
@@ -556,14 +559,17 @@ export function AppSidebar({
   // 当前产品(用于 Logo 副标题与产品切换高亮)
   const currentProduct = PRODUCTS.find((p) => p.key === product) ?? PRODUCTS[0];
 
-  // 渲染一组菜单分组(各工作区共用同一套样式)
+  // 渲染一组菜单分组(各工作区共用同一套样式;
+  // 统一舒适尺寸:按钮 h-10、项间距 1.5、图标 18px、组间距 py-3,生成件 sidebar.tsx 不改)
   const renderMenuGroups = (groups: MenuGroup[]) =>
     groups.map((group) => (
-      <SidebarGroup key={group.title || group.items[0]?.key}>
+      <SidebarGroup key={group.title || group.items[0]?.key} className="gap-1 py-3">
         {/* 标题为空的分组不渲染一级分组标题,菜单项直接平铺 */}
-        {group.title && <SidebarGroupLabel>{group.title}</SidebarGroupLabel>}
+        {group.title && (
+          <SidebarGroupLabel className="h-7 px-3 text-xs">{group.title}</SidebarGroupLabel>
+        )}
         <SidebarGroupContent>
-          <SidebarMenu>
+          <SidebarMenu className="gap-1.5">
             {group.items.map((item) => {
               const Icon = item.icon;
               return (
@@ -573,7 +579,7 @@ export function AppSidebar({
                     onClick={() => onChange(item.key)}
                     tooltip={item.label}
                     // 选中态用主题色高亮(左侧色条 + 主色文字/图标),与未选中明显区分
-                    className="data-active:bg-primary/10 data-active:font-semibold data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:hover:bg-primary/15 data-active:hover:text-primary data-active:[&_svg]:text-primary"
+                    className="h-10 gap-2.5 px-3 text-sm [&_svg]:size-4.5 data-active:bg-primary/10 data-active:font-semibold data-active:text-primary data-active:shadow-[inset_2px_0_0_var(--primary)] data-active:hover:bg-primary/15 data-active:hover:text-primary data-active:[&_svg]:text-primary"
                   >
                     <Icon />
                     <span>{item.label}</span>

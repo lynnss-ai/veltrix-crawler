@@ -367,11 +367,11 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
 
   return (
     <div
-      className={`flex min-h-0 flex-1 flex-col gap-4 ${FORM_CONTROL_SIZING}`}
+      className={`flex min-h-0 flex-1 flex-col gap-2.5 ${FORM_CONTROL_SIZING}`}
     >
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
-      <div className="flex min-h-0 flex-1 gap-4">
+      <div className="flex min-h-0 flex-1 gap-2.5">
         {/* 左侧:平台(可收起,窄屏自动收起) */}
         {!sbCollapsed && (
         <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
@@ -472,6 +472,11 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                       </Button>
                     </SimpleTooltip>
                   )}
+                  <DataTableFacetedFilter
+                    column={table.getColumn("status")}
+                    title="状态"
+                    options={statusOptions}
+                  />
                   <div className="relative w-full sm:max-w-sm">
                     <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
@@ -481,11 +486,6 @@ export function AccountsPage({ currentUser }: { currentUser: string }) {
                       onChange={(e) => table.setGlobalFilter(e.target.value)}
                     />
                   </div>
-                  <DataTableFacetedFilter
-                    column={table.getColumn("status")}
-                    title="状态"
-                    options={statusOptions}
-                  />
                 </div>
                 <div className="flex items-center gap-2">
                   <Button

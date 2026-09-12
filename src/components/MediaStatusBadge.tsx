@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
-import type { ContentView } from "@/lib/api";
+import type { ContentListView } from "@/lib/api";
 import { StepBadge } from "@/components/StepBadge";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 
@@ -11,7 +11,7 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
   retryingTranscript = false,
   onRetryTranscript,
 }: {
-  c: ContentView;
+  c: ContentListView;
   retrying: boolean;
   onRetry: () => void;
   // 文案转写重试(可选):转写失败且有音频可转时展示「重试文案」按钮
@@ -28,9 +28,9 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
   }
 
   const isVideo = c.kind === "video";
-  // 文案三态:transcript 非 null(含空串「空文案」标记)= 已转写;有错误 = 失败;否则未转写
+  // 文案三态:transcriptState 非 none(含 empty「空文案」标记)= 已转写;有错误 = 失败;否则未转写
   const transcriptState: boolean | null =
-    c.transcript != null ? true : c.transcriptError ? false : null;
+    c.transcriptState !== "none" ? true : c.transcriptError ? false : null;
   const imageState: boolean | null =
     c.imageTotal == null || c.imageTotal === 0
       ? c.mediaStatus === "success"
@@ -51,7 +51,7 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
           <StepBadge label="视频" state={c.videoDownloaded} errorTip={c.mediaError} />
           <StepBadge label="音频" state={c.audioExtracted} errorTip={c.mediaError} />
           <StepBadge
-            label={c.transcript === "" ? "空文案" : "文案"}
+            label={c.transcriptState === "empty" ? "空文案" : "文案"}
             state={transcriptState}
             errorTip={c.transcriptError}
           />
@@ -83,7 +83,7 @@ export const MediaStatusBadge = memo(function MediaStatusBadge({
       )}
       {/* 文案未转写(灰)或转写失败(红),且有音频可转:提供转写/重试,无需重跑素材链路;
           空串「空文案」是已转写标记,不再提供转写入口 */}
-      {c.transcript == null && c.audioPath && onRetryTranscript && (
+      {c.transcriptState === "none" && c.audioPath && onRetryTranscript && (
         <SimpleTooltip
           content={
             transcriptState === false ? "点击重新转写文案" : "点击转写文案"

@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, ContentLibraryStats, IndustryCount, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, ScreenInfo, ScreenPreview, AudioDeviceInfo, ClipSegment, ExportItem, VideoInfo, TransitionInput, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, CommentSourcePageResult, ContentLibraryStats, IndustryCounts, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView, ContentView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -18,6 +18,8 @@ export const api = {
   getDataDir: () => invoke<string>("get_data_dir"),
   // 当前生效的素材存储根目录(绝对路径,默认/相对会补全为完整路径)
   getMediaRoot: () => invoke<string>("get_media_root"),
+  // 把数据库中的本机媒体绝对路径转换为内网文件服务 URL
+  getMediaFileUrl: (path: string) => invoke<string | null>("get_media_file_url", { path }),
   getDatabasePath: () => invoke<string | null>("get_database_path"),
   testDatabaseConnection: (url: string) =>
     invoke<void>("test_database_connection", { url }),
@@ -31,6 +33,10 @@ export const api = {
     invoke<TableMigrationView[]>("migrate_sqlite_to_pg", { targetUrl }),
   setStoragePath: (path: string) =>
     invoke<void>("set_storage_path", { path }),
+  // 自动识别当前网卡,生成内网访问前缀(供「内网分享」展示/复制;本机渲染请用 loopback 版本)
+  getFileServerPrefix: () => invoke<string>("get_file_server_prefix"),
+  // 本机渲染专用前缀(loopback):不识别网卡、不启动 PowerShell,恒 http://127.0.0.1:8788/files
+  getLocalFileServerPrefix: () => invoke<string>("get_local_file_server_prefix"),
   // 智能体可编辑附加规范(kind: coding/computer/rpa);下一轮对话注入生效,无需重启
   getAgentGuidelines: (kind: string) =>
     invoke<string>("get_agent_guidelines", { kind }),
@@ -39,6 +45,9 @@ export const api = {
   // 保存语音转写配置(系统设置「语音转写」)
   setTranscriptionConfig: (provider: string, apiUrl: string, model: string, apiKey: string, concurrency: number) =>
     invoke<void>("set_transcription_config", { provider, apiUrl, model, apiKey, concurrency }),
+  // 保存封面文字识别配置(系统设置「封面识别」);apiKey 空串 = 不修改已存密钥
+  setOcrConfig: (provider: string, apiUrl: string, apiKey: string, concurrency: number, localPrecheck: boolean) =>
+    invoke<void>("set_ocr_config", { provider, apiUrl, apiKey, concurrency, localPrecheck }),
   // 保存海外平台音频拉流代理(系统设置「网络代理」):空=自动探测、"off"=关闭、其余=代理 URL
   setMediaProxy: (proxy: string) => invoke<void>("set_media_proxy", { proxy }),
   // 各厂商能力(chat / asr),供「语音转写」按 ASR 能力过滤厂商下拉
@@ -195,11 +204,70 @@ export const api = {
   // 屏幕录制:打开悬浮条(不录制)/ 取消 / 开始(最小化主窗口 + ffmpeg 录全屏)/ 停止 / 查状态
   openRecordingOverlay: () => invoke<void>("open_recording_overlay"),
   cancelRecordingOverlay: () => invoke<void>("cancel_recording_overlay"),
-  // 仅录视频(不录音频)
-  startScreenRecording: () =>
-    invoke<RecordingStatus>("start_screen_recording"),
+  // withMic:是否采麦克风(降噪 + 动态放大在后端滤镜链完成;无麦克风设备自动降级纯视频);
+  // includeApp:为真时不最小化主窗口,本程序的操作一并入镜(演示本软件用);
+  // micDevice:设置面板选定的麦克风设备名,空串 = 自动挑默认设备
+  startScreenRecording: (
+    withMic: boolean,
+    screenIndex: number | null,
+    includeApp: boolean,
+    micDevice: string,
+  ) =>
+    invoke<RecordingStatus>("start_screen_recording", {
+      withMic,
+      screenIndex,
+      includeApp,
+      micDevice,
+    }),
+  // 音频设备选择器:枚举可用输入设备(推荐设备标 recommended)
+  listAudioDevices: () => invoke<AudioDeviceInfo[]>("list_audio_devices"),
+  // 音频测试:用选中设备录 3 秒(与正式录制同一滤镜链),返回 m4a data URL 直接回放
+  testRecordingAudio: (device: string | null) =>
+    invoke<string>("test_recording_audio", { device }),
+  // 展开 / 收起设置面板(窗口加高;悬浮窗无窗口控制权限,缩放走后端)
+  setRecordingOverlayPanel: (open: boolean) =>
+    invoke<void>("set_recording_overlay_panel", { open }),
+  // 暂停 / 继续(分段实现:暂停收尾当前段,继续起新段,停止时拼接;暂停时段不进成片)
+  toggleRecordingPause: () =>
+    invoke<RecordingStatus>("toggle_recording_pause"),
+  // 列出可录制的显示器(悬浮条屏幕选择用;单屏时前端隐藏选择器)
+  listScreens: () => invoke<ScreenInfo[]>("list_screens"),
+  // 录屏预览:截取所有显示器的缩略图(平铺选屏用),开始前的确认弹层用
+  recordingPreviewAll: () =>
+    invoke<ScreenPreview[]>("recording_preview_all"),
+  // 悬浮条窗口切换 小条/预览 两种尺寸(悬浮窗无窗口控制权限,缩放走后端)
+  setRecordingOverlayPreview: (preview: boolean) =>
+    invoke<void>("set_recording_overlay_preview", { preview }),
   stopScreenRecording: () => invoke<RecordingStatus>("stop_screen_recording"),
   getRecordingStatus: () => invoke<RecordingStatus>("get_recording_status"),
+  // 创作-视频剪辑导出:视频轨片段剪切 + 拼接(纯视频轨时后端 -ss -t -c copy 不重编码;
+  // 带音频轨叠加段时走 filter_complex 重编码混音),返回产物路径
+  creationExportVideo: (
+    inputPath: string,
+    segments: ClipSegment[],
+    audioSegments?: ClipSegment[],
+    transition?: TransitionInput,
+  ) =>
+    invoke<string>("creation_export_video", {
+      inputPath,
+      segments,
+      audioSegments: audioSegments ?? [],
+      transition: transition ?? null,
+    }),
+  // 剪辑历史:导出目录扫描,按时间倒序
+  creationListExports: () => invoke<ExportItem[]>("creation_list_exports"),
+  // 视频元信息(帧率 / 码率 / 编码,后端 ffmpeg -i 解析)
+  creationVideoInfo: (inputPath: string) =>
+    invoke<VideoInfo>("creation_video_info", { inputPath }),
+  // 时间轴胶片条缩略图(返回 media_root 相对路径数组,mediaFileUrl 解地址)
+  creationVideoThumbs: (inputPath: string) =>
+    invoke<string[]>("creation_video_thumbs", { inputPath }),
+  // 智能剪辑:OpenCV 场景检测,返回切点秒数(升序)
+  creationDetectScenes: (inputPath: string, threshold?: number) =>
+    invoke<number[]>("creation_detect_scenes", {
+      inputPath,
+      threshold: threshold ?? null,
+    }),
   // 录屏停止后:把视频以附件方式加入指定对话(引用本地路径),返回新消息
   attachRecordingMessage: (conversationId: string, path: string) =>
     invoke<ChatMessageView>("attach_recording_message", { conversationId, path }),
@@ -416,12 +484,21 @@ export const api = {
   // 取消全量库批量提取(提取文案 / 提取评论):登记停止标记,后端逐条/逐批循环检查,
   // 已完成条目保留,未处理的不再继续(转写批间生效,评论在「下一个视频」前生效)
   cancelLibraryExtract: () => invoke<void>("cancel_library_extract"),
-  // 全量库分页列表:筛选/排序下沉 SQL,limit/offset + total
+  // 全量库分页列表:筛选/排序下沉 SQL,limit/offset + total;返回瘦身视图 ContentListView(无转写全文等大字段)
   listContentsPage: (query: ContentListQuery) =>
     invoke<ContentListResult>("list_contents_page", { query }),
+  // 按 id 集取完整内容视图(含转写全文):导出 Excel / 对话插入文案等需要全文的场景用
+  listContentsFull: (ids: string[]) =>
+    invoke<ContentView[]>("list_contents_full", { ids }),
   // 评论库分页列表(同上)
   listCommentsPage: (query: CommentListQuery) =>
     invoke<CommentListResult>("list_comments_page", { query }),
+  // 评论库瀑布流:按来源分组返回(每组含预览评论,后端截好;同筛选口径)
+  listCommentSourcesPage: (query: CommentListQuery, previewLimit?: number) =>
+    invoke<CommentSourcePageResult>("list_comment_sources_page", {
+      query,
+      previewLimit,
+    }),
   // 全量库「待转写 / 待提取评论」计数(与当前筛选口径一致)
   contentLibraryStats: (query: ContentListQuery) =>
     invoke<ContentLibraryStats>("content_library_stats", { query }),
@@ -430,12 +507,13 @@ export const api = {
     invoke<string[]>("list_batch_content_ids", { query, batch }),
   // 侧栏行业角标计数(忽略行业筛选自身,其余筛选同列表口径)
   contentIndustryCounts: (query: ContentListQuery) =>
-    invoke<IndustryCount[]>("content_industry_counts", { query }),
+    invoke<IndustryCounts>("content_industry_counts", { query }),
   commentIndustryCounts: (query: CommentListQuery) =>
-    invoke<IndustryCount[]>("comment_industry_counts", { query }),
-  // 单条内容的评论列表(全量库详情右侧评论栏,按点赞倒序)
-  listContentComments: (contentId: string, cursor?: string, limit?: number) =>
-    invoke<CommentPageView>("list_content_comments", { contentId, cursor, limit }),
+    invoke<IndustryCounts>("comment_industry_counts", { query }),
+  // 单条内容的评论列表(全量库详情右侧评论栏 / 评论库瀑布流抽屉,按点赞倒序);
+  // contentId 传内容行主键或平台原生 id(后者需带 platform 消歧)
+  listContentComments: (contentId: string, cursor?: string, limit?: number, platform?: string) =>
+    invoke<CommentPageView>("list_content_comments", { contentId, cursor, limit, platform }),
   // 采集日志:加载某任务的历史日志(任务详情页打开时回显,再接实时事件)
   listCollectLogs: (taskId: string) =>
     invoke<CollectLogEntry[]>("list_collect_logs", { taskId }),
@@ -468,6 +546,12 @@ export const api = {
   // 文案转写失败重试:对已有音频的单条内容重跑语音转写
   retryContentTranscript: (id: string) =>
     invoke<MediaStatusView>("retry_content_transcript", { id }),
+  // 封面 OCR 重试:对已有封面的单条内容重跑文字识别,返回最新三态供前端就地更新
+  retryContentOcr: (id: string) =>
+    invoke<{ id: string; coverOcrText: string | null; coverOcrError: string | null }>(
+      "retry_content_ocr",
+      { id },
+    ),
   // 批量转写:对指定 id(当前筛选列表中「有音频无文案」的条目)重跑语音转写,返回处理条数
   retryFailedTranscripts: (ids: string[]) =>
     invoke<number>("retry_failed_transcripts", { ids }),
@@ -571,3 +655,4 @@ export const api = {
     invoke<void>("close_publish_account_window", { id }),
 };
 
+

@@ -1,7 +1,7 @@
 // 待发送录屏预览条:录屏停止后挂在输入区,提示视频将随下条消息一并加入对话,可点 × 移除。
 // 点击条本身全屏预览视频(与历史消息图片预览同款 lightbox)。对话 / 电脑操作 / RPA 三处输入区共用。
 import { useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl } from "@/lib/media-file-url";
 import { Play, Video, X } from "lucide-react";
 
 export function RecordingChip({
@@ -11,6 +11,7 @@ export function RecordingChip({
   path: string;
   onRemove: () => void;
 }) {
+  const mediaFileUrl = useMediaFileUrl();
   const [preview, setPreview] = useState(false);
 
   return (
@@ -55,7 +56,7 @@ export function RecordingChip({
             <X className="size-5" />
           </button>
           <video
-            src={convertFileSrc(path)}
+            src={mediaFileUrl(path)}
             controls
             autoPlay
             className="max-h-full max-w-full rounded-lg"

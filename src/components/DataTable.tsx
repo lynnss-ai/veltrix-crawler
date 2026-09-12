@@ -117,7 +117,7 @@ export function DataTable<TData, TValue>({
   getRowId,
   renderToolbar,
   emptyState,
-  defaultPageSize = 50,
+  defaultPageSize = 20,
   pageSizeOptions,
   customizeKey,
   serverControl,

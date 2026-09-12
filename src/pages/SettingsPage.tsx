@@ -6,10 +6,11 @@ import {
   type FormEvent,
 } from "react";
 import { SECTION_GROUPS, CLEAR_CONFIRM_TEXT, formatBytes } from "./settings-meta";
+import { refreshMediaFileUrls } from "@/lib/media-file-url";
 import type { SectionKey, Provider } from "./settings-meta";
 import { SettingsCard, Row } from "./settings-shared";
 import { ProvidersSection, ProviderFormSheet } from "./settings-providers";
-import { Check, ExternalLink, FolderOpen, GripVertical, Loader2, TriangleAlert, Unplug, X } from "lucide-react";
+import { Check, Copy, ExternalLink, FolderOpen, GripVertical, Loader2, TriangleAlert, Unplug, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
@@ -233,6 +234,7 @@ export function SettingsPage() {
                   .map((c) => ({ code: c.code, name: c.name, apiUrl: c.apiUrl }))}
               />
             )}
+            {active === "ocr" && <OcrSection initial={cfg?.ocr} />}
             {active === "role-models" && (
               <RoleModelSection providers={providers} />
             )}
@@ -704,6 +706,9 @@ function GeneralSection({
 }) {
   const [storagePath, setStoragePath] = useState("");
   const [storageBaseline, setStorageBaseline] = useState("");
+  const [fileServerPrefix, setFileServerPrefix] = useState("");
+  const [fileServerError, setFileServerError] = useState("");
+  const [fileServerLoading, setFileServerLoading] = useState(true);
   const [dbSize, setDbSize] = useState<number | null>(null);
   const [dbUrl, setDbUrl] = useState("");
   const [maxConn, setMaxConn] = useState("8");
@@ -734,6 +739,36 @@ function GeneralSection({
   const [proxyMode, setProxyMode] = useState<"auto" | "off" | "custom">("auto");
   const [proxyUrl, setProxyUrl] = useState("");
   const [proxyBaseline, setProxyBaseline] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    let generation = 0;
+    const refresh = async () => {
+      const current = ++generation;
+      setFileServerLoading(true);
+      try {
+        const prefix = await api.getFileServerPrefix();
+        if (!active || current !== generation) return;
+        setFileServerPrefix(prefix);
+        setFileServerError("");
+      } catch (error) {
+        if (!active || current !== generation) return;
+        setFileServerPrefix("");
+        setFileServerError(String(error));
+      } finally {
+        if (active && current === generation) setFileServerLoading(false);
+      }
+    };
+    void refresh();
+    // 换网络后切回设置页,重新获取当前地址,不把 IP 固定写进配置。
+    window.addEventListener("focus", refresh);
+    window.addEventListener("online", refresh);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("online", refresh);
+    };
+  }, []);
 
   useEffect(() => {
     api
@@ -923,46 +958,49 @@ function GeneralSection({
 
       <SettingsCard
         title="存储"
-        description="采集数据与媒体文件的本地落地目录。"
+        description="采集媒体文件的本地目录及自动生成的内网访问地址。"
         dirty={storageDirty}
-        onSave={() => {
-          api
-            .setStoragePath(storagePath.trim())
-            .then(() => {
-              setStorageBaseline(storagePath);
-              toast.success("存储路径已保存");
-            })
-            .catch((e) => toast.error(String(e)));
+        onSave={async () => {
+          try {
+            await api.setStoragePath(storagePath.trim());
+            await refreshMediaFileUrls();
+            setStorageBaseline(storagePath);
+            toast.success("存储路径已保存");
+          } catch (e) {
+            toast.error(String(e));
+          }
         }}
       >
         <div className="space-y-1.5">
           <Label htmlFor="storage-path">存储路径</Label>
-          <div className="flex gap-2">
+          {/* 选择 / 打开 收进输入框内部右侧(小 ghost 钮,省一行高度也更紧凑) */}
+          <div className="relative">
             <Input
               id="storage-path"
               placeholder="留空则使用应用默认数据目录"
               value={storagePath}
               onChange={(e) => setStoragePath(e.target.value)}
+              className="pr-[104px]"
             />
-            <Button
-              type="button"
-              variant="outline"
-              className="shrink-0"
-              onClick={pickStorageDir}
-            >
-              <FolderOpen />
-              选择
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              className="shrink-0"
-              disabled={!storagePath}
-              onClick={openStorageDir}
-            >
-              <ExternalLink />
-              打开
-            </Button>
+            <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center">
+              <button
+                type="button"
+                onClick={pickStorageDir}
+                className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <FolderOpen className="size-3.5" />
+                选择
+              </button>
+              <button
+                type="button"
+                disabled={!storagePath}
+                onClick={openStorageDir}
+                className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+              >
+                <ExternalLink className="size-3.5" />
+                打开
+              </button>
+            </div>
           </div>
           {dataDir && (
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -982,6 +1020,42 @@ function GeneralSection({
               </SimpleTooltip>
             </p>
           )}
+          <div className="space-y-1.5 border-t pt-3">
+            <Label htmlFor="file-server-prefix">内网访问文件链接前缀</Label>
+            <div className="relative">
+              <Input
+                id="file-server-prefix"
+                placeholder={fileServerLoading ? "正在识别内网地址…" : "暂无可用的内网地址"}
+                value={fileServerPrefix}
+                readOnly
+                className="pr-14"
+              />
+              <button
+                type="button"
+                disabled={fileServerLoading || !fileServerPrefix}
+                onClick={async () => {
+                  try {
+                    const prefix = await api.getFileServerPrefix();
+                    setFileServerPrefix(prefix);
+                    setFileServerError("");
+                    if (await copyToClipboard(prefix)) toast.success("已复制内网访问前缀");
+                    else toast.error("复制失败");
+                  } catch (error) {
+                    setFileServerPrefix("");
+                    setFileServerError(String(error));
+                  }
+                }}
+                className="absolute right-1 top-1/2 inline-flex h-7 -translate-y-1/2 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+              >
+                <Copy className="size-3.5" />
+                复制
+              </button>
+            </div>
+            {fileServerError && <p className="text-xs text-destructive">{fileServerError}</p>}
+            <p className="text-xs text-muted-foreground">
+              根据本机网络自动生成,无需填写或保存。此前缀后拼接文件相对存储目录的路径即可访问;客户端需保持运行。
+            </p>
+          </div>
         </div>
       </SettingsCard>
 
@@ -1083,23 +1157,24 @@ function GeneralSection({
         </dl>
         <div className="space-y-1.5">
           <Label htmlFor="db-url">连接串</Label>
-          <div className="flex gap-2">
+          {/* 测试连接收进输入框内部右侧(同存储路径的选择/打开) */}
+          <div className="relative">
             <Input
               id="db-url"
               placeholder="留空用本地 SQLite;PG 例: postgres://postgres:123456@127.0.0.1:5432/veltrix_db"
               value={dbUrl}
               onChange={(e) => setDbUrl(e.target.value)}
+              className="pr-[76px]"
             />
-            <Button
+            <button
               type="button"
-              variant="outline"
-              className="h-10 shrink-0"
               disabled={!dbUrl.trim() || testing}
               onClick={testDbConnection}
+              className="absolute right-1 top-1/2 inline-flex h-7 -translate-y-1/2 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
             >
-              {testing && <Loader2 className="animate-spin" />}
+              {testing && <Loader2 className="size-3.5 animate-spin" />}
               测试连接
-            </Button>
+            </button>
           </div>
         </div>
         <div className="space-y-1.5">
@@ -1120,10 +1195,17 @@ function GeneralSection({
               复制出主机为本机局域网 IP 的连接串,供同局域网设备连接本机数据库
             </p>
           </div>
+          {/* 仅在上方填了 PG 连接串时可点(SQLite 模式无远程连接串可复制) */}
           <Button
             type="button"
             variant="outline"
             className="shrink-0"
+            disabled={!/^postgres(ql)?:\/\//i.test(dbUrl.trim())}
+            title={
+              /^postgres(ql)?:\/\//i.test(dbUrl.trim())
+                ? undefined
+                : "先在上方连接串填写 PostgreSQL 地址"
+            }
             onClick={() => setRemoteDbOpen(true)}
           >
             复制远程连接串
@@ -1538,6 +1620,128 @@ function TranscriptionSection({
           <p className="text-xs text-muted-foreground">
             同时在飞的转写请求数,过高易被厂商限流
           </p>
+        </div>
+      </div>
+    </SettingsCard>
+  );
+}
+
+const OCR_PROVIDER = "glm";
+const DEFAULT_OCR_API_URL = "https://open.bigmodel.cn/api/paas/v4";
+// OCR 并发默认 5 路(与后端 DEFAULT_OCR_CONCURRENCY 一致)
+const DEFAULT_OCR_CONCURRENCY = "5";
+
+function OcrSection({
+  initial,
+}: {
+  initial?: {
+    provider: string;
+    api_url: string;
+    concurrency: number;
+    local_precheck: boolean;
+  };
+}) {
+  const [apiUrl, setApiUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [concurrency, setConcurrency] = useState(DEFAULT_OCR_CONCURRENCY);
+  const [localPrecheck, setLocalPrecheck] = useState(true);
+  const [baseUrl, setBaseUrl] = useState("");
+  const [baseConcurrency, setBaseConcurrency] = useState(DEFAULT_OCR_CONCURRENCY);
+  const [baseLocalPrecheck, setBaseLocalPrecheck] = useState(true);
+
+  // 回填(api_url/concurrency/local_precheck 来自配置;api_key 存数据库不回显)。
+  // 未配置过(空值)时回退到智谱默认,与 base 一致避免一进页面就显示「未保存」。
+  useEffect(() => {
+    const url = initial?.api_url || DEFAULT_OCR_API_URL;
+    const c = String(initial?.concurrency || DEFAULT_OCR_CONCURRENCY);
+    const lp = initial?.local_precheck ?? true;
+    setApiUrl(url);
+    setConcurrency(c);
+    setLocalPrecheck(lp);
+    setBaseUrl(url);
+    setBaseConcurrency(c);
+    setBaseLocalPrecheck(lp);
+    setApiKey("");
+  }, [initial]);
+
+  const dirty =
+    apiUrl !== baseUrl ||
+    concurrency !== baseConcurrency ||
+    localPrecheck !== baseLocalPrecheck ||
+    apiKey.trim() !== "";
+
+  return (
+    <SettingsCard
+      title="封面文字识别"
+      description="采集完成后对封面图做 OCR(智谱 files/ocr 工具接口,按次计费 0.01 元/次),识别结果存为内容的封面文本。"
+      dirty={dirty}
+      onSave={() => {
+        api
+          .setOcrConfig(OCR_PROVIDER, apiUrl, apiKey, Math.max(1, Number(concurrency) || 5), localPrecheck)
+          .then(() => {
+            setBaseUrl(apiUrl);
+            setBaseConcurrency(concurrency);
+            setBaseLocalPrecheck(localPrecheck);
+            setApiKey("");
+            toast.success("封面文字识别配置已保存");
+          })
+          .catch((e) => toast.error(`保存失败: ${e}`));
+      }}
+    >
+      <div className="grid gap-4 sm:grid-cols-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="ocr-provider">厂商</Label>
+          {/* 当前仅支持智谱 GLM,固定展示、不做成可切换多家 */}
+          <Input id="ocr-provider" value="智谱 GLM" disabled readOnly />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ocr-url">API 地址</Label>
+          <Input
+            id="ocr-url"
+            placeholder="https://open.bigmodel.cn/api/paas/v4"
+            value={apiUrl}
+            onChange={(e) => setApiUrl(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ocr-key">API Key</Label>
+          <Input
+            id="ocr-key"
+            type="password"
+            placeholder="留空则不修改已保存的密钥"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ocr-concurrency">识别并发数</Label>
+          <Input
+            id="ocr-concurrency"
+            type="number"
+            min={1}
+            value={concurrency}
+            onChange={(e) => setConcurrency(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            同时在飞的识别请求数,过高易被厂商限流
+          </p>
+        </div>
+        {/* 本地预判:命中「无文字」直接落空文本标记,省掉 0.01 元/次的云端请求;
+            与「识别并发数」同排(不再通栏),垂直居中对齐 */}
+        <div className="flex items-center justify-between self-center rounded-md border px-3 py-2.5">
+          <div className="space-y-0.5">
+            <Label htmlFor="ocr-local-precheck" className="cursor-pointer">
+              本地预判有无文字
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              调用云端前先用系统 OCR 离线预判,封面无文字时跳过付费识别(仅 Windows 生效;单条手动重试不受此开关影响)
+            </p>
+          </div>
+          <Switch
+            id="ocr-local-precheck"
+            checked={localPrecheck}
+            onCheckedChange={setLocalPrecheck}
+          />
         </div>
       </div>
     </SettingsCard>

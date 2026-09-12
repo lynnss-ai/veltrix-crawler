@@ -42,6 +42,8 @@ pub struct Model {
     pub cover_url: Option<String>,
     /// 图片地址 JSON 数组,例如 `["url1","url2"]`
     pub image_urls: String,
+    /// 图集本地路径 JSON,按 image_urls 下标对应;旧数据为空。
+    pub image_paths: Option<String>,
     /// 视频时长(秒);图文为 None
     pub duration: Option<i64>,
     /// 话题标签 JSON 数组(# 开头),例如 `["#话题a","#话题b"]`
@@ -68,6 +70,10 @@ pub struct Model {
     pub transcript: Option<String>,
     /// 转写失败原因(供前端区分「未转写」与「转写失败」)
     pub transcript_error: Option<String>,
+    /// 封面图 OCR 识别文本(智谱 OCR,任务开「封面文字识别」时);None=未识别/失败,空串=已识别但无文字
+    pub cover_ocr_text: Option<String>,
+    /// 封面 OCR 失败原因(供前端区分「未识别」与「识别失败」)
+    pub cover_ocr_error: Option<String>,
     /// 视频文件是否下载成功(仅 video + ai_extract);None=非视频/未尝试
     pub video_downloaded: Option<bool>,
     /// 图文图片总数 / 已成功下载数(仅 image);None=非图文

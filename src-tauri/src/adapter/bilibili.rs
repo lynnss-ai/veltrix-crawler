@@ -8,8 +8,8 @@
 //! 评论走 `GET /x/v2/reply/wbi/main?oid={aid}`,一级评论在 `data.replies[]`(置顶在
 //! `data.top_replies[]`);评论项不含 bvid,所属内容 id 由采集上下文(`ctx.keyword`)传入。
 //!
-//! 取舍:搜索响应不含视频流地址(DASH 流在详情页 playurl 接口,带防盗链),v1 不做
-//! 视频/音频下载,`video_url` 恒为 None,只采元数据 + 封面 + 头像 + 评论。
+//! 搜索响应不含视频流地址,详情页通过 playurl / SSR 的 `__playinfo__` 补取。
+//! 优先使用带音频的 durl;只有 DASH 时分别保留视频轨和音频轨,媒体层再统一转码。
 //!
 //! ⚠️ 字段名基于 Web 端公开结构整理,真实结构需本机 `bun tauri dev` 抓包核对后微调。
 
@@ -21,6 +21,7 @@ use serde_json::Value;
 use veltrix_core::error::Result;
 
 const PLATFORM_ID: &str = "bilibili";
+const DETAIL_PATH: &str = "/x/player/";
 
 #[derive(Default)]
 pub struct BilibiliAdapter;
@@ -165,6 +166,157 @@ impl BilibiliAdapter {
             .unwrap_or_default()
     }
 
+    /// playurl 的 URL 字段同时存在驼峰/下划线版本,并允许从备用地址兜底。
+    fn stream_url(item: &Value) -> Option<String> {
+        ["url", "baseUrl", "base_url"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(Value::as_str))
+            .or_else(|| {
+                ["backupUrl", "backup_url"].iter().find_map(|key| {
+                    item.get(*key)
+                        .and_then(Value::as_array)
+                        .and_then(|urls| urls.first())
+                        .and_then(Value::as_str)
+                })
+            })
+            .and_then(Self::normalize_url)
+    }
+
+    fn first_stream(items: Option<&Value>) -> Option<String> {
+        items
+            .and_then(Value::as_array)
+            .and_then(|items| items.iter().find_map(Self::stream_url))
+    }
+
+    /// 详情响应可能拆成 view 元数据与 playurl 播放信息两条,也可能由 SSR 通道合并回传。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let mut view: Option<Value> = None;
+        let mut play: Option<Value> = None;
+        let mut tags: Option<Value> = None;
+        for resp in &ctx.responses {
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let data = root.get("data").unwrap_or(&root);
+            if let Some(value) = data.get("view") {
+                view = Some(value.clone());
+                tags = data.get("tags").cloned();
+            } else if data.get("bvid").is_some() && data.get("title").is_some() {
+                view = Some(data.clone());
+            }
+            if let Some(value) = data.get("play") {
+                play = Some(value.clone());
+            } else if data.get("dash").is_some() || data.get("durl").is_some() {
+                play = Some(data.clone());
+            }
+        }
+
+        let Some(play) = play else {
+            return FetchOutput::default();
+        };
+        let view = view.unwrap_or_else(|| serde_json::json!({ "bvid": ctx.keyword }));
+        let content_id =
+            Self::as_string_opt(view.get("bvid")).unwrap_or_else(|| ctx.keyword.clone());
+        let dash = play.get("dash");
+        let combined_url = Self::first_stream(play.get("durl"));
+        let video_url = combined_url
+            .clone()
+            .or_else(|| Self::first_stream(dash.and_then(|value| value.get("video"))));
+        let audio_source_url = Self::first_stream(dash.and_then(|value| value.get("audio")))
+            .or_else(|| {
+                Self::first_stream(
+                    dash.and_then(|value| value.get("dolby"))
+                        .and_then(|value| value.get("audio")),
+                )
+            })
+            .or_else(|| {
+                dash.and_then(|value| value.get("flac"))
+                    .and_then(|value| value.get("audio"))
+                    .and_then(Self::stream_url)
+            });
+        let owner = view.get("owner");
+        let stat = view.get("stat");
+        let desc = view
+            .get("desc")
+            .or_else(|| view.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+        let topics = tags
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("tag_name").and_then(Value::as_str))
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!("#{name}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut extra = serde_json::json!({
+            "aid": view.get("aid"),
+            "cid": view.get("cid"),
+            "quality": play.get("quality"),
+        });
+        if let Some(url) = audio_source_url {
+            extra["audio_source_url"] = Value::String(url);
+        }
+
+        let content = Content {
+            platform: PLATFORM_ID.to_string(),
+            content_id,
+            kind: ContentKind::Video,
+            title: view
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty()),
+            desc,
+            author: Author {
+                platform: PLATFORM_ID.to_string(),
+                uid: Self::as_string_opt(owner.and_then(|value| value.get("mid")))
+                    .unwrap_or_default(),
+                nickname: owner
+                    .and_then(|value| value.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                avatar: owner
+                    .and_then(|value| value.get("face"))
+                    .and_then(Value::as_str)
+                    .and_then(Self::normalize_url),
+                signature: None,
+                follower_count: None,
+                following_count: None,
+                extra: serde_json::json!({}),
+            },
+            stats: Stats {
+                like_count: Self::num(stat.and_then(|value| value.get("like"))),
+                comment_count: Self::num(stat.and_then(|value| value.get("reply"))),
+                collect_count: Self::num(stat.and_then(|value| value.get("favorite"))),
+                share_count: Self::num(stat.and_then(|value| value.get("share"))),
+                play_count: Self::num(stat.and_then(|value| value.get("view"))),
+            },
+            published_at: Self::num(view.get("pubdate")),
+            video_url,
+            cover_url: view
+                .get("pic")
+                .and_then(Value::as_str)
+                .and_then(Self::normalize_url),
+            image_urls: Vec::new(),
+            duration: Self::num(view.get("duration")),
+            topics,
+            collected_at: Utc::now().timestamp(),
+            extra,
+        };
+        FetchOutput {
+            contents: vec![content],
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
+
     /// 搜索结果项里的 UP 主信息:`author`(昵称)/`mid`(uid)/`upic`(头像,协议相对)。
     /// 粉丝数/签名搜索响应不含(在 `/x/web-interface/card?mid=` 卡片接口,需进作者主页
     /// 或额外请求才有)——平台响应限制,作者档案先建到这三个字段,画像字段留空。
@@ -299,7 +451,10 @@ impl BilibiliAdapter {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                avatar: card.get("face").and_then(Value::as_str).and_then(Self::normalize_url),
+                avatar: card
+                    .get("face")
+                    .and_then(Value::as_str)
+                    .and_then(Self::normalize_url),
                 signature: card
                     .get("sign")
                     .and_then(Value::as_str)
@@ -359,16 +514,90 @@ impl PlatformAdapter for BilibiliAdapter {
     fn supports(&self, kind: &TaskKind) -> bool {
         matches!(
             kind,
-            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile
+            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile | TaskKind::ContentDetail
         )
+    }
+
+    fn detail_pattern(&self) -> Option<&str> {
+        Some(DETAIL_PATH)
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::UserProfile => Self::parse_profile(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webview::InterceptedResponse;
+
+    #[tokio::test]
+    async fn parses_detail_with_separate_dash_audio() {
+        let body = serde_json::json!({
+            "data": {
+                "view": {
+                    "bvid": "BV1test", "aid": 10, "cid": 20, "title": "标题",
+                    "desc": "正文", "pic": "//i0.hdslb.com/cover.jpg", "duration": 66,
+                    "owner": { "mid": 30, "name": "作者", "face": "//i0.hdslb.com/avatar.jpg" },
+                    "stat": { "view": 100, "like": 20, "reply": 3, "favorite": 4, "share": 5 }
+                },
+                "tags": [{ "tag_name": "旅行" }],
+                "play": {
+                    "quality": 80,
+                    "dash": {
+                        "video": [{ "baseUrl": "https://cdn/video.m4s" }],
+                        "audio": [{ "base_url": "https://cdn/audio.m4s" }]
+                    }
+                }
+            }
+        });
+        let ctx = FetchContext {
+            keyword: "BV1test".into(),
+            responses: vec![InterceptedResponse {
+                url: "detail".into(),
+                body: body.to_string(),
+            }],
+        };
+        let output = BilibiliAdapter::new()
+            .parse(&TaskKind::ContentDetail, &ctx)
+            .await
+            .unwrap();
+        let content = &output.contents[0];
+        assert_eq!(content.video_url.as_deref(), Some("https://cdn/video.m4s"));
+        assert_eq!(content.extra["audio_source_url"], "https://cdn/audio.m4s");
+        assert_eq!(content.topics, vec!["#旅行"]);
+        assert_eq!(content.stats.like_count, Some(20));
+    }
+
+    #[tokio::test]
+    async fn prefers_combined_durl_for_saved_video() {
+        let body = serde_json::json!({
+            "data": { "view": { "bvid": "BV2test" }, "play": {
+                "durl": [{ "url": "https://cdn/combined.mp4" }],
+                "dash": { "video": [{ "baseUrl": "https://cdn/video.m4s" }] }
+            }}
+        });
+        let ctx = FetchContext {
+            keyword: "BV2test".into(),
+            responses: vec![InterceptedResponse {
+                url: "detail".into(),
+                body: body.to_string(),
+            }],
+        };
+        let output = BilibiliAdapter::new()
+            .parse(&TaskKind::ContentDetail, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.contents[0].video_url.as_deref(),
+            Some("https://cdn/combined.mp4")
+        );
     }
 }

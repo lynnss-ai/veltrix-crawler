@@ -190,12 +190,12 @@ export function DashboardPage() {
   }
 
   return (
-    <div className="veltrix-no-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-1">
+    <div className="veltrix-no-scrollbar min-h-0 flex-1 space-y-2.5 overflow-y-auto p-1">
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       {/* 累计计数 + 平台细分 */}
       <div
-        className="veltrix-enter grid grid-cols-1 gap-4 sm:grid-cols-3"
+        className="veltrix-enter grid grid-cols-1 gap-2.5 sm:grid-cols-3"
         style={{ animationDelay: "0ms" }}
       >
         <OverviewCard
@@ -247,7 +247,7 @@ export function DashboardPage() {
 
       {/* 今日采集 + 任务状态 */}
       <div
-        className="veltrix-enter grid grid-cols-1 gap-4 lg:grid-cols-2"
+        className="veltrix-enter grid grid-cols-1 gap-2.5 lg:grid-cols-2"
         style={{ animationDelay: "70ms" }}
       >
         <div className="veltrix-card p-5">
@@ -255,7 +255,7 @@ export function DashboardPage() {
             <CalendarDays className="size-4 text-muted-foreground" />
             今日采集
           </h3>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-2 gap-2.5">
             <TodayMetric
               icon={FileText}
               label="内容"
@@ -424,7 +424,7 @@ export function DashboardPage() {
 
       {/* 意向分布 / 平台占比 / 素材下载 */}
       <div
-        className="veltrix-enter grid grid-cols-1 gap-4 lg:grid-cols-3"
+        className="veltrix-enter grid grid-cols-1 gap-2.5 lg:grid-cols-3"
         style={{ animationDelay: "210ms" }}
       >
         <DonutCard title="意向分布" data={intentDonut} />
@@ -434,7 +434,7 @@ export function DashboardPage() {
 
       {/* 热门内容 / 热门关键词 */}
       <div
-        className="veltrix-enter grid grid-cols-1 gap-4 lg:grid-cols-2"
+        className="veltrix-enter grid grid-cols-1 gap-2.5 lg:grid-cols-2"
         style={{ animationDelay: "280ms" }}
       >
         <div className="veltrix-card p-5">

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "veltrix-crawler",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "identifier": "com.lynns.veltrix-crawler",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -34,7 +34,10 @@
     "targets": "all",
     "createUpdaterArtifacts": false,
     "resources": [
-      "resources/ffmpeg.exe"
+      "resources/ffmpeg.exe",
+      "resources/opencv_world4100.dll",
+      "resources/opencv_videoio_ffmpeg4100_64.dll",
+      "resources/opencv_videoio_msmf4100_64.dll"
     ],
     "icon": [
       "icons/32x32.png",

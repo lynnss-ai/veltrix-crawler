@@ -1,6 +1,6 @@
 // SettingsPage 的共享基础:导航分组、厂商类型、清空确认词、字节格式化。
 // 从 SettingsPage.tsx 拆出,作为后续 section 组件拆分的共享依赖(尤其 Provider 类型)。
-import { AudioLines, Bot, Image, Layers, MessageSquare, NotebookPen, Settings2, Smartphone, Sparkles, Video, Wrench } from "lucide-react";
+import { AudioLines, Bot, Image, Layers, MessageSquare, NotebookPen, ScanText, Settings2, Smartphone, Sparkles, Video, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ModelCapability, ModelSpec } from "@/lib/api";
 
@@ -19,6 +19,7 @@ export const SECTION_GROUPS = [
       { key: "providers", label: "模型厂商", icon: Bot },
       { key: "role-models", label: "角色模型", icon: Layers },
       { key: "transcription", label: "语音转写", icon: AudioLines },
+      { key: "ocr", label: "封面识别", icon: ScanText },
       { key: "intent", label: "意向分析", icon: Sparkles },
     ],
   },

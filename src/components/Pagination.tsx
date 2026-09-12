@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/select";
 
 // 每页行数默认档位(全站分页共用,DataTablePagination 亦复用此常量)
-export const DEFAULT_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
+export const DEFAULT_PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
 
 interface PaginationProps {
   /** 当前页(0-based) */

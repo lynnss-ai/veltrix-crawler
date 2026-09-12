@@ -1189,10 +1189,13 @@ pub async fn build_content_attachments(
         return Err(CrawlerError::Config("无权引用该内容".into()));
     }
 
+    // 库存素材路径可能是相对 media_root 的相对路径(新口径),读文件前统一 resolve 成绝对路径
+    let media_root = crate::media::media_root(&state.config_dir, &lock_config(&state)?.media.clone());
+
     // 封面图源只取封面;否则图文图片优先、无则退回封面
     let mut paths: Vec<String> = Vec::new();
     if !cover_only.unwrap_or(false) {
-        paths = local_image_paths(&row);
+        paths = local_image_paths(&row, &media_root);
         // 逐张挑选:仅保留指定位置(基于上面已排序的本地图片列表)
         if let Some(want) = indices.as_ref() {
             let want: std::collections::HashSet<usize> =
@@ -1207,7 +1210,11 @@ pub async fn build_content_attachments(
     }
     if paths.is_empty() {
         if let Some(cover) = row.cover_path.as_deref().filter(|s| !s.is_empty()) {
-            paths.push(cover.to_string());
+            paths.push(
+                crate::media::resolve_media_path(&media_root, cover)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
     }
     if paths.is_empty() {
@@ -1264,12 +1271,13 @@ fn mime_from_ext(path: &str) -> String {
 
 /// 推断某内容已下载到本地的图片绝对路径(按 idx 升序)。
 /// 图片与封面同目录,故从 cover_path 拆出目录与 `{prefix}_cover.jpg` 前缀,扫同目录 `{prefix}_img*`。
+/// 库存 cover_path 可能是相对 media_root 的相对路径(新口径),先经 root resolve 成绝对路径。
 /// 无封面路径则无从定位(下载当天日期未落库),返回空让上层提示去下载。
-fn local_image_paths(row: &veltrix_core::db::entity::content::Model) -> Vec<String> {
+fn local_image_paths(row: &veltrix_core::db::entity::content::Model, root: &std::path::Path) -> Vec<String> {
     let Some(cover) = row.cover_path.as_deref().filter(|s| !s.is_empty()) else {
         return Vec::new();
     };
-    let cover_path = std::path::Path::new(cover);
+    let cover_path = crate::media::resolve_media_path(root, cover);
     let (Some(dir), Some(file_name)) = (
         cover_path.parent(),
         cover_path.file_name().and_then(|n| n.to_str()),

@@ -7,6 +7,7 @@ pub mod billing;
 pub mod cloud;
 pub mod collect;
 pub mod creation;
+pub mod creation_vision;
 pub mod dashboard;
 pub mod publish;
 pub mod task;
@@ -202,6 +203,61 @@ pub fn get_media_root(state: State<'_, AppState>) -> Result<String> {
     Ok(crate::media::media_root(&state.config_dir, &cfg.media)
         .display()
         .to_string())
+}
+
+/// 自动生成内网访问前缀,每次读取当前网卡地址,避免换网络后仍返回旧 IP。
+#[tauri::command]
+pub async fn get_file_server_prefix() -> Result<String> {
+    let ip = tauri::async_runtime::spawn_blocking(media_lan_ipv4)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("识别内网地址失败: {e}")))??;
+    Ok(format!("http://{ip}:{}/files", crate::file_server::DEFAULT_PORT))
+}
+
+/// 本机渲染专用前缀(loopback):与 get_file_server_prefix(LAN,供内网分享)不同,
+/// 不识别网卡、不启动 PowerShell,本机 WebView 渲染图片恒走 127.0.0.1。
+#[tauri::command]
+pub fn get_local_file_server_prefix() -> Result<String> {
+    Ok(format!("http://127.0.0.1:{}/files", crate::file_server::DEFAULT_PORT))
+}
+
+/// 代理 TUN 可能接管默认路由,文件分享优先选择已联网的物理网卡。
+fn media_lan_ipv4() -> Result<String> {
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("powershell.exe");
+        crate::media::hide_console_window(&mut command);
+        command.args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            "Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up' | Sort-Object ifIndex | ForEach-Object { Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue } | Where-Object AddressState -eq 'Preferred' | Select-Object -ExpandProperty IPAddress",
+        ]);
+        if let Ok(output) = command.output() {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Ok(ip) = line.trim().parse::<std::net::Ipv4Addr>() {
+                        if ip.is_private() {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        return Err(CrawlerError::Config("未找到已连接的内网网卡,请连接 Wi-Fi 或有线网络后重试".into()));
+    }
+    #[cfg(not(windows))]
+    lan_ipv4()
+}
+
+/// 把数据库里的本机媒体路径转换成内网文件服务 URL;文件不在媒体根目录时返回 None。
+#[tauri::command]
+pub async fn get_media_file_url(state: State<'_, AppState>, path: String) -> Result<Option<String>> {
+    let prefix = get_file_server_prefix().await?;
+    let cfg = lock_config(&state)?;
+    Ok(crate::file_server::public_url_for_path(
+        &prefix,
+        &crate::media::media_root(&state.config_dir, &cfg.media),
+        &path,
+    ))
 }
 
 /// 获取当前生效的 SQLite 数据库文件路径;非 SQLite(如 PG)返回 None。
@@ -743,6 +799,36 @@ pub async fn set_transcription_config(
     }
     if !api_key.trim().is_empty() {
         set_secret(&state.db, "transcription_api_key", &api_key).await?;
+    }
+    Ok(())
+}
+
+/// 保存封面文字识别(OCR)配置(系统设置「封面文字识别」)。存厂商 code + API 地址 + 并发数;
+/// api_key 仍存数据库,不落配置文件。目前仅智谱 GLM(files/ocr 工具 API)。
+#[tauri::command]
+pub async fn set_ocr_config(
+    state: State<'_, AppState>,
+    provider: String,
+    api_url: String,
+    api_key: String,
+    concurrency: u32,
+    local_precheck: bool,
+) -> Result<()> {
+    {
+        let mut cfg = lock_config(&state)?;
+        cfg.ocr.provider = provider;
+        cfg.ocr.api_url = api_url;
+        // 并发数最小 1;前端异常传 0 时回退默认,避免 buffer_unordered(0) 空转
+        cfg.ocr.concurrency = if concurrency == 0 {
+            veltrix_core::config::DEFAULT_OCR_CONCURRENCY
+        } else {
+            concurrency
+        };
+        cfg.ocr.local_precheck = local_precheck;
+        cfg.save(&state.config_dir)?;
+    }
+    if !api_key.trim().is_empty() {
+        set_secret(&state.db, "ocr_api_key", &api_key).await?;
     }
     Ok(())
 }

@@ -1,12 +1,11 @@
-// 远程控制全局入口:顶部栏按钮 + 配对弹窗。
-// 按钮颜色按 RemoteStatus 反映远程会话健康度,弹窗内驱动 cloud_pair_init 拿真实连接码。
+// 远程控制配对弹窗:由标题栏「更多 → 远程连接」打开。
+// 弹窗内驱动 cloud_pair_init 拿真实连接码,状态点逻辑已随旧标题栏按钮一并移除。
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   Copy,
   Info,
   Loader2,
-  MonitorSmartphone,
   RefreshCw,
   Smartphone,
   Unplug,
@@ -21,51 +20,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { api, type CloudConfigView, type CloudPairView } from "@/lib/api";
 
 export type RemoteStatus = "connected" | "disconnected" | "failed";
 
-const REMOTE_STATUS_META: Record<
-  RemoteStatus,
-  { label: string; className: string }
-> = {
-  connected: { label: "远程已连接", className: "text-emerald-500" },
-  disconnected: { label: "远程未连接", className: "text-muted-foreground" },
-  failed: { label: "远程连接失败", className: "text-destructive" },
-};
-
-// 顶部栏触发按钮 + 弹窗,组件自管 open 态,父组件只传 status
-export function RemoteConnectButton({ status }: { status: RemoteStatus }) {
-  const [open, setOpen] = useState(false);
-  const meta = REMOTE_STATUS_META[status];
-
-  return (
-    <>
-      <SimpleTooltip content={meta.label}>
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          className={`relative inline-flex size-8 shrink-0 items-center justify-center rounded-md text-foreground transition-colors hover:bg-accent ${meta.className}`}
-        >
-          <MonitorSmartphone className="size-[1.1rem]" />
-          {/* 状态点:连接 / 失败时高亮,未连接时省略 */}
-          {status !== "disconnected" && (
-            <span
-              className={`absolute right-1 top-1 size-1.5 rounded-full ${
-                status === "connected" ? "bg-emerald-500" : "bg-destructive"
-              }`}
-            />
-          )}
-          <span className="sr-only">{meta.label}</span>
-        </button>
-      </SimpleTooltip>
-      <RemoteConnectDialog open={open} onOpenChange={setOpen} status={status} />
-    </>
-  );
-}
-
-function RemoteConnectDialog({
+export function RemoteConnectDialog({
   open,
   onOpenChange,
   status,

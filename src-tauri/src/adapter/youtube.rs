@@ -5,15 +5,15 @@
 //! 太脆——这里改为**递归收集目标节点**(`videoRenderer` / `commentEntityPayload` /
 //! 旧版 `commentRenderer`),只解析认识的节点,结构变化时最多漏新形态、不会整批失败。
 //!
-//! 已知限制(v1 接受):
+//! 已知限制:
 //! - 首屏搜索结果内嵌在页面 `ytInitialData`(不走 XHR)采不到,滚动分页可采;
 //! - 计数是本地化文本("1.2万次观看"/"1,234 views"),尽力解析,失败置 None;
 //! - 发布/评论时间是相对文本("3 天前")无法还原时间戳,原文存 extra;
-//! - 视频流地址有签名混淆(n-throttling),不采视频/音频,`video_url` 恒为 None。
+//! - 详情只使用播放器响应中已下发的直链 `url`;`signatureCipher` 不做逆向解密。
 //!
 //! ⚠️ 节点字段基于 Web 端公开结构整理,需本机抓包核对(需代理可用)。
 
-use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
+use crate::adapter::{extract_hashtags, FetchContext, FetchOutput, PlatformAdapter};
 use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,6 +21,7 @@ use serde_json::Value;
 use veltrix_core::error::Result;
 
 const PLATFORM_ID: &str = "youtube";
+const DETAIL_PATH: &str = "/youtubei/v1/player";
 
 #[derive(Default)]
 pub struct YoutubeAdapter;
@@ -114,6 +115,155 @@ impl YoutubeAdapter {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+    }
+
+    /// 播放器列表中挑已下发直链且码率最高的一路。只有 signatureCipher 的格式必须跳过,
+    /// 保持项目“不逆向平台签名”的边界。
+    fn best_direct_stream(items: Option<&Value>, mime_prefix: &str) -> Option<String> {
+        items
+            .and_then(Value::as_array)?
+            .iter()
+            .filter(|item| {
+                item.get("mimeType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mime| mime.starts_with(mime_prefix))
+            })
+            .filter_map(|item| {
+                let url = item
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| !url.is_empty())?;
+                Some((
+                    item.get("bitrate").and_then(Value::as_i64).unwrap_or(0),
+                    url,
+                ))
+            })
+            .max_by_key(|(bitrate, _)| *bitrate)
+            .map(|(_, url)| url.to_string())
+    }
+
+    /// 观看页播放器响应解析为完整内容。`formats` 通常是音视频合一流,适合直接落盘;
+    /// 只有 adaptiveFormats 时分别保留视频轨与音频轨,后者交媒体层 ffmpeg 转码。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        for resp in &ctx.responses {
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let player = root.get("playerResponse").unwrap_or(&root);
+            let Some(details) = player.get("videoDetails") else {
+                continue;
+            };
+            let content_id = details
+                .get("videoId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(&ctx.keyword)
+                .to_string();
+            let streaming = player.get("streamingData");
+            let combined_url = Self::best_direct_stream(
+                streaming.and_then(|value| value.get("formats")),
+                "video/",
+            );
+            let adaptive_video = Self::best_direct_stream(
+                streaming.and_then(|value| value.get("adaptiveFormats")),
+                "video/",
+            );
+            let audio_source_url = Self::best_direct_stream(
+                streaming.and_then(|value| value.get("adaptiveFormats")),
+                "audio/",
+            );
+            let desc = details
+                .get("shortDescription")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty());
+            let mut topics: Vec<String> = details
+                .get("keywords")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| {
+                            if value.starts_with('#') {
+                                value.to_string()
+                            } else {
+                                format!("#{value}")
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if topics.is_empty() {
+                topics = desc.as_deref().map(extract_hashtags).unwrap_or_default();
+            }
+            let mut extra = serde_json::json!({
+                "isLiveContent": details.get("isLiveContent"),
+                "allowRatings": details.get("allowRatings"),
+            });
+            if let Some(url) = audio_source_url {
+                extra["audio_source_url"] = Value::String(url);
+            }
+            let author = Author {
+                platform: PLATFORM_ID.to_string(),
+                uid: details
+                    .get("channelId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                nickname: details
+                    .get("author")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                avatar: None,
+                signature: None,
+                follower_count: None,
+                following_count: None,
+                extra: serde_json::json!({}),
+            };
+            let content = Content {
+                platform: PLATFORM_ID.to_string(),
+                content_id,
+                kind: ContentKind::Video,
+                title: details
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|value| !value.is_empty()),
+                desc,
+                author,
+                stats: Stats {
+                    like_count: None,
+                    comment_count: None,
+                    collect_count: None,
+                    share_count: None,
+                    play_count: details
+                        .get("viewCount")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<i64>().ok()),
+                },
+                published_at: None,
+                video_url: combined_url.or(adaptive_video),
+                cover_url: Self::last_thumbnail(details.get("thumbnail")),
+                image_urls: Vec::new(),
+                duration: details
+                    .get("lengthSeconds")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<i64>().ok()),
+                topics,
+                collected_at,
+                extra,
+            };
+            return FetchOutput {
+                contents: vec![content],
+                comments: Vec::new(),
+                authors: Vec::new(),
+            };
+        }
+        FetchOutput::default()
     }
 
     /// 把单个 videoRenderer 解析为 Content;缺 videoId 视为无效返回 None。
@@ -270,7 +420,11 @@ impl YoutubeAdapter {
     }
 
     /// 旧版评论节点(commentRenderer)解析为 Comment,作为灰度兜底。
-    fn parse_comment_renderer(node: &Value, content_id: &str, collected_at: i64) -> Option<Comment> {
+    fn parse_comment_renderer(
+        node: &Value,
+        content_id: &str,
+        collected_at: i64,
+    ) -> Option<Comment> {
         let comment_id = node
             .get("commentId")
             .and_then(Value::as_str)
@@ -346,9 +500,11 @@ impl YoutubeAdapter {
             };
             let mut subs_nodes = Vec::new();
             Self::collect_by_key(&root, "subscriberCountText", &mut subs_nodes);
-            let follower = subs_nodes
-                .iter()
-                .find_map(|n| Self::text_of(Some(*n)).as_deref().and_then(Self::parse_count_text));
+            let follower = subs_nodes.iter().find_map(|n| {
+                Self::text_of(Some(*n))
+                    .as_deref()
+                    .and_then(Self::parse_count_text)
+            });
 
             let mut header_nodes = Vec::new();
             Self::collect_by_key(&root, "c4TabbedHeaderRenderer", &mut header_nodes);
@@ -427,16 +583,87 @@ impl PlatformAdapter for YoutubeAdapter {
     fn supports(&self, kind: &TaskKind) -> bool {
         matches!(
             kind,
-            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile
+            TaskKind::Search | TaskKind::Comments | TaskKind::UserProfile | TaskKind::ContentDetail
         )
+    }
+
+    fn detail_pattern(&self) -> Option<&str> {
+        Some(DETAIL_PATH)
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
             TaskKind::UserProfile => Self::parse_profile(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webview::InterceptedResponse;
+
+    #[tokio::test]
+    async fn parses_player_response_with_combined_and_audio_streams() {
+        let body = serde_json::json!({
+            "videoDetails": {
+                "videoId": "yt-1", "title": "标题", "shortDescription": "正文",
+                "lengthSeconds": "42", "author": "作者", "channelId": "UC1",
+                "viewCount": "123", "keywords": ["旅行", "#云南"],
+                "thumbnail": { "thumbnails": [{ "url": "https://img/cover.jpg" }] }
+            },
+            "streamingData": {
+                "formats": [{ "mimeType": "video/mp4", "bitrate": 100, "url": "https://cdn/combined.mp4" }],
+                "adaptiveFormats": [{ "mimeType": "audio/mp4", "bitrate": 200, "url": "https://cdn/audio.m4a" }]
+            }
+        });
+        let ctx = FetchContext {
+            keyword: "yt-1".into(),
+            responses: vec![InterceptedResponse {
+                url: DETAIL_PATH.into(),
+                body: body.to_string(),
+            }],
+        };
+        let output = YoutubeAdapter::new()
+            .parse(&TaskKind::ContentDetail, &ctx)
+            .await
+            .unwrap();
+        let content = &output.contents[0];
+        assert_eq!(
+            content.video_url.as_deref(),
+            Some("https://cdn/combined.mp4")
+        );
+        assert_eq!(content.extra["audio_source_url"], "https://cdn/audio.m4a");
+        assert_eq!(content.topics, vec!["#旅行", "#云南"]);
+    }
+
+    #[tokio::test]
+    async fn skips_ciphered_stream_and_uses_direct_adaptive_video() {
+        let body = serde_json::json!({
+            "videoDetails": { "videoId": "yt-2" },
+            "streamingData": {
+                "formats": [{ "mimeType": "video/mp4", "signatureCipher": "encrypted" }],
+                "adaptiveFormats": [{ "mimeType": "video/mp4", "bitrate": 300, "url": "https://cdn/video.mp4" }]
+            }
+        });
+        let ctx = FetchContext {
+            keyword: "yt-2".into(),
+            responses: vec![InterceptedResponse {
+                url: DETAIL_PATH.into(),
+                body: body.to_string(),
+            }],
+        };
+        let output = YoutubeAdapter::new()
+            .parse(&TaskKind::ContentDetail, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.contents[0].video_url.as_deref(),
+            Some("https://cdn/video.mp4")
+        );
     }
 }

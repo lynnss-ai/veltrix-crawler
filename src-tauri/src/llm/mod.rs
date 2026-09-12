@@ -8,12 +8,14 @@ pub mod chat;
 pub mod embedding;
 pub mod http;
 pub mod intent;
+pub mod ocr;
 pub mod provider;
 pub mod role;
 pub mod speech;
 
 // 保持对外路径稳定(commands 现有调用零改动):crate::llm::analyze_intent 等
 pub use intent::{analyze_intent, IntentRequest, IntentVerdict};
+pub use ocr::{ocr_recognize, OcrRequest};
 pub use provider::{all_capabilities, ProviderCapability};
 pub use role::AgentRole;
 pub use speech::{transcribe, transcribe_stream, TranscribeRequest};

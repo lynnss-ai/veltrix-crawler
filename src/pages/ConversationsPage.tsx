@@ -78,7 +78,7 @@ export function ConversationsPage({
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [range, setRange] = useState<DateRange | undefined>();
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(20);
 
   // 当前分栏 + 搜索 + 日期区间过滤后的列表(按更新时间倒序)
   const list = useMemo(() => {
@@ -443,7 +443,7 @@ export function ConversationsPage({
               totalCount={list.length}
               itemLabel="条"
               pageSize={pageSize}
-              pageSizeOptions={[50, 100, 200]}
+              pageSizeOptions={[20, 50, 100, 200]}
               onPageSizeChange={(size) => {
                 setPageSize(size);
                 setPage(1);

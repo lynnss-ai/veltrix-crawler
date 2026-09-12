@@ -5,3 +5,5 @@
 //! 其它平台返回未实现提示,保证跨平台仍能编译。
 
 pub mod tools;
+
+pub use tools::recognize_image_text;

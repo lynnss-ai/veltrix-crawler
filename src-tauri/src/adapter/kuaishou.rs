@@ -11,7 +11,7 @@
 //! ⚠️ 解析全程 `serde_json::Value` 按需取值,单条脏数据只跳过、不拖垮整批;为兼容历史
 //! 结构,关键路径都保留旧字段兜底。
 
-use crate::adapter::{FetchContext, FetchOutput, PlatformAdapter};
+use crate::adapter::{extract_hashtags, FetchContext, FetchOutput, PlatformAdapter};
 use crate::model::{Author, Comment, Content, ContentKind, Stats, TaskKind};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -113,9 +113,10 @@ impl KuaishouAdapter {
         })
     }
 
-    /// 话题:快手 feed.tags[].name(若存在);统一加 # 前缀。
+    /// 话题:优先快手 feed.tags[].name,结构化字段缺失时从正文 #标签 兜底。
     fn parse_topics(feed: &Value) -> Vec<String> {
-        feed.get("tags")
+        let topics: Vec<String> = feed.get("tags")
+            .or_else(|| feed.get("photo").and_then(|p| p.get("tags")))
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -130,6 +131,15 @@ impl KuaishouAdapter {
                     })
                     .collect()
             })
+            .unwrap_or_default();
+        if !topics.is_empty() {
+            return topics;
+        }
+        let photo = feed.get("photo").unwrap_or(feed);
+        photo
+            .get("caption")
+            .and_then(Value::as_str)
+            .map(extract_hashtags)
             .unwrap_or_default()
     }
 
@@ -166,17 +176,25 @@ impl KuaishouAdapter {
             .filter(|secs| *secs > 0)
     }
 
-    /// 图集图片:快手图文在 photo.imgUrls(直链数组,推测;抓包后微调)。视频内容为空。
+    /// 图集图片:兼容 imgUrls 的字符串数组 / `{url}` 数组及 atlas.list 变体。
     fn parse_image_urls(photo: &Value) -> Vec<String> {
-        photo
+        let list = photo
             .get("imgUrls")
+            .or_else(|| photo.get("atlas").and_then(|a| a.get("list")))
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|u| u.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+                    .filter_map(|u| {
+                        u.as_str()
+                            .or_else(|| u.get("url").and_then(Value::as_str))
+                            .or_else(|| u.get("cdnUrl").and_then(Value::as_str))
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        list
     }
 
     fn parse_author(value: Option<&Value>) -> Author {
@@ -359,8 +377,8 @@ impl KuaishouAdapter {
         }
     }
 
-    /// 解析内容详情(graphql `visionVideoDetail`)为单条内容,主要拿新鲜视频直链。
-    /// 详情响应 `data.visionVideoDetail.photo`(结构同搜索 feed 的 photo);取不到直链则跳过。
+    /// 解析内容详情(graphql `visionVideoDetail`)为完整内容。复用搜索 feed 解析,
+    /// 使视频直链刷新、图集详情和正文/话题补全走同一份字段兼容逻辑。
     fn parse_detail(ctx: &FetchContext) -> FetchOutput {
         let collected_at = Utc::now().timestamp();
         let mut contents = Vec::new();
@@ -368,29 +386,15 @@ impl KuaishouAdapter {
             let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
                 continue;
             };
-            let Some(photo) = root
+            let Some(detail) = root
                 .get("data")
                 .and_then(|d| d.get("visionVideoDetail"))
-                .and_then(|v| v.get("photo"))
             else {
                 continue;
             };
-            let Some(content_id) =
-                Self::as_string_opt(photo.get("id").or_else(|| photo.get("photoId")))
-            else {
-                continue;
-            };
-            let Some(video_url) = Self::first_video_url(photo) else {
-                continue;
-            };
-            contents.push(Content {
-                platform: PLATFORM_ID.to_string(),
-                content_id,
-                kind: ContentKind::Video,
-                video_url: Some(video_url),
-                collected_at,
-                ..Default::default()
-            });
+            if let Some(content) = Self::parse_feed(detail, collected_at) {
+                contents.push(content);
+            }
         }
         FetchOutput {
             contents,
@@ -457,5 +461,63 @@ impl PlatformAdapter for KuaishouAdapter {
             _ => Self::parse_search(ctx),
         };
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webview::InterceptedResponse;
+    use serde_json::json;
+
+    #[test]
+    fn parses_complete_video_detail_for_shared_audio_pipeline() {
+        let ctx = FetchContext {
+            keyword: "photo-1".into(),
+            responses: vec![InterceptedResponse {
+                url: "https://www.kuaishou.com/graphql".into(),
+                body: json!({
+                    "data": {
+                        "visionVideoDetail": {
+                            "photo": {
+                                "id": "photo-1",
+                                "caption": "云南旅行 #丽江",
+                                "photoUrls": [{"url": "https://txmov2.a.kwimgs.com/video.mp4"}],
+                                "coverUrl": "https://ali2.a.kwimgs.com/cover.jpg",
+                                "duration": 15000,
+                                "likeCount": 20
+                            },
+                            "author": {"id": "user-1", "name": "作者"}
+                        }
+                    }
+                }).to_string(),
+            }],
+        };
+
+        let output = KuaishouAdapter::parse_detail(&ctx);
+        assert_eq!(output.contents.len(), 1);
+        let content = &output.contents[0];
+        assert!(matches!(content.kind, ContentKind::Video));
+        assert_eq!(content.video_url.as_deref(), Some("https://txmov2.a.kwimgs.com/video.mp4"));
+        assert_eq!(content.duration, Some(15));
+        assert_eq!(content.topics, vec!["#丽江"]);
+    }
+
+    #[test]
+    fn parses_all_object_images_from_detail() {
+        let feed = json!({
+            "photo": {
+                "id": "atlas-1",
+                "caption": "图集",
+                "imgUrls": [
+                    {"url": "https://img/1.jpg"},
+                    {"cdnUrl": "https://img/2.jpg"},
+                    "https://img/3.jpg"
+                ]
+            }
+        });
+        let content = KuaishouAdapter::parse_feed(&feed, 1).expect("应解析图集");
+        assert!(matches!(content.kind, ContentKind::Image));
+        assert_eq!(content.image_urls.len(), 3);
     }
 }

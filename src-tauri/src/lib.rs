@@ -5,12 +5,14 @@ mod agent;
 mod cloud;
 mod commands;
 mod cookie;
+mod file_server;
 mod llm;
 mod media;
 mod model;
 mod obsidian;
 mod publish;
 mod sandbox;
+mod thumbnail;
 mod webview;
 
 // 复用抽出到独立 crate 的核心模块,保持 config::/db:: 用法不变
@@ -280,6 +282,15 @@ pub fn run() {
 
             // 连接数据库(运行时二选一 SQLite / PG)并建表;setup 为同步上下文,阻塞等待完成
             let db = tauri::async_runtime::block_on(db::connect(&config_dir, &cfg.database))?;
+
+            // 存量迁移:contents 表本地素材路径统一改写为相对 media_root 的相对路径(幂等,失败仅告警)
+            {
+                let mroot = crate::media::media_root(&config_dir, &cfg.media);
+                let migrate_db = db.clone();
+                tauri::async_runtime::block_on(async move {
+                    crate::media::migrate_media_paths_to_relative(&migrate_db, &mroot).await;
+                });
+            }
 
             // 应用重启后内存里的采集 spawn 已丢失:把残留的「进行中」任务标记为中断,
             // 避免界面一直显示假进度(运行中 / 评论采集中 / 意向分析中 / 素材下载中)。
@@ -619,6 +630,37 @@ pub fn run() {
                     rec
                 },
             });
+            // 后台预热录屏探测缓存(麦克风枚举 / 硬编实测 / ddagrab 探测,都要起 ffmpeg 子进程),
+            // 提前在启动空闲期做掉,用户第一次点「开始录制」直接读缓存
+            {
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    agent::computer::recorder::warm_recording_probes(h).await;
+                });
+            }
+
+            // 内网文件服务固定监听 8788 /files,访问地址按当前网卡自动生成。
+            let file_server_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = file_server::serve(file_server_app).await {
+                    tracing::warn!("内网文件服务启动失败: {e}");
+                }
+            });
+
+            // 存量素材缩略图后台回填:浏览前把首张解码成本挪到启动空闲期,失败项由文件服务惰性兜底
+            {
+                let state = app.handle().state::<commands::AppState>();
+                let media_root = state
+                    .config
+                    .lock()
+                    .map(|cfg| media::media_root(&state.config_dir, &cfg.media))
+                    .ok();
+                if let Some(root) = media_root {
+                    tauri::async_runtime::spawn(async move {
+                        thumbnail::backfill_missing(root).await;
+                    });
+                }
+            }
 
             // 任务调度器:每 30s 扫描 daily / watching 任务,到点自动启动采集
             // (前端「定时任务队列」的倒计时与此对齐,误差 ≤ 一个扫描周期)
@@ -733,16 +775,20 @@ pub fn run() {
             commands::get_database_size,
             commands::get_data_dir,
             commands::get_media_root,
+            commands::get_media_file_url,
             commands::get_database_path,
             commands::test_database_connection,
             commands::set_database_config,
             commands::get_remote_database_url,
             commands::migrate_sqlite_to_pg,
             commands::set_storage_path,
+            commands::get_file_server_prefix,
+            commands::get_local_file_server_prefix,
             commands::get_agent_guidelines,
             commands::set_agent_guidelines,
             commands::set_intent_config,
             commands::set_transcription_config,
+            commands::set_ocr_config,
             commands::set_media_proxy,
             commands::get_role_models,
             commands::set_role_models,
@@ -790,6 +836,11 @@ pub fn run() {
             commands::creation::list_shot_prompts,
             commands::creation::upsert_shot_prompt,
             commands::creation::remove_shot_prompt,
+            commands::creation::creation_export_video,
+            commands::creation::creation_list_exports,
+            commands::creation::creation_video_info,
+            commands::creation::creation_video_thumbs,
+            commands::creation_vision::creation_detect_scenes,
             commands::list_platforms,
             commands::upsert_platform,
             commands::remove_platform,
@@ -826,7 +877,9 @@ pub fn run() {
             commands::task::update_task_status,
             commands::task::remove_task,
             commands::task::list_contents_page,
+            commands::task::list_contents_full,
             commands::task::list_comments_page,
+            commands::task::list_comment_sources_page,
             commands::task::content_library_stats,
             commands::task::list_batch_content_ids,
             commands::task::content_industry_counts,
@@ -849,6 +902,7 @@ pub fn run() {
             commands::enrich_authors,
             commands::retry_content_media,
             commands::retry_content_transcript,
+            commands::retry_content_ocr,
             commands::retry_failed_transcripts,
             commands::batch_collect_audios,
             commands::recollect_comments,
@@ -932,7 +986,14 @@ pub fn run() {
             agent::computer::recorder::cancel_recording_overlay,
             agent::computer::recorder::start_screen_recording,
             agent::computer::recorder::stop_screen_recording,
+            agent::computer::recorder::toggle_recording_pause,
+            agent::computer::recorder::list_audio_devices,
+            agent::computer::recorder::test_recording_audio,
+            agent::computer::recorder::set_recording_overlay_panel,
             agent::computer::recorder::get_recording_status,
+            agent::computer::recorder::list_screens,
+            agent::computer::recorder::recording_preview_all,
+            agent::computer::recorder::set_recording_overlay_preview,
             // 拍照回传:截桌面屏幕 → base64 data URL(前端预览 / 将来喂视觉模型)
             agent::capture_desktop_screenshot,
             // 云端连接(配对 / WS / 远程指令)

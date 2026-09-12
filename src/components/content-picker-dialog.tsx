@@ -2,7 +2,7 @@
 // 文案用途:按内容多选(最多 12 篇)。图片用途:按「张」选(全局最多 12 张),
 // 图文相册可内联展开逐张挑选;图源=封面时每条内容按 1 张封面计。
 import { useDeferredValue, useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaFileUrl, mediaThumbPath } from "@/lib/media-file-url";
 import {
   ArrowDown,
   ArrowUp,
@@ -23,7 +23,7 @@ import {
   api,
   type ChatAttachment,
   type ContentListQuery,
-  type ContentView,
+  type ContentListView,
   type IndustryView,
 } from "@/lib/api";
 import {
@@ -55,14 +55,14 @@ export type AssetPickMode = "copy" | "image";
 
 // 图片逐张挑选回传项:某条内容 + 是否只取封面 + 选中的本地图片位置(图文用)
 export interface AssetImagePick {
-  content: ContentView;
+  content: ContentListView;
   coverOnly: boolean;
   indices: number[];
 }
 
 // 确认结果:文案回传内容数组,图片回传逐内容的挑选项
 export type AssetPickResult =
-  | { mode: "copy"; contents: ContentView[] }
+  | { mode: "copy"; contents: ContentListView[] }
   | { mode: "image"; picks: AssetImagePick[] };
 
 // 单次最多选择数:文案 12 篇 / 图片 12 张
@@ -115,7 +115,7 @@ export function ContentPickerDialog({
   onOpenChange,
   onPick,
 }: ContentPickerDialogProps) {
-  const [contents, setContents] = useState<ContentView[]>([]);
+  const [contents, setContents] = useState<ContentListView[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
   const [loading, setLoading] = useState(false);
   const [keyword, setKeyword] = useState("");
@@ -264,7 +264,7 @@ export function ContentPickerDialog({
   }
 
   // 展开图文相册:首次展开时拉取该相册本地图片 base64 供展示
-  async function handleExpand(c: ContentView) {
+  async function handleExpand(c: ContentListView) {
     if (expandedId === c.id) {
       setExpandedId(null);
       return;
@@ -526,13 +526,15 @@ function CopyCard({
   selected,
   onToggle,
 }: {
-  content: ContentView;
+  content: ContentListView;
   selected: boolean;
   onToggle: () => void;
 }) {
+  const mediaFileUrl = useMediaFileUrl();
+  // 选择器网格小图走 _thumb 缩略图(惰性生成,源图在就不会 404);本地缺失时回退外链
   const coverSrc = content.coverPath
-    ? convertFileSrc(content.coverPath)
-    : content.coverUrl || content.imageUrls[0] || "";
+    ? mediaFileUrl(mediaThumbPath(content.coverPath))
+    : content.coverUrl || content.firstImageUrl || "";
   return (
     <li>
       <button
@@ -566,7 +568,7 @@ function ImageItem({
   onExpand,
   onToggleImage,
 }: {
-  content: ContentView;
+  content: ContentListView;
   coverMode: boolean;
   selectedImages: Set<string>;
   expanded: boolean;
@@ -577,9 +579,11 @@ function ImageItem({
   onExpand: () => void;
   onToggleImage: (pos: number) => void;
 }) {
+  const mediaFileUrl = useMediaFileUrl();
+  // 选择器网格小图走 _thumb 缩略图(惰性生成,源图在就不会 404);本地缺失时回退外链
   const coverSrc = content.coverPath
-    ? convertFileSrc(content.coverPath)
-    : content.coverUrl || content.imageUrls[0] || "";
+    ? mediaFileUrl(mediaThumbPath(content.coverPath))
+    : content.coverUrl || content.firstImageUrl || "";
   // 该内容已选张数(key 前缀匹配)
   let picked = 0;
   selectedImages.forEach((k) => {
@@ -587,7 +591,7 @@ function ImageItem({
   });
   const firstSelected = selectedImages.has(imageKey(content.id, 0));
   const total =
-    content.imageTotal || content.imageDone || content.imageUrls.length || 1;
+    content.imageTotal || content.imageDone || content.imageCount || 1;
   // 封面图源、或只有 1 张图片 → 直接勾选,不展开;多图才点开逐张挑
   const directSelect = coverMode || total <= 1;
 
@@ -705,7 +709,7 @@ function CheckBadge({
 }
 
 // 方形缩略图(本地优先;无图按类型占位)
-function Thumb({ src, kind }: { src: string; kind: ContentView["kind"] }) {
+function Thumb({ src, kind }: { src: string; kind: ContentListView["kind"] }) {
   return (
     <div className="flex aspect-square w-full items-center justify-center overflow-hidden bg-muted">
       {src ? (
@@ -728,7 +732,7 @@ function Thumb({ src, kind }: { src: string; kind: ContentView["kind"] }) {
 }
 
 // 卡片底部:标题 + 平台·作者
-function CardMeta({ content }: { content: ContentView }) {
+function CardMeta({ content }: { content: ContentListView }) {
   const primary = content.title?.trim() || content.desc?.trim() || "(无标题)";
   return (
     <div className="min-w-0 p-2">

@@ -132,33 +132,38 @@ export function BillingPage() {
             value={summary.data.totalTokens.toLocaleString()}
             icon={Coins}
             delay={0}
+            accent="bg-amber-500/10 text-amber-600 group-hover:bg-amber-500/20 dark:text-amber-400"
           />
           <StatCard
             label="输入 Token"
             value={summary.data.totalPromptTokens.toLocaleString()}
             icon={Sparkles}
             delay={60}
+            accent="bg-sky-500/10 text-sky-600 group-hover:bg-sky-500/20 dark:text-sky-400"
           />
           <StatCard
             label="输出 Token"
             value={summary.data.totalCompletionTokens.toLocaleString()}
             icon={Activity}
             delay={120}
+            accent="bg-emerald-500/10 text-emerald-600 group-hover:bg-emerald-500/20 dark:text-emerald-400"
           />
           <StatCard
             label="总请求次数"
             value={summary.data.totalRequests.toLocaleString()}
             icon={MessageSquare}
             delay={180}
+            accent="bg-violet-500/10 text-violet-600 group-hover:bg-violet-500/20 dark:text-violet-400"
           />
         </div>
       )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div
-          className="veltrix-enter veltrix-card p-6"
+          className="veltrix-enter veltrix-card relative overflow-hidden p-6"
           style={{ animationDelay: "60ms" }}
         >
+          <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-sky-500/60 via-violet-500/60 to-emerald-500/60" />
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">
               Token 消耗趋势 · 按模型
@@ -182,9 +187,10 @@ export function BillingPage() {
           )}
         </div>
         <div
-          className="veltrix-enter veltrix-card p-6"
+          className="veltrix-enter veltrix-card relative overflow-hidden p-6"
           style={{ animationDelay: "100ms" }}
         >
+          <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-sky-500/60 via-violet-500/60 to-emerald-500/60" />
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">
               请求次数趋势 · 按模型
@@ -211,9 +217,10 @@ export function BillingPage() {
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div
-          className="veltrix-enter veltrix-card p-6"
+          className="veltrix-enter veltrix-card relative overflow-hidden p-6"
           style={{ animationDelay: "140ms" }}
         >
+          <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-sky-500/60 via-violet-500/60 to-emerald-500/60" />
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">
               Token 分布 · 按模型
@@ -255,9 +262,10 @@ export function BillingPage() {
         </div>
 
         <div
-          className="veltrix-enter veltrix-card p-6"
+          className="veltrix-enter veltrix-card relative overflow-hidden p-6"
           style={{ animationDelay: "180ms" }}
         >
+          <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-sky-500/60 via-violet-500/60 to-emerald-500/60" />
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">
               请求次数分布 · 按模型
@@ -302,9 +310,10 @@ export function BillingPage() {
       {/* 各模型明细:用 min-h 兜底而非 min-h-0,避免竖向空间不足时被 flex 压缩到 0 高度看不见
           (1920*1080 下上方卡片+图表占满时会触发);空间不足则外层 overflow-y-auto 出滚动条 */}
       <div
-        className="veltrix-enter veltrix-card flex min-h-[20rem] flex-1 flex-col p-6"
+        className="veltrix-enter veltrix-card relative flex min-h-[20rem] flex-1 flex-col overflow-hidden p-6"
         style={{ animationDelay: "220ms" }}
       >
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-sky-500/60 via-violet-500/60 to-emerald-500/60" />
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-semibold text-foreground">
             各模型明细

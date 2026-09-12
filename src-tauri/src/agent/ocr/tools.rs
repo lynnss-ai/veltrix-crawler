@@ -128,6 +128,19 @@ fn crop_region(
     Ok(image::imageops::crop_imm(full, x, y, clamped_w, clamped_h).to_image())
 }
 
+/// 识别本地图片文件中的文字(供封面 OCR 前置「有无文字」预判复用,与屏幕 OCR 同一 WinRT 引擎)。
+/// 仅 Windows 可用;其它平台 / 引擎不可用(缺语言包)返回 Err——调用方应按「预判失败」处理,
+/// 继续走云端 OCR,而不是当作「无文字」。
+pub async fn recognize_image_text(path: &std::path::Path) -> Result<String, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let img = image::open(&path).map_err(|e| format!("打开图片失败({}): {e}", path.display()))?;
+        recognize_rgba(&img.to_rgba8())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("OCR 任务异常: {e}")))
+}
+
 // ===================== Windows:WinRT Windows.Media.Ocr =====================
 
 /// 把 RGBA 图交给系统 OCR 识别,返回纯文本。

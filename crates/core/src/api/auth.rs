@@ -22,7 +22,7 @@ const AUD_PC: &str = "pc";
 const AUD_MOBILE: &str = "mobile";
 
 /// 用户(桌面端/Web 登录态)。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserClaims {
     pub sub: String,
     /// 数据级别:all / self
@@ -32,7 +32,7 @@ pub struct UserClaims {
 }
 
 /// PC 客户端(配对成功后云端签发,用于设备上报)。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PcClaims {
     /// sub = device_id
     pub sub: String,
@@ -43,7 +43,7 @@ pub struct PcClaims {
 }
 
 /// 手机端(扫码绑定后签发)。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MobileClaims {
     /// sub = 手机端用户标识(扫码时由云端生成的匿名 id,或后续接入手机账号体系)
     pub sub: String,
@@ -156,7 +156,7 @@ fn validation_for(aud: &str) -> Validation {
     v
 }
 
-fn decode_typed<T: for<'de> Deserialize<'de>>(
+fn decode_typed<T: for<'de> Deserialize<'de> + Clone>(
     token: &str,
     secret: &[u8],
     aud: &str,

@@ -39,19 +39,21 @@ pub struct MediaOutcome {
     pub audio_extracted: Option<bool>,
     /// 失败原因(下载/提取任一失败时记录,供前端提示)
     pub error: Option<String>,
-    /// 封面本地绝对路径(下载成功),供回写 contents.cover_path
+    /// 封面本地路径(下载成功),供回写 contents.cover_path;内存中为绝对路径,回写 DB 时转相对 media_root 的相对路径
     pub cover_path: Option<String>,
-    /// 作者头像本地绝对路径(下载成功/已存在),供回写 contents.avatar_path
+    /// 作者头像本地路径(下载成功/已存在),供回写 contents.avatar_path;内存中为绝对路径,回写 DB 时转相对路径
     pub avatar_path: Option<String>,
-    /// 视频转出的音频(mp3)本地绝对路径,供后续语音转写读取;None=非视频/转码失败
+    /// 视频转出的音频(mp3)本地绝对路径,供后续语音转写读取;None=非视频/转码失败;回写 DB 时转相对路径
     pub audio_path: Option<String>,
-    /// 保留视频(keep_video)落盘的本地绝对路径,供自动发布读取;None=未开/下载失败
+    /// 保留视频(keep_video)落盘的本地绝对路径,供自动发布读取;None=未开/下载失败;回写 DB 时转相对路径
     pub video_path: Option<String>,
     /// 视频文件是否下载成功(仅 video + 音频提取/保留视频);None=非视频/未尝试
     pub video_downloaded: Option<bool>,
     /// 图文图片总数 / 已成功下载数(仅 image)
     pub image_total: Option<i32>,
     pub image_done: Option<i32>,
+    /// 成功下载的图集路径,下标与 image_urls 保持一致;内存中为绝对路径,回写 DB 时转相对路径。
+    pub image_paths: Vec<Option<String>>,
 }
 
 /// 任务级素材开关:从任务行透传到媒体阶段的处理策略,与单条内容无关。
@@ -84,6 +86,11 @@ const DIR_VIDEO: &str = "video";
 const DIR_IMAGE: &str = "image";
 /// 作者头像分组目录名。头像按作者去重存一份,不随内容/日期/形态分散。
 const DIR_AVATAR: &str = "avatar";
+
+/// 头像目录名(供 commands 按落盘约定反查本地头像路径)
+pub(crate) fn avatar_dir_name() -> &'static str {
+    DIR_AVATAR
+}
 /// 视频转出的音频单独分组目录:不与封面/视频同目录,便于检索与转写读取。
 const DIR_AUDIO: &str = "audio";
 /// 作者头像本地缓存有效期(秒):超过则删旧重下,保证头像不长期陈旧。7 天。
@@ -298,6 +305,134 @@ pub fn media_root(config_dir: &Path, media: &MediaConfig) -> PathBuf {
     }
 }
 
+/// 素材路径入库口径:统一存相对 media_root 的正斜杠相对路径(如 `xhs/2026-09-08/image/xxx_cover.jpg`);
+/// 读端用 resolve_media_path 还原,兼容存量绝对路径。
+pub fn to_media_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// 读取侧解析:存量绝对路径原样使用;相对路径拼到 media_root 下。
+pub fn resolve_media_path(root: &Path, stored: &str) -> std::path::PathBuf {
+    let p = Path::new(stored);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(stored)
+    }
+}
+
+/// 存量迁移:把 contents 表 5 个本地路径列中的绝对路径(以当前 media_root 为前缀)改写为相对路径。
+/// 启动时调用一次;已迁移的行不再命中前缀,幂等。比较前统一把 `\` 归一为 `/` 且忽略大小写(Windows)。
+/// 出错只 warn 不阻断启动,返回成功改写的行数。
+pub async fn migrate_media_paths_to_relative(db: &sea_orm::DatabaseConnection, root: &Path) -> u64 {
+    use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set};
+    use veltrix_core::db::entity::content;
+
+    // 归一化 root 前缀:正斜杠 + 结尾分隔符,比较时忽略大小写(Windows 盘符/路径大小写不敏感)
+    let mut prefix = root.to_string_lossy().replace('\\', "/");
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    let prefix_lower = prefix.to_lowercase();
+
+    // 只取 id + 5 个路径列,避免把 transcript 等大字段拉回来
+    let rows = match content::Entity::find()
+        .select_only()
+        .column(content::Column::Id)
+        .column(content::Column::CoverPath)
+        .column(content::Column::AvatarPath)
+        .column(content::Column::AudioPath)
+        .column(content::Column::VideoPath)
+        .column(content::Column::ImagePaths)
+        .into_tuple::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>()
+        .all(db)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("迁移素材路径:读 contents 失败: {e}");
+            return 0;
+        }
+    };
+
+    // 单个存量值若仍以 root 前缀开头(归一化、忽略大小写),剥前缀转相对路径
+    let strip = |stored: &str| -> Option<String> {
+        let normalized = stored.replace('\\', "/");
+        if normalized.to_lowercase().starts_with(&prefix_lower) {
+            Some(normalized[prefix.len()..].to_string())
+        } else {
+            None
+        }
+    };
+
+    let mut fixed = 0u64;
+    for (id, cover, avatar, audio, video, images) in rows {
+        let new_cover = cover.as_deref().and_then(&strip);
+        let new_avatar = avatar.as_deref().and_then(&strip);
+        let new_audio = audio.as_deref().and_then(&strip);
+        let new_video = video.as_deref().and_then(&strip);
+        // image_paths 是 Vec<Option<String>> 的 JSON,逐元素剥前缀;解析失败按无变更处理
+        let new_images = images.as_deref().and_then(|raw| {
+            let mut list: Vec<Option<String>> = serde_json::from_str(raw).ok()?;
+            let mut changed = false;
+            for item in list.iter_mut().flatten() {
+                if let Some(rel) = strip(item) {
+                    *item = rel;
+                    changed = true;
+                }
+            }
+            changed.then(|| serde_json::to_string(&list).ok()).flatten()
+        });
+
+        if new_cover.is_none()
+            && new_avatar.is_none()
+            && new_audio.is_none()
+            && new_video.is_none()
+            && new_images.is_none()
+        {
+            continue;
+        }
+
+        let mut am = content::ActiveModel {
+            id: sea_orm::Unchanged(id),
+            ..Default::default()
+        };
+        if let Some(v) = new_cover {
+            am.cover_path = Set(Some(v));
+        }
+        if let Some(v) = new_avatar {
+            am.avatar_path = Set(Some(v));
+        }
+        if let Some(v) = new_audio {
+            am.audio_path = Set(Some(v));
+        }
+        if let Some(v) = new_video {
+            am.video_path = Set(Some(v));
+        }
+        if let Some(v) = new_images {
+            am.image_paths = Set(Some(v));
+        }
+        match am.update(db).await {
+            Ok(_) => fixed += 1,
+            Err(e) => tracing::warn!("迁移素材路径:更新失败: {e}"),
+        }
+    }
+    if fixed > 0 {
+        tracing::info!("迁移素材路径:{fixed} 行 contents 本地路径改写为相对 media_root 的相对路径");
+    }
+    fixed
+}
+
 /// 防盗链 Referer 映射:这些平台的 CDN 校验 Referer,缺失会 403。
 /// 按 URL 子串命中;未命中的域名保持原行为(不加任何头),不影响既有平台。
 const REFERER_BY_CDN: &[(&str, &str)] = &[
@@ -328,6 +463,15 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// 素材下载连接 / 整体超时(秒):避免个别 hang 住的 CDN 直链无限阻塞,拖垮整批素材下载。
 const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 120;
+/// 素材落盘的体积硬上限:响应可能没有 Content-Length(或撒谎),流式写盘也要防磁盘写穿。
+/// 超限记失败并删掉残文件——半截素材落盘会被当成功产物回写路径、被发布服务复用。
+const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 图片 / 封面 / 头像
+const MAX_VIDEO_BYTES: u64 = 2 * 1024 * 1024 * 1024; // keep_video 视频
+/// 视频 body 流式读取的 idle 超时:reqwest 的 .timeout() 含 body 读取,慢 CDN 上数百 MB 的
+/// 视频会被 120s 总超时误杀;改为「单次读停滞 60s 无新数据判死」,正常慢速下载不受影响。
+const VIDEO_BODY_IDLE_SECS: u64 = 60;
+/// 视频下载整体兜底:idle 超时管停滞,这里管总时长(慢 CDN + 大视频 10 分钟足够)。
+const VIDEO_DOWNLOAD_MAX_SECS: u64 = 600;
 
 /// 素材下载共享 HTTP 客户端:reqwest Client 内部自带连接池,全局唯一才吃得到 keep-alive;
 /// 此前每次下载都新建客户端,同一 CDN 的每张图都重做一次 TCP+TLS 握手。
@@ -339,7 +483,63 @@ static DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::n
         .build()
 });
 
-/// 下载 URL 到本地文件。reqwest 拉取字节后整体写入;失败返回错误供调用方告警。
+/// 视频落盘专用客户端:只保留连接超时,**不设整体超时**——reqwest 的 .timeout() 含 body
+/// 读取,keep_video 视频可达数百 MB,慢 CDN 下会被总超时误杀;body 阶段的停滞 / 总时长
+/// 改由 stream_body_to_file 的 idle 超时与调用方整体上限控制。
+static VIDEO_DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .build()
+});
+
+/// 把响应 body 流式写入文件:keep_video 视频可达数百 MB,10 路并发叠加 bytes() 整文件
+/// 读入内存会爆内存,故边读边写。超过 max_bytes 或单次读停滞超过 idle 判失败;
+/// 任何失败都删掉残文件——半截素材落盘会被当成功产物(回写路径 / 发布复用)。
+/// 返回写入字节数;整体时长上限由调用方按场景在外层包 timeout(图片走客户端 120s 总超时,
+/// 视频客户端无总超时、由 download_video_file 包 600s 兜底)。
+async fn stream_body_to_file(
+    mut resp: reqwest::Response,
+    path: &Path,
+    max_bytes: u64,
+    idle: std::time::Duration,
+) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut written: u64 = 0;
+    let result: Result<()> = loop {
+        let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break Ok(()),
+            Ok(Err(e)) => break Err(CrawlerError::Parse(format!("读取响应流失败: {e}"))),
+            Err(_) => {
+                break Err(CrawlerError::Parse(format!(
+                    "下载停滞超过 {} 秒无新数据,判定连接已死",
+                    idle.as_secs()
+                )))
+            }
+        };
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            break Err(CrawlerError::Parse(format!(
+                "文件超过体积上限 {} MB,放弃下载",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        if let Err(e) = file.write_all(&chunk).await {
+            break Err(CrawlerError::Parse(format!("写入文件失败: {e}")));
+        }
+    };
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(e);
+    }
+    file.flush().await?;
+    Ok(written)
+}
+
+/// 下载 URL 到本地文件(图片 / 封面 / 头像)。body 流式写盘 + 50MB 体积上限,
+/// 不再 bytes() 整文件读入内存;失败返回错误供调用方告警(残文件已由 stream_body_to_file 删除)。
+/// 整体超时仍由共享客户端的 120s 总超时控制(图片量级足够,不另包)。
 pub async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     if url.trim().is_empty() {
         return Err(CrawlerError::Parse("下载地址为空".into()));
@@ -354,8 +554,13 @@ pub async fn download_to_file(url: &str, path: &Path) -> Result<()> {
             .header(reqwest::header::USER_AGENT, BROWSER_UA);
     }
     let resp = req.send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(path, &bytes).await?;
+    stream_body_to_file(
+        resp,
+        path,
+        MAX_IMAGE_BYTES,
+        std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS),
+    )
+    .await?;
     Ok(())
 }
 
@@ -376,14 +581,15 @@ async fn download_video_file(url: &str, path: &Path, ctx: &VideoFetchCtx<'_>) ->
         return Err(CrawlerError::Parse("下载地址为空".into()));
     }
     // 海外 CDN 需要代理时现场建带代理的客户端(冷门路径,不进全局共享客户端);
-    // 国内 CDN 走共享客户端吃 keep-alive
+    // 国内 CDN 走共享客户端吃 keep-alive。两侧都**不设整体超时**:reqwest 的 .timeout()
+    // 含 body 读取,慢 CDN 上的大视频会被误杀;body 阶段的停滞 / 总时长由下方 idle 超时
+    // 与 600s 整体兜底控制(见 stream_body_to_file)
     let owned_client;
     let client: &reqwest::Client = if url_needs_proxy(url) {
         match resolve_proxy(ctx.proxy_setting) {
             Some(proxy) => {
                 owned_client = reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
-                    .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
                     .proxy(
                         reqwest::Proxy::all(&proxy)
                             .map_err(|e| CrawlerError::Parse(format!("代理配置无效: {e}")))?,
@@ -392,12 +598,12 @@ async fn download_video_file(url: &str, path: &Path, ctx: &VideoFetchCtx<'_>) ->
                     .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?;
                 &owned_client
             }
-            None => DOWNLOAD_CLIENT
+            None => VIDEO_DOWNLOAD_CLIENT
                 .as_ref()
                 .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?,
         }
     } else {
-        DOWNLOAD_CLIENT
+        VIDEO_DOWNLOAD_CLIENT
             .as_ref()
             .map_err(|e| CrawlerError::Parse(format!("初始化下载客户端失败: {e}")))?
     };
@@ -411,9 +617,43 @@ async fn download_video_file(url: &str, path: &Path, ctx: &VideoFetchCtx<'_>) ->
     if let Some(ck) = ctx.cookie.map(str::trim).filter(|c| !c.is_empty()) {
         req = req.header(reqwest::header::COOKIE, ck);
     }
-    let resp = req.send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(path, &bytes).await?;
+    // 客户端已无总超时,连接 + 响应头阶段单独包一层 120s,保留原「hang 住判死」语义;
+    // body 阶段:流式写盘(不整文件读入内存)+ 2GB 上限 + 60s idle 判死 + 600s 整体兜底
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS),
+        req.send(),
+    )
+    .await
+    {
+        Ok(resp) => resp?.error_for_status()?,
+        Err(_) => {
+            return Err(CrawlerError::Parse(format!(
+                "连接 / 等待响应头超过 {DOWNLOAD_TOTAL_TIMEOUT_SECS} 秒,判定链接已死"
+            )))
+        }
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(VIDEO_DOWNLOAD_MAX_SECS),
+        stream_body_to_file(
+            resp,
+            path,
+            MAX_VIDEO_BYTES,
+            std::time::Duration::from_secs(VIDEO_BODY_IDLE_SECS),
+        ),
+    )
+    .await
+    {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(CrawlerError::Parse(format!(
+                "视频下载超过整体上限 {} 分钟,已放弃",
+                VIDEO_DOWNLOAD_MAX_SECS / 60
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -620,6 +860,96 @@ fn wait_ffmpeg(
     Ok(())
 }
 
+/// ffmpeg 本地文件操作(探测 / 切片 / 转码)的等待上限:本地输入无网络 IO,正常秒级到
+/// 几十秒;损坏输入可让 ffmpeg 永不退出,此前用 .status()/.output() 阻塞等待会永久占住
+/// spawn_blocking 线程,并发全挂即拖垮整个转写阶段。2 分钟足够,超时强杀按失败处理。
+const FFMPEG_LOCAL_OP_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// ffmpeg 本地文件操作(探测 / 切片 / 转码)的统一执行入口,替代裸 .status()/.output():
+/// 1) 先取 FFMPEG_SEMAPHORE permit——ASR 路径(VAD 全量解码 + 逐段切割 + 退化探测 +
+///    转码)此前不受 ffmpeg 并发上限约束,转写并发叠加下载阶段会打满 CPU / 磁盘 IO;
+///    permit 随单次进程结束释放,且持有期间只做本地文件 IO,无网络 IO;
+/// 2) stdout/stderr 用读取线程边产边收(与 .output() 同语义)——PCM 探测输出可达数十 MB,
+///    管道不排干 ffmpeg 会写满缓冲卡死;
+/// 3) FFMPEG_LOCAL_OP_MAX deadline + 强杀,挂死不再永久占住 spawn_blocking 线程;
+///    失败语义与 .output() 一致(Err / 非 0 退出码由调用方按原口径处理)。
+/// 调用方都在 spawn_blocking 线程上(Handle::block_on 合法);极少数无线程运行时上下文的
+/// 同步调用方退化为不限流,保持可用而不是 panic。
+pub(crate) fn run_ffmpeg_local(cmd: &mut std::process::Command) -> Result<std::process::Output> {
+    let _permit = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .block_on(FFMPEG_SEMAPHORE.acquire())
+            .map_err(|e| CrawlerError::Parse(format!("获取 ffmpeg 并发许可失败: {e}")))?,
+        Err(_) => {
+            // 不在 tokio 运行时内(纯同步调用方):跳过限流直接跑,信号量语义是防并发打满,
+            // 缺失时不影响正确性
+            return run_ffmpeg_local_inner(cmd);
+        }
+    };
+    run_ffmpeg_local_inner(cmd)
+}
+
+/// run_ffmpeg_local 的执行体(permit 由外层持有):spawn + 管道排干 + deadline 强杀。
+fn run_ffmpeg_local_inner(cmd: &mut std::process::Command) -> Result<std::process::Output> {
+    use std::io::Read as _;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+    // 读取线程排干管道:ffmpeg 输出超过管道缓冲(Windows ~64KB)不排干会写阻塞卡死
+    let mut out_pipe = child.stdout.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = out_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut err_pipe = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = err_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + FFMPEG_LOCAL_OP_MAX;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // 挂死的 ffmpeg:强杀并回收,读取线程随后会因管道关闭自然结束
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(CrawlerError::Parse(format!(
+                        "ffmpeg 本地操作超时(超过 {} 秒),已终止",
+                        FFMPEG_LOCAL_OP_MAX.as_secs()
+                    )));
+                }
+                // 比 wait_ffmpeg 的 500ms 更密:本地操作正常秒级完成,轮询间隔直接计入延迟
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(CrawlerError::Parse(format!("等待 ffmpeg 退出失败: {e}")));
+            }
+        }
+    };
+    // join 失败(读取线程 panic)只丢输出不丢结论:状态已拿到,按空输出处理
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// 把本地音频按时长切片(语音转写用:单文件超过 ASR 体积上限时先切再逐段转写)。
 /// 用 ffmpeg 的 segment muxer、`-c copy` 不重编码(快且无损);切片命名为 chunk_0001.mp3 起,
 /// 输出目录由调用方创建/清理。返回按文件名排序的切片路径(顺序即时间顺序)。
@@ -639,8 +969,7 @@ pub fn split_audio(
     let pattern = out_dir.join("chunk_%04d.mp3");
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let status = cmd
-        .arg("-y") // 覆盖已存在切片,避免交互确认卡住
+    cmd.arg("-y") // 覆盖已存在切片,避免交互确认卡住
         .arg("-i")
         .arg(audio)
         .arg("-f")
@@ -651,13 +980,13 @@ pub fn split_audio(
         .arg("copy") // 不重编码:按帧边界切,速度快、音质无损
         .arg("-threads")
         .arg("1")
-        .arg(&pattern)
-        .status()
-        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
-    if !status.success() {
+        .arg(&pattern);
+    // 统一入口:ffmpeg 并发限流 + 2 分钟 deadline 强杀,挂死不再占死 spawn_blocking 线程
+    let output = run_ffmpeg_local(&mut cmd)?;
+    if !output.status.success() {
         return Err(CrawlerError::Parse(format!(
             "ffmpeg 音频切片失败:{}",
-            describe_ffmpeg_exit(status.code())
+            describe_ffmpeg_exit(output.status.code())
         )));
     }
     let mut chunks: Vec<PathBuf> = std::fs::read_dir(out_dir)
@@ -740,12 +1069,11 @@ fn drop_degenerate_chunks(chunks: Vec<PathBuf>, ffmpeg_path: Option<&str>) -> Ve
 /// 探测音频流的实际解码时长(秒):解码为 16kHz 16bit 单声道 PCM 到 stdout,
 /// 按输出字节数换算时长。不依赖 ffmpeg 的 `time=` 进度输出——短于 0.5s 的碎片
 /// 解码瞬间完成、进度行根本不打印(曾因此探测返回 None 而漏放碎片,智谱 1210)。
-/// 解码失败返回 None,由调用方保守放行。
+/// 解码失败返回 None,由调用方保守放行(超时强杀同走 None,语义不变)。
 pub(crate) fn probe_decoded_seconds(program: &str, audio: &Path) -> Option<f64> {
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .arg("-hide_banner")
+    cmd.arg("-hide_banner")
         .arg("-v")
         .arg("error")
         .arg("-i")
@@ -757,9 +1085,9 @@ pub(crate) fn probe_decoded_seconds(program: &str, audio: &Path) -> Option<f64> 
         .arg("16000")
         .arg("-f")
         .arg("s16le")
-        .arg("-")
-        .output()
-        .ok()?;
+        .arg("-");
+    // 统一入口:限流 + deadline 强杀;PCM 走 stdout,由读取线程排干管道
+    let output = run_ffmpeg_local(&mut cmd).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -864,8 +1192,7 @@ fn voiced_duration_secs(frames: &[bool], frame_secs: f64) -> f64 {
 fn detect_voiced_frames(program: &str, audio: &Path) -> Result<Vec<bool>> {
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .arg("-hide_banner")
+    cmd.arg("-hide_banner")
         .arg("-v")
         .arg("error")
         .arg("-i")
@@ -877,9 +1204,9 @@ fn detect_voiced_frames(program: &str, audio: &Path) -> Result<Vec<bool>> {
         .arg("16000")
         .arg("-f")
         .arg("s16le")
-        .arg("-")
-        .output()
-        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+        .arg("-");
+    // 统一入口:限流 + deadline 强杀;失败语义不变(Err 向上传播,调用方保守放行 / 回退)
+    let output = run_ffmpeg_local(&mut cmd)?;
     if !output.status.success() {
         return Err(CrawlerError::Parse(format!(
             "ffmpeg 解码 PCM 失败:{}",
@@ -939,17 +1266,16 @@ fn gaps_from_voiced_frames(frames: &[bool], frame_secs: f64, min_gap_secs: f64) 
 fn detect_silences(program: &str, audio: &Path) -> Result<Vec<SilenceRange>> {
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .arg("-hide_banner")
+    cmd.arg("-hide_banner")
         .arg("-i")
         .arg(audio)
         .arg("-af")
         .arg(SILENCE_DETECT_FILTER)
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
+        .arg("-");
+    // 统一入口:限流 + deadline 强杀;失败语义不变(Err 向上,调用方回退按时长硬切)
+    let output = run_ffmpeg_local(&mut cmd)?;
     if !output.status.success() {
         return Err(CrawlerError::Parse(format!(
             "ffmpeg 静音探测失败:{}",
@@ -990,12 +1316,9 @@ fn parse_silences(stderr: &str) -> Vec<SilenceRange> {
 fn probe_duration(program: &str, audio: &Path) -> Option<f64> {
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .arg("-hide_banner")
-        .arg("-i")
-        .arg(audio)
-        .output()
-        .ok()?;
+    cmd.arg("-hide_banner").arg("-i").arg(audio);
+    // 统一入口:限流 + deadline 强杀;解析不到 / 失败返回 None 由调用方回退(语义不变)
+    let output = run_ffmpeg_local(&mut cmd).ok()?;
     parse_ffmpeg_duration(&String::from_utf8_lossy(&output.stderr))
 }
 
@@ -1076,13 +1399,12 @@ fn cut_audio_at(program: &str, audio: &Path, out_dir: &Path, cuts: &[f64]) -> Re
             cmd.arg("-t").arg(format!("{:.3}", next - seg_start));
         }
         cmd.arg("-c").arg("copy").arg("-threads").arg("1").arg(&out);
-        let status = cmd
-            .status()
-            .map_err(|e| CrawlerError::Parse(format!("启动 ffmpeg 失败: {e}")))?;
-        if !status.success() {
+        // 统一入口:限流 + deadline 强杀,单段挂死不再占死 spawn_blocking 线程
+        let output = run_ffmpeg_local(&mut cmd)?;
+        if !output.status.success() {
             return Err(CrawlerError::Parse(format!(
                 "ffmpeg 音频切片失败:{}",
-                describe_ffmpeg_exit(status.code())
+                describe_ffmpeg_exit(output.status.code())
             )));
         }
         chunks.push(out);
@@ -1140,7 +1462,7 @@ pub fn bundled_ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 /// 把内容 ID 清洗为合法文件名前缀:替换非法字符为 `_`,限长,空值兜底为 "unknown"。
-fn sanitize_filename(raw: &str) -> String {
+pub(crate) fn sanitize_filename(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .take(MAX_FILENAME_PREFIX_CHARS)
@@ -1188,17 +1510,23 @@ pub async fn process_content(
             video_downloaded: None,
             image_total: None,
             image_done: None,
+            image_paths: Vec::new(),
         };
     }
 
     let prefix = sanitize_filename(&content.content_id);
 
-    // 封面:下载成功记录本地绝对路径,供前端本地优先显示
+    // 封面:下载成功记录本地路径(内存中为绝对路径,回写 DB 时转相对路径),供前端本地优先显示
     let mut cover_path = None;
     if let Some(cover) = content.cover_url.as_deref().filter(|s| !s.is_empty()) {
         let path = dir.join(format!("{prefix}_cover.jpg"));
         match download_to_file(cover, &path).await {
-            Ok(()) => cover_path = Some(path.to_string_lossy().into_owned()),
+            Ok(()) => {
+                // 落盘即生成 480px 缩略图(瀑布流卡片直接加载原图会解码卡顿);
+                // 失败仅记日志,不影响封面本体与主流程
+                let _ = crate::thumbnail::ensure(path.clone()).await;
+                cover_path = Some(path.to_string_lossy().into_owned());
+            }
             Err(e) => tracing::warn!(content_id = %content.content_id, "下载封面失败: {e}"),
         }
     }
@@ -1217,12 +1545,19 @@ pub async fn process_content(
                     let _avatar_guard = lock.lock().await;
                     // 头像 7 天节流:未过期则复用;过期(或不存在)则删旧重下,避免头像长期陈旧
                     if is_file_fresh(&path, AVATAR_TTL_SECS).await {
+                        // 复用存量头像时补齐缩略图(ensure 内部已存在即快速返回)
+                        crate::thumbnail::ensure(path.clone()).await;
                         avatar_path = Some(path.to_string_lossy().into_owned());
                     } else {
-                        // 过期先删旧再下新(文件不存在时删除失败可忽略)
+                        // 过期先删旧再下新(文件不存在时删除失败可忽略);旧缩略图一并作废,
+                        // 否则 ensure 命中残留 thumb,新头像会一直显示旧图
                         let _ = tokio::fs::remove_file(&path).await;
+                        let _ = tokio::fs::remove_file(crate::thumbnail::thumb_path_for(&path)).await;
                         match download_to_file(avatar, &path).await {
-                            Ok(()) => avatar_path = Some(path.to_string_lossy().into_owned()),
+                            Ok(()) => {
+                                crate::thumbnail::ensure(path.clone()).await;
+                                avatar_path = Some(path.to_string_lossy().into_owned());
+                            }
                             Err(e) => tracing::warn!(content_id = %content.content_id, "下载头像失败: {e}"),
                         }
                     }
@@ -1246,6 +1581,7 @@ pub async fn process_content(
         video_downloaded: None,
         image_total: None,
         image_done: None,
+        image_paths: vec![None; content.image_urls.len()],
     };
 
     // 视频:任务开「音频提取」(AI 文案提取隐含开启)则转音频;开「保留视频」则落盘到
@@ -1312,7 +1648,12 @@ pub async fn process_content(
         img_total += 1;
         let path = dir.join(format!("{prefix}_img{idx}.jpg"));
         match download_to_file(img_url, &path).await {
-            Ok(()) => img_done += 1,
+            Ok(()) => {
+                img_done += 1;
+                // 同封面:落盘即生成缩略图,失败不阻断后续图片
+                let _ = crate::thumbnail::ensure(path.clone()).await;
+                outcome.image_paths[idx] = Some(path.to_string_lossy().into_owned());
+            }
             Err(e) => {
                 tracing::warn!(content_id = %content.content_id, index = idx, "下载图片失败: {e}");
                 image_failed = true;
@@ -1351,7 +1692,7 @@ struct VideoJob<'a> {
 /// 视频子流程:按开关组合处理——
 /// - 仅 keep_video:视频下载落盘到 video/ 目录(自动发布素材),不转音频;
 /// - 仅 audio_extract:不落地视频,ffmpeg 从直链拉流转音频(只留音频);
-/// - 两者皆开:先落盘视频,再让 ffmpeg 从本地文件抽音频(少拉一次流);
+/// - 两者皆开:先落盘视频;平台另下发独立音轨时直接转该音轨,否则从本地视频抽取;
 ///   落盘失败仅记 error 不阻断,音频退回直链拉流。
 /// ffmpeg 在阻塞线程池(spawn_blocking)执行,不占异步运行时工作线程。
 async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
@@ -1373,6 +1714,13 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
         media.audio_format.trim()
     };
     let audio_path = audio_dir.join(format!("{prefix}.{audio_format}"));
+    // B站/YouTube 的 DASH 播放格式常将音视频分轨。该地址不是 MP3,必须经 ffmpeg
+    // 真正转码,不能复用下方 audio_url 的“原始 MP3 直接下载”捷径。
+    let audio_source_url = content
+        .extra
+        .get("audio_source_url")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
 
     // 防盗链 Referer 优先按内容所属平台解析(视频 CDN 域名多变,按平台比按 CDN 子串更稳),
     // 平台未命中再退回 CDN 子串匹配。referer 是 &'static str,可直接进 spawn_blocking 闭包。
@@ -1481,8 +1829,8 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
         }
     }
 
-    // ffmpeg 同步阻塞,挪到阻塞线程池。优先用已落盘的本地视频(免二次拉流);
-    // 未落盘(keep_video 关或下载失败)则从直链拉流。抖音等 CDN 偶发
+    // ffmpeg 同步阻塞,挪到阻塞线程池。有独立音轨时优先转该音轨;否则优先用已落盘
+    // 的音视频文件(免二次拉流),未落盘再从视频直链拉流。抖音等 CDN 偶发
     // 「收到请求不返响应直接断」,失败后短暂退避再原样重试一次。
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_EXTRACT_ATTEMPTS {
@@ -1507,9 +1855,9 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
         let audio_for_task = audio_path.clone();
         let ffmpeg_for_task = media.ffmpeg_path.clone();
         let cancel_for_task = cancel.clone();
-        let result = if let Some(local) = &local_video {
+        let result = if audio_source_url.is_none() && local_video.is_some() {
             // 本地文件抽音频:无防盗链/代理问题,参数精简
-            let video_for_task = local.clone();
+            let video_for_task = local_video.as_ref().expect("已检查本地视频存在").clone();
             tokio::task::spawn_blocking(move || {
                 extract_audio_from_file(
                     &video_for_task,
@@ -1520,7 +1868,7 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
             })
             .await
         } else {
-            let url_for_task = video_url.to_string();
+            let url_for_task = audio_source_url.unwrap_or(video_url).to_string();
             // cookie / proxy 是借用,而 spawn_blocking 闭包要求 'static,故转 owned 再 move 进去
             let cookie_for_task = cookie.map(str::to_string);
             let proxy_for_task = media.proxy.clone();

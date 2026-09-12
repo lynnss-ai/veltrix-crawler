@@ -319,6 +319,14 @@ export function UsersPage() {
         renderToolbar={(table) => (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 flex-wrap items-center gap-2">
+              <DataTableFacetedFilter
+                column={table.getColumn("status")}
+                title="状态"
+                options={[
+                  { label: "启用", value: "enabled", icon: CircleCheck },
+                  { label: "禁用", value: "disabled", icon: CircleDashed },
+                ]}
+              />
               <div className="relative w-full sm:max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -328,14 +336,6 @@ export function UsersPage() {
                   onChange={(e) => table.setGlobalFilter(e.target.value)}
                 />
               </div>
-              <DataTableFacetedFilter
-                column={table.getColumn("status")}
-                title="状态"
-                options={[
-                  { label: "启用", value: "enabled", icon: CircleCheck },
-                  { label: "禁用", value: "disabled", icon: CircleDashed },
-                ]}
-              />
               {(table.getState().columnFilters.length > 0 ||
                 ((table.getState().globalFilter as string) ?? "") !== "") && (
                 <Button

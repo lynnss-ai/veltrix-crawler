@@ -9,13 +9,15 @@ import {
   Heart,
   Image as ImageIcon,
   MessageCircle,
+  ScanText,
   Search,
   Share2,
   Video,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
-import type { ContentView } from "@/lib/api";
+import type { ContentListView } from "@/lib/api";
+import { mediaThumbPath } from "@/lib/media-file-url";
 import {
   authorProfileUrl,
   contentDetailUrl,
@@ -28,7 +30,7 @@ import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { formatTimestamp } from "@/lib/utils";
 
 const KIND_META: Record<
-  ContentView["kind"],
+  ContentListView["kind"],
   { label: string; icon: typeof Video; cls: string }
 > = {
   video: {
@@ -84,7 +86,7 @@ export const ContentCard = memo(function ContentCard({
   showKind,
   onOpenDetail,
 }: {
-  c: ContentView;
+  c: ContentListView;
   // 平台 id → 名称(展示用),由调用方注入平台配置映射
   platformName: (id: string) => string;
   // 是否展示「形式」徽标:全量库展示;内容库/图片库已按形态限定,徽标冗余故隐藏
@@ -93,19 +95,19 @@ export const ContentCard = memo(function ContentCard({
 }) {
   const meta = KIND_META[c.kind] ?? KIND_META.unknown;
   const Icon = meta.icon;
-  const coverExternal = c.coverUrl || c.imageUrls[0] || "";
+  const coverExternal = c.coverUrl || c.firstImageUrl || "";
   const hasCover = Boolean(c.coverPath || coverExternal);
   const hasAvatar = Boolean(c.avatarPath || c.authorAvatar);
   const titleText = c.title || c.desc || "(无文案)";
   const homeUrl = authorProfileUrl(c.platform, c.authorUid);
-  const detailUrl = contentDetailUrl(c.platform, c.contentId) || c.videoUrl;
+  const detailUrl = contentDetailUrl(c.platform, c.contentId, c.xsecToken) || c.videoUrl;
   return (
     <div className="flex w-[64rem] max-w-full gap-3 py-1">
       {hasCover ? (
-        <SimpleTooltip content={detailUrl ? "打开视频详情" : "暂无详情链接"}>
+        <SimpleTooltip content={detailUrl ? "打开平台原文" : "暂无原文链接"}>
           {/* 固定 3:4 竖版缩略图(不拉伸不变形),顶端对齐;尺寸取 w-40 使高度≈文案截断后的行高 */}
           <LocalFirstImage
-            localPath={c.coverPath}
+            localPath={c.coverPath ? mediaThumbPath(c.coverPath) : null}
             externalUrl={coverExternal}
             className={`aspect-[3/4] w-36 shrink-0 self-start rounded-md object-cover transition ${
               detailUrl ? "cursor-pointer hover:opacity-80" : ""
@@ -114,7 +116,7 @@ export const ContentCard = memo(function ContentCard({
               detailUrl
                 ? () =>
                     openUrl(detailUrl).catch((e) =>
-                      toast.error(`打开视频详情失败: ${e}`),
+                      toast.error(`打开平台原文失败: ${e}`),
                     )
                 : undefined
             }
@@ -131,7 +133,7 @@ export const ContentCard = memo(function ContentCard({
           {hasAvatar ? (
             <SimpleTooltip content={homeUrl ? "打开作者主页" : "暂无主页链接"}>
               <LocalFirstImage
-                localPath={c.avatarPath}
+                localPath={c.avatarPath ? mediaThumbPath(c.avatarPath) : null}
                 externalUrl={c.authorAvatar ?? ""}
                 className={`size-9 shrink-0 rounded-full object-cover transition ${
                   homeUrl
@@ -260,18 +262,18 @@ export const ContentCard = memo(function ContentCard({
           )}
         </div>
 
-        {c.kind === "video" && c.transcript && (
+        {c.kind === "video" && c.transcriptState === "has" && c.transcriptPreview && (
           <details className="rounded-md bg-muted/50 px-2 py-1.5">
             <summary className="flex cursor-pointer items-center gap-1 text-[11px] font-medium text-muted-foreground">
               <AudioLines className="size-3.5" />
               语音文案
             </summary>
             <p className="mt-1 whitespace-pre-wrap break-words text-xs text-foreground">
-              {c.transcript}
+              {c.transcriptPreview}
             </p>
           </details>
         )}
-        {c.kind === "video" && c.transcript === "" && !c.transcriptError && (
+        {c.kind === "video" && c.transcriptState === "empty" && !c.transcriptError && (
           <SimpleTooltip content="语音转写已完成,但未识别到人声(纯音乐/静音内容)">
             <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
               <AudioLines className="size-3" />
@@ -279,11 +281,39 @@ export const ContentCard = memo(function ContentCard({
             </span>
           </SimpleTooltip>
         )}
-        {c.kind === "video" && !c.transcript && c.transcriptError && (
+        {c.kind === "video" && c.transcriptState === "none" && c.transcriptError && (
           <SimpleTooltip content={c.transcriptError}>
             <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
               <AudioLines className="size-3" />
               转写失败
+            </span>
+          </SimpleTooltip>
+        )}
+        {/* 封面 OCR 三态:不限内容类型(图文内容的封面也有文字可识别) */}
+        {c.coverOcrState === "has" && c.coverOcrPreview && (
+          <details className="rounded-md bg-muted/50 px-2 py-1.5">
+            <summary className="flex cursor-pointer items-center gap-1 text-[11px] font-medium text-muted-foreground">
+              <ScanText className="size-3.5" />
+              封面文字
+            </summary>
+            <p className="mt-1 whitespace-pre-wrap break-words text-xs text-foreground">
+              {c.coverOcrPreview}
+            </p>
+          </details>
+        )}
+        {c.coverOcrState === "empty" && !c.coverOcrError && (
+          <SimpleTooltip content="封面文字识别已完成,但封面上没有可识别的文字">
+            <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+              <ScanText className="size-3" />
+              无文字
+            </span>
+          </SimpleTooltip>
+        )}
+        {c.coverOcrState === "none" && c.coverOcrError && (
+          <SimpleTooltip content={c.coverOcrError}>
+            <span className="inline-flex w-fit cursor-help items-center gap-1 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+              <ScanText className="size-3" />
+              识别失败
             </span>
           </SimpleTooltip>
         )}

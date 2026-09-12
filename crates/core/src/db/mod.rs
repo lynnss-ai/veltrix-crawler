@@ -293,6 +293,14 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         }
     }
 
+    // 图集路径独立保存,封面失败也不影响其他已下载图片的读取。
+    if !column_exists(db, "contents", "image_paths").await {
+        db.execute(Statement::from_string(
+            backend,
+            "ALTER TABLE contents ADD COLUMN image_paths TEXT DEFAULT NULL".to_owned(),
+        )).await?;
+    }
+
     // 兼容已建的 contents 表:补 cover_url 列(封面下载与展示)
     if !column_exists(db, "contents", "cover_url").await {
         if let Err(e) = db
@@ -341,6 +349,9 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("audio_path", "ALTER TABLE contents ADD COLUMN audio_path TEXT"),
         ("transcript", "ALTER TABLE contents ADD COLUMN transcript TEXT"),
         ("transcript_error", "ALTER TABLE contents ADD COLUMN transcript_error TEXT"),
+        // 封面 OCR 文本与失败原因(智谱 OCR);可空,旧行 None=未识别
+        ("cover_ocr_text", "ALTER TABLE contents ADD COLUMN cover_ocr_text TEXT"),
+        ("cover_ocr_error", "ALTER TABLE contents ADD COLUMN cover_ocr_error TEXT"),
         ("video_downloaded", "ALTER TABLE contents ADD COLUMN video_downloaded BOOLEAN"),
         ("image_total", "ALTER TABLE contents ADD COLUMN image_total INTEGER"),
         ("image_done", "ALTER TABLE contents ADD COLUMN image_done INTEGER"),
@@ -399,6 +410,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("account_id", "ALTER TABLE tasks ADD COLUMN account_id TEXT"),
         // 「保留视频」开关:采集后视频落盘留存,供发布服务复用;旧行回填 0(不保留)
         ("keep_video", "ALTER TABLE tasks ADD COLUMN keep_video BOOLEAN NOT NULL DEFAULT FALSE"),
+        // 「封面文字识别」开关:采集后对封面图做 OCR(智谱),旧行回填 FALSE(不识别)
+        ("cover_ocr", "ALTER TABLE tasks ADD COLUMN cover_ocr BOOLEAN NOT NULL DEFAULT FALSE"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db

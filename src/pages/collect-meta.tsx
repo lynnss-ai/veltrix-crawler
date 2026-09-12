@@ -18,6 +18,10 @@ export type SortMode = TaskView["sortMode"];
 export type TimeRange = TaskView["timeRange"];
 export type TaskItem = TaskView;
 
+// 单任务关键词数量上限:与后端 MAX_TASK_KEYWORDS(commands/task.rs)同口径,
+// 创建表单与「执行」按钮两侧都按它拦截
+export const MAX_TASK_KEYWORDS = 10;
+
 export const SORT_MODE_META: Record<SortMode, { label: string }> = {
   synthetic: { label: "综合" },
   hottest: { label: "最热" },

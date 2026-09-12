@@ -229,7 +229,8 @@ async fn is_mono_audio(path: &Path, ffmpeg_path: Option<&str>) -> bool {
 
 /// 把任意本地音频转码为 96kbps 单声道 mp3(GLM ASR 用,参数与 media 模块抽音频口径一致)。
 /// 输出为系统临时目录下的唯一文件,由调用方负责清理;ffmpeg 缺失/失败返回明确错误。
-/// ffmpeg 同步执行包在 spawn_blocking 以避免阻塞 tokio 工作线程。
+/// ffmpeg 同步执行包在 spawn_blocking 以避免阻塞 tokio 工作线程;进程执行走
+/// run_ffmpeg_local(并发限流 + deadline 强杀),转写 5 路并发不再绕过 FFMPEG_SEMAPHORE。
 async fn convert_to_mp3(audio_path: &Path, ffmpeg_path: Option<&str>) -> Result<PathBuf> {
     let program = ffmpeg_path
         .map(str::trim)
@@ -249,8 +250,7 @@ async fn convert_to_mp3(audio_path: &Path, ffmpeg_path: Option<&str>) -> Result<
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&program);
         crate::media::hide_console_window(&mut cmd);
-        let status = cmd
-            .arg("-y") // 覆盖已存在文件,避免交互确认卡住
+        cmd.arg("-y") // 覆盖已存在文件,避免交互确认卡住
             .arg("-i")
             .arg(&audio_path)
             .arg("-vn")
@@ -266,17 +266,14 @@ async fn convert_to_mp3(audio_path: &Path, ffmpeg_path: Option<&str>) -> Result<
                 "-threads",
                 "1",
             ])
-            .arg(&out2)
-            .status()
-            .map_err(|e| {
-                CrawlerError::Config(format!(
-                    "智谱 GLM 转写需先把音频转码为 mp3,启动 ffmpeg 失败: {e}"
-                ))
-            })?;
-        if !status.success() {
+            .arg(&out2);
+        let output = crate::media::run_ffmpeg_local(&mut cmd).map_err(|e| {
+            CrawlerError::Config(format!("智谱 GLM 转写需先把音频转码为 mp3,执行 ffmpeg 失败: {e}"))
+        })?;
+        if !output.status.success() {
             return Err(CrawlerError::Config(format!(
                 "音频转码 mp3 失败(ffmpeg 退出码 {:?})",
-                status.code()
+                output.status.code()
             )));
         }
         Ok(out2)

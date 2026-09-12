@@ -48,7 +48,7 @@ function contentRows(
     分享数: c.shareCount ?? 0,
     采集关键词: c.keyword,
     文案: c.transcript ?? "",
-    内容链接: contentDetailUrl(c.platform, c.contentId) ?? "",
+    内容链接: contentDetailUrl(c.platform, c.contentId, c.xsecToken) ?? "",
     发布时间: formatTimestamp(c.publishedAt),
     采集时间: formatTimestamp(c.collectedAt),
   }));

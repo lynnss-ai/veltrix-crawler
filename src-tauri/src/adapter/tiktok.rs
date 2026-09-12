@@ -19,6 +19,8 @@ use serde_json::Value;
 use veltrix_core::error::Result;
 
 const PLATFORM_ID: &str = "tiktok";
+/// 视频详情接口。详情页首屏若未发请求,WebView 会从页面 SSR 数据合成同形响应回传。
+const DETAIL_PATH: &str = "/api/item/detail/";
 
 #[derive(Default)]
 pub struct TiktokAdapter;
@@ -293,6 +295,34 @@ impl TiktokAdapter {
             authors: Vec::new(),
         }
     }
+
+    /// 解析 TikTok 详情响应。真实接口为 `itemInfo.itemStruct`,SSR 兜底也包装成同一结构;
+    /// 兼容少量 snake_case / 顶层 item 变体,最终复用搜索解析拿完整视频流、图集和作者信息。
+    fn parse_detail(ctx: &FetchContext) -> FetchOutput {
+        let collected_at = Utc::now().timestamp();
+        let mut contents = Vec::new();
+        for resp in &ctx.responses {
+            if !resp.url.contains(DETAIL_PATH) {
+                continue;
+            }
+            let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
+                continue;
+            };
+            let item = root
+                .pointer("/itemInfo/itemStruct")
+                .or_else(|| root.pointer("/item_info/item_struct"))
+                .or_else(|| root.get("itemStruct"))
+                .or_else(|| root.get("item"));
+            if let Some(content) = item.and_then(|item| Self::parse_item(item, collected_at)) {
+                contents.push(content);
+            }
+        }
+        FetchOutput {
+            contents,
+            comments: Vec::new(),
+            authors: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -302,14 +332,79 @@ impl PlatformAdapter for TiktokAdapter {
     }
 
     fn supports(&self, kind: &TaskKind) -> bool {
-        matches!(kind, TaskKind::Search | TaskKind::Comments)
+        matches!(kind, TaskKind::Search | TaskKind::Comments | TaskKind::ContentDetail)
+    }
+
+    fn detail_pattern(&self) -> Option<&str> {
+        Some(DETAIL_PATH)
     }
 
     async fn parse(&self, kind: &TaskKind, ctx: &FetchContext) -> Result<FetchOutput> {
         let output = match kind {
             TaskKind::Comments => Self::parse_comments(ctx),
+            TaskKind::ContentDetail => Self::parse_detail(ctx),
             _ => Self::parse_search(ctx),
         };
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webview::InterceptedResponse;
+    use serde_json::json;
+
+    #[test]
+    fn parses_detail_video_for_shared_audio_pipeline() {
+        let ctx = FetchContext {
+            keyword: "7300123456".into(),
+            responses: vec![InterceptedResponse {
+                url: "https://www.tiktok.com/api/item/detail/?itemId=7300123456".into(),
+                body: json!({
+                    "itemInfo": {
+                        "itemStruct": {
+                            "id": "7300123456",
+                            "desc": "travel #china",
+                            "createTime": 1_725_000_000_i64,
+                            "author": {"id": "u1", "uniqueId": "creator", "nickname": "Creator"},
+                            "stats": {"diggCount": 12, "commentCount": 3},
+                            "video": {
+                                "playAddr": "https://v16.tiktokcdn.com/video.mp4",
+                                "cover": "https://p16.tiktokcdn.com/cover.jpg",
+                                "duration": 18
+                            },
+                            "challenges": [{"title": "china"}]
+                        }
+                    }
+                }).to_string(),
+            }],
+        };
+
+        let output = TiktokAdapter::parse_detail(&ctx);
+        assert_eq!(output.contents.len(), 1);
+        let content = &output.contents[0];
+        assert!(matches!(content.kind, ContentKind::Video));
+        assert_eq!(content.video_url.as_deref(), Some("https://v16.tiktokcdn.com/video.mp4"));
+        assert_eq!(content.topics, vec!["#china"]);
+    }
+
+    #[test]
+    fn parses_all_images_from_detail_item() {
+        let item = json!({
+            "id": "image-1",
+            "desc": "album",
+            "author": {"id": "u1", "nickname": "Creator"},
+            "imagePost": {
+                "images": [
+                    {"imageURL": {"urlList": ["https://img/1.jpg"]}},
+                    {"imageURL": {"urlList": ["https://img/2.jpg"]}},
+                    {"imageURL": {"urlList": ["https://img/3.jpg"]}}
+                ]
+            }
+        });
+        let content = TiktokAdapter::parse_item(&item, 1).expect("应解析图集");
+        assert!(matches!(content.kind, ContentKind::Image));
+        assert_eq!(content.image_urls.len(), 3);
     }
 }

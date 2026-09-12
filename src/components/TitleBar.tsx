@@ -1,23 +1,34 @@
-// 自定义无边框标题栏:左侧侧栏开关 + 中部可拖拽区 + 右侧窗口控制按钮(最小化/最大化/关闭) + 检查更新 + 远程连接。
+// 自定义无边框标题栏:左侧侧栏开关 + 远程控制 + 「更多」工具菜单(屏幕录制/远程连接)
+// + 中部可拖拽区 + 右侧刷新/检查更新/主题/下载记录 + 窗口控制按钮(最小化/最大化/关闭)。
 // 窗口装饰已在 tauri.conf.json 关闭(decorations:false),拖拽与最小化/最大化/关闭全部走前端。
 import { useEffect, useState } from "react";
 import {
   CircleArrowUp,
   Copy,
+  LayoutGrid,
   Minus,
+  MonitorSmartphone,
   PanelLeftClose,
   PanelLeftOpen,
   RotateCw,
   Square,
+  Video,
   X,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { checkForUpdate, currentVersion } from "@/lib/updater";
+import { useScreenRecording } from "@/hooks/use-screen-recording";
 import { SimpleTooltip } from "@/components/SimpleTooltip";
 import { ModeToggle } from "@/components/mode-toggle";
 import { DownloadHistory } from "@/components/DownloadHistory";
 import {
-  RemoteConnectButton,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  RemoteConnectDialog,
   type RemoteStatus,
 } from "@/components/RemoteConnect";
 
@@ -59,6 +70,11 @@ export function TitleBar({
   const [isMaximized, setIsMaximized] = useState(false);
   // 当前应用版本:用于「检查更新」按钮悬浮提示展示
   const [appVersion, setAppVersion] = useState("");
+  // 「更多」菜单里的「远程连接」项:直接驱动配对弹窗
+  const [remoteDialogOpen, setRemoteDialogOpen] = useState(false);
+  // 屏幕录制入口(「更多」菜单项):只开/关悬浮控制条,开始/停止在悬浮条上操作;
+  // 不传 onSaved——录制完成走默认 toast(打开文件夹),对话页在场时由其接管挂到输入区
+  const { openOverlay: openScreenRecording } = useScreenRecording();
 
   useEffect(() => {
     currentVersion()
@@ -112,7 +128,35 @@ export function TitleBar({
             <span className="sr-only">切换侧边栏</span>
           </button>
           <span className="mx-1 h-4 w-px bg-border" />
-          <RemoteConnectButton status={remoteStatus} />
+          {/* 更多工具:屏幕录制 / 远程连接 等收纳进下拉,后续新工具继续往里加 */}
+          <DropdownMenu>
+            <SimpleTooltip content="更多工具" side="bottom">
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <LayoutGrid className="size-[1.1rem]" />
+                  <span className="sr-only">更多工具</span>
+                </button>
+              </DropdownMenuTrigger>
+            </SimpleTooltip>
+            <DropdownMenuContent align="start" sideOffset={6}>
+              <DropdownMenuItem onClick={() => void openScreenRecording()}>
+                <Video className="size-4" />
+                屏幕录制
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setRemoteDialogOpen(true)}>
+                <MonitorSmartphone className="size-4" />
+                远程连接
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <RemoteConnectDialog
+            open={remoteDialogOpen}
+            onOpenChange={setRemoteDialogOpen}
+            status={remoteStatus}
+          />
         </div>
       )}
 
