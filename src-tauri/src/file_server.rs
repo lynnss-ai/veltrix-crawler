@@ -65,7 +65,9 @@ pub fn public_url_for_path(prefix: &str, media_root: &Path, local_path: &str) ->
         return None;
     }
     let root = media_root.canonicalize().ok()?;
-    let file = crate::media::resolve_media_path(media_root, local_path).canonicalize().ok()?;
+    let file = crate::media::resolve_media_path(media_root, local_path)
+        .canonicalize()
+        .ok()?;
     if !file.starts_with(&root) || !file.is_file() {
         return None;
     }
@@ -211,11 +213,18 @@ fn relative_path(prefix: &str, uri: &Uri) -> Option<String> {
         request_path.strip_prefix(prefix_path)?.strip_prefix('/')?
     };
     // 浏览器会编码中文、空格和 #。按路径段解码一次,解码后仍拒绝分隔符与路径穿越。
-    let parts = relative.split('/').map(|part| {
-        percent_encoding::percent_decode_str(part).decode_utf8().ok().map(|s| s.into_owned())
-    }).collect::<Option<Vec<_>>>()?;
-    if parts.iter().any(|part| part.is_empty() || part == "." || part == ".."
-        || part.contains(['/', '\\', '\0', ':'])) {
+    let parts = relative
+        .split('/')
+        .map(|part| {
+            percent_encoding::percent_decode_str(part)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.into_owned())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if parts.iter().any(|part| {
+        part.is_empty() || part == "." || part == ".." || part.contains(['/', '\\', '\0', ':'])
+    }) {
         return None;
     }
     Some(parts.join("/"))
@@ -246,7 +255,11 @@ async fn lazy_thumbnail(root: &Path, relative: &str) -> Option<PathBuf> {
         let Some(source) = safe_file_path(root, &candidate).await else {
             continue;
         };
-        return Some(crate::thumbnail::ensure(source.clone()).await.unwrap_or(source));
+        return Some(
+            crate::thumbnail::ensure(source.clone())
+                .await
+                .unwrap_or(source),
+        );
     }
     None
 }
@@ -254,7 +267,10 @@ async fn lazy_thumbnail(root: &Path, relative: &str) -> Option<PathBuf> {
 /// 协商缓存判定:If-None-Match 命中(弱比较,兼容 `*` 与客户端回传时去/加 W/ 前缀)
 /// 或 If-Modified-Since 不早于文件 mtime 时返回 true(httpdate 只有秒粒度,mtime 先截断到秒再比)。
 fn is_not_modified(headers: &axum::http::HeaderMap, etag: &str, mtime_secs: u64) -> bool {
-    if let Some(value) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+    if let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
         let bare = etag.trim_start_matches("W/");
         let matched = value.split(',').any(|token| {
             let token = token.trim();
@@ -264,7 +280,10 @@ fn is_not_modified(headers: &axum::http::HeaderMap, etag: &str, mtime_secs: u64)
             return true;
         }
     }
-    if let Some(value) = headers.get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()) {
+    if let Some(value) = headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(since) = httpdate::parse_http_date(value) {
             let since_secs = since
                 .duration_since(std::time::UNIX_EPOCH)
@@ -384,10 +403,21 @@ mod tests {
     #[test]
     fn file_paths_decode_names_without_allowing_encoded_traversal() {
         let prefix = "http://192.168.1.2:8788/files";
-        assert_eq!(relative_path(prefix, &Uri::from_static("/files/xhs/%E5%9B%BE%20%231.jpg")),
-            Some("xhs/图 #1.jpg".into()));
-        assert_eq!(relative_path(prefix, &Uri::from_static("/files/100%25.jpg")), Some("100%.jpg".into()));
-        for path in ["/files/%2e%2e/secret", "/files/a%2fb.jpg", "/files/a%5cb.jpg", "/files/a%00.jpg", "/files/a%3ab.jpg"] {
+        assert_eq!(
+            relative_path(prefix, &Uri::from_static("/files/xhs/%E5%9B%BE%20%231.jpg")),
+            Some("xhs/图 #1.jpg".into())
+        );
+        assert_eq!(
+            relative_path(prefix, &Uri::from_static("/files/100%25.jpg")),
+            Some("100%.jpg".into())
+        );
+        for path in [
+            "/files/%2e%2e/secret",
+            "/files/a%2fb.jpg",
+            "/files/a%5cb.jpg",
+            "/files/a%00.jpg",
+            "/files/a%3ab.jpg",
+        ] {
             assert_eq!(relative_path(prefix, &path.parse().unwrap()), None);
         }
     }
@@ -399,20 +429,38 @@ mod tests {
         let mtime = 0x64a1b2c3u64;
         let mut headers = HeaderMap::new();
         assert!(!is_not_modified(&headers, etag, mtime));
-        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("W/\"3e8-64a1b2c3\""));
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("W/\"3e8-64a1b2c3\""),
+        );
         assert!(is_not_modified(&headers, etag, mtime));
         // 客户端回传裸值(去 W/ 前缀)也应弱比较命中
-        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"3e8-64a1b2c3\""));
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"3e8-64a1b2c3\""),
+        );
         assert!(is_not_modified(&headers, etag, mtime));
-        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("W/\"3e8-00000000\""));
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("W/\"3e8-00000000\""),
+        );
         assert!(!is_not_modified(&headers, etag, mtime));
         // If-Modified-Since 等于 / 晚于 mtime 均 304;早于则重新下发
         headers.remove(header::IF_NONE_MATCH);
-        let since = httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime));
-        headers.insert(header::IF_MODIFIED_SINCE, HeaderValue::from_str(&since).unwrap());
+        let since =
+            httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime));
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(&since).unwrap(),
+        );
         assert!(is_not_modified(&headers, etag, mtime));
-        let stale = httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime - 1));
-        headers.insert(header::IF_MODIFIED_SINCE, HeaderValue::from_str(&stale).unwrap());
+        let stale = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime - 1),
+        );
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(&stale).unwrap(),
+        );
         assert!(!is_not_modified(&headers, etag, mtime));
     }
 }

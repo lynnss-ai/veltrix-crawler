@@ -213,7 +213,13 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::customer::Entity, "customers").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
-    create_table(db, &schema, entity::prompt_category::Entity, "prompt_categories").await?;
+    create_table(
+        db,
+        &schema,
+        entity::prompt_category::Entity,
+        "prompt_categories",
+    )
+    .await?;
     create_table(db, &schema, entity::shot_prompt::Entity, "shot_prompts").await?;
     create_table(db, &schema, entity::app_secret::Entity, "app_secrets").await?;
     create_table(db, &schema, entity::task::Entity, "tasks").await?;
@@ -221,7 +227,13 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::comment::Entity, "comments").await?;
     create_table(db, &schema, entity::collect_log::Entity, "collect_logs").await?;
     // 采集去重台账:独立于业务数据,「清空业务数据」不清它(见 clear_business_data)
-    create_table(db, &schema, entity::collect_record::Entity, "collect_records").await?;
+    create_table(
+        db,
+        &schema,
+        entity::collect_record::Entity,
+        "collect_records",
+    )
+    .await?;
     create_table(db, &schema, entity::task_run::Entity, "task_runs").await?;
     create_table(
         db,
@@ -240,8 +252,20 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     .await?;
     create_table(db, &schema, entity::chat_message::Entity, "chat_messages").await?;
     create_table(db, &schema, entity::chat_memory::Entity, "chat_memories").await?;
-    create_table(db, &schema, entity::model_usage_record::Entity, "model_usage_records").await?;
-    create_table(db, &schema, entity::agent_route_log::Entity, "agent_route_logs").await?;
+    create_table(
+        db,
+        &schema,
+        entity::model_usage_record::Entity,
+        "model_usage_records",
+    )
+    .await?;
+    create_table(
+        db,
+        &schema,
+        entity::agent_route_log::Entity,
+        "agent_route_logs",
+    )
+    .await?;
     // 发布服务:发布账号(独立于采集账号池 accounts;分组维度复用 customers 表,不再单独建分类表)
     create_table(
         db,
@@ -254,9 +278,18 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // 兼容旧版 accounts 表:仅在列不存在时 ALTER,避免每次启动都触发(SQLite 不可逆操作)
     let backend = db.get_database_backend();
     for (col, ddl) in [
-        ("code", "ALTER TABLE accounts ADD COLUMN code TEXT NOT NULL DEFAULT ''"),
-        ("remark", "ALTER TABLE accounts ADD COLUMN remark TEXT NOT NULL DEFAULT ''"),
-        ("owner", "ALTER TABLE accounts ADD COLUMN owner TEXT NOT NULL DEFAULT ''"),
+        (
+            "code",
+            "ALTER TABLE accounts ADD COLUMN code TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "remark",
+            "ALTER TABLE accounts ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "owner",
+            "ALTER TABLE accounts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        ),
     ] {
         if !column_exists(db, "accounts", col).await {
             if let Err(e) = db
@@ -298,7 +331,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         db.execute(Statement::from_string(
             backend,
             "ALTER TABLE contents ADD COLUMN image_paths TEXT DEFAULT NULL".to_owned(),
-        )).await?;
+        ))
+        .await?;
     }
 
     // 兼容已建的 contents 表:补 cover_url 列(封面下载与展示)
@@ -341,24 +375,72 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // 兼容已建的 contents 表:补素材状态列(下载/音频提取结果与失败重试)。
     // 均可空,旧行 None 表示「未跑过下载」,前端按未知态展示。
     for (col, ddl) in [
-        ("media_status", "ALTER TABLE contents ADD COLUMN media_status TEXT"),
-        ("audio_extracted", "ALTER TABLE contents ADD COLUMN audio_extracted BOOLEAN"),
-        ("media_error", "ALTER TABLE contents ADD COLUMN media_error TEXT"),
-        ("cover_path", "ALTER TABLE contents ADD COLUMN cover_path TEXT"),
-        ("avatar_path", "ALTER TABLE contents ADD COLUMN avatar_path TEXT"),
-        ("audio_path", "ALTER TABLE contents ADD COLUMN audio_path TEXT"),
-        ("transcript", "ALTER TABLE contents ADD COLUMN transcript TEXT"),
-        ("transcript_error", "ALTER TABLE contents ADD COLUMN transcript_error TEXT"),
+        (
+            "media_status",
+            "ALTER TABLE contents ADD COLUMN media_status TEXT",
+        ),
+        (
+            "audio_extracted",
+            "ALTER TABLE contents ADD COLUMN audio_extracted BOOLEAN",
+        ),
+        (
+            "media_error",
+            "ALTER TABLE contents ADD COLUMN media_error TEXT",
+        ),
+        (
+            "cover_path",
+            "ALTER TABLE contents ADD COLUMN cover_path TEXT",
+        ),
+        (
+            "avatar_path",
+            "ALTER TABLE contents ADD COLUMN avatar_path TEXT",
+        ),
+        (
+            "audio_path",
+            "ALTER TABLE contents ADD COLUMN audio_path TEXT",
+        ),
+        (
+            "transcript",
+            "ALTER TABLE contents ADD COLUMN transcript TEXT",
+        ),
+        (
+            "transcript_error",
+            "ALTER TABLE contents ADD COLUMN transcript_error TEXT",
+        ),
         // 封面 OCR 文本与失败原因(智谱 OCR);可空,旧行 None=未识别
-        ("cover_ocr_text", "ALTER TABLE contents ADD COLUMN cover_ocr_text TEXT"),
-        ("cover_ocr_error", "ALTER TABLE contents ADD COLUMN cover_ocr_error TEXT"),
-        ("video_downloaded", "ALTER TABLE contents ADD COLUMN video_downloaded BOOLEAN"),
-        ("image_total", "ALTER TABLE contents ADD COLUMN image_total INTEGER"),
-        ("image_done", "ALTER TABLE contents ADD COLUMN image_done INTEGER"),
-        ("comment_collected", "ALTER TABLE contents ADD COLUMN comment_collected BOOLEAN"),
-        ("intent_analyzed", "ALTER TABLE contents ADD COLUMN intent_analyzed BOOLEAN"),
+        (
+            "cover_ocr_text",
+            "ALTER TABLE contents ADD COLUMN cover_ocr_text TEXT",
+        ),
+        (
+            "cover_ocr_error",
+            "ALTER TABLE contents ADD COLUMN cover_ocr_error TEXT",
+        ),
+        (
+            "video_downloaded",
+            "ALTER TABLE contents ADD COLUMN video_downloaded BOOLEAN",
+        ),
+        (
+            "image_total",
+            "ALTER TABLE contents ADD COLUMN image_total INTEGER",
+        ),
+        (
+            "image_done",
+            "ALTER TABLE contents ADD COLUMN image_done INTEGER",
+        ),
+        (
+            "comment_collected",
+            "ALTER TABLE contents ADD COLUMN comment_collected BOOLEAN",
+        ),
+        (
+            "intent_analyzed",
+            "ALTER TABLE contents ADD COLUMN intent_analyzed BOOLEAN",
+        ),
         // 视频落盘路径(开「保留视频」时留存,发布服务复用素材);可空,旧行 None=未落盘
-        ("video_path", "ALTER TABLE contents ADD COLUMN video_path TEXT"),
+        (
+            "video_path",
+            "ALTER TABLE contents ADD COLUMN video_path TEXT",
+        ),
     ] {
         if !column_exists(db, "contents", col).await {
             if let Err(e) = db
@@ -373,12 +455,27 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // 兼容已建的 tasks 表:补素材下载进度列(采集完成 → downloading_media 阶段统计)。
     // NOT NULL DEFAULT 0,旧行回填 0,语义为「无素材待下载」。
     for (col, ddl) in [
-        ("media_total", "ALTER TABLE tasks ADD COLUMN media_total INTEGER NOT NULL DEFAULT 0"),
-        ("media_done", "ALTER TABLE tasks ADD COLUMN media_done INTEGER NOT NULL DEFAULT 0"),
+        (
+            "media_total",
+            "ALTER TABLE tasks ADD COLUMN media_total INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "media_done",
+            "ALTER TABLE tasks ADD COLUMN media_done INTEGER NOT NULL DEFAULT 0",
+        ),
         // 失败自动重试:上限 0=关闭;重试计数与下次重试时间(见 write_task_failed / 调度器)
-        ("max_retries", "ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0"),
-        ("retry_count", "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"),
-        ("next_retry_at", "ALTER TABLE tasks ADD COLUMN next_retry_at BIGINT"),
+        (
+            "max_retries",
+            "ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "retry_count",
+            "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "next_retry_at",
+            "ALTER TABLE tasks ADD COLUMN next_retry_at BIGINT",
+        ),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -394,24 +491,60 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // 布尔 NOT NULL DEFAULT FALSE、整数 DEFAULT 0,文本默认 'any'(不限),旧行回填默认值语义为「未开评论采集」。
     // (布尔默认值必须用 FALSE 而非 0:PG 布尔列不接受整数默认值,SQLite ≥3.23 两种写法都认)
     for (col, ddl) in [
-        ("collect_comments", "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT FALSE"),
-        ("comment_time_range", "ALTER TABLE tasks ADD COLUMN comment_time_range TEXT NOT NULL DEFAULT 'any'"),
-        ("comment_limit", "ALTER TABLE tasks ADD COLUMN comment_limit INTEGER NOT NULL DEFAULT 0"),
-        ("analyze_comment_intent", "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT FALSE"),
-        ("comment_video_total", "ALTER TABLE tasks ADD COLUMN comment_video_total INTEGER NOT NULL DEFAULT 0"),
-        ("comment_video_done", "ALTER TABLE tasks ADD COLUMN comment_video_done INTEGER NOT NULL DEFAULT 0"),
-        ("archived", "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE"),
-        ("auto_sync_obsidian", "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT FALSE"),
+        (
+            "collect_comments",
+            "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "comment_time_range",
+            "ALTER TABLE tasks ADD COLUMN comment_time_range TEXT NOT NULL DEFAULT 'any'",
+        ),
+        (
+            "comment_limit",
+            "ALTER TABLE tasks ADD COLUMN comment_limit INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "analyze_comment_intent",
+            "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "comment_video_total",
+            "ALTER TABLE tasks ADD COLUMN comment_video_total INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "comment_video_done",
+            "ALTER TABLE tasks ADD COLUMN comment_video_done INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "archived",
+            "ALTER TABLE tasks ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "auto_sync_obsidian",
+            "ALTER TABLE tasks ADD COLUMN auto_sync_obsidian BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
         // 平台专属额外筛选(抖音视频时长/搜索范围/内容形式等),JSON 对象,旧行回填 '{}'(全不限)
-        ("extra_filters", "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'"),
+        (
+            "extra_filters",
+            "ALTER TABLE tasks ADD COLUMN extra_filters TEXT NOT NULL DEFAULT '{}'",
+        ),
         // 定向采集目标链接(JSON 数组,视频链接/主页链接);旧行回填 '[]'(非定向任务)
-        ("target_urls", "ALTER TABLE tasks ADD COLUMN target_urls TEXT NOT NULL DEFAULT '[]'"),
+        (
+            "target_urls",
+            "ALTER TABLE tasks ADD COLUMN target_urls TEXT NOT NULL DEFAULT '[]'",
+        ),
         // 指定采集账号(accounts.id);可空,旧行回填 NULL = 自动轮换
         ("account_id", "ALTER TABLE tasks ADD COLUMN account_id TEXT"),
         // 「保留视频」开关:采集后视频落盘留存,供发布服务复用;旧行回填 0(不保留)
-        ("keep_video", "ALTER TABLE tasks ADD COLUMN keep_video BOOLEAN NOT NULL DEFAULT FALSE"),
+        (
+            "keep_video",
+            "ALTER TABLE tasks ADD COLUMN keep_video BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
         // 「封面文字识别」开关:采集后对封面图做 OCR(智谱),旧行回填 FALSE(不识别)
-        ("cover_ocr", "ALTER TABLE tasks ADD COLUMN cover_ocr BOOLEAN NOT NULL DEFAULT FALSE"),
+        (
+            "cover_ocr",
+            "ALTER TABLE tasks ADD COLUMN cover_ocr BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -430,7 +563,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         if let Err(e) = db
             .execute(Statement::from_string(
                 backend,
-                "ALTER TABLE tasks ADD COLUMN audio_extract BOOLEAN NOT NULL DEFAULT FALSE".to_owned(),
+                "ALTER TABLE tasks ADD COLUMN audio_extract BOOLEAN NOT NULL DEFAULT FALSE"
+                    .to_owned(),
             ))
             .await
         {
@@ -462,8 +596,14 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
 
     // 兼容已建的 comments 表:补意向分析列(AI 标注,可空,旧行 None=未分析)
     for (col, ddl) in [
-        ("intent_level", "ALTER TABLE comments ADD COLUMN intent_level TEXT"),
-        ("intent_reason", "ALTER TABLE comments ADD COLUMN intent_reason TEXT"),
+        (
+            "intent_level",
+            "ALTER TABLE comments ADD COLUMN intent_level TEXT",
+        ),
+        (
+            "intent_reason",
+            "ALTER TABLE comments ADD COLUMN intent_reason TEXT",
+        ),
     ] {
         if !column_exists(db, "comments", col).await {
             if let Err(e) = db
@@ -510,13 +650,31 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
 
     // 兼容已建的 chat_messages 表:补工具消息列(Agent 工具往返;均可空,旧行为纯文本)
     for (col, ddl) in [
-        ("tool_calls", "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT"),
-        ("tool_call_id", "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT"),
-        ("tool_name", "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT"),
-        ("attachments", "ALTER TABLE chat_messages ADD COLUMN attachments TEXT"),
-        ("reasoning", "ALTER TABLE chat_messages ADD COLUMN reasoning TEXT"),
+        (
+            "tool_calls",
+            "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT",
+        ),
+        (
+            "tool_call_id",
+            "ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT",
+        ),
+        (
+            "tool_name",
+            "ALTER TABLE chat_messages ADD COLUMN tool_name TEXT",
+        ),
+        (
+            "attachments",
+            "ALTER TABLE chat_messages ADD COLUMN attachments TEXT",
+        ),
+        (
+            "reasoning",
+            "ALTER TABLE chat_messages ADD COLUMN reasoning TEXT",
+        ),
         // 用户反馈:like / dislike / null(未反馈),用于学习与适应功能
-        ("feedback", "ALTER TABLE chat_messages ADD COLUMN feedback TEXT"),
+        (
+            "feedback",
+            "ALTER TABLE chat_messages ADD COLUMN feedback TEXT",
+        ),
     ] {
         if !column_exists(db, "chat_messages", col).await {
             if let Err(e) = db
@@ -531,18 +689,48 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // 兼容已建的 chat_memories 表:补向量检索列(RAG)。embedding/embed_model 可空(未生成时为 NULL),
     // pinned 默认 0;旧库走 ALTER,新库走 entity DDL。
     for (col, ddl) in [
-        ("embedding", "ALTER TABLE chat_memories ADD COLUMN embedding TEXT"),
-        ("embed_model", "ALTER TABLE chat_memories ADD COLUMN embed_model TEXT"),
-        ("pinned", "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE"),
+        (
+            "embedding",
+            "ALTER TABLE chat_memories ADD COLUMN embedding TEXT",
+        ),
+        (
+            "embed_model",
+            "ALTER TABLE chat_memories ADD COLUMN embed_model TEXT",
+        ),
+        (
+            "pinned",
+            "ALTER TABLE chat_memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
         // 记忆模块深化:分类 + 重要度/置信度打分 + 命中计数/时间衰减(检索排序与淘汰用)
-        ("mem_type", "ALTER TABLE chat_memories ADD COLUMN mem_type TEXT NOT NULL DEFAULT 'other'"),
-        ("importance", "ALTER TABLE chat_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3"),
-        ("confidence", "ALTER TABLE chat_memories ADD COLUMN confidence INTEGER NOT NULL DEFAULT 3"),
-        ("hit_count", "ALTER TABLE chat_memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0"),
-        ("last_hit_at", "ALTER TABLE chat_memories ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0"),
+        (
+            "mem_type",
+            "ALTER TABLE chat_memories ADD COLUMN mem_type TEXT NOT NULL DEFAULT 'other'",
+        ),
+        (
+            "importance",
+            "ALTER TABLE chat_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3",
+        ),
+        (
+            "confidence",
+            "ALTER TABLE chat_memories ADD COLUMN confidence INTEGER NOT NULL DEFAULT 3",
+        ),
+        (
+            "hit_count",
+            "ALTER TABLE chat_memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_hit_at",
+            "ALTER TABLE chat_memories ADD COLUMN last_hit_at INTEGER NOT NULL DEFAULT 0",
+        ),
         // 记忆层级化:scope(作用域) + scope_id(作用域 ID)
-        ("scope", "ALTER TABLE chat_memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'"),
-        ("scope_id", "ALTER TABLE chat_memories ADD COLUMN scope_id TEXT NOT NULL DEFAULT ''"),
+        (
+            "scope",
+            "ALTER TABLE chat_memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'",
+        ),
+        (
+            "scope_id",
+            "ALTER TABLE chat_memories ADD COLUMN scope_id TEXT NOT NULL DEFAULT ''",
+        ),
     ] {
         if !column_exists(db, "chat_memories", col).await {
             if let Err(e) = db

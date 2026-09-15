@@ -35,6 +35,8 @@ veltrix-crawler 是抖音 / 小红书 / 快手 / Bilibili / TikTok / YouTube 等
 
 **OpenCV 构建环境(智能剪辑-场景检测,仅 Windows)**:预编译包在 `third_party/opencv/`(不进 git,首次需下载 opencv-4.10.0-windows.exe 自解压);`.cargo/config.toml [env]` 已配 `OPENCV_*`。绑定生成依赖 clang 工具链(全部走 scripts/.venv 的 pip 包,无需管理员):`CLANG_PATH` 指向 `third_party/clang-shim/clang.cmd`(ziglang 的 zig cc -target x86_64-windows-msvc 充当 clang 驱动;**`ziglang/lib/include` 已替换为 llvmorg-18.1.1 的 clang 内建头**,与 pip libclang 18.1.1 版本对齐,源包抽自 `third_party/llvm-project-llvmorg-18.1.1/`);`LIBCLANG_PATH` 指向 libclang pip 包,链接期 `libclang.lib` 由 pefile 导符号 + `zig dlltool` 生成(已放 libclang.dll 同目录,dll 另拷 target/debug 与 deps 供构建脚本加载);`OPENCV_CLANG_ARGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`(pip libclang 18 过本机 VS 18 STL 的 clang≥20 版本检查)。运行时依赖 `opencv_world4100.dll` 等 3 个 DLL(dev 已拷 target/debug;打包走 `src-tauri/resources/`,tauri.conf bundle.resources 已含)。
 
+**FFmpeg libav 集成(视频剪辑-探测,渐进迁移中)**:`.cargo/config.toml [env]` 配 `FFMPEG_DIR` 指向 `third_party/ffmpeg/`(不进 git;BtbN **win64-gpl-shared 9.0** 构建,含 include/ 与 MSVC 导入库)。依赖 `ffmpeg-next` 9.0(关默认 feature,显式挑 format/codec/filter/device/software-resampling/software-scaling;**勿开 `resampling`**,它映射到 FFmpeg 5 已移除的 avresample)。根 Cargo.toml `[patch.crates-io]` 指向本地 `third_party/ffmpeg-sys-next/`(唯一改动:bindgen 去掉 `runtime` feature——runtime 模式经 cargo 特性统一会传染 clang-sys,令 OpenCV 绑定生成器 panic;升级 ffmpeg-sys-next 需重新同步补丁)。**隐式链接**:进程启动即需 av*.dll/sw*.dll,新机器需把 `third_party/ffmpeg/bin/` 下 7 个 DLL 拷到 target/debug(deps 同)与 src-tauri/resources/(bundle.resources 已含);DLL 缺失时进程无法启动,无降级。已迁移:probe_video_info(优先 libav,失败回退 CLI 解析);导出/抽帧/录屏仍走 exe,迁移继续分阶段进行。
+
 ## 仓库结构与模块划分
 
 ```

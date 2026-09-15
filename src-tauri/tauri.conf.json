@@ -34,10 +34,7 @@
     "targets": "all",
     "createUpdaterArtifacts": false,
     "resources": [
-      "resources/ffmpeg.exe",
-      "resources/opencv_world4100.dll",
-      "resources/opencv_videoio_ffmpeg4100_64.dll",
-      "resources/opencv_videoio_msmf4100_64.dll"
+      "resources/ffmpeg.exe"
     ],
     "icon": [
       "icons/32x32.png",
@@ -48,7 +45,8 @@
     ],
     "windows": {
       "nsis": {
-        "installerHooks": "./installer-hooks.nsh"
+        "installerHooks": "./installer-hooks.nsh",
+        "template": "./nsis/installer.nsi"
       }
     }
   },

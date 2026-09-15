@@ -48,6 +48,24 @@ import { PageLoading } from "@/components/PageLoading";
 const REFRESH_THROTTLE_MS = 10_000;
 // 兜底轮询间隔:覆盖无事件推送的数据变化(删除内容、其他端写入等)
 const POLL_INTERVAL_MS = 30_000;
+const DASHBOARD_CACHE_PREFIX = "veltrix.dashboard.cache.";
+
+function readDashboardCache(username: string): DashboardOverview | null {
+  try {
+    const raw = localStorage.getItem(`${DASHBOARD_CACHE_PREFIX}${username}`);
+    return raw ? (JSON.parse(raw) as DashboardOverview) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDashboardCache(username: string, value: DashboardOverview) {
+  try {
+    localStorage.setItem(`${DASHBOARD_CACHE_PREFIX}${username}`, JSON.stringify(value));
+  } catch {
+    // 缓存仅用于加速冷启动，空间不足或隐私模式下失败不影响真实数据加载。
+  }
+}
 
 // 平台配色:三大平台用官方品牌色(与全局平台标一致),其余平台按序号回退调色板
 function platformColor(platform: string, index: number): string {
@@ -78,8 +96,9 @@ function fmtMd(d: Date): string {
 }
 
 // 数据概览:累计计数(平台细分)+ 今日/任务概况 + 多平台趋势 + 意向/平台/素材占比 + 热门榜。
-export function DashboardPage() {
-  const [data, setData] = useState<DashboardOverview | null>(null);
+export function DashboardPage({ username }: { username: string }) {
+  // 电脑冷启动时先展示上次成功结果，再在后台刷新；避免磁盘尚未预热时长时间停留骨架屏。
+  const [data, setData] = useState<DashboardOverview | null>(() => readDashboardCache(username));
   const [platforms, setPlatforms] = useState<{ id: string; name: string }[]>(
     [],
   );
@@ -102,7 +121,10 @@ export function DashboardPage() {
     const end = r?.to ? toEndTs(r.to) : r?.from ? toEndTs(r.from) : undefined;
     api
       .dashboardOverview(start, end)
-      .then(setData)
+      .then((value) => {
+        setData(value);
+        if (!r?.from && !r?.to) writeDashboardCache(username, value);
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setInitialLoading(false));
   };

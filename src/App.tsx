@@ -157,7 +157,7 @@ function renderPage(
 ): ReactNode {
   switch (active) {
     case "dashboard":
-      return <DashboardPage />;
+      return <DashboardPage username={loggedUser.username} />;
     case "collect-tasks":
       return <CollectPage onNavigate={onNavigate} />;
     case "accounts":

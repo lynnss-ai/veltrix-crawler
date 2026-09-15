@@ -1037,10 +1037,69 @@ export interface RecordingStatus {
 
 // ===================== 创作 =====================
 
-// 视频剪辑片段(秒;对应后端 ClipSegment)
+// 视频剪辑片段(秒;对应后端 ClipSegment)。position = 时间轴(序列)位置,
+// 音轨混音按它做 adelay 定位;缺省时后端回退按顺序串接
 export interface ClipSegment {
   start: number;
   end: number;
+  position?: number;
+  // 片段自己的视频或音频素材路径;为空时使用工程主视频。
+  inputPath?: string;
+  // 视频片段画面变换;音频片段忽略该字段。
+  transform?: VideoTransformInput;
+  // 导出时仅关闭该视频片段的原声,用于多视频轨按轨静音。
+  muteOriginal?: boolean;
+  // 视频合成层级;数值越大越靠上。音频片段忽略。
+  layer?: number;
+  // 相对片段起点的画面关键帧；后端在相邻点之间线性插值。
+  keyframes?: VideoKeyframeInput[];
+  // 片段级混音参数。音量允许 0~2 倍，声像 -1=左 / 1=右；淡入淡出单位为秒。
+  volume?: number;
+  pan?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  // 片段恒定播放速度，0.25~4；时间线时长 = 源区间时长 / speed。
+  speed?: number;
+  // 速度曲线节点：offset 为相对源片段起点的源时间秒数。
+  speedCurve?: SpeedPointInput[];
+  // 进入该片段时使用的独立转场；kind=none 可覆盖工程级默认转场。
+  transitionIn?: TransitionInput;
+}
+
+export interface SpeedPointInput {
+  id: string;
+  offset: number;
+  speed: number;
+}
+
+export interface VideoKeyframeInput {
+  id: string;
+  offset: number;
+  scale: number;
+  positionX: number;
+  positionY: number;
+  // 到达该关键帧前一段动画的缓动方式。
+  easing?: "linear" | "easeIn" | "easeOut" | "easeInOut";
+}
+
+export interface VideoTransformInput {
+  rotation?: 0 | 90 | 180 | 270;
+  scale?: number;
+  positionX?: number;
+  positionY?: number;
+  cropTop?: number;
+  cropRight?: number;
+  cropBottom?: number;
+  cropLeft?: number;
+  // 画中画透明度,0~1。
+  opacity?: number;
+  // 基础色彩调节。brightness/temperature 为 -1~1，其余为倍率。
+  brightness?: number;
+  contrast?: number;
+  saturation?: number;
+  temperature?: number;
+  hue?: number;
+  filter?: "none" | "vivid" | "cinema" | "warm" | "cool" | "mono";
 }
 
 // 剪辑轨道类型(对齐专业 NLE:视频 / 音频 / 字幕)
@@ -1057,15 +1116,68 @@ export interface VideoInfo {
   bitrateKbps: number;
 }
 
-// 导出转场参数:kind = dissolve(叠化)/ fade(淡黑);不传 = 不加转场(流拷贝快路径)
+// 片段转场参数:none 显式覆盖全局转场为硬切；不传则继承工程全局设置。
 export interface TransitionInput {
-  kind: "dissolve" | "fade";
+  kind: "none" | "dissolve" | "fade";
   durationSecs: number;
 }
 
-// 轨道上的片段
+// 导出画质档位(后端映射 CRF:high=18 / medium=21 / low=27;流拷贝路径不适用)
+export type ExportQuality = "high" | "medium" | "low";
+
+// 导出分辨率档位:目标为「短边」像素,仅在源短边大于目标时缩放(不放大)
+export type ExportResolution = "original" | "1080p" | "720p" | "480p";
+
+// 后端 FFmpeg 真实处理进度事件；jobId 用于过滤同窗口或并发任务。
+export interface CreationExportProgress {
+  jobId: string;
+  percent: number;
+  stage: string;
+  status: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+  outputPath?: string;
+  error?: string;
+}
+
+// DeepSeek-V4.1-Flash 只返回真实候选镜头的编号和策划理由；时间码由本地场景检测提供。
+export interface AiVideoPlanView {
+  selectedIndices: number[];
+  title: string;
+  rationale: string;
+  model: string;
+}
+
+// 轨道上的片段:start/end 为源视频内区间;position 为时间轴(序列)位置(秒)——
+// 缺省时视为等于 start(旧草稿迁移口径),拖动拼接 / 自动拼接改变的是 position;
+// detachedFrom = 音轨分离来源视频片段 id(「合并音频」据此找回归属)
 export interface TrackClip extends ClipSegment {
   id: string;
+  // 多轨片段编组；同组片段共同选择、移动和删除。
+  groupId?: string;
+  position?: number;
+  detachedFrom?: string;
+  // 波形按源素材总时长换算;旧草稿缺省时回退工程主视频时长。
+  sourceDuration?: number;
+  // 字幕轨专用样式;position + 片段时长决定成片中的显示区间。
+  text?: string;
+  fontSize?: number;
+  textColor?: string;
+  textPosition?: "top" | "center" | "bottom";
+  // 文字中心点在画布中的百分比坐标，以及顺时针旋转角度。
+  textX?: number;
+  textY?: number;
+  textRotation?: number;
+}
+
+export interface TextOverlay {
+  start: number;
+  end: number;
+  text: string;
+  fontSize?: number;
+  color?: string;
+  position?: "top" | "center" | "bottom";
+  x?: number;
+  y?: number;
+  rotation?: number;
 }
 
 // 剪辑轨道(草稿持久化用,前端模型,无后端表)
@@ -1090,6 +1202,10 @@ export interface ExportItem {
   size: number;
   // 导出时间(Unix 秒)
   createdAt: number;
+  // 成片媒体信息；存量文件探测失败时为 0。
+  durationSecs: number;
+  width: number;
+  height: number;
 }
 
 // ===================== 发布服务 =====================

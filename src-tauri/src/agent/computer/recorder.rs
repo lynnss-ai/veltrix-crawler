@@ -452,7 +452,11 @@ pub async fn start_screen_recording(
     // 未指定走启动预热缓存(枚举要起一次 ffmpeg 设备列表子进程,是「开始」等待的大头);
     // 缓存未就绪(启动后立刻点录屏)才现场枚举并回填。枚举不到设备降级纯视频。
     let mic = if with_mic {
-        match mic_device.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match mic_device
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(named) => Some(named.to_string()),
             None => match state.recording.probed_mic() {
                 Some(cached) => cached,
@@ -488,7 +492,11 @@ pub async fn start_screen_recording(
             probed
         }
     };
-    tracing::info!("录屏参数:编码器={} 抓屏={}", encoder.label(), if ddagrab { "ddagrab" } else { "gdigrab" });
+    tracing::info!(
+        "录屏参数:编码器={} 抓屏={}",
+        encoder.label(),
+        if ddagrab { "ddagrab" } else { "gdigrab" }
+    );
     let mut spec = RecordSpec {
         output: output_path.clone(),
         mic,
@@ -506,7 +514,10 @@ pub async fn start_screen_recording(
     if let Ok(Some(_)) | Err(_) = child.try_wait() {
         // 麦克风设备打开失败(被占用 / 系统隐私设置拦截)不应拖垮录屏:降级纯视频重试一次
         if spec.mic.take().is_some() {
-            tracing::warn!("麦克风采集启动失败,降级纯视频重试: {}", stderr_last_line(&stderr_tail));
+            tracing::warn!(
+                "麦克风采集启动失败,降级纯视频重试: {}",
+                stderr_last_line(&stderr_tail)
+            );
             // 缓存的设备名可能已失效(热插拔 / 被占用):后台重新探测刷新,避免下次还踩同一设备
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -989,7 +1000,9 @@ fn record_audio_sample(program: &str, mic: &str) -> std::result::Result<String, 
         .stderr(Stdio::null())
         .status();
     let ok = status.map(|s| s.success()).unwrap_or(false)
-        && std::fs::metadata(&tmp).map(|m| m.len() > 1000).unwrap_or(false);
+        && std::fs::metadata(&tmp)
+            .map(|m| m.len() > 1000)
+            .unwrap_or(false);
     if !ok {
         let _ = std::fs::remove_file(&tmp);
         return Err("录音失败:设备打不开或被占用".to_string());
@@ -1031,7 +1044,9 @@ pub struct ScreenPreview {
 /// 截取所有显示器的预览缩略图(悬浮条平铺选屏用,不落盘)。
 /// 某屏截取失败则跳过该屏,不让整体失败;全失败才报错。
 #[tauri::command]
-pub async fn recording_preview_all(app: AppHandle) -> std::result::Result<Vec<ScreenPreview>, String> {
+pub async fn recording_preview_all(
+    app: AppHandle,
+) -> std::result::Result<Vec<ScreenPreview>, String> {
     // 目标屏幕沿用录制同款枚举(Tauri),与 xcap 显示器按物理坐标配对,避免两套枚举顺序不一致选错屏
     let screens: Vec<(u32, i32, i32)> = enumerate_screens(&app)
         .into_iter()
@@ -1050,9 +1065,10 @@ fn capture_all_previews(
     let monitors = xcap::Monitor::all().map_err(|e| format!("枚举显示器失败: {e}"))?;
     let mut out = Vec::new();
     for (index, x, y) in screens {
-        let Some(m) = monitors.iter().find(|m| {
-            m.x().unwrap_or(i32::MIN) == *x && m.y().unwrap_or(i32::MIN) == *y
-        }) else {
+        let Some(m) = monitors
+            .iter()
+            .find(|m| m.x().unwrap_or(i32::MIN) == *x && m.y().unwrap_or(i32::MIN) == *y)
+        else {
             continue;
         };
         let Ok(img) = m.capture_image() else { continue };
@@ -1077,7 +1093,12 @@ fn encode_preview_png(image: &image::RgbaImage) -> String {
         let nh = (h as f64 * PREVIEW_MAX_W as f64 / w as f64)
             .round()
             .max(1.0) as u32;
-        resized = image::imageops::resize(image, PREVIEW_MAX_W, nh, image::imageops::FilterType::Triangle);
+        resized = image::imageops::resize(
+            image,
+            PREVIEW_MAX_W,
+            nh,
+            image::imageops::FilterType::Triangle,
+        );
         &resized
     } else {
         image
@@ -1148,7 +1169,16 @@ impl VideoEncoder {
     fn encode_args(self) -> &'static [&'static str] {
         match self {
             // p3 预设 + vbr cq:质量接近 x264 medium,GPU 完成,CPU 几乎零开销
-            VideoEncoder::Nvenc => &["-c:v", "h264_nvenc", "-preset", "p3", "-rc", "vbr", "-cq", "26"],
+            VideoEncoder::Nvenc => &[
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p3",
+                "-rc",
+                "vbr",
+                "-cq",
+                "26",
+            ],
             // 关 look_ahead 省 CPU(前瞻分析在 CPU 侧跑)
             VideoEncoder::Qsv => &["-c:v", "h264_qsv", "-b:v", "8M", "-look_ahead", "0"],
             VideoEncoder::Amf => &["-c:v", "h264_amf", "-quality", "speed", "-b:v", "8M"],
@@ -1180,7 +1210,12 @@ fn test_video_encoder(program: &str, enc: VideoEncoder) -> bool {
     let mut cmd = std::process::Command::new(program);
     crate::media::hide_console_window(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"])
-        .args(["-f", "lavfi", "-i", "nullsrc=size=64x64:duration=0.2:rate=15"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=64x64:duration=0.2:rate=15",
+        ])
         .args(enc.encode_args())
         .args(["-pix_fmt", enc.pix_fmt()])
         .args(["-frames:v", "3", "-f", "null", "-"])
@@ -1232,7 +1267,9 @@ fn parse_dshow_audio_devices(text: &str) -> Vec<(String, i32)> {
         if !line.contains("(audio)") {
             continue;
         }
-        let Some(name) = line.split('"').nth(1) else { continue };
+        let Some(name) = line.split('"').nth(1) else {
+            continue;
+        };
         let lower = name.to_lowercase();
         let mut score = 0;
         if name.contains("麦克风") || lower.contains("microphone") || lower.contains("mic") {
@@ -1485,8 +1522,7 @@ async fn concat_segments(
 /// 停止后后台 faststart 重排:moov 搬到文件头(<video> 经 asset 协议才能读时长 / 拖动)。
 /// 重排走同目录临时文件,成功后换名替换原文件;失败保留原文件(moov 在尾部,多数播放器仍可播)。
 async fn remux_faststart(program: &str, path: &std::path::Path) {
-    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
-    else {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
         return;
     };
     let tmp = dir.join(format!("{stem}.faststart-tmp.mp4"));
@@ -1509,7 +1545,10 @@ async fn remux_faststart(program: &str, path: &std::path::Path) {
     })
     .await
     .unwrap_or(false);
-    let tmp_ok = ok && std::fs::metadata(&tmp).map(|m| m.len() >= 4096).unwrap_or(false);
+    let tmp_ok = ok
+        && std::fs::metadata(&tmp)
+            .map(|m| m.len() >= 4096)
+            .unwrap_or(false);
     if !tmp_ok {
         tracing::warn!("faststart 重排失败,保留原始文件: {}", path.display());
         let _ = std::fs::remove_file(&tmp);
@@ -1534,17 +1573,14 @@ async fn remux_faststart(program: &str, path: &std::path::Path) {
 /// ① 默认麦克风枚举;② 编码器实测初始化探测(nvenc/qsv/amf,兜底 libx264);③ ddagrab 抓屏探测。
 /// 这些都要起 ffmpeg 子进程(合计近秒级),提前在启动空闲期做掉,首次「开始录制」直接读缓存。
 pub async fn warm_recording_probes(app: AppHandle) {
-    let (available, program) = {
+    let (known_available, configured_program) = {
         let state = app.state::<AppState>();
         let program = lock_config(&state)
             .ok()
             .and_then(|cfg| cfg.media.ffmpeg_path.clone());
         (state.recording.ffmpeg_available(), program)
     };
-    if !available {
-        return;
-    }
-    let program = program
+    let program = configured_program
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
@@ -1552,15 +1588,29 @@ pub async fn warm_recording_probes(app: AppHandle) {
         .to_string();
     // 探测全是阻塞子进程调用,放 blocking 线程一次做完
     let prog = program.clone();
-    let (mic, encoder, ddagrab) = tauri::async_runtime::spawn_blocking(move || {
-        (
-            default_microphone(&prog),
-            probe_video_encoder(&prog),
-            probe_ddagrab(&prog),
-        )
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let available = known_available
+            || crate::media::probe_ffmpeg(Some(&prog)).is_some()
+            || crate::media::probe_ffmpeg(None).is_some();
+        if !available {
+            return None;
+        }
+        Some((
+            available,
+            (
+                default_microphone(&prog),
+                probe_video_encoder(&prog),
+                probe_ddagrab(&prog),
+            ),
+        ))
     })
     .await
-    .unwrap_or((None, VideoEncoder::Software, false));
+    .ok()
+    .flatten();
+    let Some((available, (mic, encoder, ddagrab))) = result else {
+        tracing::warn!("录屏预热:未找到可用 FFmpeg");
+        return;
+    };
     tracing::info!(
         "录屏预热:麦克风={} 编码器={} 抓屏={}",
         mic.as_deref().unwrap_or("(无可用设备,将降级纯视频)"),
@@ -1568,6 +1618,7 @@ pub async fn warm_recording_probes(app: AppHandle) {
         if ddagrab { "ddagrab" } else { "gdigrab" },
     );
     let state = app.state::<AppState>();
+    state.recording.set_ffmpeg_available(available);
     state.recording.set_default_mic(mic);
     state.recording.set_video_probe(encoder, ddagrab);
 }

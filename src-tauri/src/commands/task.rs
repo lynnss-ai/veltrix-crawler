@@ -5,11 +5,11 @@
 
 use crate::commands::{current_user, AppState};
 use chrono::Utc;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
-use sea_orm::sea_query::{Expr, ExprTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tauri::State;
@@ -507,14 +507,18 @@ pub struct TaskStatusPatch {
 }
 
 #[tauri::command]
-pub async fn update_task_status(
-    state: State<'_, AppState>,
-    patch: TaskStatusPatch,
-) -> Result<()> {
+pub async fn update_task_status(state: State<'_, AppState>, patch: TaskStatusPatch) -> Result<()> {
     // 白名单校验:仅允许合法状态,防止前端 bug / 恶意调用写入不存在状态导致调度器误判
     const VALID_STATUSES: &[&str] = &[
-        "pending", "running", "paused", "collecting_comments",
-        "analyzing_comments", "downloading_media", "completed", "failed", "cancelled",
+        "pending",
+        "running",
+        "paused",
+        "collecting_comments",
+        "analyzing_comments",
+        "downloading_media",
+        "completed",
+        "failed",
+        "cancelled",
     ];
     if !VALID_STATUSES.contains(&patch.status.as_str()) {
         return Err(CrawlerError::Config(format!(
@@ -636,8 +640,12 @@ impl From<content::Model> for ContentView {
         let topics: Vec<String> = serde_json::from_str(&m.topics).unwrap_or_default();
         let xsec_token = serde_json::from_str::<serde_json::Value>(&m.extra)
             .ok()
-            .and_then(|v| v.get("xsec_token").and_then(|t| t.as_str())
-                .filter(|t| !t.trim().is_empty()).map(str::to_string));
+            .and_then(|v| {
+                v.get("xsec_token")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_string)
+            });
         // 头像在完整作者 JSON 里(实体只单列了 uid/nickname),按需解析出来
         let author_avatar = serde_json::from_str::<serde_json::Value>(&m.author_json)
             .ok()
@@ -664,8 +672,11 @@ impl From<content::Model> for ContentView {
             video_url: m.video_url,
             cover_url: m.cover_url,
             image_urls,
-            image_paths: m.image_paths.as_deref()
-                .and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default(),
+            image_paths: m
+                .image_paths
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or_default(),
             xsec_token,
             duration: m.duration,
             topics,
@@ -856,7 +867,11 @@ pub async fn get_content_detail(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let top_i64 = |key: &str| av.as_ref().and_then(|v| v.get(key)).and_then(|x| x.as_i64());
+    let top_i64 = |key: &str| {
+        av.as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|x| x.as_i64())
+    };
     let extra_str = |key: &str| {
         av.as_ref()
             .and_then(|v| v.get("extra"))
@@ -930,12 +945,16 @@ pub async fn get_content_detail(
             .map(|a| a.nickname.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| row.author_nickname.clone()),
-        avatar: ar.and_then(|a| a.avatar.clone()).or_else(|| top_str("avatar")),
+        avatar: ar
+            .and_then(|a| a.avatar.clone())
+            .or_else(|| top_str("avatar")),
         avatar_path: row.avatar_path.clone(),
         platform_id: ar
             .and_then(|a| a.platform_id.clone())
             .or_else(|| extra_str("unique_id")),
-        short_id: ar.and_then(|a| a.short_id.clone()).or_else(|| extra_str("uid")),
+        short_id: ar
+            .and_then(|a| a.short_id.clone())
+            .or_else(|| extra_str("uid")),
         signature: ar
             .and_then(|a| a.signature.clone())
             .or_else(|| top_str("signature")),
@@ -964,23 +983,34 @@ pub async fn get_content_detail(
     content_view.synced_by_me = synced_by_me;
 
     // 下载器将图集与封面放在同目录。用实际封面定位,兼容旧数据及跨日下载。
-    content_view.image_paths.resize(content_view.image_urls.len(), None);
+    content_view
+        .image_paths
+        .resize(content_view.image_urls.len(), None);
     // 库存 cover_path 可能是相对 media_root 的相对路径(新口径),先 resolve 成绝对路径做磁盘判断;
     // 写回 view 的条目再经 to_media_rel 转回相对路径,保持视图输出口径一致
-    let root = crate::media::media_root(&state.config_dir, &crate::commands::lock_config(&state)?.media.clone());
+    let root = crate::media::media_root(
+        &state.config_dir,
+        &crate::commands::lock_config(&state)?.media.clone(),
+    );
     let cover_abs = content_view
         .cover_path
         .as_deref()
         .map(|p| crate::media::resolve_media_path(&root, p));
     if let Some(cover) = cover_abs.as_deref() {
-        if let (Some(dir), Some(prefix)) = (cover.parent(), cover.file_stem()
-            .and_then(|s| s.to_str()).and_then(|s| s.strip_suffix("_cover"))) {
+        if let (Some(dir), Some(prefix)) = (
+            cover.parent(),
+            cover
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_suffix("_cover")),
+        ) {
             for index in 0..content_view.image_urls.len() {
                 if content_view.image_paths[index].is_some() {
                     continue;
                 }
                 let path = dir.join(format!("{prefix}_img{index}.jpg"));
-                let exists = tokio::fs::metadata(&path).await
+                let exists = tokio::fs::metadata(&path)
+                    .await
                     .is_ok_and(|meta| meta.is_file() && meta.len() > 0);
                 content_view.image_paths[index] =
                     exists.then(|| crate::media::to_media_rel(&root, &path));
@@ -1029,8 +1059,7 @@ pub struct AuthorView {
 pub async fn list_authors(state: State<'_, AppState>) -> Result<Vec<AuthorView>> {
     use veltrix_core::db::entity::author as author_entity;
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let mut q = author_entity::Entity::find()
-        .order_by_desc(author_entity::Column::LastCollectedAt);
+    let mut q = author_entity::Entity::find().order_by_desc(author_entity::Column::LastCollectedAt);
     if me.scope == "self" {
         q = q.filter(author_entity::Column::Owner.eq(me.name.clone()));
     }
@@ -1083,8 +1112,10 @@ pub async fn list_authors(state: State<'_, AppState>) -> Result<Vec<AuthorView>>
         .all(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("聚合作者任务失败: {e}")))?;
-    let task_ids: std::collections::HashSet<String> =
-        author_tasks.iter().map(|(_, _, _, tid)| tid.clone()).collect();
+    let task_ids: std::collections::HashSet<String> = author_tasks
+        .iter()
+        .map(|(_, _, _, tid)| tid.clone())
+        .collect();
     let industry_map: std::collections::HashMap<String, String> = task::Entity::find()
         .filter(task::Column::Id.is_in(task_ids))
         .all(&state.db)
@@ -1131,28 +1162,28 @@ pub async fn list_authors(state: State<'_, AppState>) -> Result<Vec<AuthorView>>
                 .filter(|root| root.join(&avatar_rel).is_file())
                 .map(|_| avatar_rel);
             AuthorView {
-            avatar_path,
-            content_count: count_map.get(&m.id).copied().unwrap_or(0),
-            industries: author_industries
-                .get(&m.id)
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default(),
-            id: m.id,
-            owner: m.owner,
-            platform: m.platform,
-            uid: m.uid,
-            nickname: m.nickname,
-            avatar: m.avatar,
-            platform_id: m.platform_id,
-            signature: m.signature,
-            follower_count: m.follower_count,
-            following_count: m.following_count,
-            total_favorited: m.total_favorited,
-            location: m.location,
-            is_monitored: m.is_monitored,
-            is_blacklisted: m.is_blacklisted,
-            first_collected_at: m.first_collected_at,
-            last_collected_at: m.last_collected_at,
+                avatar_path,
+                content_count: count_map.get(&m.id).copied().unwrap_or(0),
+                industries: author_industries
+                    .get(&m.id)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default(),
+                id: m.id,
+                owner: m.owner,
+                platform: m.platform,
+                uid: m.uid,
+                nickname: m.nickname,
+                avatar: m.avatar,
+                platform_id: m.platform_id,
+                signature: m.signature,
+                follower_count: m.follower_count,
+                following_count: m.following_count,
+                total_favorited: m.total_favorited,
+                location: m.location,
+                is_monitored: m.is_monitored,
+                is_blacklisted: m.is_blacklisted,
+                first_collected_at: m.first_collected_at,
+                last_collected_at: m.last_collected_at,
             }
         })
         .collect())
@@ -1247,7 +1278,11 @@ pub async fn set_author_monitored(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        let top_i64 = |key: &str| av.as_ref().and_then(|v| v.get(key)).and_then(|x| x.as_i64());
+        let top_i64 = |key: &str| {
+            av.as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|x| x.as_i64())
+        };
         let extra_str = |key: &str| {
             av.as_ref()
                 .and_then(|v| v.get("extra"))
@@ -1368,7 +1403,11 @@ pub async fn migrate_authors_from_contents(db: &sea_orm::DatabaseConnection) {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        let top_i64 = |key: &str| av.as_ref().and_then(|v| v.get(key)).and_then(|x| x.as_i64());
+        let top_i64 = |key: &str| {
+            av.as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|x| x.as_i64())
+        };
         let extra_str = |key: &str| {
             av.as_ref()
                 .and_then(|v| v.get("extra"))
@@ -1474,7 +1513,13 @@ pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Re
         .map_err(|e| CrawlerError::Config(format!("批量删除内容失败: {e}")))?;
     let keys: Vec<(&str, &str, &str)> = rows
         .iter()
-        .map(|r| (r.task_id.as_str(), r.platform.as_str(), r.content_id.as_str()))
+        .map(|r| {
+            (
+                r.task_id.as_str(),
+                r.platform.as_str(),
+                r.content_id.as_str(),
+            )
+        })
         .collect();
     cascade_delete_comments(&state.db, &keys).await?;
     Ok(res.rows_affected)
@@ -1748,12 +1793,7 @@ fn raw_statement(
 }
 
 /// 追加一条 AND 条件(值为占位符参数)
-fn and_cond(
-    conds: &mut String,
-    values: &mut Vec<sea_orm::Value>,
-    frag: &str,
-    v: sea_orm::Value,
-) {
+fn and_cond(conds: &mut String, values: &mut Vec<sea_orm::Value>, frag: &str, v: sea_orm::Value) {
     conds.push_str(" AND ");
     conds.push_str(frag);
     values.push(v);
@@ -1776,21 +1816,51 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
     let mut conds = String::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     if self_only {
-        and_cond(&mut conds, &mut values, "contents.owner = ?", owner.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.owner = ?",
+            owner.to_string().into(),
+        );
     }
     if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
-        and_cond(&mut conds, &mut values, "contents.task_id = ?", tid.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.task_id = ?",
+            tid.to_string().into(),
+        );
     }
     if let Some(kw) = query.keyword.as_deref().filter(|k| !k.is_empty()) {
-        and_cond(&mut conds, &mut values, "contents.keyword = ?", kw.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.keyword = ?",
+            kw.to_string().into(),
+        );
     }
     if let Some(start) = query.run_start {
-        and_cond(&mut conds, &mut values, "contents.collected_at >= ?", start.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.collected_at >= ?",
+            start.into(),
+        );
     }
     if let Some(end) = query.run_end {
-        and_cond(&mut conds, &mut values, "contents.collected_at <= ?", end.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.collected_at <= ?",
+            end.into(),
+        );
     }
-    if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+    if let Some(q) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
         let pattern = format!("%{}%", escape_like(q));
         // 三个命中列共用同一模式(前端 title / keyword / desc 任一 includes 即命中)
         and_cond(
@@ -1803,7 +1873,12 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
         values.push(pattern.into());
     }
     if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
-        and_cond(&mut conds, &mut values, "contents.platform = ?", p.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.platform = ?",
+            p.to_string().into(),
+        );
     }
     if !query.kinds.is_empty() {
         let placeholders = vec!["?"; query.kinds.len()].join(", ");
@@ -1831,16 +1906,36 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
         );
     }
     if let Some(from) = query.created_from {
-        and_cond(&mut conds, &mut values, "contents.collected_at >= ?", from.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.collected_at >= ?",
+            from.into(),
+        );
     }
     if let Some(to) = query.created_to {
-        and_cond(&mut conds, &mut values, "contents.collected_at <= ?", to.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.collected_at <= ?",
+            to.into(),
+        );
     }
     if let Some(from) = query.published_from {
-        and_cond(&mut conds, &mut values, "contents.published_at >= ?", from.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.published_at >= ?",
+            from.into(),
+        );
     }
     if let Some(to) = query.published_to {
-        and_cond(&mut conds, &mut values, "contents.published_at <= ?", to.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "contents.published_at <= ?",
+            to.into(),
+        );
     }
     match query.image_source.as_deref() {
         // "image":本地封面路径非空(图片素材定位口径,内容选择弹窗用——远程 URL 无法定位本地素材)
@@ -1863,7 +1958,9 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
                  (contents.kind = 'video' AND contents.transcript IS NOT NULL AND trim(contents.transcript) <> ''))",
             );
         } else {
-            conds.push_str(" AND contents.transcript IS NOT NULL AND trim(contents.transcript) <> ''");
+            conds.push_str(
+                " AND contents.transcript IS NOT NULL AND trim(contents.transcript) <> ''",
+            );
         }
     }
     if let Some(ids) = query.ids.as_deref() {
@@ -1910,12 +2007,27 @@ fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> Fil
     let mut conds = String::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     if self_only {
-        and_cond(&mut conds, &mut values, "comments.owner = ?", owner.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "comments.owner = ?",
+            owner.to_string().into(),
+        );
     }
     if let Some(tid) = query.task_id.as_deref().filter(|t| !t.is_empty()) {
-        and_cond(&mut conds, &mut values, "comments.task_id = ?", tid.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "comments.task_id = ?",
+            tid.to_string().into(),
+        );
     }
-    if let Some(q) = query.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+    if let Some(q) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
         let pattern = format!("%{}%", escape_like(q));
         and_cond(
             &mut conds,
@@ -1926,7 +2038,12 @@ fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> Fil
         values.push(pattern.into());
     }
     if let Some(p) = query.platform.as_deref().filter(|p| !p.is_empty()) {
-        and_cond(&mut conds, &mut values, "comments.platform = ?", p.to_string().into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "comments.platform = ?",
+            p.to_string().into(),
+        );
     }
     if !query.kinds.is_empty() {
         // 所属内容形态:相关 EXISTS(评论与内容按任务级三列关联,无物理外键)
@@ -1972,10 +2089,20 @@ fn comment_filter(query: &CommentListQuery, self_only: bool, owner: &str) -> Fil
         conds.push_str(&format!(" AND ({})", parts.join(" OR ")));
     }
     if let Some(from) = query.created_from {
-        and_cond(&mut conds, &mut values, "comments.created_at >= ?", from.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "comments.created_at >= ?",
+            from.into(),
+        );
     }
     if let Some(to) = query.created_to {
-        and_cond(&mut conds, &mut values, "comments.created_at <= ?", to.into());
+        and_cond(
+            &mut conds,
+            &mut values,
+            "comments.created_at <= ?",
+            to.into(),
+        );
     }
     FilterParts { conds, values }
 }
@@ -2049,7 +2176,9 @@ fn map_content_list_row(r: &sea_orm::QueryResult) -> Result<ContentListView> {
     let col_err = |col: &'static str| {
         move |e: sea_orm::DbErr| CrawlerError::Config(format!("读取内容列表列 {col} 失败: {e}"))
     };
-    let author_json: String = r.try_get("", "author_json").map_err(col_err("author_json"))?;
+    let author_json: String = r
+        .try_get("", "author_json")
+        .map_err(col_err("author_json"))?;
     let image_urls_raw: String = r.try_get("", "image_urls").map_err(col_err("image_urls"))?;
     let extra: String = r.try_get("", "extra").map_err(col_err("extra"))?;
     let topics_raw: String = r.try_get("", "topics").map_err(col_err("topics"))?;
@@ -2081,14 +2210,24 @@ fn map_content_list_row(r: &sea_orm::QueryResult) -> Result<ContentListView> {
         title: r.try_get("", "title").map_err(col_err("title"))?,
         desc: r.try_get("", "desc").map_err(col_err("desc"))?,
         author_uid: r.try_get("", "author_uid").map_err(col_err("author_uid"))?,
-        author_nickname: r.try_get("", "author_nickname").map_err(col_err("author_nickname"))?,
+        author_nickname: r
+            .try_get("", "author_nickname")
+            .map_err(col_err("author_nickname"))?,
         author_avatar,
         like_count: r.try_get("", "like_count").map_err(col_err("like_count"))?,
-        comment_count: r.try_get("", "comment_count").map_err(col_err("comment_count"))?,
-        collect_count: r.try_get("", "collect_count").map_err(col_err("collect_count"))?,
-        share_count: r.try_get("", "share_count").map_err(col_err("share_count"))?,
+        comment_count: r
+            .try_get("", "comment_count")
+            .map_err(col_err("comment_count"))?,
+        collect_count: r
+            .try_get("", "collect_count")
+            .map_err(col_err("collect_count"))?,
+        share_count: r
+            .try_get("", "share_count")
+            .map_err(col_err("share_count"))?,
         play_count: r.try_get("", "play_count").map_err(col_err("play_count"))?,
-        published_at: r.try_get("", "published_at").map_err(col_err("published_at"))?,
+        published_at: r
+            .try_get("", "published_at")
+            .map_err(col_err("published_at"))?,
         video_url: r.try_get("", "video_url").map_err(col_err("video_url"))?,
         cover_url: r.try_get("", "cover_url").map_err(col_err("cover_url"))?,
         first_image_url,
@@ -2097,24 +2236,54 @@ fn map_content_list_row(r: &sea_orm::QueryResult) -> Result<ContentListView> {
         duration: r.try_get("", "duration").map_err(col_err("duration"))?,
         topics,
         owner: r.try_get("", "owner").map_err(col_err("owner"))?,
-        collected_at: r.try_get("", "collected_at").map_err(col_err("collected_at"))?,
-        media_status: r.try_get("", "media_status").map_err(col_err("media_status"))?,
-        audio_extracted: r.try_get("", "audio_extracted").map_err(col_err("audio_extracted"))?,
-        media_error: r.try_get("", "media_error").map_err(col_err("media_error"))?,
+        collected_at: r
+            .try_get("", "collected_at")
+            .map_err(col_err("collected_at"))?,
+        media_status: r
+            .try_get("", "media_status")
+            .map_err(col_err("media_status"))?,
+        audio_extracted: r
+            .try_get("", "audio_extracted")
+            .map_err(col_err("audio_extracted"))?,
+        media_error: r
+            .try_get("", "media_error")
+            .map_err(col_err("media_error"))?,
         cover_path: r.try_get("", "cover_path").map_err(col_err("cover_path"))?,
-        avatar_path: r.try_get("", "avatar_path").map_err(col_err("avatar_path"))?,
+        avatar_path: r
+            .try_get("", "avatar_path")
+            .map_err(col_err("avatar_path"))?,
         audio_path: r.try_get("", "audio_path").map_err(col_err("audio_path"))?,
-        transcript_state: r.try_get("", "transcript_state").map_err(col_err("transcript_state"))?,
-        transcript_preview: r.try_get("", "transcript_preview").map_err(col_err("transcript_preview"))?,
-        transcript_error: r.try_get("", "transcript_error").map_err(col_err("transcript_error"))?,
-        cover_ocr_state: r.try_get("", "cover_ocr_state").map_err(col_err("cover_ocr_state"))?,
-        cover_ocr_preview: r.try_get("", "cover_ocr_preview").map_err(col_err("cover_ocr_preview"))?,
-        cover_ocr_error: r.try_get("", "cover_ocr_error").map_err(col_err("cover_ocr_error"))?,
-        video_downloaded: r.try_get("", "video_downloaded").map_err(col_err("video_downloaded"))?,
-        image_total: r.try_get("", "image_total").map_err(col_err("image_total"))?,
+        transcript_state: r
+            .try_get("", "transcript_state")
+            .map_err(col_err("transcript_state"))?,
+        transcript_preview: r
+            .try_get("", "transcript_preview")
+            .map_err(col_err("transcript_preview"))?,
+        transcript_error: r
+            .try_get("", "transcript_error")
+            .map_err(col_err("transcript_error"))?,
+        cover_ocr_state: r
+            .try_get("", "cover_ocr_state")
+            .map_err(col_err("cover_ocr_state"))?,
+        cover_ocr_preview: r
+            .try_get("", "cover_ocr_preview")
+            .map_err(col_err("cover_ocr_preview"))?,
+        cover_ocr_error: r
+            .try_get("", "cover_ocr_error")
+            .map_err(col_err("cover_ocr_error"))?,
+        video_downloaded: r
+            .try_get("", "video_downloaded")
+            .map_err(col_err("video_downloaded"))?,
+        image_total: r
+            .try_get("", "image_total")
+            .map_err(col_err("image_total"))?,
         image_done: r.try_get("", "image_done").map_err(col_err("image_done"))?,
-        comment_collected: r.try_get("", "comment_collected").map_err(col_err("comment_collected"))?,
-        intent_analyzed: r.try_get("", "intent_analyzed").map_err(col_err("intent_analyzed"))?,
+        comment_collected: r
+            .try_get("", "comment_collected")
+            .map_err(col_err("comment_collected"))?,
+        intent_analyzed: r
+            .try_get("", "intent_analyzed")
+            .map_err(col_err("intent_analyzed"))?,
         synced_by_me: false, // 由 fill_content_list_views 按当前用户回填
     })
 }
@@ -2131,7 +2300,11 @@ async fn query_content_list_rows(
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let values: Vec<sea_orm::Value> = ids.iter().cloned().map(Into::into).collect();
     let rows = db
-        .query_all(raw_statement(backend, content_list_select_sql(&placeholders), values))
+        .query_all(raw_statement(
+            backend,
+            content_list_select_sql(&placeholders),
+            values,
+        ))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
     rows.iter().map(map_content_list_row).collect()
@@ -2260,20 +2433,20 @@ async fn fill_comment_views(
             view.industry = industry;
             if let Some(c) = content {
                 // 抖音/快手无独立标题(正文在 desc),title 缺失时回退 desc 截断,避免「所属内容标题」为空
-                view.content_title = c
-                    .title
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| {
-                        c.desc.as_deref().filter(|s| !s.trim().is_empty()).map(|d| {
-                            let head: String = d.chars().take(60).collect();
-                            if d.chars().count() > 60 {
-                                format!("{head}…")
-                            } else {
-                                head
-                            }
-                        })
-                    });
+                view.content_title =
+                    c.title
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            c.desc.as_deref().filter(|s| !s.trim().is_empty()).map(|d| {
+                                let head: String = d.chars().take(60).collect();
+                                if d.chars().count() > 60 {
+                                    format!("{head}…")
+                                } else {
+                                    head
+                                }
+                            })
+                        });
                 view.keyword = c.keyword.clone();
                 view.content_kind = Some(c.kind.clone());
                 view.content_cover_url = c.cover_url.clone();
@@ -2282,9 +2455,7 @@ async fn fill_comment_views(
                 view.content_author_avatar =
                     serde_json::from_str::<serde_json::Value>(&c.author_json)
                         .ok()
-                        .and_then(|v| {
-                            v.get("avatar").and_then(|a| a.as_str()).map(str::to_string)
-                        });
+                        .and_then(|v| v.get("avatar").and_then(|a| a.as_str()).map(str::to_string));
             }
             view
         })
@@ -2314,7 +2485,11 @@ pub async fn list_contents_page(
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let filter = content_filter(&query, me.scope == "self", &me.name);
     let backend = state.db.get_database_backend();
-    let use_ids = query.ids.as_deref().map(|ids| !ids.is_empty()).unwrap_or(false);
+    let use_ids = query
+        .ids
+        .as_deref()
+        .map(|ids| !ids.is_empty())
+        .unwrap_or(false);
     let limit = query.limit.clamp(1, 2000);
     let (page_limit, page_offset) = if use_ids {
         (10000u64, 0u64)
@@ -2658,9 +2833,9 @@ pub async fn list_batch_content_ids(
         BatchKind::Audio => {
             // 缺音频的视频:不限素材状态——failed(下载失败)/ pending(历史任务媒体阶段未跑)/
             // success(任务未开音频提取)都可能是缺音频,用户点「采集音频」即显式要求补采
-            filter.conds.push_str(
-                " AND kind = 'video' AND (audio_path IS NULL OR audio_path = '')",
-            );
+            filter
+                .conds
+                .push_str(" AND kind = 'video' AND (audio_path IS NULL OR audio_path = '')");
         }
     }
     let sql = format!(
@@ -2905,7 +3080,6 @@ pub async fn list_run_logs(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-
 /// 单次运行的导出数据视图:该运行时间窗内落库的内容 + 评论。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2917,10 +3091,7 @@ pub struct RunDataView {
 /// 某次运行采集到的内容 + 评论(任务详情「执行历史」导出 Excel 用)。
 /// 时间窗口径与「查看内容」穿透一致:collected_at ∈ [started_at, finished_at ?? 现在]。
 #[tauri::command]
-pub async fn list_run_data(
-    state: State<'_, AppState>,
-    run_id: String,
-) -> Result<RunDataView> {
+pub async fn list_run_data(state: State<'_, AppState>, run_id: String) -> Result<RunDataView> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let run = task_run::Entity::find_by_id(run_id)
         .one(&state.db)
@@ -2952,10 +3123,7 @@ pub async fn list_run_data(
 
 /// 任务全部采集数据(任务调度「更多 → 导出」Excel 用):该任务落库的全部内容 + 评论。
 #[tauri::command]
-pub async fn list_task_data(
-    state: State<'_, AppState>,
-    task_id: String,
-) -> Result<RunDataView> {
+pub async fn list_task_data(state: State<'_, AppState>, task_id: String) -> Result<RunDataView> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let t = task::Entity::find_by_id(task_id)
         .one(&state.db)
@@ -2990,10 +3158,8 @@ async fn collect_task_data_window(
         .await
         .map_err(|e| CrawlerError::Config(format!("查询内容失败: {e}")))?;
     // 评论的「所属内容」关联表(id → Model);内容视图在评论之后统一构建,避免 clone
-    let content_map: HashMap<String, content::Model> = contents
-        .iter()
-        .map(|c| (c.id.clone(), c.clone()))
-        .collect();
+    let content_map: HashMap<String, content::Model> =
+        contents.iter().map(|c| (c.id.clone(), c.clone())).collect();
 
     let mut mq = comment::Entity::find().filter(comment::Column::TaskId.eq(task_id));
     if let Some(s) = start {
@@ -3112,8 +3278,8 @@ pub async fn list_content_comments(
     let row = match by_pk {
         Some(r) => Some(r),
         None => {
-            let mut cq = content::Entity::find()
-                .filter(content::Column::ContentId.eq(content_id.clone()));
+            let mut cq =
+                content::Entity::find().filter(content::Column::ContentId.eq(content_id.clone()));
             if let Some(p) = platform.as_deref().filter(|p| !p.is_empty()) {
                 cq = cq.filter(content::Column::Platform.eq(p));
             }
@@ -3157,21 +3323,22 @@ pub async fn list_content_comments(
             cq
         }
     };
-    let total = q
-        .clone()
-        .count(&state.db)
-        .await
-        .unwrap_or(0);
+    let total = q.clone().count(&state.db).await.unwrap_or(0);
     if let Some(cur) = cursor.as_deref().filter(|c| !c.is_empty()) {
         let (last_likes, last_id) = parse_comment_cursor(cur)?;
         // 复合游标条件:点赞数更小,或点赞数相同但行 id 更大(id 升序 tiebreak,不重不漏)
         q = q.filter(
-            Condition::any()
-                .add(likes.clone().lt(last_likes))
-                .add(likes.clone().eq(last_likes).and(comment::Column::Id.gt(last_id))),
+            Condition::any().add(likes.clone().lt(last_likes)).add(
+                likes
+                    .clone()
+                    .eq(last_likes)
+                    .and(comment::Column::Id.gt(last_id)),
+            ),
         );
     }
-    let limit = limit.unwrap_or(COMMENT_PAGE_SIZE).clamp(1, COMMENT_PAGE_MAX) as u64;
+    let limit = limit
+        .unwrap_or(COMMENT_PAGE_SIZE)
+        .clamp(1, COMMENT_PAGE_MAX) as u64;
     // 多取一条判断是否还有下一页,避免前端再发一次空页请求
     let rows = q
         .order_by_desc(likes)

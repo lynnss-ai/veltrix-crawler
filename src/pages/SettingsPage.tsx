@@ -1761,7 +1761,7 @@ const DEFAULT_INTENT_PROMPT =
 // 意向分析常用服务预设:点击快捷填入 API 地址 + 模型(仍可手改)
 const INTENT_PROVIDERS: { label: string; apiUrl: string; model: string }[] = [
   { label: "智谱 GLM", apiUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4" },
-  { label: "DeepSeek", apiUrl: "https://api.deepseek.com", model: "deepseek-v4-flash" },
+  { label: "DeepSeek", apiUrl: "https://api.deepseek.com", model: "deepseek-flash" },
   { label: "小米 MiMo", apiUrl: "https://api.xiaomimimo.com/v1", model: "MiMo-V2-Flash" },
 ];
 
@@ -1879,7 +1879,7 @@ function IntentSection({
           <Label htmlFor="intent-model">模型</Label>
           <Input
             id="intent-model"
-            placeholder="如 deepseek-v4-flash / glm-4"
+            placeholder="如 deepseek-flash / glm-4"
             value={model}
             onChange={(e) => setModel(e.target.value)}
           />

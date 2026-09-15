@@ -34,8 +34,14 @@ impl ReactHooks for LocalHooks {
             return None; // 非危险工具,正常执行
         }
         // 危险工具:走共享确认闸门(emit agent-confirm → 等前端回执 / 超时拒绝)
-        confirm_dangerous_tool(&self.confirm_channel, &self.app, &self.conversation_id, name, args)
-            .await
+        confirm_dangerous_tool(
+            &self.confirm_channel,
+            &self.app,
+            &self.conversation_id,
+            name,
+            args,
+        )
+        .await
     }
 }
 
@@ -63,7 +69,9 @@ pub async fn send_local_message(
     // 构建上下文:系统提示词 + 滚动摘要 + live 原文窗口
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(local::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(&state.config_dir, "local").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
@@ -152,7 +160,9 @@ pub async fn run_local_subtask(
     let registry = local::build_registry();
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(local::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(config_dir, "local").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     messages.push(ChatMsg::User(task.to_string()));
     let config = ReactConfig {
@@ -170,7 +180,14 @@ pub async fn run_local_subtask(
         conversation_id: conversation_id.to_string(),
     };
     let result = crate::agent::core::react::react_run(
-        db, app, conversation_id, provider_ref, config, &mut hooks, &registry, &mut messages,
+        db,
+        app,
+        conversation_id,
+        provider_ref,
+        config,
+        &mut hooks,
+        &registry,
+        &mut messages,
         None,
     )
     .await?;

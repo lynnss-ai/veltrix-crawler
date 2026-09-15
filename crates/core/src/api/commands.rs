@@ -2,9 +2,9 @@
 //!
 //! 指令本身是无副作用的 RPC 入口;真正的执行由 PC 端处理 WS command 消息时完成。
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::auth::AuthMobile;
 use super::{ApiResponse, ApiState, AppError};

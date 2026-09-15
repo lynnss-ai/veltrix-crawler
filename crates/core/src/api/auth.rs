@@ -10,7 +10,7 @@
 
 use axum::{extract::FromRequestParts, http::request::Parts};
 use bb8_redis::redis::AsyncCommands;
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 use super::{ApiState, AppError};
@@ -87,8 +87,12 @@ fn exp_ts() -> usize {
 }
 
 fn encode_with<T: Serialize>(secret: &[u8], claims: &T) -> Result<String, AppError> {
-    encode(&Header::default(), claims, &EncodingKey::from_secret(secret))
-        .map_err(|e| AppError::Internal(format!("签发 token 失败: {e}")))
+    encode(
+        &Header::default(),
+        claims,
+        &EncodingKey::from_secret(secret),
+    )
+    .map_err(|e| AppError::Internal(format!("签发 token 失败: {e}")))
 }
 
 /// 签发用户 token(登录用)。
@@ -161,9 +165,13 @@ fn decode_typed<T: for<'de> Deserialize<'de> + Clone>(
     secret: &[u8],
     aud: &str,
 ) -> Result<T, AppError> {
-    decode::<T>(token, &DecodingKey::from_secret(secret), &validation_for(aud))
-        .map(|d| d.claims)
-        .map_err(|e| AppError::Unauthorized(format!("token 无效或已过期: {e}")))
+    decode::<T>(
+        token,
+        &DecodingKey::from_secret(secret),
+        &validation_for(aud),
+    )
+    .map(|d| d.claims)
+    .map_err(|e| AppError::Unauthorized(format!("token 无效或已过期: {e}")))
 }
 
 pub struct AuthUser(pub UserClaims);

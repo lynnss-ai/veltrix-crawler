@@ -127,12 +127,14 @@ pub async fn transcribe_stream(
         "mimo" => mimo_transcribe_stream(&req, &audio_path, &mut on_delta).await,
         "glm" => glm_transcribe_stream(&req, &audio_path, &mut on_delta).await,
         // 回退:非流式整段转写,全文一次性回传
-        _ => transcribe_single(&req, &audio_path).await.map(|(text, usage)| {
-            if !text.is_empty() {
-                on_delta(text.clone());
-            }
-            (text, usage)
-        }),
+        _ => transcribe_single(&req, &audio_path)
+            .await
+            .map(|(text, usage)| {
+                if !text.is_empty() {
+                    on_delta(text.clone());
+                }
+                (text, usage)
+            }),
     };
     // 转码临时文件无论成败都清理(失败忽略,不影响转写结果)
     if let Some(path) = converted {
@@ -242,10 +244,7 @@ async fn convert_to_mp3(audio_path: &Path, ffmpeg_path: Option<&str>) -> Result<
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let out = std::env::temp_dir().join(format!(
-        "veltrix-asr-{}-{nanos}.mp3",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("veltrix-asr-{}-{nanos}.mp3", std::process::id()));
     let out2 = out.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&program);
@@ -268,7 +267,9 @@ async fn convert_to_mp3(audio_path: &Path, ffmpeg_path: Option<&str>) -> Result<
             ])
             .arg(&out2);
         let output = crate::media::run_ffmpeg_local(&mut cmd).map_err(|e| {
-            CrawlerError::Config(format!("智谱 GLM 转写需先把音频转码为 mp3,执行 ffmpeg 失败: {e}"))
+            CrawlerError::Config(format!(
+                "智谱 GLM 转写需先把音频转码为 mp3,执行 ffmpeg 失败: {e}"
+            ))
         })?;
         if !output.status.success() {
             return Err(CrawlerError::Config(format!(
@@ -319,8 +320,12 @@ async fn transcribe_chunked(
             let dir2 = dir.clone();
             let ffmpeg_path = req.ffmpeg_path.map(|s| s.to_string());
             tokio::task::spawn_blocking(move || {
-                let chunks =
-                    crate::media::split_audio_for_asr(&audio_path, &dir2, chunk_seconds, ffmpeg_path.as_deref())?;
+                let chunks = crate::media::split_audio_for_asr(
+                    &audio_path,
+                    &dir2,
+                    chunk_seconds,
+                    ffmpeg_path.as_deref(),
+                )?;
                 let total = chunks.len();
                 Ok::<_, CrawlerError>((chunks, total))
             })
@@ -350,9 +355,16 @@ async fn transcribe_chunked(
                 Err(e) if is_content_filter_block(&e) => {
                     // 内容安全审核拦截是确定性拒绝(重试无用):跳过该段、文内留缺段标记,
                     // 保住其余段。请求已发出照常计费,usage 补 0 保持「请求次数」口径
-                    tracing::warn!(chunk = idx + 1, total, "该段被厂商内容安全审核拦截,跳过本段");
+                    tracing::warn!(
+                        chunk = idx + 1,
+                        total,
+                        "该段被厂商内容安全审核拦截,跳过本段"
+                    );
                     usages.push(TokenUsage::default());
-                    texts.push(format!("[第 {} 段被平台内容安全审核拦截,本段缺失]", idx + 1));
+                    texts.push(format!(
+                        "[第 {} 段被平台内容安全审核拦截,本段缺失]",
+                        idx + 1
+                    ));
                 }
                 Err(e) => {
                     // 带上切片体积:1210 类「参数有误」多与切片本身(过短/空壳)相关,便于排查
@@ -505,7 +517,9 @@ async fn mimo_transcribe_stream(
         .await
         .map_err(|e| CrawlerError::Config(format!("小米 MiMo 流式转写请求失败: {e}")))?;
     if !resp.status().is_success() {
-        return Err(CrawlerError::Config(stream_error_body("小米 MiMo 流式转写", resp).await));
+        return Err(CrawlerError::Config(
+            stream_error_body("小米 MiMo 流式转写", resp).await,
+        ));
     }
     let mut full = String::new();
     let mut usage = TokenUsage::default();
@@ -551,7 +565,8 @@ fn is_content_filter_block(e: &CrawlerError) -> bool {
 fn content_filter_hint(e: CrawlerError) -> CrawlerError {
     if is_content_filter_block(&e) {
         CrawlerError::Config(
-            "厂商内容安全审核拦截:该音频(或其转写结果)被判定为敏感内容,重试无效;可改换其他转写厂商".into(),
+            "厂商内容安全审核拦截:该音频(或其转写结果)被判定为敏感内容,重试无效;可改换其他转写厂商"
+                .into(),
         )
     } else {
         e
@@ -638,7 +653,9 @@ async fn glm_transcribe_stream(
         .await
         .map_err(|e| CrawlerError::Config(format!("智谱 GLM 流式转写请求失败: {e}")))?;
     if !resp.status().is_success() {
-        return Err(CrawlerError::Config(stream_error_body("智谱 GLM 流式转写", resp).await));
+        return Err(CrawlerError::Config(
+            stream_error_body("智谱 GLM 流式转写", resp).await,
+        ));
     }
     let mut full = String::new();
     // 上一帧原始 text:累计形态据此 diff,增量形态基本不影响(见 glm_frame_delta)
@@ -753,7 +770,9 @@ mod tests {
     fn content_filter_block_detected() {
         let e = CrawlerError::Config("智谱 GLM 语音转写 返回错误状态 400: {\"contentFilter\":[{\"level\":1,\"role\":\"assistant\"}],\"error\":{\"code\":\"1301\",\"message\":\"...\"}}".into());
         assert!(is_content_filter_block(&e));
-        let other = CrawlerError::Config("智谱 GLM 语音转写 返回错误状态 400: {\"error\":{\"code\":\"1210\"}}".into());
+        let other = CrawlerError::Config(
+            "智谱 GLM 语音转写 返回错误状态 400: {\"error\":{\"code\":\"1210\"}}".into(),
+        );
         assert!(!is_content_filter_block(&other));
         // 提示改写只作用于审核类错误
         let hinted = content_filter_hint(e);
@@ -778,7 +797,8 @@ mod tests {
 
     #[test]
     fn mimo_delta_from_openai_style_frame() {
-        let v: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
         assert_eq!(mimo_frame_delta(&v), Some("你好".to_string()));
         // 缺 content / 空 content / 无 choices 都不出增量
         let v: Value = serde_json::from_str(r#"{"choices":[{"delta":{}}]}"#).unwrap();

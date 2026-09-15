@@ -158,18 +158,18 @@ impl XhsAdapter {
     fn parse_image_url(image: &Value) -> Option<String> {
         let from_infos = || {
             let infos = image.get("info_list").and_then(Value::as_array)?;
-                        infos
-                            .iter()
+            infos
+                .iter()
                 .find(|i| i.get("image_scene").and_then(Value::as_str) == Some("WB_DFT"))
-                            .or_else(|| infos.first())
-                            .and_then(|i| i.get("url").and_then(Value::as_str))
+                .or_else(|| infos.first())
+                .and_then(|i| i.get("url").and_then(Value::as_str))
         };
         from_infos()
             .or_else(|| image.get("url_default").and_then(Value::as_str))
             .or_else(|| image.get("url_pre").and_then(Value::as_str))
             .map(str::trim)
             .filter(|s| !s.is_empty())
-                            .map(str::to_string)
+            .map(str::to_string)
     }
 
     /// 取每张图的直链;详情图与搜索图字段形态不同,统一走 parse_image_url。

@@ -138,6 +138,34 @@ body {
     background: var(--muted-foreground);
   }
 
+  /* 剪辑器专用滚动条:WebView2 下完全接管系统样式,保持轨道区低干扰。 */
+  .veltrix-editor-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--muted-foreground) 45%, transparent) transparent;
+  }
+  .veltrix-editor-scrollbar::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  .veltrix-editor-scrollbar::-webkit-scrollbar-track,
+  .veltrix-editor-scrollbar::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  .veltrix-editor-scrollbar::-webkit-scrollbar-thumb {
+    min-width: 28px;
+    min-height: 28px;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--muted-foreground) 38%, transparent);
+  }
+  .veltrix-editor-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--muted-foreground) 70%, transparent);
+  }
+  .veltrix-editor-scrollbar::-webkit-scrollbar-button {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
   /* 表格专用:纵向滚动条轨道避开吸顶表头(表头 h-10 = 40px),
      滑块只在数据行区域内活动,不压在表头上 */
   .veltrix-table-scrollbar::-webkit-scrollbar-track {

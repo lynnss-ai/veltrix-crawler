@@ -1005,7 +1005,7 @@ impl WebviewPool {
         #[cfg(target_os = "macos")]
         {
             let _ = &data_dir; // mac 不用目录隔离,但仍保留路径计算以兼容 clear_login_data
-            // data_store_identifier 同样按账号级 label 派生:任务级窗口共用账号数据存储(登录态延续)
+                               // data_store_identifier 同样按账号级 label 派生:任务级窗口共用账号数据存储(登录态延续)
             builder = builder
                 .data_store_identifier(account_store_id(&account_label))
                 .initialization_script(crate::webview::build_native_intercept_init_script_mac(
@@ -2894,11 +2894,11 @@ impl CollectBridge {
                         &cfg.id,
                     )
                     .await
-                {
-                    return Err(CrawlerError::Config(
-                        "检测到安全验证未在限时内完成,采集中止(已保留已采数据)".into(),
-                    ));
-                }
+            {
+                return Err(CrawlerError::Config(
+                    "检测到安全验证未在限时内完成,采集中止(已保留已采数据)".into(),
+                ));
+            }
             // 滚动失败(常见于采集窗口被手动关闭)即终止本次采集
             window.eval(build_scroll_eval()).map_err(|e| {
                 CrawlerError::Config(format!("执行滚动失败(采集窗口可能已关闭): {e}"))
@@ -3712,7 +3712,7 @@ impl CollectBridge {
             NAV_RESPONSE_WAIT_MS,
             NAV_SETTLE_MS,
         )
-                .await;
+        .await;
         tracing::debug!(nav_ready, "详情补取:导航后等首屏响应");
         let _ = window.eval(build_set_session_eval(session_id));
         let _ = wait_network_idle(&window, sink.as_ref(), 800, DETAIL_FETCH_WAIT_MS).await;
@@ -3752,7 +3752,7 @@ impl CollectBridge {
                 NAV_RESPONSE_WAIT_MS,
                 NAV_SETTLE_MS,
             )
-                    .await;
+            .await;
             // 解除后页面可能已重载,补挂自检(脚本幂等,重复注入无副作用)
             if !verify_eval.is_empty() {
                 let _ = window.eval(&verify_eval);
@@ -4363,7 +4363,10 @@ impl CollectBridge {
             // 采集窗口被用户关闭:HUD 随之销毁,is_stopping 永远不会置位,eval 回读也
             // 快速返回 None,不主动探测会每批评论空转满超时才 Fallback(与超时同口径)。
             if collect_window_gone(req.window) {
-                tracing::info!(session_id = req.session_id, "小红书页内直采:采集窗口已关闭,立即结束等待");
+                tracing::info!(
+                    session_id = req.session_id,
+                    "小红书页内直采:采集窗口已关闭,立即结束等待"
+                );
                 return CommentApiOutcome::Fallback;
             }
             if let Some(result) = self.control.take_api_done(req.session_id) {
@@ -4663,32 +4666,32 @@ impl CollectBridge {
         // 重读仍无则导航详情页让页面 JS 重新生成 msToken 后再试一次(见收尾段)。
         let mut refreshed = false;
         'retry: loop {
-        // 每视频的模板各自现找:兜底导航后 sink 里才有真实 comment/list 首屏 URL;
-        // 重试轮次 sink 也可能已更新(导航重生成 msToken 时页面又发了一轮首屏请求)。
-        // 批内未导航过的视频通常无模板,走无模板模式(实测详情页环境下可行)
-        let job_specs: Vec<(String, String)> = batch
-            .iter()
-            .map(|(id, _)| {
-                let tpl = match sink {
-                    Some(s) => match s.lock() {
-                        Ok(buf) => buf
-                            .iter()
-                            .rev()
-                            .find(|r| {
-                                r.url.contains("comment/list")
-                                    && !r.url.contains("reply")
-                                    && r.url.contains(&format!("aweme_id={id}"))
-                            })
-                            .map(|r| r.url.clone())
-                            .unwrap_or_default(),
-                        Err(_) => String::new(),
-                    },
-                    None => String::new(),
-                };
-                (id.to_string(), tpl)
-            })
-            .collect();
-        tracing::info!(
+            // 每视频的模板各自现找:兜底导航后 sink 里才有真实 comment/list 首屏 URL;
+            // 重试轮次 sink 也可能已更新(导航重生成 msToken 时页面又发了一轮首屏请求)。
+            // 批内未导航过的视频通常无模板,走无模板模式(实测详情页环境下可行)
+            let job_specs: Vec<(String, String)> = batch
+                .iter()
+                .map(|(id, _)| {
+                    let tpl = match sink {
+                        Some(s) => match s.lock() {
+                            Ok(buf) => buf
+                                .iter()
+                                .rev()
+                                .find(|r| {
+                                    r.url.contains("comment/list")
+                                        && !r.url.contains("reply")
+                                        && r.url.contains(&format!("aweme_id={id}"))
+                                })
+                                .map(|r| r.url.clone())
+                                .unwrap_or_default(),
+                            Err(_) => String::new(),
+                        },
+                        None => String::new(),
+                    };
+                    (id.to_string(), tpl)
+                })
+                .collect();
+            tracing::info!(
             "评论直采注入 session={session_id} attempt={} aweme_ids=[{}] msToken={} fp={} template={}",
             if refreshed { 2 } else { 1 },
             ids.join(","),
@@ -4696,74 +4699,74 @@ impl CollectBridge {
             if fp.is_empty() { "无" } else { "有" },
             if job_specs.iter().any(|(_, t)| !t.is_empty()) { "有" } else { "无" },
         );
-        let job_refs: Vec<(&str, &str)> = job_specs
-            .iter()
-            .map(|(id, tpl)| (id.as_str(), tpl.as_str()))
-            .collect();
-        if let Err(e) = window.eval(crate::webview::build_comment_api_collect_eval(
+            let job_refs: Vec<(&str, &str)> = job_specs
+                .iter()
+                .map(|(id, tpl)| (id.as_str(), tpl.as_str()))
+                .collect();
+            if let Err(e) = window.eval(crate::webview::build_comment_api_collect_eval(
                 session_id, &job_refs, limit, max_pages, &ms_token, &fp,
-        )) {
-            tracing::warn!("注入评论直采脚本失败: {e}");
-            return CommentApiOutcome::Fallback;
-        }
-        let mut deadline =
-            std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
-        // 停滞检测:页内脚本死掉(页面冻结 / 导航 / 风控静默吞请求)时评论响应数不再
-        // 增长,停滞过久主动结束,不死等整体超时
-        let mut last_hits = 0usize;
-        let mut last_growth = std::time::Instant::now();
-        // 风控滑块:验证由用户在窗口里手动完成,期间挂起的 fetch 验证通过后会继续返回。
-        // 故验证态不计停滞、整体超时顺延。验证态的置位依赖页内链路(初始化脚本全帧运行,
-        // 验证码 iframe 子帧 postMessage 到顶层 → report_collect_verify):原生拦截缓冲只收
-        // intercept_patterns 命中的 URL,captcha 请求不进缓冲,响应侧扫描不可行,勿在此加。
-        let mut verify_logged = false;
-        // 回读兜底的分频计数:每 4 轮(≈2s)eval 一次 __veltrixCommentApiResult
-        let mut poll_tick: u32 = 0;
-        let wait_outcome: (CommentApiOutcome, String) = loop {
-            if self.control.is_stopping(session_id) {
-                let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                // 给页内脚本收尾时间(已采部分经 hook 回流后正常 finish)
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                let _ = self.control.take_api_done(session_id);
-                let _ = window.eval(build_hud_log_eval("info", "⏹️ 已手动结束 · 保留已采评论"));
-                return CommentApiOutcome::Aborted;
+            )) {
+                tracing::warn!("注入评论直采脚本失败: {e}");
+                return CommentApiOutcome::Fallback;
             }
-            if self.control.is_verifying(session_id) {
-                if !verify_logged {
-                    verify_logged = true;
-                    // 验证需要人工操作,把窗口带到前台(复用窗口平时不抢焦点,见 bring_to_front)
-                    focus_collect_window(window);
-                    let _ = window.eval(build_hud_log_eval(
-                        "warn",
-                        "🛡️ 检测到安全验证(滑块)· 请在采集窗口中完成,完成后自动继续",
-                    ));
+            let mut deadline =
+                std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
+            // 停滞检测:页内脚本死掉(页面冻结 / 导航 / 风控静默吞请求)时评论响应数不再
+            // 增长,停滞过久主动结束,不死等整体超时
+            let mut last_hits = 0usize;
+            let mut last_growth = std::time::Instant::now();
+            // 风控滑块:验证由用户在窗口里手动完成,期间挂起的 fetch 验证通过后会继续返回。
+            // 故验证态不计停滞、整体超时顺延。验证态的置位依赖页内链路(初始化脚本全帧运行,
+            // 验证码 iframe 子帧 postMessage 到顶层 → report_collect_verify):原生拦截缓冲只收
+            // intercept_patterns 命中的 URL,captcha 请求不进缓冲,响应侧扫描不可行,勿在此加。
+            let mut verify_logged = false;
+            // 回读兜底的分频计数:每 4 轮(≈2s)eval 一次 __veltrixCommentApiResult
+            let mut poll_tick: u32 = 0;
+            let wait_outcome: (CommentApiOutcome, String) = loop {
+                if self.control.is_stopping(session_id) {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    // 给页内脚本收尾时间(已采部分经 hook 回流后正常 finish)
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let _ = self.control.take_api_done(session_id);
+                    let _ = window.eval(build_hud_log_eval("info", "⏹️ 已手动结束 · 保留已采评论"));
+                    return CommentApiOutcome::Aborted;
                 }
-                last_growth = std::time::Instant::now();
-                deadline =
-                    std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
-                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
-                continue;
-            }
-            if verify_logged {
-                verify_logged = false;
-                let _ = window.eval(build_hud_log_eval("info", "✅ 安全验证已通过 · 继续直采"));
-            }
-            if let Some(result) = self.control.take_api_done(session_id) {
-                match self.handle_comment_api_result(window, batch, &result) {
-                    Some(outcome) => break outcome,
-                    // 串号残留:丢弃,继续等本批的回传
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
-                        continue;
+                if self.control.is_verifying(session_id) {
+                    if !verify_logged {
+                        verify_logged = true;
+                        // 验证需要人工操作,把窗口带到前台(复用窗口平时不抢焦点,见 bring_to_front)
+                        focus_collect_window(window);
+                        let _ = window.eval(build_hud_log_eval(
+                            "warn",
+                            "🛡️ 检测到安全验证(滑块)· 请在采集窗口中完成,完成后自动继续",
+                        ));
+                    }
+                    last_growth = std::time::Instant::now();
+                    deadline =
+                        std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
+                    tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+                    continue;
+                }
+                if verify_logged {
+                    verify_logged = false;
+                    let _ = window.eval(build_hud_log_eval("info", "✅ 安全验证已通过 · 继续直采"));
+                }
+                if let Some(result) = self.control.take_api_done(session_id) {
+                    match self.handle_comment_api_result(window, batch, &result) {
+                        Some(outcome) => break outcome,
+                        // 串号残留:丢弃,继续等本批的回传
+                        None => {
+                            tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+                            continue;
+                        }
                     }
                 }
-            }
-            // 回读兜底(每 4 轮 ≈ 2s 一次):信号桥(postMessage / invoke)在部分环境会静默
-            // 丢失——页内已打 🏁 收尾但 Rust 收不到,干等 90s 停滞看门狗。脚本 finish 时把
-            // 结果留在 window.__veltrixCommentApiResult,这里 eval 回读(读即清)与信号桥
-            // 同口径处理;mac 无 eval 回读实现,自动跳过、维持原有桥通道。
-            if poll_tick % 4 == 0 {
-                if let Some(raw) = crate::webview::script_eval::eval_json(
+                // 回读兜底(每 4 轮 ≈ 2s 一次):信号桥(postMessage / invoke)在部分环境会静默
+                // 丢失——页内已打 🏁 收尾但 Rust 收不到,干等 90s 停滞看门狗。脚本 finish 时把
+                // 结果留在 window.__veltrixCommentApiResult,这里 eval 回读(读即清)与信号桥
+                // 同口径处理;mac 无 eval 回读实现,自动跳过、维持原有桥通道。
+                if poll_tick % 4 == 0 {
+                    if let Some(raw) = crate::webview::script_eval::eval_json(
                     window.as_ref(),
                     "(function(){ var r = window.__veltrixCommentApiResult || ''; window.__veltrixCommentApiResult = ''; return r; })()",
                 )
@@ -4779,192 +4782,192 @@ impl CollectBridge {
                         }
                     }
                 }
-            }
-            poll_tick += 1;
-            if std::time::Instant::now() > deadline {
-                let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                let _ = window.eval(build_hud_log_eval(
-                    "warn",
-                    "⚠️ API 直采超时 · 跳过本批评论采集",
-                ));
-                break (CommentApiOutcome::Fallback, "timeout".to_string());
-            }
-            if let Some(s) = sink {
-                // 只数本批视频的响应:sink 是全会话累积的,跨批混数会让停滞/终态判定失真。
-                // 停滞看「任一路增长」:批内任一视频出新响应即重置看门狗
-                let probe = s
-                    .lock()
-                    .map(|b| {
-                        b.iter()
-                            .filter(|r| {
-                                r.url.contains(pattern)
-                                    && !r.url.contains("reply")
+                }
+                poll_tick += 1;
+                if std::time::Instant::now() > deadline {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        "⚠️ API 直采超时 · 跳过本批评论采集",
+                    ));
+                    break (CommentApiOutcome::Fallback, "timeout".to_string());
+                }
+                if let Some(s) = sink {
+                    // 只数本批视频的响应:sink 是全会话累积的,跨批混数会让停滞/终态判定失真。
+                    // 停滞看「任一路增长」:批内任一视频出新响应即重置看门狗
+                    let probe = s
+                        .lock()
+                        .map(|b| {
+                            b.iter()
+                                .filter(|r| {
+                                    r.url.contains(pattern)
+                                        && !r.url.contains("reply")
                                         && ids
                                             .iter()
                                             .any(|id| r.url.contains(&format!("aweme_id={id}")))
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if probe > last_hits {
-                    last_hits = probe;
-                    last_growth = std::time::Instant::now();
-                    // 评论接口恢复出数 = 验证已通过(重试成功),解除验证态
-                    if self.control.is_verifying(session_id) {
-                        self.control.set_verifying(session_id, false);
-                    }
-                    // 完成信号备用通道:页内 comment_api_done 回传可能丢失(Tauri IPC
-                    // 对远程页面不稳定),按「响应终态」直接判定——批内**每个**视频都出现
-                    // 不足一页 / has_more=0 / total=0 的响应,或累计达限量,才判整批采完。
-                    // 与页内脚本的到底条件保持同口径(不足一页即到底,has_more 不可靠)
-                    let all_terminal = ids.iter().all(|id| {
-                        s.lock()
-                            .map(|b| {
-                                let mut total = 0usize;
-                                let mut terminal = false;
-                                for r in b.iter().filter(|r| {
-                                    r.url.contains(pattern)
-                                        && !r.url.contains("reply")
-                                        && r.url.contains(&format!("aweme_id={id}"))
-                                }) {
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    if probe > last_hits {
+                        last_hits = probe;
+                        last_growth = std::time::Instant::now();
+                        // 评论接口恢复出数 = 验证已通过(重试成功),解除验证态
+                        if self.control.is_verifying(session_id) {
+                            self.control.set_verifying(session_id, false);
+                        }
+                        // 完成信号备用通道:页内 comment_api_done 回传可能丢失(Tauri IPC
+                        // 对远程页面不稳定),按「响应终态」直接判定——批内**每个**视频都出现
+                        // 不足一页 / has_more=0 / total=0 的响应,或累计达限量,才判整批采完。
+                        // 与页内脚本的到底条件保持同口径(不足一页即到底,has_more 不可靠)
+                        let all_terminal = ids.iter().all(|id| {
+                            s.lock()
+                                .map(|b| {
+                                    let mut total = 0usize;
+                                    let mut terminal = false;
+                                    for r in b.iter().filter(|r| {
+                                        r.url.contains(pattern)
+                                            && !r.url.contains("reply")
+                                            && r.url.contains(&format!("aweme_id={id}"))
+                                    }) {
                                         let Ok(v) =
                                             serde_json::from_str::<serde_json::Value>(&r.body)
-                                    else {
-                                        continue;
-                                    };
-                                    let Some(arr) =
-                                        v.get("comments").and_then(|c| c.as_array())
-                                    else {
-                                        continue;
-                                    };
-                                    let n = arr.len();
-                                    total += n;
-                                    let has_more = v
-                                        .get("has_more")
-                                        .and_then(|x| x.as_bool())
-                                        .unwrap_or(true);
-                                    let declared_empty =
-                                        v.get("total").and_then(|x| x.as_i64()) == Some(0);
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(arr) =
+                                            v.get("comments").and_then(|c| c.as_array())
+                                        else {
+                                            continue;
+                                        };
+                                        let n = arr.len();
+                                        total += n;
+                                        let has_more = v
+                                            .get("has_more")
+                                            .and_then(|x| x.as_bool())
+                                            .unwrap_or(true);
+                                        let declared_empty =
+                                            v.get("total").and_then(|x| x.as_i64()) == Some(0);
                                         if (n > 0 && n < 20)
                                             || (n == 0 && declared_empty)
                                             || !has_more
                                         {
+                                            terminal = true;
+                                        }
+                                    }
+                                    if limit > 0 && total >= limit {
                                         terminal = true;
                                     }
-                                }
-                                if limit > 0 && total >= limit {
-                                    terminal = true;
-                                }
-                                terminal
-                            })
-                            .unwrap_or(false)
-                    });
-                    if all_terminal {
-                        // 页内脚本理论上已收尾(或正卡在重试眠里),中止它并取走残留
-                        // 回传,避免污染下批的判定
+                                    terminal
+                                })
+                                .unwrap_or(false)
+                        });
+                        if all_terminal {
+                            // 页内脚本理论上已收尾(或正卡在重试眠里),中止它并取走残留
+                            // 回传,避免污染下批的判定
+                            let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                            let _ = self.control.take_api_done(session_id);
+                            // 留痕:此路径不经 handle_comment_api_result,不回传不打日志,
+                            // 排查「某批直采无回传记录」时这里就是答案
+                            tracing::info!(
+                                "评论直采 session={session_id} 按响应终态判定完成 probe={probe} 页"
+                            );
+                            let _ = window.eval(build_hud_log_eval(
+                                "info",
+                                &format!("✅ API 直采完成 · {probe} 页(按响应终态判定)"),
+                            ));
+                            return CommentApiOutcome::Done;
+                        }
+                    } else if last_growth.elapsed() > Duration::from_secs(COMMENT_API_STALL_SECS) {
                         let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                        let _ = self.control.take_api_done(session_id);
-                        // 留痕:此路径不经 handle_comment_api_result,不回传不打日志,
-                        // 排查「某批直采无回传记录」时这里就是答案
-                        tracing::info!(
-                            "评论直采 session={session_id} 按响应终态判定完成 probe={probe} 页"
-                        );
                         let _ = window.eval(build_hud_log_eval(
-                            "info",
-                            &format!("✅ API 直采完成 · {probe} 页(按响应终态判定)"),
-                        ));
-                        return CommentApiOutcome::Done;
-                    }
-                } else if last_growth.elapsed() > Duration::from_secs(COMMENT_API_STALL_SECS) {
-                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
-                    let _ = window.eval(build_hud_log_eval(
                         "warn",
                         &format!(
                             "⚠️ API 直采停滞({COMMENT_API_STALL_SECS} 秒无新响应)· 结束本批评论采集(已采部分保留)"
                         ),
                     ));
-                    break (CommentApiOutcome::Fallback, "stall".to_string());
+                        break (CommentApiOutcome::Fallback, "stall".to_string());
+                    }
                 }
-            }
-            tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
-        };
-        // 风控补发重试判定:blocked-html(服务端回 HTML 验证/拦截页)时重读 Cookie——
-        // 验证页响应通常 Set-Cookie 补发 msToken,拿到就重签再试一次(仅一次,防死循环)。
-        // 重读仍无(msToken 被风控清掉/从未生成):导航本视频详情页让页面 JS 重新生成
-        // msToken 后再试一次——凭空构造的请求缺 msToken 必被拒,导航是唯一环境修复手段。
-        let (outcome, err) = wait_outcome;
-        tracing::info!("评论直采收尾 session={session_id} outcome={outcome:?} error={err}");
-        if !refreshed
-            && matches!(outcome, CommentApiOutcome::Fallback)
-            && err.starts_with("blocked-html")
-        {
-            refreshed = true;
-            let cookies2 = native_intercept::get_cookies(
-                window.as_ref(),
-                "https://www.douyin.com/",
-                &["msToken", "s_v_web_id"],
-            )
-            .await;
-            let fresh = find_cookie(&cookies2, "msToken");
-            if !fresh.is_empty() {
-                ms_token = fresh;
-                let fp2 = find_cookie(&cookies2, "s_v_web_id");
-                if !fp2.is_empty() {
-                    fp = fp2;
-                }
+                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
+            };
+            // 风控补发重试判定:blocked-html(服务端回 HTML 验证/拦截页)时重读 Cookie——
+            // 验证页响应通常 Set-Cookie 补发 msToken,拿到就重签再试一次(仅一次,防死循环)。
+            // 重读仍无(msToken 被风控清掉/从未生成):导航本视频详情页让页面 JS 重新生成
+            // msToken 后再试一次——凭空构造的请求缺 msToken 必被拒,导航是唯一环境修复手段。
+            let (outcome, err) = wait_outcome;
+            tracing::info!("评论直采收尾 session={session_id} outcome={outcome:?} error={err}");
+            if !refreshed
+                && matches!(outcome, CommentApiOutcome::Fallback)
+                && err.starts_with("blocked-html")
+            {
+                refreshed = true;
+                let cookies2 = native_intercept::get_cookies(
+                    window.as_ref(),
+                    "https://www.douyin.com/",
+                    &["msToken", "s_v_web_id"],
+                )
+                .await;
+                let fresh = find_cookie(&cookies2, "msToken");
+                if !fresh.is_empty() {
+                    ms_token = fresh;
+                    let fp2 = find_cookie(&cookies2, "s_v_web_id");
+                    if !fp2.is_empty() {
+                        fp = fp2;
+                    }
                     tracing::info!(
                         "评论直采 session={session_id} 验证页响应已补发 msToken,重签重试一次"
                     );
-                let _ = window.eval(build_hud_log_eval(
-                    "info",
-                    "🔄 风控响应已补发 msToken · 用新令牌重试直采",
-                ));
-                continue 'retry;
-            }
-            // 重读仍无:导航批内第一个视频的详情页重新生成 msToken 后重试最后一次。
-            // 导航整页重载,页内会话与验证检测一并重注(与 run_comment_scroll 预检导航同口径)
-            let (nav_id, nav_token) = (batch[0].0, batch[0].1);
-            if !cfg.collect.detail_url_template.is_empty()
-                && window
-                    .eval(build_detail_eval(
-                        &cfg.collect.detail_url_template,
-                        nav_id,
-                        nav_token,
-                    ))
-                    .is_ok()
-            {
-                tracing::info!("评论直采 session={session_id} blocked-html 且无 msToken,导航详情页重生成后重试");
-                let _ = window.eval(build_hud_log_eval(
-                    "info",
-                    "🔄 风控拦截(无 msToken)· 导航详情页恢复页面环境后重试直采",
-                ));
-                self.wait_page_ready(window, session_id).await;
-                let _ = window.eval(build_set_session_eval(session_id));
-                let verify_eval = crate::webview::build_verify_check_eval(
-                    session_id,
-                    &cfg.collect.verify_selectors,
-                    &cfg.collect.verify_texts,
-                    &cfg.collect.verify_url_patterns,
-                );
-                if !verify_eval.is_empty() {
-                    let _ = window.eval(&verify_eval);
+                    let _ = window.eval(build_hud_log_eval(
+                        "info",
+                        "🔄 风控响应已补发 msToken · 用新令牌重试直采",
+                    ));
+                    continue 'retry;
                 }
-                let regen = self.wait_ms_token(window, session_id).await;
-                if !regen.is_empty() {
-                    ms_token = regen;
+                // 重读仍无:导航批内第一个视频的详情页重新生成 msToken 后重试最后一次。
+                // 导航整页重载,页内会话与验证检测一并重注(与 run_comment_scroll 预检导航同口径)
+                let (nav_id, nav_token) = (batch[0].0, batch[0].1);
+                if !cfg.collect.detail_url_template.is_empty()
+                    && window
+                        .eval(build_detail_eval(
+                            &cfg.collect.detail_url_template,
+                            nav_id,
+                            nav_token,
+                        ))
+                        .is_ok()
+                {
+                    tracing::info!("评论直采 session={session_id} blocked-html 且无 msToken,导航详情页重生成后重试");
+                    let _ = window.eval(build_hud_log_eval(
+                        "info",
+                        "🔄 风控拦截(无 msToken)· 导航详情页恢复页面环境后重试直采",
+                    ));
+                    self.wait_page_ready(window, session_id).await;
+                    let _ = window.eval(build_set_session_eval(session_id));
+                    let verify_eval = crate::webview::build_verify_check_eval(
+                        session_id,
+                        &cfg.collect.verify_selectors,
+                        &cfg.collect.verify_texts,
+                        &cfg.collect.verify_url_patterns,
+                    );
+                    if !verify_eval.is_empty() {
+                        let _ = window.eval(&verify_eval);
+                    }
+                    let regen = self.wait_ms_token(window, session_id).await;
+                    if !regen.is_empty() {
+                        ms_token = regen;
                         tracing::info!(
                             "评论直采 session={session_id} 导航后 msToken 已重新生成,重签重试"
                         );
-                    continue 'retry;
-                }
-                tracing::info!("评论直采 session={session_id} 导航后仍无 msToken,放弃重试");
-            } else {
+                        continue 'retry;
+                    }
+                    tracing::info!("评论直采 session={session_id} 导航后仍无 msToken,放弃重试");
+                } else {
                     tracing::info!(
                         "评论直采 session={session_id} blocked-html 后仍无 msToken,放弃重试"
                     );
+                }
             }
-        }
-        return outcome;
+            return outcome;
         }
     }
 

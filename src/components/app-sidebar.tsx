@@ -10,7 +10,6 @@ import {
   FileStack,
   Clapperboard,
   FileText,
-  FolderKanban,
   Grip,
   Images,
   MessageSquare,
@@ -152,8 +151,7 @@ const MENU_GROUPS: MenuGroup[] = [
   },
 ];
 
-// 顶层产品:同一账号体系下的多个 AI 产品,Logo 旁 Grip 切换。
-// crawler=协作平台(采集) publish=发布服务。
+// 顶层产品聚焦内容运营闭环，避免继续用“协作平台”承载无边界功能。
 export type ProductKey = "crawler" | "publish";
 
 interface ProductMeta {
@@ -163,18 +161,18 @@ interface ProductMeta {
 }
 
 const PRODUCTS: ProductMeta[] = [
-  { key: "crawler", name: "协作平台", icon: Radar },
+  { key: "crawler", name: "内容运营", icon: Radar },
   { key: "publish", name: "发布服务", icon: Rocket },
 ];
 
-// 顶层工作区分类:management(当前采集管理)、chat(对话)、cowork(创作);后两者暂为占位
+// 内容运营的三个阶段：洞察 → AI 辅助 → 内容生产。
 export type Workspace = "management" | "chat" | "cowork";
 
 // 工作区元数据(标签固定);展示顺序由 useWorkspaceOrder 控制,可在系统配置调整。
 export const WORKSPACES: { key: Workspace; label: string }[] = [
-  { key: "management", label: "运营" },
-  { key: "chat", label: "对话" },
-  { key: "cowork", label: "创作" },
+  { key: "management", label: "数据洞察" },
+  { key: "chat", label: "AI 助手" },
+  { key: "cowork", label: "内容生产" },
 ];
 
 // 侧栏顶部「服务」切换项 = 协作平台的工作区(运营/对话/创作)+ 独立产品(发布服务)。
@@ -207,12 +205,10 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
       // 标题留空不渲染分组名(菜单项直接平铺)
       title: "",
       items: [
-        { key: "cowork-video", label: "视频剪辑", icon: Clapperboard },
-        { key: "cowork-copy", label: "文案撰写", icon: FileText },
-        { key: "cowork-assets", label: "素材管理", icon: Images },
-        { key: "cowork-project", label: "项目管理", icon: FolderKanban },
+        { key: "cowork-video", label: "AI 成片", icon: Clapperboard },
+        { key: "cowork-copy", label: "AI 文案", icon: FileText },
+        { key: "cowork-assets", label: "素材库", icon: Images },
         { key: "customers", label: "客户管理", icon: Contact },
-        { key: "cowork-team", label: "团队成员", icon: Users },
       ],
     },
   ],

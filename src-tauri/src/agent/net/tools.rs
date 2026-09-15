@@ -30,9 +30,10 @@ impl Tool for HttpRequestTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "http_request".into(),
-            description: "发起一个 HTTP 请求,返回状态码、关键响应头与响应体(截断)。仅支持 http/https。\
+            description:
+                "发起一个 HTTP 请求,返回状态码、关键响应头与响应体(截断)。仅支持 http/https。\
                 适合查 REST API、拉网页、调 webhook。"
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +57,11 @@ impl Tool for HttpRequestTool {
         if !(lower.starts_with("http://") || lower.starts_with("https://")) {
             return ToolResult::err("url 仅支持 http/https");
         }
-        let method = args.get("method").and_then(Value::as_str).unwrap_or("GET").to_uppercase();
+        let method = args
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_uppercase();
         let http_method = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
             Err(_) => return ToolResult::err(format!("非法 method: {method}")),
@@ -67,7 +72,10 @@ impl Tool for HttpRequestTool {
             .unwrap_or(DEFAULT_TIMEOUT)
             .clamp(1, MAX_TIMEOUT);
 
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(timeout)).build() {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => return ToolResult::err(format!("构造 HTTP 客户端失败: {e}")),
         };

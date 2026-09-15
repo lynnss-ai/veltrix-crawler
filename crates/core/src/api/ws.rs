@@ -4,20 +4,20 @@
 //! WS 内消息走 JSON 文本帧,协议见 api/mod.rs 顶部注释。
 
 use axum::{
-    Router,
     extract::{
-        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::Response,
     routing::get,
+    Router,
 };
 use bb8_redis::redis::AsyncCommands;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::auth::{AuthMobile, AuthPc};
-use super::{ApiState};
+use super::ApiState;
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -159,9 +159,7 @@ async fn handle_mobile_socket(
         "type": "presence",
         "pc_online": hub.pc_online(&device_id),
     });
-    let _ = sink
-        .send(Message::Text(initial.to_string().into()))
-        .await;
+    let _ = sink.send(Message::Text(initial.to_string().into())).await;
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

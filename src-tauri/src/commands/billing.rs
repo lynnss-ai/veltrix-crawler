@@ -181,9 +181,7 @@ async fn trend_data(
         _ => "CAST(SUM(total_tokens) AS BIGINT)",
     };
     let date_expr = match backend {
-        DatabaseBackend::Sqlite => {
-            "strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime')"
-        }
+        DatabaseBackend::Sqlite => "strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime')",
         _ => "to_char(to_timestamp(created_at), 'YYYY-MM-DD')",
     };
     let sql = format!(

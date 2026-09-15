@@ -64,8 +64,9 @@ fn protected_path_reason(path: &str) -> Option<&'static str> {
         return Some("不能操作根目录");
     }
     let unix = raw.trim_end_matches('/');
-    const UNIX_PROTECTED: &[&str] =
-        &["/bin", "/sbin", "/etc", "/usr", "/boot", "/sys", "/dev", "/lib", "/proc"];
+    const UNIX_PROTECTED: &[&str] = &[
+        "/bin", "/sbin", "/etc", "/usr", "/boot", "/sys", "/dev", "/lib", "/proc",
+    ];
     for pre in UNIX_PROTECTED {
         if unix == *pre || unix.starts_with(&format!("{pre}/")) {
             return Some("目标位于系统关键目录,已拒绝");
@@ -150,7 +151,12 @@ impl Tool for FindFilesTool {
                     continue;
                 }
                 if let Some(nc) = &name_contains {
-                    if !entry.file_name().to_string_lossy().to_lowercase().contains(nc) {
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(nc)
+                    {
                         continue;
                     }
                 }
@@ -231,7 +237,11 @@ impl Tool for ReadFileTool {
             buf.truncate(n);
             let text = String::from_utf8_lossy(&buf).into_owned();
             let note = if total > max_bytes {
-                format!("(文件共 {}, 仅读取前 {})\n", human_size(total), human_size(max_bytes))
+                format!(
+                    "(文件共 {}, 仅读取前 {})\n",
+                    human_size(total),
+                    human_size(max_bytes)
+                )
             } else {
                 String::new()
             };
@@ -271,7 +281,11 @@ impl Tool for WriteFileTool {
         if path.is_empty() {
             return ToolResult::err("path 不能为空");
         }
-        let content = args.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let joined = tokio::task::spawn_blocking(move || {
             if let Some(reason) = protected_path_reason(&path) {
                 return Err(format!("拒绝写入:{reason}"));
@@ -369,7 +383,11 @@ impl Tool for FileInfoTool {
         let joined = tokio::task::spawn_blocking(move || {
             let meta = std::fs::metadata(&path).map_err(|e| format!("读取元信息失败: {e}"))?;
             let kind = if meta.is_dir() { "目录" } else { "文件" };
-            let readonly = if meta.permissions().readonly() { "是" } else { "否" };
+            let readonly = if meta.permissions().readonly() {
+                "是"
+            } else {
+                "否"
+            };
             // 修改时间转 Unix 秒(失败留空)
             let mtime = meta
                 .modified()
@@ -427,7 +445,8 @@ impl Tool for CopyFileTool {
                 return Err(format!("源不是文件或不存在: {src}"));
             }
             if let Some(parent) = Path::new(&dest).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("创建目标上级目录失败: {e}"))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建目标上级目录失败: {e}"))?;
             }
             let n = std::fs::copy(&src, &dest).map_err(|e| format!("复制失败: {e}"))?;
             Ok::<String, String>(format!("已复制 {src} → {dest}({})", human_size(n)))
@@ -447,7 +466,8 @@ impl Tool for MovePathTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "move_path".into(),
-            description: "移动或重命名文件 / 目录(src→dest;同盘为重命名,跨盘可能失败需改用复制+删除)".into(),
+            description:
+                "移动或重命名文件 / 目录(src→dest;同盘为重命名,跨盘可能失败需改用复制+删除)".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -469,14 +489,17 @@ impl Tool for MovePathTool {
         let dest = dest.trim().to_string();
         let joined = tokio::task::spawn_blocking(move || {
             // src 被移走、dest 被覆盖,两端都要过护栏
-            if let Some(reason) = protected_path_reason(&src).or_else(|| protected_path_reason(&dest)) {
+            if let Some(reason) =
+                protected_path_reason(&src).or_else(|| protected_path_reason(&dest))
+            {
                 return Err(format!("拒绝移动:{reason}"));
             }
             if !Path::new(&src).exists() {
                 return Err(format!("源不存在: {src}"));
             }
             if let Some(parent) = Path::new(&dest).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("创建目标上级目录失败: {e}"))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建目标上级目录失败: {e}"))?;
             }
             std::fs::rename(&src, &dest).map_err(|e| format!("移动失败: {e}"))?;
             Ok::<String, String>(format!("已移动 {src} → {dest}"))
@@ -556,12 +579,16 @@ impl Tool for DeletePathTool {
         if path.is_empty() {
             return ToolResult::err("path 不能为空");
         }
-        let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let joined = tokio::task::spawn_blocking(move || {
             if let Some(reason) = protected_path_reason(&path) {
                 return Err(format!("拒绝删除:{reason}"));
             }
-            let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("路径不存在或不可访问: {e}"))?;
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("路径不存在或不可访问: {e}"))?;
             if meta.is_dir() {
                 if recursive {
                     std::fs::remove_dir_all(&path).map_err(|e| format!("删除目录失败: {e}"))?;

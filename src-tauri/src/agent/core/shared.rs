@@ -511,7 +511,10 @@ pub async fn finalize_conversation_meta(
 
 /// 合法的 agent 规范种类(防路径穿越):coding / computer / rpa / local / orchestrator。
 pub fn is_valid_guidelines_kind(kind: &str) -> bool {
-    matches!(kind, "coding" | "computer" | "rpa" | "local" | "orchestrator")
+    matches!(
+        kind,
+        "coding" | "computer" | "rpa" | "local" | "orchestrator"
+    )
 }
 
 /// 某 agent 规范文件路径:<config_dir>/agent-guidelines/<kind>.md。

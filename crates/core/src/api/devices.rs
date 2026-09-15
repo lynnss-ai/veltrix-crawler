@@ -3,10 +3,14 @@
 //! Redis 数据布局:
 //! - device:status:{device_id} → JSON(整张快照), TTL=600s(过期视为 PC 离线)
 
-use axum::{Json, Router, extract::State, routing::{get, post}};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use bb8_redis::redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::auth::{AuthMobile, AuthPc};
 use super::{ApiResponse, ApiState, AppError};
@@ -43,7 +47,9 @@ struct ReportResp {
     accepted: bool,
 }
 
-async fn redis_conn(state: &ApiState) -> Result<bb8::PooledConnection<'_, bb8_redis::RedisConnectionManager>, AppError> {
+async fn redis_conn(
+    state: &ApiState,
+) -> Result<bb8::PooledConnection<'_, bb8_redis::RedisConnectionManager>, AppError> {
     let pool = state
         .redis
         .as_ref()

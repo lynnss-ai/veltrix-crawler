@@ -126,8 +126,7 @@ pub async fn list_chat_memories(
     scope_id: Option<String>,
 ) -> Result<Vec<MemoryView>> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let mut query = mem::Entity::find()
-        .filter(mem::Column::Owner.eq(me.name));
+    let mut query = mem::Entity::find().filter(mem::Column::Owner.eq(me.name));
 
     // 按 scope 过滤
     if let Some(s) = scope {
@@ -276,7 +275,12 @@ pub async fn get_chat_memory_enabled(state: State<'_, AppState>) -> Result<bool>
 /// 设置全局记忆开关:关闭后既不注入也不自动提取。
 #[tauri::command]
 pub async fn set_chat_memory_enabled(state: State<'_, AppState>, enabled: bool) -> Result<()> {
-    crate::commands::set_secret(&state.db, MEMORY_ENABLED_KEY, if enabled { "1" } else { "0" }).await
+    crate::commands::set_secret(
+        &state.db,
+        MEMORY_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
 }
 
 // ===================== 命令:embedding(语义检索)配置 =====================
@@ -354,8 +358,9 @@ pub async fn memory_system_message(
         .filter(mem::Column::Owner.eq(owner))
         .filter(mem::Column::Enabled.eq(true))
         .filter(
-            mem::Column::Scope.eq("global")
-                .or(mem::Column::Scope.eq(scope).and(mem::Column::ScopeId.eq(scope_id)))
+            mem::Column::Scope.eq("global").or(mem::Column::Scope
+                .eq(scope)
+                .and(mem::Column::ScopeId.eq(scope_id))),
         )
         .order_by_desc(mem::Column::UpdatedAt)
         .limit(MEMORY_HARD_CAP as u64)
@@ -399,10 +404,11 @@ async fn select_memories<'a>(
         .map(|m| m.id)
         .chain(identity_ranked.iter().map(|m| m.id))
         .collect();
-    let always: Vec<&mem::Model> =
-        rows.iter().filter(|m| always_ids.contains(&m.id)).collect();
-    let rest: Vec<&mem::Model> =
-        rows.iter().filter(|m| !always_ids.contains(&m.id)).collect();
+    let always: Vec<&mem::Model> = rows.iter().filter(|m| always_ids.contains(&m.id)).collect();
+    let rest: Vec<&mem::Model> = rows
+        .iter()
+        .filter(|m| !always_ids.contains(&m.id))
+        .collect();
 
     // 非恒注入项本就 ≤ 额度:全注入即可,省掉 embedding 往返
     let selected_rest: Vec<&mem::Model> = if rest.len() <= TOP_K_INJECT {
@@ -434,7 +440,11 @@ async fn select_memories<'a>(
             spawn_backfill(db, missing);
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.into_iter().take(TOP_K_INJECT).map(|(_, m)| m).collect()
+        scored
+            .into_iter()
+            .take(TOP_K_INJECT)
+            .map(|(_, m)| m)
+            .collect()
     };
 
     let mut out = always;
@@ -489,7 +499,10 @@ fn spawn_record_hits(db: &DatabaseConnection, ids: Vec<i64>, now: i64) {
     tauri::async_runtime::spawn(async move {
         use sea_orm::sea_query::Expr;
         if let Err(e) = mem::Entity::update_many()
-            .col_expr(mem::Column::HitCount, Expr::col(mem::Column::HitCount).add(1))
+            .col_expr(
+                mem::Column::HitCount,
+                Expr::col(mem::Column::HitCount).add(1),
+            )
             .col_expr(mem::Column::LastHitAt, Expr::value(now))
             .filter(mem::Column::Id.is_in(ids))
             .exec(&db)
@@ -650,8 +663,15 @@ pub async fn extract_and_store_memories(
 
     // 检索与本轮最相关的已有记忆,作为 LLM 判断去重 / 更新的依据
     let relevant = retrieve_relevant(db, &existing, user_text).await;
-    let Some(ops) =
-        call_maintainer(api_url, api_key, model, user_text, assistant_text, &relevant).await
+    let Some(ops) = call_maintainer(
+        api_url,
+        api_key,
+        model,
+        user_text,
+        assistant_text,
+        &relevant,
+    )
+    .await
     else {
         return;
     };
@@ -857,7 +877,11 @@ async fn retrieve_relevant<'a>(
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.into_iter().take(MAINTAIN_CONTEXT_N).map(|(_, m)| m).collect()
+        scored
+            .into_iter()
+            .take(MAINTAIN_CONTEXT_N)
+            .map(|(_, m)| m)
+            .collect()
     } else {
         let mut sorted: Vec<&mem::Model> = existing.iter().collect();
         sorted.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
@@ -958,7 +982,11 @@ fn parse_operations(reply: &str) -> Option<Vec<MemOp>> {
         if content.is_empty() {
             continue;
         }
-        let op = v.get("op").and_then(Value::as_str).unwrap_or("add").to_string();
+        let op = v
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("add")
+            .to_string();
         let id = v.get("id").and_then(Value::as_i64);
         let mem_type = normalize_type(v.get("type").and_then(Value::as_str));
         let importance =

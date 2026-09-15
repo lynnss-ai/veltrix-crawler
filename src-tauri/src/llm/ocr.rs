@@ -64,7 +64,9 @@ async fn zhipu_ocr(req: &OcrRequest<'_>) -> Result<String> {
             Ok(text) => return Ok(text),
             Err(e) if attempt < 2 && e.to_string().contains("Internal System Error") => {
                 attempt += 1;
-                tracing::warn!("智谱封面 OCR 网关瞬时错误(Internal System Error),第 {attempt} 次退避重试");
+                tracing::warn!(
+                    "智谱封面 OCR 网关瞬时错误(Internal System Error),第 {attempt} 次退避重试"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(800 << attempt)).await;
             }
             Err(e) => return Err(e),
@@ -83,7 +85,8 @@ async fn zhipu_ocr_once(
     let resp = http::send_with_retry(
         || {
             // multipart Form 不可 Clone,每次(含重试)重建;封面图一般数百 KB,克隆开销可忽略
-            let part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string());
+            let part =
+                reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string());
             let form = reqwest::multipart::Form::new()
                 .text("tool_type", "hand_write")
                 .text("language_type", "CHN_ENG")
@@ -105,7 +108,9 @@ async fn zhipu_ocr_once(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("未知错误");
-        return Err(CrawlerError::Config(format!("智谱封面 OCR 识别失败: {msg}")));
+        return Err(CrawlerError::Config(format!(
+            "智谱封面 OCR 识别失败: {msg}"
+        )));
     }
     let lines: Vec<&str> = body
         .get("words_result")

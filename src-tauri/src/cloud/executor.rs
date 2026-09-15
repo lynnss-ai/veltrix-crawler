@@ -16,7 +16,10 @@ pub struct CommandResult {
 
 impl CommandResult {
     pub fn ok() -> Self {
-        Self { ok: true, error: None }
+        Self {
+            ok: true,
+            error: None,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         Self {

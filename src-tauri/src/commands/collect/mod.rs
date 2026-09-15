@@ -4,7 +4,9 @@
 //! 设计分层:控制面(应用状态、系统配置、账号 / 平台命令)留在 `commands` 模块根;
 //! 此处只承载「数据面」——采集任务的执行调度与持久化,逻辑虽长但内聚单一职责。
 
-use super::{account_collect_lock, account_lock_key, current_user, get_secret, lock_config, AppState};
+use super::{
+    account_collect_lock, account_lock_key, current_user, get_secret, lock_config, AppState,
+};
 use crate::adapter::{FetchContext, FetchOutput};
 use crate::cookie::CookiePool;
 use crate::model::{Author, Comment, Content, ContentKind, TaskKind};
@@ -25,10 +27,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
 use veltrix_core::error::{CrawlerError, Result};
-mod obsidian;
 mod enrich;
-pub use obsidian::*;
+mod obsidian;
 pub use enrich::*;
+pub use obsidian::*;
 
 /// 关键词采集阶段的共享状态,由 run_task_body 维护,传递给子阶段函数。
 struct CollectSharedState {
@@ -141,7 +143,11 @@ pub async fn intercept_sink_push(app: AppHandle, label: String, url: String, bod
         return;
     }
     let len = body.len();
-    if app.state::<AppState>().webviews.push_window_sink(&label, url.clone(), body) {
+    if app
+        .state::<AppState>()
+        .webviews
+        .push_window_sink(&label, url.clone(), body)
+    {
         tracing::info!(url = %url, len, "空 stream 兜底:页内回传成功,已补入拦截缓冲");
     } else {
         tracing::warn!(label = %label, url = %url, "页内回传找不到窗口拦截缓冲,已丢弃");
@@ -161,11 +167,7 @@ pub async fn comment_api_done(app: AppHandle, session_id: u64, result: String) {
 /// 两者都登记:session 用于当前关键词滚动循环即时停止,task 用于关键词切换时终止整任务
 /// (避免在关键词空档点结束落到已结束的旧会话上而漏判)。
 #[tauri::command]
-pub fn stop_collect(
-    state: State<'_, AppState>,
-    session_id: Option<u64>,
-    task_id: Option<String>,
-) {
+pub fn stop_collect(state: State<'_, AppState>, session_id: Option<u64>, task_id: Option<String>) {
     if let Some(sid) = session_id {
         state.collect_control.request_stop(sid);
     }
@@ -186,11 +188,7 @@ pub fn cancel_library_extract(state: State<'_, AppState>) {
 /// 采集窗口验证弹窗自检回传:页面检测到 / 解除安全验证弹窗时上报。
 /// 采集循环据此暂停 / 恢复滚动;并向前端推送 `collect-verify` 事件,便于主界面提示用户去窗口手动验证。
 #[tauri::command]
-pub async fn report_collect_verify(
-    app: AppHandle,
-    session_id: u64,
-    present: bool,
-) {
+pub async fn report_collect_verify(app: AppHandle, session_id: u64, present: bool) {
     use tauri::Emitter;
     tracing::info!("验证检测:report_collect_verify session={session_id} present={present}");
     app.state::<AppState>()
@@ -206,13 +204,7 @@ pub async fn report_collect_verify(
 /// 拟人 RPA 执行器跑完(或某步失败)时回传结果。
 /// 字段与注入脚本一致(camelCase: runId/ok/failedStep/message)。
 #[tauri::command]
-pub async fn rpa_done(
-    app: AppHandle,
-    run_id: u64,
-    ok: bool,
-    failed_step: i64,
-    message: String,
-) {
+pub async fn rpa_done(app: AppHandle, run_id: u64, ok: bool, failed_step: i64, message: String) {
     app.state::<AppState>().rpa_channel.complete(
         run_id,
         RpaOutcome {
@@ -319,11 +311,7 @@ pub async fn start_collect(
 /// 命令立即返回,采集在后台进行,前端轮询 `list_tasks` 看进度;
 /// 拦截 / 落库 / 解析失败等计数按次写入 task_runs 运行指标(见 finalize_task_run)。
 #[tauri::command]
-pub async fn run_task(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    task_id: String,
-) -> Result<()> {
+pub async fn run_task(state: State<'_, AppState>, app: AppHandle, task_id: String) -> Result<()> {
     // entity 名与本模块 `mod task` 同名,别名规避冲突
     use veltrix_core::db::entity::task as task_entity;
 
@@ -619,9 +607,17 @@ pub async fn run_task(
         }));
         if body.catch_unwind().await.is_err() {
             tracing::error!(task_id = %task_id_guard, "采集任务 panic,已落 failed");
-            bridge_guard.close_collect_window(&platform_guard, &account_id_guard, Some(&task_id_guard));
+            bridge_guard.close_collect_window(
+                &platform_guard,
+                &account_id_guard,
+                Some(&task_id_guard),
+            );
             // 自清主动关窗置位的「被手动关闭」标记,防污染下次「关窗即终止」判定
-            bridge_guard.reset_collect_window_closed(&platform_guard, &account_id_guard, Some(&task_id_guard));
+            bridge_guard.reset_collect_window_closed(
+                &platform_guard,
+                &account_id_guard,
+                Some(&task_id_guard),
+            );
             write_task_failed(
                 &app_guard,
                 &db_guard,
@@ -712,9 +708,7 @@ fn spawn_content_consumer(
                 continue;
             }
             for c in &batch {
-                let seq = content_seq
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
+                let seq = content_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let title = log_content_title(c);
                 let likes = c.stats.like_count.unwrap_or(0);
                 let msg = format!("[{seq}] {title} | 点赞:{likes}");
@@ -738,11 +732,34 @@ fn spawn_content_consumer(
                 comments: Vec::new(),
                 authors: Vec::new(),
             };
-            persist_collected(&db, &task_id, &owner, &keyword, output, &mut seen_contents, &mut seen_comments).await;
+            persist_collected(
+                &db,
+                &task_id,
+                &owner,
+                &keyword,
+                output,
+                &mut seen_contents,
+                &mut seen_comments,
+            )
+            .await;
             // 日志按本次新增口径,任务行计数按累计口径(基数 + 本次新增)
             let (c, m) = (seen_contents.len() as i64, seen_comments.len() as i64);
-            write_task_progress(&app, &db, &task_id, progress, content_base + c, comment_base + m, false).await;
-            emit_collect_log(&app, &task_id, "info", format!("📦 「{keyword}」已保存 {c} 条内容"));
+            write_task_progress(
+                &app,
+                &db,
+                &task_id,
+                progress,
+                content_base + c,
+                comment_base + m,
+                false,
+            )
+            .await;
+            emit_collect_log(
+                &app,
+                &task_id,
+                "info",
+                format!("📦 「{keyword}」已保存 {c} 条内容"),
+            );
         }
         (seen_contents, seen_comments)
     })
@@ -772,7 +789,12 @@ async fn collect_keywords(
     shared: &mut CollectSharedState,
 ) -> (i64, i64) {
     let total = keywords.len();
-    emit_collect_log(app, task_id, "info", format!("🚀 开始采集 · 共 {total} 个关键词"));
+    emit_collect_log(
+        app,
+        task_id,
+        "info",
+        format!("🚀 开始采集 · 共 {total} 个关键词"),
+    );
     if adapter.is_none() {
         emit_collect_log(
             app,
@@ -824,15 +846,23 @@ async fn collect_keywords(
         let stop_reason: Option<CollectStop>;
         let (content_count, comment_count) = match adapter {
             Some(adapter_arc) => {
-                let (tx, rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Vec<Content>>();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Content>>();
                 let consumer = spawn_content_consumer(
-                    rx, db.clone(), task_id.to_string(), owner.to_string(),
-                    keyword.clone(), app.clone(), content_seq.clone(),
-                    cfg.id.clone(), account_id.to_string(), progress,
+                    rx,
+                    db.clone(),
+                    task_id.to_string(),
+                    owner.to_string(),
+                    keyword.clone(),
+                    app.clone(),
+                    content_seq.clone(),
+                    cfg.id.clone(),
+                    account_id.to_string(),
+                    progress,
                     existing_ids_shared.clone(),
-                    shared.seen_contents.clone(), shared.seen_comments.clone(),
-                    shared.content_base, shared.comment_base,
+                    shared.seen_contents.clone(),
+                    shared.seen_comments.clone(),
+                    shared.content_base,
+                    shared.comment_base,
                 );
 
                 let collect_result = bridge
@@ -914,7 +944,9 @@ async fn collect_keywords(
                                     format!("⏭️ 「{keyword}」跳过已采内容 {skipped} 条(去重台账)"),
                                 );
                             }
-                            shared.contents_for_media.extend(output.contents.iter().cloned());
+                            shared
+                                .contents_for_media
+                                .extend(output.contents.iter().cloned());
                             persist_collected(
                                 db,
                                 task_id,
@@ -936,9 +968,21 @@ async fn collect_keywords(
                     }
                 }
 
-                let (c, m) = (shared.seen_contents.len() as i64, shared.seen_comments.len() as i64);
+                let (c, m) = (
+                    shared.seen_contents.len() as i64,
+                    shared.seen_comments.len() as i64,
+                );
                 // 日志按本次新增口径,任务行计数按累计口径(基数 + 本次新增)
-                write_task_progress(app, db, task_id, progress, shared.content_base + c, shared.comment_base + m, false).await;
+                write_task_progress(
+                    app,
+                    db,
+                    task_id,
+                    progress,
+                    shared.content_base + c,
+                    shared.comment_base + m,
+                    false,
+                )
+                .await;
                 emit_collect_log(
                     app,
                     task_id,
@@ -993,8 +1037,16 @@ async fn collect_keywords(
             }
         };
 
-        write_task_progress(app, db, task_id, progress,
-            shared.content_base + content_count, shared.comment_base + comment_count, false).await;
+        write_task_progress(
+            app,
+            db,
+            task_id,
+            progress,
+            shared.content_base + content_count,
+            shared.comment_base + comment_count,
+            false,
+        )
+        .await;
 
         // 用户在本关键词采集途中主动停止:不再为后续关键词重开窗口继续采集(已采数据已增量入库)。
         // 关窗 → 取消任务;点结束 → 停止后续关键词/评论但仍完成素材下载。两者均在此终止关键词循环。
@@ -1023,7 +1075,10 @@ async fn collect_keywords(
         }
     }
 
-    (shared.seen_contents.len() as i64, shared.seen_comments.len() as i64)
+    (
+        shared.seen_contents.len() as i64,
+        shared.seen_comments.len() as i64,
+    )
 }
 
 /// 判定定向链接是否为「作者主页链接」(区别于单条内容链接)。
@@ -1234,7 +1289,10 @@ async fn collect_direct_urls(
                     };
                     match adapter_arc.parse(&TaskKind::UserProfile, &pctx).await {
                         Ok(out) if !out.authors.is_empty() => {
-                            let follower = out.authors[0].follower_count.map(|n| n.to_string()).unwrap_or_else(|| "未知".into());
+                            let follower = out.authors[0]
+                                .follower_count
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "未知".into());
                             emit_collect_log(
                                 app,
                                 task_id,
@@ -1243,7 +1301,8 @@ async fn collect_direct_urls(
                             );
                             persist_author_rows(db, owner, &out.authors).await;
                         }
-                        Ok(_) => { /* 未解析出画像(接口未命中/改版):auto_enrich 兜底 */ }
+                        Ok(_) => { /* 未解析出画像(接口未命中/改版):auto_enrich 兜底 */
+                        }
                         Err(e) => {
                             tracing::warn!(url = %url, "定向主页画像解析失败: {e}");
                         }
@@ -1293,10 +1352,15 @@ async fn collect_direct_urls(
                             app,
                             task_id,
                             "info",
-                            format!("📦 链接 {url} 解析到 {} 条内容 · 入库中", output.contents.len()),
+                            format!(
+                                "📦 链接 {url} 解析到 {} 条内容 · 入库中",
+                                output.contents.len()
+                            ),
                         );
                     }
-                    shared.contents_for_media.extend(output.contents.iter().cloned());
+                    shared
+                        .contents_for_media
+                        .extend(output.contents.iter().cloned());
                     // keyword 列存链接本身:全量库按词筛选 / HUD tab 归属都可用它定位
                     persist_collected(
                         db,
@@ -1322,8 +1386,16 @@ async fn collect_direct_urls(
             shared.seen_comments.len() as i64,
         );
         // 任务行计数按累计口径(基数 + 本次新增),避免重跑全去重时把已有计数清 0
-        write_task_progress(app, db, task_id, progress,
-            shared.content_base + c, shared.comment_base + m, false).await;
+        write_task_progress(
+            app,
+            db,
+            task_id,
+            progress,
+            shared.content_base + c,
+            shared.comment_base + m,
+            false,
+        )
+        .await;
 
         // 用户在本链接采集途中主动停止:与 collect_keywords 同语义,终止整个任务
         match stop_reason {
@@ -1410,11 +1482,20 @@ async fn collect_comments_phase(
     let cutoff = comment_time_cutoff(comment_time_range);
     let total_videos = video_ids.len();
     write_task_collecting_comments(app, db, task_id, total_videos as i32).await;
-    emit_collect_log(app, task_id, "info", format!(
-        "💬 开始采集评论 · 共 {} 个视频 · 每视频最多 {}",
-        video_ids.len(),
-        if comment_limit == 0 { "不限".to_string() } else { comment_limit.to_string() }
-    ));
+    emit_collect_log(
+        app,
+        task_id,
+        "info",
+        format!(
+            "💬 开始采集评论 · 共 {} 个视频 · 每视频最多 {}",
+            video_ids.len(),
+            if comment_limit == 0 {
+                "不限".to_string()
+            } else {
+                comment_limit.to_string()
+            }
+        ),
+    );
     if zero_comment > 0 {
         emit_collect_log(
             app,
@@ -1480,8 +1561,16 @@ async fn collect_comments_phase(
                 format!(" · {video_link}")
             };
             let abs_idx = vidx + g;
-            emit_collect_log(app, task_id, "info",
-                format!("💬 [{}/{}] 正在采集「{title}」的评论{link_part}", abs_idx + 1, total_videos));
+            emit_collect_log(
+                app,
+                task_id,
+                "info",
+                format!(
+                    "💬 [{}/{}] 正在采集「{title}」的评论{link_part}",
+                    abs_idx + 1,
+                    total_videos
+                ),
+            );
             // HUD 同步一条(HUD 默认只显示逐条评论,看不到当前在采哪个视频)
             crate::webview::hud_log(
                 app,
@@ -1489,57 +1578,64 @@ async fn collect_comments_phase(
                 account_id,
                 Some(task_id),
                 "info",
-                &format!("💬 [{}/{}] 采集评论「{title}」{link_part}", abs_idx + 1, total_videos),
+                &format!(
+                    "💬 [{}/{}] 采集评论「{title}」{link_part}",
+                    abs_idx + 1,
+                    total_videos
+                ),
             );
         }
         // 采集:批(抖音/小红书 2 路并发)或单内容(其他平台 / 尾批)
-        let (responses, failed_with): (Vec<crate::webview::InterceptedResponse>, Option<String>) = if batch_size > 1 {
-            let reqs: Vec<CommentCollectRequest<'_>> = group
-                .iter()
-                .enumerate()
-                .map(|(g, (content_id, xsec_token, title, keyword))| CommentCollectRequest {
-                    account_id,
-                    content_id,
-                    title,
-                    xsec_token,
-                    platform_cfg: cfg,
-                    task_id: Some(task_id),
-                    limit: comment_limit,
-                    adapter: adapter.clone(),
-                    keyword,
-                    video_index: vidx + g + 1,
-                    video_total: total_videos,
-                })
-                .collect();
-            match bridge.collect_comments_batch(app, reqs).await {
-                Ok(r) => (r, None),
-                Err(e) => (Vec::new(), Some(e.to_string())),
-            }
-        } else {
-            let (content_id, xsec_token, title, keyword) = &group[0];
-            match bridge
-                .collect_comments(
-                    app,
-                    CommentCollectRequest {
-                        account_id,
-                        content_id,
-                        title,
-                        xsec_token,
-                        platform_cfg: cfg,
-                        task_id: Some(task_id),
-                        limit: comment_limit,
-                        adapter: adapter.clone(),
-                        keyword,
-                        video_index: vidx + 1,
-                        video_total: total_videos,
-                    },
-                )
-                .await
-            {
-                Ok(r) => (r, None),
-                Err(e) => (Vec::new(), Some(e.to_string())),
-            }
-        };
+        let (responses, failed_with): (Vec<crate::webview::InterceptedResponse>, Option<String>) =
+            if batch_size > 1 {
+                let reqs: Vec<CommentCollectRequest<'_>> = group
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(g, (content_id, xsec_token, title, keyword))| CommentCollectRequest {
+                            account_id,
+                            content_id,
+                            title,
+                            xsec_token,
+                            platform_cfg: cfg,
+                            task_id: Some(task_id),
+                            limit: comment_limit,
+                            adapter: adapter.clone(),
+                            keyword,
+                            video_index: vidx + g + 1,
+                            video_total: total_videos,
+                        },
+                    )
+                    .collect();
+                match bridge.collect_comments_batch(app, reqs).await {
+                    Ok(r) => (r, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                }
+            } else {
+                let (content_id, xsec_token, title, keyword) = &group[0];
+                match bridge
+                    .collect_comments(
+                        app,
+                        CommentCollectRequest {
+                            account_id,
+                            content_id,
+                            title,
+                            xsec_token,
+                            platform_cfg: cfg,
+                            task_id: Some(task_id),
+                            limit: comment_limit,
+                            adapter: adapter.clone(),
+                            keyword,
+                            video_index: vidx + 1,
+                            video_total: total_videos,
+                        },
+                    )
+                    .await
+                {
+                    Ok(r) => (r, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                }
+            };
         // 批内逐内容:按平台请求参数拆分响应后各自解析入库,
         // 与单视频路径完全同口径;某视频零响应不解析、不标记,留 false 供下次重采
         for (g, (content_id, _xsec_token, title, _keyword)) in group.iter().enumerate() {
@@ -1580,8 +1676,7 @@ async fn collect_comments_phase(
                         // 解析成功才标记已采;解析失败留 false 供下次重采(此前在 parse 前 push,
                         // 解析失败的视频会被误标已采,永久失去重采机会)
                         comment_done_ids.push(format!("{task_id}-{}-{}", cfg.id, content_id));
-                        output.comments =
-                            filter_comments(output.comments, cutoff, comment_limit);
+                        output.comments = filter_comments(output.comments, cutoff, comment_limit);
                         // 评论编号按视频从 1 开始,并带「第几/共几个视频」——全局累加编号
                         // 看不出评论属于哪个视频,跨视频排查时对不上号
                         let mut vseq: i64 = 0;
@@ -1594,19 +1689,40 @@ async fn collect_comments_phase(
                                 abs_idx + 1
                             );
                             crate::webview::hud_log(
-                                app, &cfg.id, account_id, Some(task_id), "info", &msg,
+                                app,
+                                &cfg.id,
+                                account_id,
+                                Some(task_id),
+                                "info",
+                                &msg,
                             );
-                            emit_collect_entry(app, task_id, msg, CollectEntry {
-                                kind: "comment".to_string(), seq: vseq,
-                                avatar: cm.author.avatar.clone(), nickname: cm.author.nickname.clone(),
-                                title: text, content_kind: None,
-                            });
+                            emit_collect_entry(
+                                app,
+                                task_id,
+                                msg,
+                                CollectEntry {
+                                    kind: "comment".to_string(),
+                                    seq: vseq,
+                                    avatar: cm.author.avatar.clone(),
+                                    nickname: cm.author.nickname.clone(),
+                                    title: text,
+                                    content_kind: None,
+                                },
+                            );
                         }
                         // 评论解析不产出内容,清空防误入库(keyword 口径是 content_id,混入会污染)
                         output.contents = Vec::new();
                         // 整批一次 upsert:此前逐条落库,一个视频上百条评论就是上百次 DB 往返
-                        persist_collected(db, task_id, owner, content_id, output,
-                            &mut shared.seen_contents, &mut shared.seen_comments).await;
+                        persist_collected(
+                            db,
+                            task_id,
+                            owner,
+                            content_id,
+                            output,
+                            &mut shared.seen_contents,
+                            &mut shared.seen_comments,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         shared.parse_failures += 1;
@@ -1634,14 +1750,20 @@ async fn collect_comments_phase(
             app,
             task_id,
             "info",
-            format!("⏹ 评论采集提前终止 · 已采集 {} 条评论", shared.seen_comments.len()),
+            format!(
+                "⏹ 评论采集提前终止 · 已采集 {} 条评论",
+                shared.seen_comments.len()
+            ),
         );
     } else {
         emit_collect_log(
             app,
             task_id,
             "info",
-            format!("✅ 评论采集完成 · 共采集 {} 条评论", shared.seen_comments.len()),
+            format!(
+                "✅ 评论采集完成 · 共采集 {} 条评论",
+                shared.seen_comments.len()
+            ),
         );
     }
     {
@@ -1721,7 +1843,10 @@ async fn auto_enrich_authors_phase(
         args.app,
         task_id,
         "info",
-        format!("👤 作者画像补采 · 本次待补 {} 个(粉丝/关注/获赞/属地)", batch.len()),
+        format!(
+            "👤 作者画像补采 · 本次待补 {} 个(粉丝/关注/获赞/属地)",
+            batch.len()
+        ),
     );
     if total_missing > batch.len() {
         emit_collect_log(
@@ -1739,7 +1864,9 @@ async fn auto_enrich_authors_phase(
     for (idx, author) in batch.iter().enumerate() {
         // 手动结束 / 关窗即停:与评论采集同规则,不为补采重开窗口
         if args.bridge.is_task_stopping(task_id)
-            || args.bridge.is_collect_window_closed(&args.cfg.id, args.account_id, args.task_id)
+            || args
+                .bridge
+                .is_collect_window_closed(&args.cfg.id, args.account_id, args.task_id)
         {
             emit_collect_log(
                 args.app,
@@ -1874,7 +2001,10 @@ async fn finalize_task_run(
         comment as comment_entity, content as content_entity, task as task_entity,
         task_run as run_entity,
     };
-    let final_task = match task_entity::Entity::find_by_id(task_id.to_string()).one(db).await {
+    let final_task = match task_entity::Entity::find_by_id(task_id.to_string())
+        .one(db)
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             // 查询失败不能兜底成 completed(会把 failed 的运行在执行历史里记成成功);
@@ -1909,7 +2039,10 @@ async fn finalize_task_run(
             0
         }
     };
-    match run_entity::Entity::find_by_id(run_id.to_string()).one(db).await {
+    match run_entity::Entity::find_by_id(run_id.to_string())
+        .one(db)
+        .await
+    {
         Ok(Some(run)) => {
             let mut am = run.into_active_model();
             am.finished_at = Set(Some(Utc::now().timestamp()));
@@ -1919,8 +2052,7 @@ async fn finalize_task_run(
             am.content_delta = Set(content_delta);
             am.comment_delta = Set(comment_delta);
             am.error_message = Set(final_error);
-            am.metrics_json =
-                Set(metrics.map(|m| serde_json::to_string(m).unwrap_or_default()));
+            am.metrics_json = Set(metrics.map(|m| serde_json::to_string(m).unwrap_or_default()));
             if let Err(e) = am.update(db).await {
                 tracing::warn!(task_id = %task_id, "收尾执行历史失败: {e}");
             }
@@ -2068,10 +2200,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
         // 阶段1:内容采集。定向目标来自 target_urls 列(创建定向任务时前端已把视频 ID 拼成链接,
         // 定向任务 keywords 只存占位词「定向采集」,需剔除、不参与搜索);兼容早期把链接存进
         // keywords 的任务:http(s) 开头的条目仍按定向处理。两类可混合——先搜索后定向,共用同一采集窗口。
-        let (mut direct_urls, mut search_keywords): (Vec<String>, Vec<String>) = keywords
-            .iter()
-            .cloned()
-            .partition(|k| {
+        let (mut direct_urls, mut search_keywords): (Vec<String>, Vec<String>) =
+            keywords.iter().cloned().partition(|k| {
                 let lower = k.to_ascii_lowercase();
                 lower.starts_with("http://") || lower.starts_with("https://")
             });
@@ -2130,7 +2260,9 @@ async fn run_task_body(ctx: RunTaskCtx) {
 
         // 用户中途手动关闭采集窗口 → 终止任务:不再采评论 / 不跑后处理(二者都会重建采集窗口),
         // 标记 cancelled 收尾;已增量落库的内容保留,素材可日后重跑补齐。
-        if shared.window_closed || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id)) {
+        if shared.window_closed
+            || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id))
+        {
             emit_collect_log(
                 &app,
                 &task_id,
@@ -2164,7 +2296,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
             );
             // 关窗前先留存会话 Cookie(含 httponly tt_chain_token),供后续素材下载复用——
             // 此前先关窗后下载,下载只能退回 DB Cookie(常为空),TikTok 类 CDN 批量 403
-            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
+            session_cookie =
+                resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
             bridge.close_collect_window(&cfg.id, &account_id, Some(&task_id));
             // 程序主动关窗(非用户手动关窗),自清 Destroyed 置位的标记,理由同主链路收尾
             bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
@@ -2176,12 +2309,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
         if cfg.id == "xhs" && !shared.user_ended && !shared.window_closed {
             // 重跑任务时搜索命中去重台账不会再进入本次清单;把本任务尚未完整解析详情的
             // 历史行补回来,用户直接重跑即可修复存量数据,无需清库。
-            backfill_xhs_incomplete_contents(
-                &db,
-                &task_id,
-                &mut shared.contents_for_media,
-            )
-            .await;
+            backfill_xhs_incomplete_contents(&db, &task_id, &mut shared.contents_for_media).await;
             let detail_params = StreamRefreshParams {
                 app: &app,
                 bridge: &bridge,
@@ -2272,7 +2400,9 @@ async fn run_task_body(ctx: RunTaskCtx) {
                 || bridge.is_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
             if refresh_aborted {
                 emit_collect_log(
-                    &app, &task_id, "info",
+                    &app,
+                    &task_id,
+                    "info",
                     "ℹ️ 已手动结束 · 跳过直链补取".to_string(),
                 );
             } else {
@@ -2361,7 +2491,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
         // 关窗仍在放锁之前:锁一放同账号下一任务即可复用本窗口,迟关会误杀新任务的窗口。
         let window_kept_open = !shared.user_ended && !shared.window_closed;
         if window_kept_open {
-            session_cookie = resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
+            session_cookie =
+                resolve_session_cookie(&app, &db, &cfg.id, &account_id, Some(&task_id)).await;
         }
 
         // 采集收尾:成功则清风控计数。零产出只记日志提示,不再标记账号风控/冷却——
@@ -2476,7 +2607,8 @@ async fn run_task_body(ctx: RunTaskCtx) {
         // Obsidian 同步:排在转写 / 意向之后,同步出去的文案与意向最全
         if auto_sync_obsidian {
             let obsidian_root = crate::media::media_root(&config_dir, &media_cfg);
-            let synced = obsidian::sync_task_to_obsidian(&db, &task_id, &owner, &obsidian_root).await;
+            let synced =
+                obsidian::sync_task_to_obsidian(&db, &task_id, &owner, &obsidian_root).await;
             emit_collect_log(
                 &app,
                 &task_id,
@@ -2601,8 +2733,7 @@ fn daily_task_due(
         return false;
     };
     let today_target = now.date_naive().and_time(target_time);
-    let chrono::LocalResult::Single(target) = today_target.and_local_timezone(chrono::Local)
-    else {
+    let chrono::LocalResult::Single(target) = today_target.and_local_timezone(chrono::Local) else {
         return false;
     };
     let target_ts = target.timestamp();
@@ -2645,14 +2776,14 @@ const PROGRESS_WRITE_MIN_INTERVAL_MS: u64 = 600;
 /// task_id → 上次进度回写时刻。按任务隔离,避免一个任务的节流饿到其它并行任务。
 static LAST_PROGRESS_WRITE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(std::collections::HashMap::new())
-});
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 进度回写节流判断:force=true 或距上次回写超过间隔才放行;放行时更新时间戳。
 /// 任务条目超过 64 个时清掉 5 分钟前的旧条目,防长时间运行内存增长。
 fn progress_write_allowed(task_id: &str, force: bool) -> bool {
-    let mut map = LAST_PROGRESS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = LAST_PROGRESS_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     let allowed = if force {
         map.insert(task_id.to_string(), now);
@@ -2698,8 +2829,14 @@ async fn write_task_progress(
     let now = Utc::now().timestamp();
     match task_entity::Entity::update_many()
         .col_expr(task_entity::Column::Progress, Expr::value(progress))
-        .col_expr(task_entity::Column::ContentCount, Expr::value(content_count))
-        .col_expr(task_entity::Column::CommentCount, Expr::value(comment_count))
+        .col_expr(
+            task_entity::Column::ContentCount,
+            Expr::value(content_count),
+        )
+        .col_expr(
+            task_entity::Column::CommentCount,
+            Expr::value(comment_count),
+        )
         .col_expr(task_entity::Column::UpdatedAt, Expr::value(now))
         .filter(task_entity::Column::Id.eq(task_id))
         .exec(db)
@@ -2707,8 +2844,9 @@ async fn write_task_progress(
     {
         Ok(_) => {
             // update_many 不返回模型,重新读取用于前端推送
-            if let Ok(Some(updated)) =
-                task_entity::Entity::find_by_id(task_id.to_string()).one(db).await
+            if let Ok(Some(updated)) = task_entity::Entity::find_by_id(task_id.to_string())
+                .one(db)
+                .await
             {
                 emit_task_progress(app, updated);
             }
@@ -2768,12 +2906,15 @@ fn content_kind_label(kind: &ContentKind) -> &'static str {
 fn detail_navigation_token(platform: &str, content: &Content) -> String {
     match platform {
         "douyin" => content.author.uid.clone(),
-        "tiktok" => content.author.extra
+        "tiktok" => content
+            .author
+            .extra
             .get("unique_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        _ => content.extra
+        _ => content
+            .extra
             .get("xsec_token")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -2891,7 +3032,8 @@ async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: 
             tracing::warn!(content_id = %content.content_id, "小红书详情补全跳过:缺少 xsec_token");
             continue;
         }
-        let responses = match params.bridge
+        let responses = match params
+            .bridge
             .fetch_content_detail(
                 params.app,
                 DetailFetchRequest {
@@ -2960,10 +3102,18 @@ async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: 
 /// 详情字段仅在有有效值时覆盖摘要卡,避免平台降级响应把已采作者/封面/互动数抹空。
 fn merge_content_detail(base: &mut Content, detail: Content) {
     base.kind = detail.kind;
-    if detail.title.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+    if detail
+        .title
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+    {
         base.title = detail.title;
     }
-    if detail.desc.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+    if detail
+        .desc
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+    {
         base.desc = detail.desc;
     }
     if !detail.author.uid.is_empty() {
@@ -3059,9 +3209,9 @@ async fn refresh_stream_urls(
     let cfg = if params.cfg.id == "douyin" {
         let mut c = params.cfg.clone();
         c.collect.detail_url_template = "https://www.douyin.com/video/{id}".to_string();
-        c.collect
-            .intercept_patterns
-            .retain(|p| p.contains("/aweme/v1/web/aweme/detail/") || p.contains("/aweme/v1/web/aweme/post/"));
+        c.collect.intercept_patterns.retain(|p| {
+            p.contains("/aweme/v1/web/aweme/detail/") || p.contains("/aweme/v1/web/aweme/post/")
+        });
         cfg_override = c;
         &cfg_override
     } else {
@@ -3135,7 +3285,8 @@ async fn refresh_stream_urls(
             "info",
             format!("补取直链 · {} · 打开 {detail_url}", content.content_id),
         );
-        let responses = match params.bridge
+        let responses = match params
+            .bridge
             .fetch_content_detail(
                 params.app,
                 DetailFetchRequest {
@@ -3168,23 +3319,21 @@ async fn refresh_stream_urls(
                 .into_iter()
                 .find(|c| c.content_id == target)
                 .and_then(|c| {
-                    c.video_url
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|u| {
-                            let audio = c
-                                .extra
-                                .get("audio_url")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string);
-                            let audio_source = c
-                                .extra
-                                .get("audio_source_url")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string);
-                            (u, audio, audio_source)
-                        })
+                    c.video_url.filter(|s| !s.trim().is_empty()).map(|u| {
+                        let audio = c
+                            .extra
+                            .get("audio_url")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let audio_source = c
+                            .extra
+                            .get("audio_source_url")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        (u, audio, audio_source)
+                    })
                 })
         }
         let fresh = match adapter.parse(&TaskKind::ContentDetail, &ctx).await {
@@ -3245,7 +3394,10 @@ async fn refresh_stream_urls(
                     ),
                 );
                 // 回写 DB:content 行 id = "{task_id}-{platform}-{content_id}"(与落库口径一致)
-                let row_id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
+                let row_id = format!(
+                    "{}-{}-{}",
+                    params.task_id, content.platform, content.content_id
+                );
                 update_content_video_streams(params.db, &row_id, &url, &content.extra).await;
             }
             None => {
@@ -3267,7 +3419,11 @@ async fn refresh_stream_urls(
                             "/{} [{}B{}]",
                             short,
                             r.body.len(),
-                            if r.body.contains(&content.content_id) { ",含目标" } else { "" }
+                            if r.body.contains(&content.content_id) {
+                                ",含目标"
+                            } else {
+                                ""
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
@@ -3280,7 +3436,11 @@ async fn refresh_stream_urls(
                         "补取直链未果 · {} · 本次拦截 {} 条响应{} · 该视频可能无音频可提",
                         content.content_id,
                         ctx.responses.len(),
-                        if diag.is_empty() { String::new() } else { format!(":{diag}") },
+                        if diag.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":{diag}")
+                        },
                     ),
                 );
             }
@@ -3410,10 +3570,7 @@ async fn fetch_platform_cookie(db: &DatabaseConnection, platform: &str) -> Optio
 /// `platform`/`account_id` 用于把素材下载日志写进该账号采集窗口的 HUD 浮层。
 /// 本 wrapper 保持「下载 → 语音转写 → 写终态」的旧行为,供补偿 / 重试路径使用;
 /// 主链路(run_task)改用 download_media_core,把转写与终态排到评论采集之后。
-async fn download_media_for_contents(
-    params: &MediaDownloadParams<'_>,
-    contents: Vec<Content>,
-) {
+async fn download_media_for_contents(params: &MediaDownloadParams<'_>, contents: Vec<Content>) {
     if contents.is_empty() {
         return;
     }
@@ -3421,7 +3578,18 @@ async fn download_media_for_contents(
     // 素材下载完成后统一做语音转写(视频音频→文案),仅任务开了「AI 文案提取」才转写;
     // 只开「音频提取」时音频留存即可。失败仅告警不影响任务终态
     if params.ai_extract && !params.bridge.is_task_stopping(params.task_id) {
-        transcribe_for_contents(params.app, params.db, params.task_id, params.platform, params.account_id, params.transcription_cfg, params.media_cfg.ffmpeg_path.clone(), Some(params.bridge), audios).await;
+        transcribe_for_contents(
+            params.app,
+            params.db,
+            params.task_id,
+            params.platform,
+            params.account_id,
+            params.transcription_cfg,
+            params.media_cfg.ffmpeg_path.clone(),
+            Some(params.bridge),
+            audios,
+        )
+        .await;
     }
     // 素材全部处理完毕,任务从 downloading_media 收尾为 completed
     write_task_done(params.app, params.db, params.task_id).await;
@@ -3445,7 +3613,14 @@ async fn download_media_core(
     let cookie = match &params.session_cookie {
         Some(c) => Some(c.clone()),
         None => {
-            resolve_session_cookie(params.app, params.db, params.platform, params.account_id, Some(params.task_id)).await
+            resolve_session_cookie(
+                params.app,
+                params.db,
+                params.platform,
+                params.account_id,
+                Some(params.task_id),
+            )
+            .await
         }
     };
     // 收集视频转出的音频(content row id, mp3 路径),供素材下载结束后统一转写
@@ -3459,10 +3634,24 @@ async fn download_media_core(
         .filter(|c| downloaded.insert(c.content_id.clone()))
         .collect();
     let total = targets.len();
-    emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("开始下载素材 · 共 {total} 条"));
+    emit_media_log(
+        params.app,
+        params.task_id,
+        params.platform,
+        params.account_id,
+        "info",
+        format!("开始下载素材 · 共 {total} 条"),
+    );
     // 任务在采集阶段已被手动结束:整条素材阶段不再启动,音频清单为空(终态由调用方写)
     if params.bridge.is_task_stopping(params.task_id) {
-        emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", "🛑 已手动结束 · 跳过素材下载与语音转写".to_string());
+        emit_media_log(
+            params.app,
+            params.task_id,
+            params.platform,
+            params.account_id,
+            "info",
+            "🛑 已手动结束 · 跳过素材下载与语音转写".to_string(),
+        );
         return Vec::new();
     }
     let mut count = 0usize;
@@ -3470,8 +3659,7 @@ async fn download_media_core(
     // 素材结果攒批回写:每攒够 MEDIA_OUTCOME_FLUSH_SIZE 条在一个事务里统一 UPDATE
     let mut pending_outcomes: Vec<(String, crate::media::MediaOutcome)> = Vec::new();
     // 素材进度回写节流:≤600ms 合并,最后一条必写
-    let mut last_media_write =
-        std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut last_media_write = std::time::Instant::now() - std::time::Duration::from_secs(1);
     // 并发下载(限 10 路并发,不再串行限速),边完成边回写结果与进度。
     // 按批(=并发路数)推进:窗口保活时每批开工取一次窗口实时 Cookie——
     // 会话令牌(tt_chain_token 等)随页面活动轮换,批与批之间自动切到最新一份;
@@ -3502,42 +3690,55 @@ async fn download_media_core(
             // Cookie 取 owned(理由同上):闭包借用局部变量跨 await 会触发同类编译问题
             let item_cookie = batch_cookie.clone().or_else(|| cookie.clone());
             async move {
-            // 标题在下载前取;用于 HUD 逐条日志展示
-            let title = log_content_title(&content);
-            // 素材类型标签(实时日志按类型着色):视频按开关标 [视频]/[音频]/[视频+音频];图文 → [图片];其余(仅封面/头像)→ [封面]
-            let tag = if content.kind == ContentKind::Video && params.audio_extract && params.keep_video {
-                "素材[视频+音频]"
-            } else if content.kind == ContentKind::Video && params.keep_video {
-                "素材[视频]"
-            } else if content.kind == ContentKind::Video && params.audio_extract {
-                "素材[音频]"
-            } else if content.kind == ContentKind::Video {
-                "素材[封面]"
-            } else {
-                "素材[图片]"
-            };
-            let outcome = crate::media::process_content(
-                &content,
-                root_ref,
-                params.media_cfg,
-                crate::media::MediaSwitches {
-                    audio_extract: params.audio_extract,
-                    keep_video: params.keep_video,
-                },
-                item_cookie.as_deref(),
-                Some(cancel),
-            )
-            .await;
-            let id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
-            // content 一并带出:失败且疑似直链过期的条目要进末尾的刷新补偿
-            (id, title, tag, content, outcome)
+                // 标题在下载前取;用于 HUD 逐条日志展示
+                let title = log_content_title(&content);
+                // 素材类型标签(实时日志按类型着色):视频按开关标 [视频]/[音频]/[视频+音频];图文 → [图片];其余(仅封面/头像)→ [封面]
+                let tag = if content.kind == ContentKind::Video
+                    && params.audio_extract
+                    && params.keep_video
+                {
+                    "素材[视频+音频]"
+                } else if content.kind == ContentKind::Video && params.keep_video {
+                    "素材[视频]"
+                } else if content.kind == ContentKind::Video && params.audio_extract {
+                    "素材[音频]"
+                } else if content.kind == ContentKind::Video {
+                    "素材[封面]"
+                } else {
+                    "素材[图片]"
+                };
+                let outcome = crate::media::process_content(
+                    &content,
+                    root_ref,
+                    params.media_cfg,
+                    crate::media::MediaSwitches {
+                        audio_extract: params.audio_extract,
+                        keep_video: params.keep_video,
+                    },
+                    item_cookie.as_deref(),
+                    Some(cancel),
+                )
+                .await;
+                let id = format!(
+                    "{}-{}-{}",
+                    params.task_id, content.platform, content.content_id
+                );
+                // content 一并带出:失败且疑似直链过期的条目要进末尾的刷新补偿
+                (id, title, tag, content, outcome)
             }
         }))
         .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
         while let Some((id, title, tag, content, outcome)) = stream.next().await {
             // 任务被手动结束:不再启动新下载(stream 随 break 丢弃,未开始的条目不执行;在飞 ≤10 条跑完即弃)
             if params.bridge.is_task_stopping(params.task_id) {
-                emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 已手动结束 · 停止素材下载(已完成 {count}/{total} 条保留)"));
+                emit_media_log(
+                    params.app,
+                    params.task_id,
+                    params.platform,
+                    params.account_id,
+                    "info",
+                    format!("🛑 已手动结束 · 停止素材下载(已完成 {count}/{total} 条保留)"),
+                );
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 break 'outer;
             }
@@ -3549,62 +3750,72 @@ async fn download_media_core(
                     Some(params.task_id),
                 )
             {
-                emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 采集窗口已被手动关闭 · 停止素材下载(已完成 {count}/{total} 条保留)"));
+                emit_media_log(
+                    params.app,
+                    params.task_id,
+                    params.platform,
+                    params.account_id,
+                    "info",
+                    format!(
+                        "🛑 采集窗口已被手动关闭 · 停止素材下载(已完成 {count}/{total} 条保留)"
+                    ),
+                );
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 break 'outer;
             }
-        let ok = is_media_ok(&outcome);
-        if !ok {
-            failed += 1;
-            // 仅视频可经详情页刷新直链(refresh_stream_urls 跳过非视频);疑似 4xx 才收编,
-            // 其它失败(网络中断/手动停止)刷新直链无意义
-            if content.kind == ContentKind::Video && is_suspected_stale_link(&outcome) {
-                stale_link_retry.push(content);
+            let ok = is_media_ok(&outcome);
+            if !ok {
+                failed += 1;
+                // 仅视频可经详情页刷新直链(refresh_stream_urls 跳过非视频);疑似 4xx 才收编,
+                // 其它失败(网络中断/手动停止)刷新直链无意义
+                if content.kind == ContentKind::Video && is_suspected_stale_link(&outcome) {
+                    stale_link_retry.push(content);
+                }
             }
-        }
-        // 视频转出音频的,记下供采集结束后统一转写(不占采集通道)
-        if let Some(audio_path) = &outcome.audio_path {
-            audios.push((id.clone(), audio_path.clone()));
-        }
-        count += 1;
-        // 逐条素材下载日志:HUD 面板可见下载过程(成功标题 / 失败原因)
-        if ok {
-            // 视频转音频成功时额外标注,便于看出转写素材已就绪
-            let extra = if outcome.audio_extracted == Some(true) {
-                " · 已转音频"
+            // 视频转出音频的,记下供采集结束后统一转写(不占采集通道)
+            if let Some(audio_path) = &outcome.audio_path {
+                audios.push((id.clone(), audio_path.clone()));
+            }
+            count += 1;
+            // 逐条素材下载日志:HUD 面板可见下载过程(成功标题 / 失败原因)
+            if ok {
+                // 视频转音频成功时额外标注,便于看出转写素材已就绪
+                let extra = if outcome.audio_extracted == Some(true) {
+                    " · 已转音频"
+                } else {
+                    ""
+                };
+                emit_media_log(
+                    params.app,
+                    params.task_id,
+                    params.platform,
+                    params.account_id,
+                    "info",
+                    format!("{tag} {count}/{total} · {title} · 完成{extra}"),
+                );
             } else {
-                ""
-            };
-            emit_media_log(
-                params.app,
-                params.task_id,
-                params.platform,
-                params.account_id,
-                "info",
-                format!("{tag} {count}/{total} · {title} · 完成{extra}"),
-            );
-        } else {
-            let reason = outcome.error.as_deref().unwrap_or("未知原因");
-            emit_media_log(
-                params.app,
-                params.task_id,
-                params.platform,
-                params.account_id,
-                "warn",
-                format!("{tag} {count}/{total} · {title} · 失败:{reason}"),
-            );
-        }
-        // 逐条回写进度(节流合并),调度页据此刷新「素材下载中 done/total」;最后一条必写
-        if count == total || last_media_write.elapsed().as_millis() as u64 >= PROGRESS_WRITE_MIN_INTERVAL_MS
-        {
-            write_task_media_done(params.app, params.db, params.task_id, count as i32).await;
-            last_media_write = std::time::Instant::now();
-        }
-        // 素材结果攒批:满一批事务性回写,减少 SQLite 锁获取与提交次数
-        pending_outcomes.push((id, outcome));
-        if pending_outcomes.len() >= MEDIA_OUTCOME_FLUSH_SIZE {
-            flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
-        }
+                let reason = outcome.error.as_deref().unwrap_or("未知原因");
+                emit_media_log(
+                    params.app,
+                    params.task_id,
+                    params.platform,
+                    params.account_id,
+                    "warn",
+                    format!("{tag} {count}/{total} · {title} · 失败:{reason}"),
+                );
+            }
+            // 逐条回写进度(节流合并),调度页据此刷新「素材下载中 done/total」;最后一条必写
+            if count == total
+                || last_media_write.elapsed().as_millis() as u64 >= PROGRESS_WRITE_MIN_INTERVAL_MS
+            {
+                write_task_media_done(params.app, params.db, params.task_id, count as i32).await;
+                last_media_write = std::time::Instant::now();
+            }
+            // 素材结果攒批:满一批事务性回写,减少 SQLite 锁获取与提交次数
+            pending_outcomes.push((id, outcome));
+            if pending_outcomes.len() >= MEDIA_OUTCOME_FLUSH_SIZE {
+                flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
+            }
         }
     }
     // 收尾 flush 剩余素材回写
@@ -3681,9 +3892,11 @@ async fn refresh_and_retry_stale_media(
     };
     if stale.is_empty()
         || params.bridge.is_task_stopping(params.task_id)
-        || params
-            .bridge
-            .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+        || params.bridge.is_collect_window_closed(
+            params.platform,
+            params.account_id,
+            Some(params.task_id),
+        )
     {
         return 0;
     }
@@ -3710,9 +3923,11 @@ async fn refresh_and_retry_stale_media(
     let mut redownload: Vec<Content> = Vec::new();
     for mut content in stale {
         if params.bridge.is_task_stopping(params.task_id)
-            || params
-                .bridge
-                .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+            || params.bridge.is_collect_window_closed(
+                params.platform,
+                params.account_id,
+                Some(params.task_id),
+            )
         {
             break;
         }
@@ -3791,9 +4006,11 @@ async fn refresh_and_retry_stale_media(
     while let Some((content, outcome)) = stream.next().await {
         // 任务被手动结束 / 用户关窗:不再启动新下载,在飞条目跑完即弃(与主下载循环同语义)
         if params.bridge.is_task_stopping(params.task_id)
-            || params
-                .bridge
-                .is_collect_window_closed(params.platform, params.account_id, Some(params.task_id))
+            || params.bridge.is_collect_window_closed(
+                params.platform,
+                params.account_id,
+                Some(params.task_id),
+            )
         {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
@@ -3802,7 +4019,10 @@ async fn refresh_and_retry_stale_media(
         if ok {
             recovered += 1;
         }
-        let id = format!("{}-{}-{}", params.task_id, content.platform, content.content_id);
+        let id = format!(
+            "{}-{}-{}",
+            params.task_id, content.platform, content.content_id
+        );
         // 补偿补出的音频同样进转写清单,AI 文案提取不漏
         if let Some(audio_path) = &outcome.audio_path {
             out.audios.push((id.clone(), audio_path.clone()));
@@ -3860,7 +4080,14 @@ async fn transcribe_for_contents(
     use tauri::Emitter;
     // 任务已被手动结束(素材下载期间点的结束):不再发起任何转写请求
     if bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
-        emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 跳过语音转写".to_string());
+        emit_media_log(
+            app,
+            task_id,
+            platform,
+            account_id,
+            "info",
+            "🛑 已手动结束 · 跳过语音转写".to_string(),
+        );
         return;
     }
     let api_key = get_secret(db, "transcription_api_key").await;
@@ -3883,7 +4110,14 @@ async fn transcribe_for_contents(
     } else {
         transcription_cfg.concurrency
     } as usize;
-    emit_media_log(app, task_id, platform, account_id, "info", format!("开始语音转写 · 共 {total} 条 · 并发 {concurrency} 路"));
+    emit_media_log(
+        app,
+        task_id,
+        platform,
+        account_id,
+        "info",
+        format!("开始语音转写 · 共 {total} 条 · 并发 {concurrency} 路"),
+    );
     let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // 在飞计数监控:进入转写 +1、完成 -1,进度日志可见实时在飞路数;一旦超上限说明并发控制退化,记 error 便于排查
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3959,11 +4193,25 @@ async fn transcribe_for_contents(
     while stream.next().await.is_some() {
         // 任务被手动结束:停止拉取后续转写(在飞条目跑完即弃,已完成结果已回写保留)
         if bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
-            emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 停止后续语音转写(已完成条目保留)".to_string());
+            emit_media_log(
+                app,
+                task_id,
+                platform,
+                account_id,
+                "info",
+                "🛑 已手动结束 · 停止后续语音转写(已完成条目保留)".to_string(),
+            );
             break;
         }
     }
-    emit_media_log(app, task_id, platform, account_id, "info", format!("语音转写完成 · {total}/{total}"));
+    emit_media_log(
+        app,
+        task_id,
+        platform,
+        account_id,
+        "info",
+        format!("语音转写完成 · {total}/{total}"),
+    );
 }
 
 /// 记录一次转写的 ASR 用量到账单(model_usage_records):每次 API 请求一条记录
@@ -4045,7 +4293,11 @@ struct OcrPhaseParams<'a> {
 /// 待识别封面清单:本任务内、尚未识别(cover_ocr_text IS NULL)且有本地图的内容。
 /// 图源优先本地封面 cover_path,图文内容封面未单独下载时回退图集首张本地图(image_paths[0])。
 /// 库存路径可能是相对 media_root 的相对路径(新口径),统一 resolve 成绝对路径返回。
-async fn pending_cover_ocr_items(db: &DatabaseConnection, task_id: &str, root: &std::path::Path) -> Vec<(String, String)> {
+async fn pending_cover_ocr_items(
+    db: &DatabaseConnection,
+    task_id: &str,
+    root: &std::path::Path,
+) -> Vec<(String, String)> {
     use sea_orm::{ColumnTrait, QueryFilter};
     use veltrix_core::db::entity::content as content_entity;
     let rows = match content_entity::Entity::find()
@@ -4063,7 +4315,12 @@ async fn pending_cover_ocr_items(db: &DatabaseConnection, task_id: &str, root: &
     rows.into_iter()
         .filter_map(|m| {
             let path = local_cover_path(&m.cover_path, m.image_paths.as_deref())?;
-            Some((m.id, crate::media::resolve_media_path(root, &path).to_string_lossy().into_owned()))
+            Some((
+                m.id,
+                crate::media::resolve_media_path(root, &path)
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
         })
         .collect()
 }
@@ -4090,8 +4347,18 @@ async fn ocr_for_contents(p: &OcrPhaseParams<'_>, items: Vec<(String, String)>) 
     let (app, db, task_id, platform, account_id) =
         (p.app, p.db, p.task_id, p.platform, p.account_id);
     // 任务已被手动结束:不再发起任何 OCR 请求
-    if p.bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
-        emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 跳过封面文字识别".to_string());
+    if p.bridge
+        .map(|b| b.is_task_stopping(task_id))
+        .unwrap_or(false)
+    {
+        emit_media_log(
+            app,
+            task_id,
+            platform,
+            account_id,
+            "info",
+            "🛑 已手动结束 · 跳过封面文字识别".to_string(),
+        );
         return;
     }
     let api_key = get_secret(db, "ocr_api_key").await;
@@ -4102,7 +4369,8 @@ async fn ocr_for_contents(p: &OcrPhaseParams<'_>, items: Vec<(String, String)>) 
             platform,
             account_id,
             "warn",
-            "未配置封面 OCR API Key,跳过识别 · 请到「系统设置 → 封面文字识别」填写 API Key".to_string(),
+            "未配置封面 OCR API Key,跳过识别 · 请到「系统设置 → 封面文字识别」填写 API Key"
+                .to_string(),
         );
         return;
     }
@@ -4114,7 +4382,14 @@ async fn ocr_for_contents(p: &OcrPhaseParams<'_>, items: Vec<(String, String)>) 
     } else {
         p.ocr_cfg.concurrency
     } as usize;
-    emit_media_log(app, task_id, platform, account_id, "info", format!("开始封面文字识别 · 共 {total} 条 · 并发 {concurrency} 路"));
+    emit_media_log(
+        app,
+        task_id,
+        platform,
+        account_id,
+        "info",
+        format!("开始封面文字识别 · 共 {total} 条 · 并发 {concurrency} 路"),
+    );
     let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // SQLite 写串行化:并发 OCR 完成后的 DB 写入经此 Mutex 串行,避免 database is locked 丢结果
     let db_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
@@ -4198,17 +4473,39 @@ async fn ocr_for_contents(p: &OcrPhaseParams<'_>, items: Vec<(String, String)>) 
     .buffer_unordered(concurrency);
     while stream.next().await.is_some() {
         // 任务被手动结束:停止拉取后续识别(在飞条目跑完即弃,已完成结果已回写保留)
-        if p.bridge.map(|b| b.is_task_stopping(task_id)).unwrap_or(false) {
-            emit_media_log(app, task_id, platform, account_id, "info", "🛑 已手动结束 · 停止后续封面识别(已完成条目保留)".to_string());
+        if p.bridge
+            .map(|b| b.is_task_stopping(task_id))
+            .unwrap_or(false)
+        {
+            emit_media_log(
+                app,
+                task_id,
+                platform,
+                account_id,
+                "info",
+                "🛑 已手动结束 · 停止后续封面识别(已完成条目保留)".to_string(),
+            );
             break;
         }
     }
-    emit_media_log(app, task_id, platform, account_id, "info", format!("封面文字识别完成 · {total}/{total}"));
+    emit_media_log(
+        app,
+        task_id,
+        platform,
+        account_id,
+        "info",
+        format!("封面文字识别完成 · {total}/{total}"),
+    );
 }
 
 /// 回写单条内容的封面 OCR 结果(只更新 cover_ocr_text / cover_ocr_error 两列,不触碰其它字段)。
 /// text 传 Some("") 表示「已识别但无文字」;None 表示失败/未识别。
-async fn record_cover_ocr(db: &DatabaseConnection, id: &str, text: Option<String>, err: Option<String>) {
+async fn record_cover_ocr(
+    db: &DatabaseConnection,
+    id: &str,
+    text: Option<String>,
+    err: Option<String>,
+) {
     use veltrix_core::db::entity::content as content_entity;
     let am = content_entity::ActiveModel {
         id: Set(id.to_string()),
@@ -4239,16 +4536,9 @@ async fn record_ocr_usage(db: &DatabaseConnection, content_id: &str, provider: &
             return;
         }
     };
-    if let Err(e) = model_usage_record::Model::record(
-        db,
-        "files/ocr",
-        provider,
-        0,
-        0,
-        "cover_ocr",
-        &owner,
-    )
-    .await
+    if let Err(e) =
+        model_usage_record::Model::record(db, "files/ocr", provider, 0, 0, "cover_ocr", &owner)
+            .await
     {
         tracing::warn!(content_id, "封面 OCR 账单记录写入失败: {e}");
     }
@@ -4451,7 +4741,11 @@ fn media_outcome_active(
     root: &std::path::Path,
 ) -> veltrix_core::db::entity::content::ActiveModel {
     use veltrix_core::db::entity::content as content_entity;
-    let status = if is_media_ok(outcome) { "success" } else { "failed" };
+    let status = if is_media_ok(outcome) {
+        "success"
+    } else {
+        "failed"
+    };
     let mut am = content_entity::ActiveModel {
         id: Set(id.to_string()),
         media_status: Set(Some(status.to_string())),
@@ -4461,19 +4755,31 @@ fn media_outcome_active(
     };
     // 下载成功才回写本地路径;失败/未下不覆盖旧值(NotSet),便于重试后保留上次成功路径
     if let Some(p) = &outcome.cover_path {
-        am.cover_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
+        am.cover_path = Set(Some(crate::media::to_media_rel(
+            root,
+            std::path::Path::new(p),
+        )));
     }
     if let Some(p) = &outcome.avatar_path {
-        am.avatar_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
+        am.avatar_path = Set(Some(crate::media::to_media_rel(
+            root,
+            std::path::Path::new(p),
+        )));
     }
     // 音频路径回写:详情页播放音频用(仅视频 + 提取成功时有值)
     if let Some(p) = &outcome.audio_path {
-        am.audio_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
+        am.audio_path = Set(Some(crate::media::to_media_rel(
+            root,
+            std::path::Path::new(p),
+        )));
     }
     // 视频落盘路径回写:自动发布读本地视频用(仅 keep_video 下载成功时有值);
     // 失败/未开不覆盖旧值(NotSet),便于重试后保留上次成功路径
     if let Some(p) = &outcome.video_path {
-        am.video_path = Set(Some(crate::media::to_media_rel(root, std::path::Path::new(p))));
+        am.video_path = Set(Some(crate::media::to_media_rel(
+            root,
+            std::path::Path::new(p),
+        )));
     }
     if let Some(v) = outcome.video_downloaded {
         am.video_downloaded = Set(Some(v));
@@ -4593,12 +4899,14 @@ fn content_from_model(m: &veltrix_core::db::entity::content::Model) -> Content {
     };
     let image_urls: Vec<String> = serde_json::from_str(&m.image_urls).unwrap_or_default();
     let author_snapshot = serde_json::from_str::<serde_json::Value>(&m.author_json).ok();
-    let avatar = author_snapshot.as_ref()
+    let avatar = author_snapshot
+        .as_ref()
         .and_then(|v| v.get("avatar"))
         .and_then(Value::as_str)
         .map(str::to_string);
     // TikTok 详情导航需要 author.extra.unique_id(@handle);失败重试从 DB 回读时必须保留。
-    let author_extra = author_snapshot.as_ref()
+    let author_extra = author_snapshot
+        .as_ref()
         .and_then(|v| v.get("extra"))
         .cloned()
         .unwrap_or(Value::Null);
@@ -4666,32 +4974,48 @@ pub async fn retry_content_media(
     let root = crate::media::media_root(&state.config_dir, &media_cfg);
     // 重试遵循任务的「音频提取 / AI 文案提取 / 保留视频」设置:
     // 分别决定视频是否转音频、是否补转写、是否补落盘视频文件
-    let (audio_extract, keep_video, ai_extract) = match veltrix_core::db::entity::task::Entity::find_by_id(
-        row.task_id.clone(),
-    )
-    .one(&state.db)
-    .await
-    {
-        Ok(Some(t)) => (t.audio_extract || t.ai_extract, t.keep_video, t.ai_extract),
-        other => {
-            // 查不到任务行(DB 错误 / 任务已删)不能静默按「不提取」处理:那会让视频
-            // 「封面下载成功即判成功」而音频仍缺。按内容行自身状态推断:
-            // 视频且尚无音频 → 仍需下载转音频;视频且尚无落盘文件 → 仍需补视频;不补转写(无任务设置可依)
-            tracing::warn!(content_id = %id, "重试:查询任务提取设置失败({other:?}),按内容行状态推断");
-            let need_audio = row.kind == "video"
-                && row.audio_path.as_deref().map(|s| s.is_empty()).unwrap_or(true);
-            let need_video = row.kind == "video"
-                && row.video_path.as_deref().map(|s| s.is_empty()).unwrap_or(true);
-            (need_audio, need_video, false)
-        }
+    let (audio_extract, keep_video, ai_extract) =
+        match veltrix_core::db::entity::task::Entity::find_by_id(row.task_id.clone())
+            .one(&state.db)
+            .await
+        {
+            Ok(Some(t)) => (t.audio_extract || t.ai_extract, t.keep_video, t.ai_extract),
+            other => {
+                // 查不到任务行(DB 错误 / 任务已删)不能静默按「不提取」处理:那会让视频
+                // 「封面下载成功即判成功」而音频仍缺。按内容行自身状态推断:
+                // 视频且尚无音频 → 仍需下载转音频;视频且尚无落盘文件 → 仍需补视频;不补转写(无任务设置可依)
+                tracing::warn!(content_id = %id, "重试:查询任务提取设置失败({other:?}),按内容行状态推断");
+                let need_audio = row.kind == "video"
+                    && row
+                        .audio_path
+                        .as_deref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                let need_video = row.kind == "video"
+                    && row
+                        .video_path
+                        .as_deref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                (need_audio, need_video, false)
+            }
+        };
+    let switches = crate::media::MediaSwitches {
+        audio_extract,
+        keep_video,
     };
-    let switches = crate::media::MediaSwitches { audio_extract, keep_video };
     let mut content = content_from_model(&row);
     // 重试无绑定账号:取该平台一个可用账号的 Cookie 供 ffmpeg 拉流(防盗链 CDN 校验会话)
     let cookie = fetch_platform_cookie(&state.db, &row.platform).await;
-    let mut outcome =
-        crate::media::process_content(&content, &root, &media_cfg, switches, cookie.as_deref(), None)
-            .await;
+    let mut outcome = crate::media::process_content(
+        &content,
+        &root,
+        &media_cfg,
+        switches,
+        cookie.as_deref(),
+        None,
+    )
+    .await;
 
     // 视频素材失败(典型:直链短期签名过期;无直链时 process_video 未执行、
     // audio_extracted 为 None,同样是缺直链场景;keep_video 开而视频没落盘同理)
@@ -4733,12 +5057,7 @@ pub async fn retry_content_media(
                     account_id: &acc.id,
                     task_id: &row.task_id,
                 };
-                refresh_stream_urls(
-                    &stream_params,
-                    std::slice::from_mut(&mut content),
-                    true,
-                )
-                .await;
+                refresh_stream_urls(&stream_params, std::slice::from_mut(&mut content), true).await;
                 // 直链确有刷新才重试,避免拿同一过期链接再失败一次。
                 // 直链与会话绑定,口径要一致:从刷新直链那个账号(acc)的存活窗口读实时 Cookie
                 // (含 httponly tt_chain_token;DB 里 acc.cookie 往往是空的,故必须读实时)
@@ -4748,8 +5067,14 @@ pub async fn retry_content_media(
                     content.extra.get("audio_source_url").cloned(),
                 ) != before;
                 if changed {
-                    let session_cookie =
-                        resolve_session_cookie(&app, &state.db, &row.platform, &acc.id, Some(&row.task_id)).await;
+                    let session_cookie = resolve_session_cookie(
+                        &app,
+                        &state.db,
+                        &row.platform,
+                        &acc.id,
+                        Some(&row.task_id),
+                    )
+                    .await;
                     outcome = crate::media::process_content(
                         &content,
                         &root,
@@ -4799,7 +5124,11 @@ pub async fn retry_content_media(
         }
     }
 
-    let status = if is_media_ok(&outcome) { "success" } else { "failed" };
+    let status = if is_media_ok(&outcome) {
+        "success"
+    } else {
+        "failed"
+    };
     // 回读最新转写结果(可能刚被补上)一并返回,前端就地刷新行内三个徽章
     let (transcript, transcript_error) = content_entity::Entity::find_by_id(id.clone())
         .one(&state.db)
@@ -4853,7 +5182,9 @@ pub async fn retry_content_transcript(
     let media_cfg = { lock_config(&state)?.media.clone() };
     // 库存 audio_path 可能是相对 media_root 的相对路径(新口径),resolve 成绝对路径再转写
     let root = crate::media::media_root(&state.config_dir, &media_cfg);
-    let audio_path = crate::media::resolve_media_path(&root, &audio_path).to_string_lossy().into_owned();
+    let audio_path = crate::media::resolve_media_path(&root, &audio_path)
+        .to_string_lossy()
+        .into_owned();
     transcribe_for_contents(
         &app,
         &state.db,
@@ -4862,7 +5193,7 @@ pub async fn retry_content_transcript(
         "",
         &transcription_cfg,
         media_cfg.ffmpeg_path.clone(),
-                None, // 单条重试:无任务停止标记可查
+        None, // 单条重试:无任务停止标记可查
         vec![(id.clone(), audio_path)],
     )
     .await;
@@ -4910,7 +5241,9 @@ pub async fn retry_content_ocr(
     // 库存路径可能是相对 media_root 的相对路径(新口径),resolve 成绝对路径再识别
     let media_cfg = { lock_config(&state)?.media.clone() };
     let root = crate::media::media_root(&state.config_dir, &media_cfg);
-    let image_path = crate::media::resolve_media_path(&root, &image_path).to_string_lossy().into_owned();
+    let image_path = crate::media::resolve_media_path(&root, &image_path)
+        .to_string_lossy()
+        .into_owned();
     // 提前校验 API Key:OCR 缺少 Key 会被静默跳过,命令层应给用户明确反馈
     let api_key = get_secret(&state.db, "ocr_api_key").await;
     if api_key.trim().is_empty() {
@@ -4927,7 +5260,7 @@ pub async fn retry_content_ocr(
             platform: &row.platform,
             account_id: "",
             ocr_cfg: &ocr_cfg,
-            bridge: None, // 单条重试:无任务停止标记可查
+            bridge: None,        // 单条重试:无任务停止标记可查
             skip_precheck: true, // 用户显式重试:直接走云端,不被本地预判拦下
         },
         vec![(id.clone(), image_path)],
@@ -5004,9 +5337,10 @@ pub async fn retry_failed_transcripts(
     let mut by_task: std::collections::HashMap<(String, String), Vec<(String, String)>> =
         std::collections::HashMap::new();
     for r in rows {
-        let audio = crate::media::resolve_media_path(&root, &r.audio_path.clone().unwrap_or_default())
-            .to_string_lossy()
-            .into_owned();
+        let audio =
+            crate::media::resolve_media_path(&root, &r.audio_path.clone().unwrap_or_default())
+                .to_string_lossy()
+                .into_owned();
         by_task
             .entry((r.task_id.clone(), r.platform.clone()))
             .or_default()
@@ -5061,7 +5395,12 @@ fn emit_content_media_updated(app: &AppHandle, id: &str, outcome: &crate::media:
         "content-media-updated",
         Payload {
             id: id.to_string(),
-            media_status: if is_media_ok(outcome) { "success" } else { "failed" }.to_string(),
+            media_status: if is_media_ok(outcome) {
+                "success"
+            } else {
+                "failed"
+            }
+            .to_string(),
             audio_extracted: outcome.audio_extracted,
             media_error: outcome.error.clone(),
             audio_path: outcome.audio_path.clone(),
@@ -5182,10 +5521,8 @@ pub async fn batch_collect_audios(
             .collect();
         // 直链补取占采集窗口:同账号互斥锁(与采集主链路 / 单条重试同一把),
         // 防并发操控同一 WebView、互吃拦截响应
-        let refresh_lock = account_collect_lock(
-            &state.collect_locks,
-            &account_lock_key(&platform, &acc.id),
-        );
+        let refresh_lock =
+            account_collect_lock(&state.collect_locks, &account_lock_key(&platform, &acc.id));
         let refresh_guard = refresh_lock.lock().await;
         let bridge = CollectBridge::new(
             state.webviews.clone(),
@@ -5433,11 +5770,7 @@ pub async fn batch_collect_audios(
 /// 仅 failed 任务;无已采内容时落 failed 并提示用「重新运行」重采。
 /// 评论缺失需用「重新运行」(评论采集依赖 WebView,不在补偿范围)。
 #[tauri::command]
-pub async fn compensate_task(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    id: String,
-) -> Result<()> {
+pub async fn compensate_task(state: State<'_, AppState>, app: AppHandle, id: String) -> Result<()> {
     use sea_orm::sea_query::Expr;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     use veltrix_core::db::entity::task as task_entity;
@@ -5458,7 +5791,10 @@ pub async fn compensate_task(
     // 两次并发补偿点击只有一个能成功(rows_affected==0 即被抢占)。
     let now = Utc::now().timestamp();
     let res = task_entity::Entity::update_many()
-        .col_expr(task_entity::Column::Status, Expr::value("downloading_media"))
+        .col_expr(
+            task_entity::Column::Status,
+            Expr::value("downloading_media"),
+        )
         .col_expr(task_entity::Column::Progress, Expr::value(100))
         .col_expr(task_entity::Column::MediaDone, Expr::value(0))
         .col_expr(task_entity::Column::UpdatedAt, Expr::value(now))
@@ -5512,141 +5848,147 @@ pub async fn compensate_task(
     tauri::async_runtime::spawn(async move {
         use futures_util::FutureExt;
         let body = std::panic::AssertUnwindSafe(async move {
-        use sea_orm::sea_query::Expr;
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use veltrix_core::db::entity::content as content_entity;
+            use sea_orm::sea_query::Expr;
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            use veltrix_core::db::entity::content as content_entity;
 
-        let rows = match content_entity::Entity::find()
-            .filter(content_entity::Column::TaskId.eq(&id))
-            .all(&db)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                write_task_failed(&app, &db, &id, &format!("补偿查询内容失败: {e}")).await;
-                return;
-            }
-        };
-        if rows.is_empty() {
-            write_task_failed(&app, &db, &id, "补偿:本任务无已采内容,请用「重新运行」重新采集")
-                .await;
-            return;
-        }
-        emit_collect_log(&app, &id, "info", format!("开始补偿 · 已采内容 {} 条", rows.len()));
-
-        // 意向分析补做(analyze_comments_intent 内部按 intent_level IS NULL 幂等筛选)
-        let intent_ready = analyze_comment_intent
-            && !intent_cfg.api_url.trim().is_empty()
-            && !intent_cfg.model.trim().is_empty();
-        if intent_ready {
-            write_task_analyzing(&app, &db, &id).await;
-            let analyzed = analyze_comments_intent(&app, &db, &id, &intent_cfg).await;
-            // 确有评论被分析出结果才标记(与采集主链路同口径;0 产出标记会掩盖「实际没分析」)
-            if analyzed > 0 {
-                if let Err(e) = content_entity::Entity::update_many()
-                    .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
-                    .filter(content_entity::Column::TaskId.eq(&id))
-                    .filter(content_entity::Column::CommentCollected.eq(true))
-                    .exec(&db)
-                    .await
-                {
-                    tracing::warn!("补偿:标记 intent_analyzed 失败: {e}");
+            let rows = match content_entity::Entity::find()
+                .filter(content_entity::Column::TaskId.eq(&id))
+                .all(&db)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    write_task_failed(&app, &db, &id, &format!("补偿查询内容失败: {e}")).await;
+                    return;
                 }
-            }
-        }
-
-        // 素材下载 + 转写补做;只开“保留视频”也需要进入该流程。
-        if audio_extract || keep_video {
-            let contents: Vec<Content> = rows.iter().map(content_from_model).collect();
-            let mut pending = filter_pending_media(&db, &id, contents).await;
-            if !pending.is_empty() {
-                write_task_downloading(&app, &db, &id, pending.len() as i32).await;
-                // 补直链:小红书无直链 / 缺直链的视频先经详情页拦截补取,再下载转音频。
-                // 顺带记下补取用的账号,作为媒体下载日志写 HUD 的目标窗口。
-                let mut hud_account = String::new();
-                let mut session_cookie: Option<String> = None;
-                match (&platform_cfg, cookies.acquire(&platform).await) {
-                    (Some(cfg), Ok(acc)) => {
-                        hud_account = acc.id.clone();
-                        // 直链补取占采集窗口:同账号互斥锁,防与在跑的采集任务
-                        // 并发操控同一 WebView、互吃拦截响应(与采集主链路同一把锁)
-                        let refresh_lock = account_collect_lock(
-                            &collect_locks,
-                            &account_lock_key(&platform, &acc.id),
-                        );
-                        let _refresh_guard = refresh_lock.lock().await;
-                        // 持锁期间该账号无采集在跑,残留的「手动关窗」标记只会是历史遗留,
-                        // 重置后再补取(否则补取循环第一轮就误判终止)
-                        bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
-                        let stream_params = StreamRefreshParams {
-                            app: &app,
-                            bridge: &bridge,
-                            registry: &registry,
-                            db: &db,
-                            cfg,
-                            account_id: &acc.id,
-                            task_id: &id,
-                        };
-                        // force=true:补偿对象多为「有直链但签名过期」的失败内容,
-                        // force=false 会因「已有直链」跳过重取,下载仍 403,补偿反复失败
-                        refresh_stream_urls(
-                            &stream_params, &mut pending, true,
-                        )
-                        .await;
-                        // 直链与本次窗口会话绑定:关窗前留存 Cookie 供下载;
-                        // 持锁期间关窗,避免窗口遗留驻留、或迟关误杀下一任务复用的窗口
-                        session_cookie =
-                            resolve_session_cookie(&app, &db, &platform, &acc.id, Some(&id)).await;
-                        bridge.close_collect_window(&platform, &acc.id, Some(&id));
-                        // 自清主动关窗置位的「被手动关闭」标记(理由同采集主链路)
-                        bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
-                    }
-                    (cfg_opt, acc_res) => {
-                        // 不补直链也要说明原因:无平台配置 / 无可用账号时静默跳过,
-                        // 随后无直链的内容下载必失败,排查时无从得知补取根本没发生
-                        let reason = match (cfg_opt.is_none(), acc_res.err()) {
-                            (true, _) => "无平台配置".to_string(),
-                            (false, Some(e)) => format!("无可用账号: {e}"),
-                            _ => "未知原因".to_string(),
-                        };
-                        tracing::warn!(task_id = %id, "补偿:跳过直链补取({reason})");
-                        emit_collect_log(
-                            &app, &id, "warn",
-                            format!("⚠️ 跳过直链补取 · {reason},缺直链的内容可能下载失败"),
-                        );
-                    }
-                }
-                let media_params = MediaDownloadParams {
-                    app: &app,
-                    db: &db,
-                    task_id: &id,
-                    platform: &platform,
-                    account_id: &hud_account,
-                    config_dir: &config_dir,
-                    media_cfg: &media_cfg,
-                    transcription_cfg: &transcription_cfg,
-                    audio_extract,
-                    keep_video,
-                    ai_extract,
-                    session_cookie,
-                    bridge: &bridge,
-                    // 补偿在补取后已关窗,下载阶段无窗口可保活(行为同旧版)
-                    window_open: false,
-                    // 窗口已关、无可导航的采集窗口,不做直链刷新补偿
-                    refresh_ctx: None,
-                };
-                download_media_for_contents(
-                    &media_params,
-                    pending,
+            };
+            if rows.is_empty() {
+                write_task_failed(
+                    &app,
+                    &db,
+                    &id,
+                    "补偿:本任务无已采内容,请用「重新运行」重新采集",
                 )
-                .await; // 内部末尾会 write_task_done
-                emit_collect_log(&app, &id, "info", "补偿完成");
+                .await;
                 return;
             }
-        }
-        // 无素材可补 → 直接收尾为完成
-        write_task_done(&app, &db, &id).await;
-        emit_collect_log(&app, &id, "info", "补偿完成");
+            emit_collect_log(
+                &app,
+                &id,
+                "info",
+                format!("开始补偿 · 已采内容 {} 条", rows.len()),
+            );
+
+            // 意向分析补做(analyze_comments_intent 内部按 intent_level IS NULL 幂等筛选)
+            let intent_ready = analyze_comment_intent
+                && !intent_cfg.api_url.trim().is_empty()
+                && !intent_cfg.model.trim().is_empty();
+            if intent_ready {
+                write_task_analyzing(&app, &db, &id).await;
+                let analyzed = analyze_comments_intent(&app, &db, &id, &intent_cfg).await;
+                // 确有评论被分析出结果才标记(与采集主链路同口径;0 产出标记会掩盖「实际没分析」)
+                if analyzed > 0 {
+                    if let Err(e) = content_entity::Entity::update_many()
+                        .col_expr(content_entity::Column::IntentAnalyzed, Expr::value(true))
+                        .filter(content_entity::Column::TaskId.eq(&id))
+                        .filter(content_entity::Column::CommentCollected.eq(true))
+                        .exec(&db)
+                        .await
+                    {
+                        tracing::warn!("补偿:标记 intent_analyzed 失败: {e}");
+                    }
+                }
+            }
+
+            // 素材下载 + 转写补做;只开“保留视频”也需要进入该流程。
+            if audio_extract || keep_video {
+                let contents: Vec<Content> = rows.iter().map(content_from_model).collect();
+                let mut pending = filter_pending_media(&db, &id, contents).await;
+                if !pending.is_empty() {
+                    write_task_downloading(&app, &db, &id, pending.len() as i32).await;
+                    // 补直链:小红书无直链 / 缺直链的视频先经详情页拦截补取,再下载转音频。
+                    // 顺带记下补取用的账号,作为媒体下载日志写 HUD 的目标窗口。
+                    let mut hud_account = String::new();
+                    let mut session_cookie: Option<String> = None;
+                    match (&platform_cfg, cookies.acquire(&platform).await) {
+                        (Some(cfg), Ok(acc)) => {
+                            hud_account = acc.id.clone();
+                            // 直链补取占采集窗口:同账号互斥锁,防与在跑的采集任务
+                            // 并发操控同一 WebView、互吃拦截响应(与采集主链路同一把锁)
+                            let refresh_lock = account_collect_lock(
+                                &collect_locks,
+                                &account_lock_key(&platform, &acc.id),
+                            );
+                            let _refresh_guard = refresh_lock.lock().await;
+                            // 持锁期间该账号无采集在跑,残留的「手动关窗」标记只会是历史遗留,
+                            // 重置后再补取(否则补取循环第一轮就误判终止)
+                            bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
+                            let stream_params = StreamRefreshParams {
+                                app: &app,
+                                bridge: &bridge,
+                                registry: &registry,
+                                db: &db,
+                                cfg,
+                                account_id: &acc.id,
+                                task_id: &id,
+                            };
+                            // force=true:补偿对象多为「有直链但签名过期」的失败内容,
+                            // force=false 会因「已有直链」跳过重取,下载仍 403,补偿反复失败
+                            refresh_stream_urls(&stream_params, &mut pending, true).await;
+                            // 直链与本次窗口会话绑定:关窗前留存 Cookie 供下载;
+                            // 持锁期间关窗,避免窗口遗留驻留、或迟关误杀下一任务复用的窗口
+                            session_cookie =
+                                resolve_session_cookie(&app, &db, &platform, &acc.id, Some(&id))
+                                    .await;
+                            bridge.close_collect_window(&platform, &acc.id, Some(&id));
+                            // 自清主动关窗置位的「被手动关闭」标记(理由同采集主链路)
+                            bridge.reset_collect_window_closed(&platform, &acc.id, Some(&id));
+                        }
+                        (cfg_opt, acc_res) => {
+                            // 不补直链也要说明原因:无平台配置 / 无可用账号时静默跳过,
+                            // 随后无直链的内容下载必失败,排查时无从得知补取根本没发生
+                            let reason = match (cfg_opt.is_none(), acc_res.err()) {
+                                (true, _) => "无平台配置".to_string(),
+                                (false, Some(e)) => format!("无可用账号: {e}"),
+                                _ => "未知原因".to_string(),
+                            };
+                            tracing::warn!(task_id = %id, "补偿:跳过直链补取({reason})");
+                            emit_collect_log(
+                                &app,
+                                &id,
+                                "warn",
+                                format!("⚠️ 跳过直链补取 · {reason},缺直链的内容可能下载失败"),
+                            );
+                        }
+                    }
+                    let media_params = MediaDownloadParams {
+                        app: &app,
+                        db: &db,
+                        task_id: &id,
+                        platform: &platform,
+                        account_id: &hud_account,
+                        config_dir: &config_dir,
+                        media_cfg: &media_cfg,
+                        transcription_cfg: &transcription_cfg,
+                        audio_extract,
+                        keep_video,
+                        ai_extract,
+                        session_cookie,
+                        bridge: &bridge,
+                        // 补偿在补取后已关窗,下载阶段无窗口可保活(行为同旧版)
+                        window_open: false,
+                        // 窗口已关、无可导航的采集窗口,不做直链刷新补偿
+                        refresh_ctx: None,
+                    };
+                    download_media_for_contents(&media_params, pending).await; // 内部末尾会 write_task_done
+                    emit_collect_log(&app, &id, "info", "补偿完成");
+                    return;
+                }
+            }
+            // 无素材可补 → 直接收尾为完成
+            write_task_done(&app, &db, &id).await;
+            emit_collect_log(&app, &id, "info", "补偿完成");
         });
         // 与 run_task 相同的 panic 兜底:补偿体 panic 不再让任务永久卡「素材下载中」
         if body.catch_unwind().await.is_err() {
@@ -5800,25 +6142,25 @@ pub async fn recollect_comments(
             }
         };
         // 账号采集互斥(与采集主链路同一把锁):30s 等不到就跳过本平台,不阻塞整批
-        let account_lock =
-            account_collect_lock(&state.collect_locks, &account_lock_key(&platform, &account_id));
-        let _guard = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            account_lock.lock(),
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                summary.skipped += group.len();
-                summary.messages.push(format!(
-                    "平台 {} 账号窗口被采集任务占用,已跳过 {} 条",
-                    cfg.name,
-                    group.len()
-                ));
-                continue;
-            }
-        };
+        let account_lock = account_collect_lock(
+            &state.collect_locks,
+            &account_lock_key(&platform, &account_id),
+        );
+        let _guard =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), account_lock.lock())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    summary.skipped += group.len();
+                    summary.messages.push(format!(
+                        "平台 {} 账号窗口被采集任务占用,已跳过 {} 条",
+                        cfg.name,
+                        group.len()
+                    ));
+                    continue;
+                }
+            };
         // 持锁期间该账号无采集在跑,残留的「手动关窗」标记只会是历史遗留,重置后再开始
         // (否则首轮检查就误判终止);补采途中的关窗由逐条检查捕获
         bridge.reset_collect_window_closed(&platform, &account_id, None);
@@ -5848,7 +6190,9 @@ pub async fn recollect_comments(
             if state.collect_control.is_library_batch_stopping() {
                 let remaining = total - idx;
                 summary.skipped += remaining;
-                summary.messages.push(format!("已手动取消 · 剩余 {remaining} 条未处理"));
+                summary
+                    .messages
+                    .push(format!("已手动取消 · 剩余 {remaining} 条未处理"));
                 break;
             }
             // 串行限速:首个不等,之后每个之间随机间隔降频
@@ -5946,7 +6290,9 @@ pub async fn recollect_comments(
                         }
                         Err(e) => {
                             summary.failed += 1;
-                            summary.messages.push(format!("「{title}」评论解析失败: {e}"));
+                            summary
+                                .messages
+                                .push(format!("「{title}」评论解析失败: {e}"));
                         }
                     }
                 }
@@ -5956,7 +6302,9 @@ pub async fn recollect_comments(
                 }
                 Err(e) => {
                     summary.failed += 1;
-                    summary.messages.push(format!("「{title}」评论采集失败: {e}"));
+                    summary
+                        .messages
+                        .push(format!("「{title}」评论采集失败: {e}"));
                     crate::webview::hud_log(
                         &app,
                         &platform,
@@ -5993,9 +6341,7 @@ pub async fn recollect_comments(
     // (采集时增量维护),补采入库的评论不经过该链路——按任务实算一次,避免总数少计
     {
         use sea_orm::PaginatorTrait;
-        use veltrix_core::db::entity::{
-            comment as comment_entity, task as task_entity,
-        };
+        use veltrix_core::db::entity::{comment as comment_entity, task as task_entity};
         for task_id in &succeeded_task_ids {
             let count = comment_entity::Entity::find()
                 .filter(comment_entity::Column::TaskId.eq(task_id))
@@ -6026,9 +6372,9 @@ pub async fn recollect_comments(
         && !intent_cfg.model.trim().is_empty();
     if analyze_intent && !intent_ready {
         // 用户选了「是」但未配置,静默跳过会误以为已分析,必须留痕
-        summary.messages.push(
-            "意向分析未配置(系统设置 → 意向分析),已跳过该步".to_string(),
-        );
+        summary
+            .messages
+            .push("意向分析未配置(系统设置 → 意向分析),已跳过该步".to_string());
     }
     if intent_ready {
         for task_id in &succeeded_task_ids {
@@ -6095,7 +6441,6 @@ pub async fn check_ffmpeg(
         version,
     })
 }
-
 
 /// 把适配器解析出的内容/评论落库。调用方维护跨关键词去重集合,
 /// 避免同任务多关键词命中同一条造成主键冲突。落库失败仅告警,不中断采集。
@@ -6222,12 +6567,9 @@ async fn persist_contents(
                     let ledger_key = candidates
                         .get(i)
                         .map(|(_, c)| ledger_entity::ledger_key(&c.platform, &c.content_id));
-                    if let Some(entry) = ledger_key
-                    .as_deref()
-                    .and_then(|k| ledger_by_key.get(k))
-                {
-                    upserted_ledger.push(entry.clone());
-                }
+                    if let Some(entry) = ledger_key.as_deref().and_then(|k| ledger_by_key.get(k)) {
+                        upserted_ledger.push(entry.clone());
+                    }
                 }
                 Err(e2) => {
                     lost += 1;
@@ -6247,10 +6589,9 @@ async fn persist_contents(
     // 登记采集去重台账(仅登记实际操作成功的条目):
     // 主键冲突忽略;台账写失败不影响采集主流程。
     if !upserted_ledger.is_empty() {
-        let on_conflict_ledger =
-            sea_orm::sea_query::OnConflict::column(ledger_entity::Column::Id)
-                .do_nothing()
-                .to_owned();
+        let on_conflict_ledger = sea_orm::sea_query::OnConflict::column(ledger_entity::Column::Id)
+            .do_nothing()
+            .to_owned();
         match ledger_entity::Entity::insert_many(upserted_ledger)
             .on_conflict(on_conflict_ledger)
             .exec(db)
@@ -6521,7 +6862,6 @@ fn to_json_text<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
-
 /// model::Content → contents 实体 ActiveModel。复合字段(作者/图片/扩展)序列化为 JSON 文本。
 fn content_to_active(
     id: String,
@@ -6639,8 +6979,9 @@ async fn update_task_fields(
     match res {
         Ok(_) => {
             // 回读整行推送进度;读取失败仅丢一次推送,下一条进度会补上
-            if let Ok(Some(m)) =
-                task_entity::Entity::find_by_id(task_id.to_string()).one(db).await
+            if let Ok(Some(m)) = task_entity::Entity::find_by_id(task_id.to_string())
+                .one(db)
+                .await
             {
                 emit_task_progress(app, m);
             }
@@ -6700,12 +7041,18 @@ async fn write_task_collecting_comments(
     use sea_orm::sea_query::Expr;
     use veltrix_core::db::entity::task::Column as C;
     let now = Utc::now().timestamp();
-    update_task_fields(app, db, task_id, "标记任务评论采集态失败", move |u| {
-        u.col_expr(C::Status, Expr::value("collecting_comments"))
-            .col_expr(C::CommentVideoTotal, Expr::value(video_total))
-            .col_expr(C::CommentVideoDone, Expr::value(0))
-            .col_expr(C::UpdatedAt, Expr::value(now))
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "标记任务评论采集态失败",
+        move |u| {
+            u.col_expr(C::Status, Expr::value("collecting_comments"))
+                .col_expr(C::CommentVideoTotal, Expr::value(video_total))
+                .col_expr(C::CommentVideoDone, Expr::value(0))
+                .col_expr(C::UpdatedAt, Expr::value(now))
+        },
+    )
     .await;
 }
 
@@ -6724,11 +7071,17 @@ async fn write_task_comment_progress(
     }
     use sea_orm::sea_query::Expr;
     use veltrix_core::db::entity::task::Column as C;
-    update_task_fields(app, db, task_id, "回写评论采集进度失败", move |u| {
-        u.col_expr(C::CommentVideoDone, Expr::value(video_done))
-            .col_expr(C::CommentCount, Expr::value(comment_count))
-            .col_expr(C::UpdatedAt, Expr::value(Utc::now().timestamp()))
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "回写评论采集进度失败",
+        move |u| {
+            u.col_expr(C::CommentVideoDone, Expr::value(video_done))
+                .col_expr(C::CommentCount, Expr::value(comment_count))
+                .col_expr(C::UpdatedAt, Expr::value(Utc::now().timestamp()))
+        },
+    )
     .await;
 }
 
@@ -6736,10 +7089,16 @@ async fn write_task_comment_progress(
 async fn write_task_analyzing(app: &AppHandle, db: &DatabaseConnection, task_id: &str) {
     use sea_orm::sea_query::Expr;
     use veltrix_core::db::entity::task::Column as C;
-    update_task_fields(app, db, task_id, "标记任务意向分析态失败", move |u| {
-        u.col_expr(C::Status, Expr::value("analyzing_comments"))
-            .col_expr(C::UpdatedAt, Expr::value(Utc::now().timestamp()))
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "标记任务意向分析态失败",
+        move |u| {
+            u.col_expr(C::Status, Expr::value("analyzing_comments"))
+                .col_expr(C::UpdatedAt, Expr::value(Utc::now().timestamp()))
+        },
+    )
     .await;
 }
 
@@ -6751,9 +7110,7 @@ async fn analyze_comments_intent(
     task_id: &str,
     intent_cfg: &veltrix_core::config::CommentIntentConfig,
 ) -> usize {
-    use veltrix_core::db::entity::{
-        comment as comment_entity,
-    };
+    use veltrix_core::db::entity::comment as comment_entity;
 
     // 未配置 API Key 直接跳过——否则空 Bearer 会让每个批次 401 全失败、0 条评论被标注,
     // 还无意义地刷一串「批次失败」(早返回守卫在重构中被误删,这里补回)。
@@ -6838,12 +7195,22 @@ async fn analyze_comments_intent(
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            emit_collect_log(&app, &task_id, "warn", format!("意向分析批次失败: {e}"));
+                            emit_collect_log(
+                                &app,
+                                &task_id,
+                                "warn",
+                                format!("意向分析批次失败: {e}"),
+                            );
                             Vec::new()
                         }
                     };
                     let done = returned.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    emit_collect_log(&app, &task_id, "info", format!("意向分析批次 {done}/{batch_total} 已返回"));
+                    emit_collect_log(
+                        &app,
+                        &task_id,
+                        "info",
+                        format!("意向分析批次 {done}/{batch_total} 已返回"),
+                    );
                     (chunk, verdicts)
                 }
             })
@@ -6863,9 +7230,9 @@ async fn analyze_comments_intent(
         let updates: Vec<(String, String, String)> = chunk
             .iter()
             .filter_map(|c| {
-                verdict_map.get(&c.comment_id).map(|v| {
-                    (c.id.clone(), v.level.clone(), v.reason.clone())
-                })
+                verdict_map
+                    .get(&c.comment_id)
+                    .map(|v| (c.id.clone(), v.level.clone(), v.reason.clone()))
             })
             .collect();
         let updates_count = updates.len();
@@ -6877,7 +7244,11 @@ async fn analyze_comments_intent(
             let mut reason_cases = String::from("CASE id");
             let mut in_list = String::new();
             // PG 用 $N 可复用同一参数;SQLite ? 每个位置需独立参数,故 id 重复 3 次
-            let cap = if is_pg { updates.len() * 3 } else { updates.len() * 5 };
+            let cap = if is_pg {
+                updates.len() * 3
+            } else {
+                updates.len() * 5
+            };
             let mut params: Vec<sea_orm::Value> = Vec::with_capacity(cap);
             if is_pg {
                 for (i, (id, level, reason)) in updates.iter().enumerate() {
@@ -6928,13 +7299,21 @@ async fn analyze_comments_intent(
             );
             // 写库成功才计入 analyzed:失败不计,否则内容会被误标 intent_analyzed
             // 而 intent_level 仍为空,永久停在「已标记未分析」(重跑也不再补标)
-            match db.execute(Statement::from_sql_and_values(backend, sql, params)).await {
+            match db
+                .execute(Statement::from_sql_and_values(backend, sql, params))
+                .await
+            {
                 Ok(_) => analyzed += updates_count,
                 Err(e) => tracing::warn!("批量回写意向失败(影响 {} 条): {e}", updates.len()),
             }
         }
     }
-    emit_collect_log(app, task_id, "info", format!("意向分析进度 {analyzed}/{total}"));
+    emit_collect_log(
+        app,
+        task_id,
+        "info",
+        format!("意向分析进度 {analyzed}/{total}"),
+    );
     emit_collect_log(
         app,
         task_id,
@@ -6955,13 +7334,19 @@ async fn write_task_downloading(
     use sea_orm::sea_query::Expr;
     use veltrix_core::db::entity::task::Column as C;
     let now = Utc::now().timestamp();
-    update_task_fields(app, db, task_id, "标记任务素材下载态失败", move |u| {
-        u.col_expr(C::Status, Expr::value("downloading_media"))
-            .col_expr(C::Progress, Expr::value(100))
-            .col_expr(C::MediaTotal, Expr::value(media_total))
-            .col_expr(C::MediaDone, Expr::value(0))
-            .col_expr(C::UpdatedAt, Expr::value(now))
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "标记任务素材下载态失败",
+        move |u| {
+            u.col_expr(C::Status, Expr::value("downloading_media"))
+                .col_expr(C::Progress, Expr::value(100))
+                .col_expr(C::MediaTotal, Expr::value(media_total))
+                .col_expr(C::MediaDone, Expr::value(0))
+                .col_expr(C::UpdatedAt, Expr::value(now))
+        },
+    )
     .await;
 }
 
@@ -6983,19 +7368,30 @@ async fn write_task_media_done(
 
 /// 标记任务取消(status=cancelled, finished_at, error_message)。
 /// 用户主动终止(如采集途中手动关闭采集窗口)时调用;cancelled 为终态,监听任务据此停止自动轮转。
-async fn write_task_cancelled(app: &AppHandle, db: &DatabaseConnection, task_id: &str, message: &str) {
+async fn write_task_cancelled(
+    app: &AppHandle,
+    db: &DatabaseConnection,
+    task_id: &str,
+    message: &str,
+) {
     use sea_orm::sea_query::Expr;
     use veltrix_core::db::entity::task::Column as C;
     let now = Utc::now().timestamp();
     let message = message.to_string();
-    update_task_fields(app, db, task_id, "标记任务取消状态失败", move |u| {
-        u.col_expr(C::Status, Expr::value("cancelled"))
-            .col_expr(C::FinishedAt, Expr::value(Some(now)))
-            .col_expr(C::ErrorMessage, Expr::value(Some(message)))
-            // 取消是用户主动终止:清掉可能的自动重试排期,调度器不会再拉起
-            .col_expr(C::NextRetryAt, Expr::value(None::<i64>))
-            .col_expr(C::UpdatedAt, Expr::value(now))
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "标记任务取消状态失败",
+        move |u| {
+            u.col_expr(C::Status, Expr::value("cancelled"))
+                .col_expr(C::FinishedAt, Expr::value(Some(now)))
+                .col_expr(C::ErrorMessage, Expr::value(Some(message)))
+                // 取消是用户主动终止:清掉可能的自动重试排期,调度器不会再拉起
+                .col_expr(C::NextRetryAt, Expr::value(None::<i64>))
+                .col_expr(C::UpdatedAt, Expr::value(now))
+        },
+    )
     .await;
 }
 
@@ -7026,7 +7422,10 @@ async fn write_task_failed(app: &AppHandle, db: &DatabaseConnection, task_id: &s
     use veltrix_core::db::entity::task as task_entity;
     use veltrix_core::db::entity::task::Column as C;
     // 需要当前重试计数计算退避排期(只读;写回走定向列更新,不整行覆盖)
-    let m = match task_entity::Entity::find_by_id(task_id.to_string()).one(db).await {
+    let m = match task_entity::Entity::find_by_id(task_id.to_string())
+        .one(db)
+        .await
+    {
         Ok(Some(m)) => m,
         Ok(None) => return,
         Err(e) => {
@@ -7063,19 +7462,25 @@ async fn write_task_failed(app: &AppHandle, db: &DatabaseConnection, task_id: &s
         );
     }
     let message = message.to_string();
-    update_task_fields(app, db, task_id, "标记任务失败状态失败", move |u| {
-        let u = u
-            .col_expr(C::Status, Expr::value("failed"))
-            .col_expr(C::FinishedAt, Expr::value(Some(now)))
-            .col_expr(C::ErrorMessage, Expr::value(Some(message)))
-            .col_expr(C::UpdatedAt, Expr::value(now));
-        if will_retry {
-            u.col_expr(C::RetryCount, Expr::value(next_retry))
-                .col_expr(C::NextRetryAt, Expr::value(Some(now + delay_secs)))
-        } else {
-            u.col_expr(C::NextRetryAt, Expr::value(None::<i64>))
-        }
-    })
+    update_task_fields(
+        app,
+        db,
+        task_id,
+        "标记任务失败状态失败",
+        move |u| {
+            let u = u
+                .col_expr(C::Status, Expr::value("failed"))
+                .col_expr(C::FinishedAt, Expr::value(Some(now)))
+                .col_expr(C::ErrorMessage, Expr::value(Some(message)))
+                .col_expr(C::UpdatedAt, Expr::value(now));
+            if will_retry {
+                u.col_expr(C::RetryCount, Expr::value(next_retry))
+                    .col_expr(C::NextRetryAt, Expr::value(Some(now + delay_secs)))
+            } else {
+                u.col_expr(C::NextRetryAt, Expr::value(None::<i64>))
+            }
+        },
+    )
     .await;
 }
 
@@ -7105,19 +7510,39 @@ mod tests {
     #[test]
     fn truncate_chars_short_returns_trimmed() {
         assert_eq!(truncate_chars("hello", 10), "hello", "短串应原样返回");
-        assert_eq!(truncate_chars("  hello  ", 10), "hello", "首尾空白应被 trim");
+        assert_eq!(
+            truncate_chars("  hello  ", 10),
+            "hello",
+            "首尾空白应被 trim"
+        );
     }
 
     #[test]
     fn truncate_chars_over_max_appends_ellipsis() {
-        assert_eq!(truncate_chars("abcdefghij", 5), "abcde…", "超长应截断并加省略号");
-        assert_eq!(truncate_chars("abcde", 5), "abcde", "恰好 max 个字符不应加省略号");
+        assert_eq!(
+            truncate_chars("abcdefghij", 5),
+            "abcde…",
+            "超长应截断并加省略号"
+        );
+        assert_eq!(
+            truncate_chars("abcde", 5),
+            "abcde",
+            "恰好 max 个字符不应加省略号"
+        );
     }
 
     #[test]
     fn truncate_chars_multibyte_no_panic() {
-        assert_eq!(truncate_chars("你好世界啊", 3), "你好世…", "中文应按字符截断");
-        assert_eq!(truncate_chars("😀😀😀😀", 2), "😀😀…", "emoji 截断不应 panic");
+        assert_eq!(
+            truncate_chars("你好世界啊", 3),
+            "你好世…",
+            "中文应按字符截断"
+        );
+        assert_eq!(
+            truncate_chars("😀😀😀😀", 2),
+            "😀😀…",
+            "emoji 截断不应 panic"
+        );
     }
 
     // ---------- comment_time_cutoff ----------
@@ -7197,7 +7622,11 @@ mod tests {
         assert_eq!(retry_backoff_secs(3), 900, "第 3 次起应封顶 900s");
         assert_eq!(retry_backoff_secs(10), 900, "更大次数仍应封顶 900s");
         assert_eq!(retry_backoff_secs(0), 60, "非正次数兜底按第 1 次");
-        assert_eq!(retry_backoff_secs(26), 900, "溢出边界(5^25×60 超 i64)应饱和封顶,不得 panic/wrap 成负数");
+        assert_eq!(
+            retry_backoff_secs(26),
+            900,
+            "溢出边界(5^25×60 超 i64)应饱和封顶,不得 panic/wrap 成负数"
+        );
         assert_eq!(retry_backoff_secs(i32::MAX), 900, "极大次数仍封顶 900s");
     }
 
@@ -7205,7 +7634,10 @@ mod tests {
 
     #[test]
     fn is_profile_url_douyin_modal_id_is_content() {
-        assert!(is_profile_url("douyin", "https://www.douyin.com/user/MS4wLjABxxxx"));
+        assert!(is_profile_url(
+            "douyin",
+            "https://www.douyin.com/user/MS4wLjABxxxx"
+        ));
         assert!(
             !is_profile_url(
                 "douyin",
@@ -7219,18 +7651,30 @@ mod tests {
     fn is_profile_url_tiktok_at_user() {
         assert!(is_profile_url("tiktok", "https://www.tiktok.com/@someuser"));
         assert!(
-            !is_profile_url("tiktok", "https://www.tiktok.com/@someuser/video/7300123456"),
+            !is_profile_url(
+                "tiktok",
+                "https://www.tiktok.com/@someuser/video/7300123456"
+            ),
             "@user/video/xxx 是内容链接,应判 false"
         );
     }
 
     #[test]
     fn is_profile_url_other_platforms() {
-        assert!(is_profile_url("xhs", "https://www.xiaohongshu.com/user/profile/abc"));
-        assert!(is_profile_url("kuaishou", "https://www.kuaishou.com/profile/abc"));
+        assert!(is_profile_url(
+            "xhs",
+            "https://www.xiaohongshu.com/user/profile/abc"
+        ));
+        assert!(is_profile_url(
+            "kuaishou",
+            "https://www.kuaishou.com/profile/abc"
+        ));
         assert!(is_profile_url("bilibili", "https://space.bilibili.com/123"));
         assert!(is_profile_url("youtube", "https://www.youtube.com/@chan"));
-        assert!(is_profile_url("youtube", "https://www.youtube.com/channel/UCxxx"));
+        assert!(is_profile_url(
+            "youtube",
+            "https://www.youtube.com/channel/UCxxx"
+        ));
         assert!(
             !is_profile_url("unknown", "https://www.douyin.com/user/xxx"),
             "未知平台应判 false"
@@ -7242,11 +7686,23 @@ mod tests {
     #[test]
     fn platform_home_url_covers_known_platforms() {
         assert_eq!(platform_home_url("tiktok"), Some("https://www.tiktok.com/"));
-        assert_eq!(platform_home_url("youtube"), Some("https://www.youtube.com/"));
+        assert_eq!(
+            platform_home_url("youtube"),
+            Some("https://www.youtube.com/")
+        );
         assert_eq!(platform_home_url("douyin"), Some("https://www.douyin.com/"));
-        assert_eq!(platform_home_url("kuaishou"), Some("https://www.kuaishou.com/"));
-        assert_eq!(platform_home_url("xhs"), Some("https://www.xiaohongshu.com/"));
-        assert_eq!(platform_home_url("bilibili"), Some("https://www.bilibili.com/"));
+        assert_eq!(
+            platform_home_url("kuaishou"),
+            Some("https://www.kuaishou.com/")
+        );
+        assert_eq!(
+            platform_home_url("xhs"),
+            Some("https://www.xiaohongshu.com/")
+        );
+        assert_eq!(
+            platform_home_url("bilibili"),
+            Some("https://www.bilibili.com/")
+        );
         assert_eq!(platform_home_url("weibo"), None, "未登记平台应返回 None");
     }
 
@@ -7278,10 +7734,22 @@ mod tests {
 
     #[test]
     fn is_media_ok_requires_main_ok_and_audio_not_failed() {
-        assert!(is_media_ok(&outcome(true, Some(true))), "主素材 ok + 音频成功 → true");
-        assert!(is_media_ok(&outcome(true, None)), "主素材 ok + 未提取音频 → true");
-        assert!(!is_media_ok(&outcome(true, Some(false))), "音频提取失败 → false");
-        assert!(!is_media_ok(&outcome(false, Some(true))), "主素材失败 → false");
+        assert!(
+            is_media_ok(&outcome(true, Some(true))),
+            "主素材 ok + 音频成功 → true"
+        );
+        assert!(
+            is_media_ok(&outcome(true, None)),
+            "主素材 ok + 未提取音频 → true"
+        );
+        assert!(
+            !is_media_ok(&outcome(true, Some(false))),
+            "音频提取失败 → false"
+        );
+        assert!(
+            !is_media_ok(&outcome(false, Some(true))),
+            "主素材失败 → false"
+        );
     }
 
     #[test]
@@ -7289,9 +7757,16 @@ mod tests {
         let mut result = outcome(false, None);
         result.image_paths = vec![Some("first.jpg".into()), None, Some("third.jpg".into())];
         let active = media_outcome_active("note", &result, std::path::Path::new(""));
-        assert_eq!(active.image_paths, Set(Some(r#"["first.jpg",null,"third.jpg"]"#.into())));
+        assert_eq!(
+            active.image_paths,
+            Set(Some(r#"["first.jpg",null,"third.jpg"]"#.into()))
+        );
         assert!(active.cover_path.is_not_set());
-        assert!(media_outcome_active("note", &outcome(false, None), std::path::Path::new("")).image_paths.is_not_set());
+        assert!(
+            media_outcome_active("note", &outcome(false, None), std::path::Path::new(""))
+                .image_paths
+                .is_not_set()
+        );
     }
 
     // ---------- content_from_model ----------
@@ -7345,11 +7820,23 @@ mod tests {
 
     #[test]
     fn content_from_model_maps_kind_string() {
-        assert!(matches!(content_from_model(&content_model("video")).kind, ContentKind::Video));
-        assert!(matches!(content_from_model(&content_model("image")).kind, ContentKind::Image));
-        assert!(matches!(content_from_model(&content_model("article")).kind, ContentKind::Article));
+        assert!(matches!(
+            content_from_model(&content_model("video")).kind,
+            ContentKind::Video
+        ));
+        assert!(matches!(
+            content_from_model(&content_model("image")).kind,
+            ContentKind::Image
+        ));
+        assert!(matches!(
+            content_from_model(&content_model("article")).kind,
+            ContentKind::Article
+        ));
         assert!(
-            matches!(content_from_model(&content_model("live")).kind, ContentKind::Unknown),
+            matches!(
+                content_from_model(&content_model("live")).kind,
+                ContentKind::Unknown
+            ),
             "未知 kind 应兜底 Unknown"
         );
     }
@@ -7387,7 +7874,10 @@ mod tests {
 
     #[test]
     fn log_content_title_prefers_title_then_desc_then_placeholder() {
-        assert_eq!(log_content_title(&titled(Some("标题"), Some("正文"))), "标题");
+        assert_eq!(
+            log_content_title(&titled(Some("标题"), Some("正文"))),
+            "标题"
+        );
         assert_eq!(
             log_content_title(&titled(Some("  "), Some("正文"))),
             "正文",
@@ -7429,14 +7919,7 @@ mod tests {
 
     #[test]
     fn textless_comment_keeps_any_alphanumeric_content() {
-        for s in [
-            "哈哈哈",
-            "666",
-            "[捂脸]太真实了",
-            "好用吗?",
-            "1",
-            "苏州",
-        ] {
+        for s in ["哈哈哈", "666", "[捂脸]太真实了", "好用吗?", "1", "苏州"] {
             assert!(!is_textless_comment(s), "应保留: {s:?}");
         }
     }
@@ -7514,7 +7997,10 @@ mod tests {
     fn daily_task_due_before_target_not_due() {
         let mut t = task_stub();
         t.scheduled_at = Some("09:30".into());
-        assert!(!daily_task_due(&t, &local_dt(9, 0)), "未到今日目标点不应触发");
+        assert!(
+            !daily_task_due(&t, &local_dt(9, 0)),
+            "未到今日目标点不应触发"
+        );
     }
 
     #[test]
@@ -7564,7 +8050,10 @@ mod tests {
 
     #[test]
     fn progress_write_first_call_allowed() {
-        assert!(progress_write_allowed("test-pw-first", false), "首次回写应放行");
+        assert!(
+            progress_write_allowed("test-pw-first", false),
+            "首次回写应放行"
+        );
     }
 
     #[test]
@@ -7609,7 +8098,12 @@ mod tests {
         db.execute(backend.build(&stmt)).await.expect("建表失败");
     }
 
-    fn content_row(id: &str, task_id: &str, content_id: &str, media_status: Option<&str>) -> content_entity::ActiveModel {
+    fn content_row(
+        id: &str,
+        task_id: &str,
+        content_id: &str,
+        media_status: Option<&str>,
+    ) -> content_entity::ActiveModel {
         content_entity::ActiveModel {
             id: Set(id.into()),
             task_id: Set(task_id.into()),
@@ -7680,11 +8174,9 @@ mod tests {
             .await
             .expect("插入台账行失败");
         }
-        let hits = load_recorded_ledger_ids(
-            &db,
-            &["douyin::c1".to_string(), "douyin::c9".to_string()],
-        )
-        .await;
+        let hits =
+            load_recorded_ledger_ids(&db, &["douyin::c1".to_string(), "douyin::c9".to_string()])
+                .await;
         assert_eq!(hits.len(), 1, "只应返回已登记的 id");
         assert!(hits.contains("douyin::c1"));
         assert!(

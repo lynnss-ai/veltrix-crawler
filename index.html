@@ -8,6 +8,23 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
     <title>Tauri + React + Typescript</title>
+    <script>
+      // 主题预置:首帧绘制前把主题 class 挂到 <html>,并给 html 一个同色底,
+      // 消除「暗色用户刷新/启动时先闪一下白底」(React 挂载后才由 ThemeProvider 补 class)。
+      // 取值须与 ThemeProvider(storageKey=veltrix-theme, default=system)及 index.css 的
+      // --background(dark=oklch(0.145 0 0))保持一致。
+      (function () {
+        try {
+          var t = localStorage.getItem("veltrix-theme");
+          var dark =
+            t === "dark" ||
+            ((!t || t === "system") &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.add(dark ? "dark" : "light");
+          document.documentElement.style.background = dark ? "#0c0c0d" : "#ffffff";
+        } catch (e) {}
+      })();
+    </script>
   </head>
 
   <body>

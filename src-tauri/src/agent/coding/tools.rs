@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::agent::resolve_in_workspace;
 use crate::agent::core::{Tool, ToolDef, ToolRegistry, ToolResult};
+use crate::agent::resolve_in_workspace;
 use crate::sandbox::LocalSandbox;
 
 /// 单次 read_file 返回上限(字节);超出截断,避免撑爆上下文。
@@ -117,8 +117,16 @@ pub fn plan_system_message(plan_todos: &str) -> Option<String> {
 /// 只匹配近乎绝不会出现在正常代码里的明确占位语,避免误伤(故不含裸 `...` / 裸 TODO)。
 pub fn detect_placeholder(s: &str) -> Option<&'static str> {
     const ZH: &[&str] = &[
-        "此处省略", "省略其余", "其余省略", "其余代码不变", "其余部分不变",
-        "其余保持不变", "保持原代码不变", "以下省略", "代码省略", "其余略",
+        "此处省略",
+        "省略其余",
+        "其余省略",
+        "其余代码不变",
+        "其余部分不变",
+        "其余保持不变",
+        "保持原代码不变",
+        "以下省略",
+        "代码省略",
+        "其余略",
     ];
     for p in ZH {
         if s.contains(p) {
@@ -148,9 +156,9 @@ pub fn placeholder_reject(marker: &str) -> ToolResult {
 /// 是否为「需要验证」的代码文件(按扩展名)。用于收尾前的强制验证闸门。
 pub fn is_code_file(path: &str) -> bool {
     const EXTS: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "c",
-        "h", "cpp", "cc", "cxx", "hpp", "cs", "rb", "php", "swift", "scala", "sh", "bash",
-        "sql", "vue", "svelte",
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "c", "h",
+        "cpp", "cc", "cxx", "hpp", "cs", "rb", "php", "swift", "scala", "sh", "bash", "sql", "vue",
+        "svelte",
     ];
     path.rsplit('.')
         .next()
@@ -204,14 +212,24 @@ impl AgentMode {
 /// 跨场景任务由「统一编排器」按 agent 即 tool 委派,编程 Agent 自身不再持委派工具(递归护栏)。
 pub fn build_registry(workspace: PathBuf, exec: ExecConfig, mode: AgentMode) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(ReadFileTool { workspace: workspace.clone() }));
-    registry.register(Arc::new(ListDirTool { workspace: workspace.clone() }));
-    registry.register(Arc::new(SearchFilesTool { workspace: workspace.clone() }));
+    registry.register(Arc::new(ReadFileTool {
+        workspace: workspace.clone(),
+    }));
+    registry.register(Arc::new(ListDirTool {
+        workspace: workspace.clone(),
+    }));
+    registry.register(Arc::new(SearchFilesTool {
+        workspace: workspace.clone(),
+    }));
     // 计划工具两模式都挂:Plan 产出 todo 清单,Act 按 todo 执行并勾选进度(持久化由 commands 拦截落库)
     registry.register(Arc::new(UpdatePlanTool));
     if mode == AgentMode::Act {
-        registry.register(Arc::new(WriteFileTool { workspace: workspace.clone() }));
-        registry.register(Arc::new(ReplaceInFileTool { workspace: workspace.clone() }));
+        registry.register(Arc::new(WriteFileTool {
+            workspace: workspace.clone(),
+        }));
+        registry.register(Arc::new(ReplaceInFileTool {
+            workspace: workspace.clone(),
+        }));
         registry.register(Arc::new(RunCommandTool { workspace, exec }));
         // 自主续航的显式完成信号:模型全部做完时调 finish,命令层据此停止外层续航
         registry.register(Arc::new(FinishTool));
@@ -442,7 +460,8 @@ impl Tool for RunCommandTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "run_command".into(),
-            description: "在工作区目录内执行一条 shell 命令(有超时;返回退出码 + stdout/stderr)".into(),
+            description: "在工作区目录内执行一条 shell 命令(有超时;返回退出码 + stdout/stderr)"
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": { "command": { "type": "string", "description": "要执行的命令行" } },
@@ -467,7 +486,11 @@ pub async fn run_command_in(workspace: &Path, command: &str, exec: &ExecConfig) 
         Ok(s) => Arc::new(s),
         Err(e) => return ToolResult::err(format!("创建命令沙盒失败: {e}")),
     };
-    let scoped_exec = ExecConfig { sandbox: scoped.clone(), sandbox_id: exec.sandbox_id.clone(), config_dir: exec.config_dir.clone() };
+    let scoped_exec = ExecConfig {
+        sandbox: scoped.clone(),
+        sandbox_id: exec.sandbox_id.clone(),
+        config_dir: exec.config_dir.clone(),
+    };
     let mut cmd = build_exec_command(&scoped_exec, workspace, command);
     cmd.kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
@@ -597,7 +620,10 @@ fn parse_diff_blocks(diff: &str) -> std::result::Result<Vec<(String, String)>, S
         return Err("diff 格式错误:存在未闭合的 SEARCH/REPLACE 块".into());
     }
     if blocks.is_empty() {
-        return Err("未解析到任何 SEARCH/REPLACE 块(格式:<<<<<<< SEARCH … ======= … >>>>>>> REPLACE)".into());
+        return Err(
+            "未解析到任何 SEARCH/REPLACE 块(格式:<<<<<<< SEARCH … ======= … >>>>>>> REPLACE)"
+                .into(),
+        );
     }
     Ok(blocks)
 }
@@ -682,8 +708,16 @@ impl Tool for ReplaceInFileTool {
 /// search_files 上限:最多匹配行 / 遍历文件;跳过的常见大目录。
 const SEARCH_MAX_MATCHES: usize = 200;
 const SEARCH_MAX_FILES: usize = 5000;
-const SEARCH_SKIP_DIRS: &[&str] =
-    &[".git", "node_modules", "target", "dist", "build", ".next", ".cache", "vendor"];
+const SEARCH_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "vendor",
+];
 
 struct SearchFilesTool {
     workspace: PathBuf,
@@ -693,7 +727,9 @@ impl Tool for SearchFilesTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "search_files".into(),
-            description: "在工作区内按关键词搜索文件内容(返回 路径:行号: 行内容);不知道改哪里时用它定位代码".into(),
+            description:
+                "在工作区内按关键词搜索文件内容(返回 路径:行号: 行内容);不知道改哪里时用它定位代码"
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -713,12 +749,19 @@ impl Tool for SearchFilesTool {
             return ToolResult::err("query 不能为空");
         }
         let sub = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let ignore_case = args.get("ignore_case").and_then(Value::as_bool).unwrap_or(false);
+        let ignore_case = args
+            .get("ignore_case")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let root = match resolve_in_workspace(&self.workspace, sub) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e.to_string()),
         };
-        let needle = if ignore_case { query.to_lowercase() } else { query.to_string() };
+        let needle = if ignore_case {
+            query.to_lowercase()
+        } else {
+            query.to_string()
+        };
 
         let mut out: Vec<String> = Vec::new();
         let mut files_scanned = 0usize;
@@ -820,4 +863,3 @@ fn checkpoint_message(label: &str) -> String {
         trimmed
     }
 }
-

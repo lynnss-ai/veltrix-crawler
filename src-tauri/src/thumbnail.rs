@@ -58,8 +58,7 @@ fn ensure_blocking(source: &Path) -> Option<PathBuf> {
     }
     // 按魔数嗅探真实格式:部分平台(如抖音图集)直接返回 WebP,落盘却按约定命名 .jpg,
     // 用 image::open 按扩展名选解码器会报 "Illegal start bytes"(5249 = "RI" 即 RIFF/WebP 头)
-    let img = match image::ImageReader::open(source)
-        .and_then(|reader| reader.with_guessed_format())
+    let img = match image::ImageReader::open(source).and_then(|reader| reader.with_guessed_format())
     {
         Ok(reader) => match reader.decode() {
             Ok(img) => img,
@@ -86,11 +85,13 @@ fn ensure_blocking(source: &Path) -> Option<PathBuf> {
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed),
     ));
-    let encode_result = std::fs::File::create(&tmp).map_err(|e| e.to_string()).and_then(|mut file| {
-        let mut encoder =
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, THUMB_QUALITY);
-        encoder.encode_image(&resized).map_err(|e| e.to_string())
-    });
+    let encode_result = std::fs::File::create(&tmp)
+        .map_err(|e| e.to_string())
+        .and_then(|mut file| {
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, THUMB_QUALITY);
+            encoder.encode_image(&resized).map_err(|e| e.to_string())
+        });
     if let Err(e) = encode_result {
         tracing::warn!(path = %source.display(), "编码缩略图失败: {e}");
         let _ = std::fs::remove_file(&tmp);

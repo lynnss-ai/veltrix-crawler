@@ -65,9 +65,7 @@ impl KuaishouAdapter {
     fn parse_feed(feed: &Value, collected_at: i64) -> Option<Content> {
         // 兼容 feed.photo 包裹与 feed 本身即详情两种形态
         let photo = feed.get("photo").unwrap_or(feed);
-        let content_id = Self::as_string_opt(
-            photo.get("id").or_else(|| photo.get("photoId")),
-        )?;
+        let content_id = Self::as_string_opt(photo.get("id").or_else(|| photo.get("photoId")))?;
 
         let video_url = Self::first_video_url(photo);
         // 图集图片(快手图文);视频内容通常为空
@@ -115,7 +113,8 @@ impl KuaishouAdapter {
 
     /// 话题:优先快手 feed.tags[].name,结构化字段缺失时从正文 #标签 兜底。
     fn parse_topics(feed: &Value) -> Vec<String> {
-        let topics: Vec<String> = feed.get("tags")
+        let topics: Vec<String> = feed
+            .get("tags")
             .or_else(|| feed.get("photo").and_then(|p| p.get("tags")))
             .and_then(Value::as_array)
             .map(|arr| {
@@ -148,15 +147,11 @@ impl KuaishouAdapter {
     /// 老接口的 `mainMvUrls[].url`。任一命中即返回,供后续拉流转音频。
     fn first_video_url(photo: &Value) -> Option<String> {
         for key in ["photoUrls", "photoH265Urls", "mainMvUrls"] {
-            if let Some(url) = photo
-                .get(key)
-                .and_then(Value::as_array)
-                .and_then(|arr| {
-                    arr.iter()
-                        .filter_map(|item| item.get("url").and_then(Value::as_str))
-                        .find(|s| !s.is_empty())
-                })
-            {
+            if let Some(url) = photo.get(key).and_then(Value::as_array).and_then(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("url").and_then(Value::as_str))
+                    .find(|s| !s.is_empty())
+            }) {
                 return Some(url.to_string());
             }
         }
@@ -249,7 +244,10 @@ impl KuaishouAdapter {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                avatar: item.get("headurl").and_then(Value::as_str).map(str::to_string),
+                avatar: item
+                    .get("headurl")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 signature: None,
                 follower_count: None,
                 following_count: None,
@@ -349,7 +347,8 @@ impl KuaishouAdapter {
             let owner_count = up.get("ownerCount");
             let count = |key: &str| -> Option<i64> {
                 let v = owner_count?.get(key)?;
-                v.as_i64().or_else(|| v.as_str().and_then(Self::parse_cn_count))
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(Self::parse_cn_count))
             };
             let profile_str = |key: &str| {
                 profile
@@ -386,10 +385,7 @@ impl KuaishouAdapter {
             let Ok(root) = serde_json::from_str::<Value>(&resp.body) else {
                 continue;
             };
-            let Some(detail) = root
-                .get("data")
-                .and_then(|d| d.get("visionVideoDetail"))
-            else {
+            let Some(detail) = root.get("data").and_then(|d| d.get("visionVideoDetail")) else {
                 continue;
             };
             if let Some(content) = Self::parse_feed(detail, collected_at) {
@@ -490,7 +486,8 @@ mod tests {
                             "author": {"id": "user-1", "name": "作者"}
                         }
                     }
-                }).to_string(),
+                })
+                .to_string(),
             }],
         };
 
@@ -498,7 +495,10 @@ mod tests {
         assert_eq!(output.contents.len(), 1);
         let content = &output.contents[0];
         assert!(matches!(content.kind, ContentKind::Video));
-        assert_eq!(content.video_url.as_deref(), Some("https://txmov2.a.kwimgs.com/video.mp4"));
+        assert_eq!(
+            content.video_url.as_deref(),
+            Some("https://txmov2.a.kwimgs.com/video.mp4")
+        );
         assert_eq!(content.duration, Some(15));
         assert_eq!(content.topics, vec!["#丽江"]);
     }

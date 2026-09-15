@@ -98,7 +98,9 @@ impl TiktokAdapter {
                 .or_else(|| video.and_then(|v| Self::str_field(v.get("downloadAddr")))),
             cover_url,
             image_urls,
-            duration: video.and_then(|v| Self::num(v.get("duration"))).filter(|d| *d > 0),
+            duration: video
+                .and_then(|v| Self::num(v.get("duration")))
+                .filter(|d| *d > 0),
             topics: Self::parse_topics(item),
             collected_at,
             extra: serde_json::json!({}),
@@ -332,7 +334,10 @@ impl PlatformAdapter for TiktokAdapter {
     }
 
     fn supports(&self, kind: &TaskKind) -> bool {
-        matches!(kind, TaskKind::Search | TaskKind::Comments | TaskKind::ContentDetail)
+        matches!(
+            kind,
+            TaskKind::Search | TaskKind::Comments | TaskKind::ContentDetail
+        )
     }
 
     fn detail_pattern(&self) -> Option<&str> {
@@ -377,7 +382,8 @@ mod tests {
                             "challenges": [{"title": "china"}]
                         }
                     }
-                }).to_string(),
+                })
+                .to_string(),
             }],
         };
 
@@ -385,7 +391,10 @@ mod tests {
         assert_eq!(output.contents.len(), 1);
         let content = &output.contents[0];
         assert!(matches!(content.kind, ContentKind::Video));
-        assert_eq!(content.video_url.as_deref(), Some("https://v16.tiktokcdn.com/video.mp4"));
+        assert_eq!(
+            content.video_url.as_deref(),
+            Some("https://v16.tiktokcdn.com/video.mp4")
+        );
         assert_eq!(content.topics, vec!["#china"]);
     }
 

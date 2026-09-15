@@ -193,14 +193,15 @@ mod win {
     use tauri::webview::PlatformWebview;
     use tauri::Emitter;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2CookieList, ICoreWebView2WebMessageReceivedEventArgs, ICoreWebView2_2,
+        ICoreWebView2CookieList, ICoreWebView2WebMessageReceivedEventArgs,
         ICoreWebView2WebResourceResponseReceivedEventArgs, ICoreWebView2WebResourceResponseView,
+        ICoreWebView2_2,
     };
     use webview2_com::{
         GetCookiesCompletedHandler, WebMessageReceivedEventHandler,
         WebResourceResponseReceivedEventHandler, WebResourceResponseViewGetContentCompletedHandler,
     };
-    use windows::core::{w, HSTRING, Interface, PCWSTR, PWSTR};
+    use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
     use windows::Win32::System::Com::{CoTaskMemFree, IStream};
 
     /// 空 stream 兜底上下文:AppHandle + 窗口 label(用于页内 eval 重取)+ 已重取 URL 去重集合。
@@ -348,57 +349,59 @@ mod win {
                 let sink = sink.clone();
                 let emit = emit.clone();
                 let fallback = fallback.clone();
-                let completed = WebResourceResponseViewGetContentCompletedHandler::create(Box::new(
-                    move |_result: windows::core::Result<()>, stream: Option<IStream>| {
-                        let Some(stream) = stream else {
-                            // GetContent 返回空 stream(命中缓存 / Service Worker 应答 / body 已被消费,
-                            // 拿不到响应体):打 warn 留痕后,由页面以会话 Cookie 重取同一条已签名 URL
-                            // 兜底补回(intercept_sink_push 命令 → sink)。seen 去重防「重取响应再空 stream」
-                            // 死循环;仅 200 值得重取(204/304/重定向本就无业务 body)
-                            tracing::warn!(url = %url, status, "拦截器 GetContent 返回空 stream,漏捕该响应");
-                            if status == 200 {
-                                if let Some(fb) = &fallback {
-                                    let first = fb
-                                        .seen
-                                        .lock()
-                                        .map(|mut s| s.insert(url.clone()))
-                                        .unwrap_or(false);
-                                    if first {
-                                        tracing::info!(url = %url, "空 stream → 触发页内重取兜底");
-                                        eval_refetch(&fb.app, &fb.label, &url);
+                let completed = WebResourceResponseViewGetContentCompletedHandler::create(
+                    Box::new(
+                        move |_result: windows::core::Result<()>, stream: Option<IStream>| {
+                            let Some(stream) = stream else {
+                                // GetContent 返回空 stream(命中缓存 / Service Worker 应答 / body 已被消费,
+                                // 拿不到响应体):打 warn 留痕后,由页面以会话 Cookie 重取同一条已签名 URL
+                                // 兜底补回(intercept_sink_push 命令 → sink)。seen 去重防「重取响应再空 stream」
+                                // 死循环;仅 200 值得重取(204/304/重定向本就无业务 body)
+                                tracing::warn!(url = %url, status, "拦截器 GetContent 返回空 stream,漏捕该响应");
+                                if status == 200 {
+                                    if let Some(fb) = &fallback {
+                                        let first = fb
+                                            .seen
+                                            .lock()
+                                            .map(|mut s| s.insert(url.clone()))
+                                            .unwrap_or(false);
+                                        if first {
+                                            tracing::info!(url = %url, "空 stream → 触发页内重取兜底");
+                                            eval_refetch(&fb.app, &fb.label, &url);
+                                        }
                                     }
                                 }
+                                return Ok(());
+                            };
+                            let body = read_stream(&stream, STREAM_READ_CAP, &url);
+                            if let Ok(mut buf) = sink.lock() {
+                                buf.push(InterceptedResponse {
+                                    url: url.clone(),
+                                    body: body.clone(),
+                                });
+                                // 缓冲限长:Agent 长会话(emit)与非采集窗口(登录/访问,cap_entries)
+                                // 超限丢最旧;采集窗口不丢(滚动循环按游标增量消费,丢了会漏解析)
+                                if (agent_mode || cap_entries) && buf.len() > SINK_MAX_ENTRIES {
+                                    let overflow = buf.len() - SINK_MAX_ENTRIES;
+                                    buf.drain(0..overflow);
+                                }
                             }
-                            return Ok(());
-                        };
-                        let body = read_stream(&stream, STREAM_READ_CAP, &url);
-                        if let Ok(mut buf) = sink.lock() {
-                            buf.push(InterceptedResponse {
-                                url: url.clone(),
-                                body: body.clone(),
-                            });
-                            // 缓冲限长:Agent 长会话(emit)与非采集窗口(登录/访问,cap_entries)
-                            // 超限丢最旧;采集窗口不丢(滚动循环按游标增量消费,丢了会漏解析)
-                            if (agent_mode || cap_entries) && buf.len() > SINK_MAX_ENTRIES {
-                                let overflow = buf.len() - SINK_MAX_ENTRIES;
-                                buf.drain(0..overflow);
+                            // 实时推前端拦截面板(截断响应体,仅展示)
+                            if let Some(ctx) = &emit {
+                                let preview: String = body.chars().take(EMIT_BODY_CAP).collect();
+                                let _ = ctx.app.emit(
+                                    "agent-network",
+                                    serde_json::json!({
+                                        "conversationId": ctx.conversation_id,
+                                        "url": url,
+                                        "body": preview,
+                                    }),
+                                );
                             }
-                        }
-                        // 实时推前端拦截面板(截断响应体,仅展示)
-                        if let Some(ctx) = &emit {
-                            let preview: String = body.chars().take(EMIT_BODY_CAP).collect();
-                            let _ = ctx.app.emit(
-                                "agent-network",
-                                serde_json::json!({
-                                    "conversationId": ctx.conversation_id,
-                                    "url": url,
-                                    "body": preview,
-                                }),
-                            );
-                        }
-                        Ok(())
-                    },
-                ));
+                            Ok(())
+                        },
+                    ),
+                );
                 response.GetContent(&completed)?;
                 Ok(())
             },
@@ -647,7 +650,11 @@ mod mac {
     }
 
     /// 给 WKWebView 的 userContentController 注册响应回传处理器。
-    pub unsafe fn install(webview: PlatformWebview, sink: ResponseSink, signals: Option<SignalCtx>) {
+    pub unsafe fn install(
+        webview: PlatformWebview,
+        sink: ResponseSink,
+        signals: Option<SignalCtx>,
+    ) {
         let Some(mtm) = MainThreadMarker::new() else {
             tracing::warn!("非主线程,mac 原生拦截未安装");
             return;

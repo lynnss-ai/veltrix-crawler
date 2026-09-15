@@ -109,9 +109,8 @@ const FFMPEG_EXTRACT_MAX: std::time::Duration = std::time::Duration::from_secs(6
 /// ffmpeg 子进程并发上限:素材下载已按 10 路并发,但视频转音频每个都起一个 ffmpeg;
 /// 全开会打满 CPU / 出口带宽并放大 CDN 并发限制,故对 ffmpeg 单独限流,与 HTTP 下载解耦。
 const MAX_FFMPEG_CONCURRENCY: usize = 3;
-static FFMPEG_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
-    Arc::new(tokio::sync::Semaphore::new(MAX_FFMPEG_CONCURRENCY))
-});
+static FFMPEG_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_FFMPEG_CONCURRENCY)));
 
 // ffmpeg(libavformat)拉流失败时进程退出码即 AVERROR 负值。HTTP 错误形如
 // `-MKTAG(0xF8,'4','0','3')`,直接看是「魔法负数」。这里登记常见几种,把退出码翻译成
@@ -126,7 +125,9 @@ const FFMPEG_HTTP_5XX: i32 = -1482175992; // -MKTAG(0xF8,'5','X','X') 服务端 
 /// 未登记的码原样回显,被信号终止(无退出码)单独标注。
 fn describe_ffmpeg_exit(code: Option<i32>) -> String {
     match code {
-        Some(FFMPEG_HTTP_403) => "HTTP 403 拒绝(防盗链/地域限制:缺会话 Cookie 或未走代理)".to_string(),
+        Some(FFMPEG_HTTP_403) => {
+            "HTTP 403 拒绝(防盗链/地域限制:缺会话 Cookie 或未走代理)".to_string()
+        }
         Some(FFMPEG_HTTP_401) => "HTTP 401 未授权".to_string(),
         Some(FFMPEG_HTTP_404) => "HTTP 404 直链已失效".to_string(),
         Some(FFMPEG_HTTP_4XX) => "HTTP 4xx 客户端错误".to_string(),
@@ -188,7 +189,9 @@ const OVERSEAS_CDN_MARKERS: &[&str] = &["tiktok", "ytimg.com", "googlevideo.com"
 
 /// 该直链是否属于需要代理的海外 CDN。
 fn url_needs_proxy(url: &str) -> bool {
-    OVERSEAS_CDN_MARKERS.iter().any(|marker| url.contains(marker))
+    OVERSEAS_CDN_MARKERS
+        .iter()
+        .any(|marker| url.contains(marker))
 }
 
 /// 代理串补全 scheme:ffmpeg 的 `-http_proxy` 需要带 scheme 的 URL;`host:port` 形态补 `http://`。
@@ -478,7 +481,9 @@ const VIDEO_DOWNLOAD_MAX_SECS: u64 = 600;
 /// 构建失败(TLS 后端初始化异常等)时保留 Err,由 download_to_file 逐次报错,与旧行为一致。
 static DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(
+            DOWNLOAD_CONNECT_TIMEOUT_SECS,
+        ))
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
         .build()
 });
@@ -488,7 +493,9 @@ static DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::n
 /// 改由 stream_body_to_file 的 idle 超时与调用方整体上限控制。
 static VIDEO_DOWNLOAD_CLIENT: LazyLock<reqwest::Result<reqwest::Client>> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(
+            DOWNLOAD_CONNECT_TIMEOUT_SECS,
+        ))
         .build()
 });
 
@@ -589,7 +596,9 @@ async fn download_video_file(url: &str, path: &Path, ctx: &VideoFetchCtx<'_>) ->
         match resolve_proxy(ctx.proxy_setting) {
             Some(proxy) => {
                 owned_client = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+                    .connect_timeout(std::time::Duration::from_secs(
+                        DOWNLOAD_CONNECT_TIMEOUT_SECS,
+                    ))
                     .proxy(
                         reqwest::Proxy::all(&proxy)
                             .map_err(|e| CrawlerError::Parse(format!("代理配置无效: {e}")))?,
@@ -708,9 +717,9 @@ pub fn extract_audio_from_url(
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
     cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
-    // CDN 偶发中途断流:让 ffmpeg 自行重连续传,避免一断就整条失败(须在 -i 之前作为输入选项)
-    // -rw_timeout(微秒):单次 I/O 停滞上限,CDN 建立连接后滴流/不返数据时 30s 无数据即报错退出,
-    // 否则 ffmpeg 会在这种连接上挂住数小时(整体兜底见下方等待循环)
+                   // CDN 偶发中途断流:让 ffmpeg 自行重连续传,避免一断就整条失败(须在 -i 之前作为输入选项)
+                   // -rw_timeout(微秒):单次 I/O 停滞上限,CDN 建立连接后滴流/不返数据时 30s 无数据即报错退出,
+                   // 否则 ffmpeg 会在这种连接上挂住数小时(整体兜底见下方等待循环)
     cmd.args([
         "-reconnect",
         "1",
@@ -740,11 +749,17 @@ pub fn extract_audio_from_url(
     }
     if !header_lines.is_empty() {
         // ffmpeg 的 -headers 各行以 \r\n 分隔(含末行),UA 单独走 -user_agent
-        let headers: String = header_lines.iter().map(|line| format!("{line}\r\n")).collect();
-        cmd.arg("-user_agent").arg(BROWSER_UA).arg("-headers").arg(headers);
+        let headers: String = header_lines
+            .iter()
+            .map(|line| format!("{line}\r\n"))
+            .collect();
+        cmd.arg("-user_agent")
+            .arg(BROWSER_UA)
+            .arg("-headers")
+            .arg(headers);
     }
     cmd.arg("-i").arg(url).arg("-vn"); // -vn 丢视频流,只保留音频
-    // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
+                                       // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
     let is_mp3 = audio
         .extension()
         .and_then(|ext| ext.to_str())
@@ -788,7 +803,7 @@ pub fn extract_audio_from_file(
     hide_console_window(&mut cmd);
     cmd.arg("-y"); // 覆盖已存在的输出,避免交互确认卡住
     cmd.arg("-i").arg(video).arg("-vn"); // -vn 丢视频流,只保留音频
-    // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
+                                         // mp3 输出按语音转写优化:单声道 22kHz 96k 足够 ASR,体积/转码成本减半
     let is_mp3 = audio
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1112,8 +1127,10 @@ pub fn split_audio_for_asr(
         .unwrap_or("ffmpeg");
     // 探测 / 时长读取 / 切点规划任一步失败都沿「VAD → 静音 → 硬切」回退,行为不差于原硬切逻辑;
     // 两条路径产出的切片都过一道退化过滤(空壳切片不送 ASR)
-    let fallback =
-        || split_audio(audio, out_dir, max_seconds, ffmpeg_path).map(|c| drop_degenerate_chunks(c, ffmpeg_path));
+    let fallback = || {
+        split_audio(audio, out_dir, max_seconds, ffmpeg_path)
+            .map(|c| drop_degenerate_chunks(c, ffmpeg_path))
+    };
     let gaps = match detect_speech_gaps(program, audio) {
         Ok(g) if !g.is_empty() => g,
         other => {
@@ -1165,7 +1182,11 @@ const VAD_MIN_GAP_SECS: f64 = 0.5;
 /// Aggressive 模式把背景音乐更多地判为非人声,适合带 BGM 的短视频。
 fn detect_speech_gaps(program: &str, audio: &Path) -> Result<Vec<SilenceRange>> {
     let voiced = detect_voiced_frames(program, audio)?;
-    Ok(gaps_from_voiced_frames(&voiced, VAD_FRAME_SECS, VAD_MIN_GAP_SECS))
+    Ok(gaps_from_voiced_frames(
+        &voiced,
+        VAD_FRAME_SECS,
+        VAD_MIN_GAP_SECS,
+    ))
 }
 
 /// 语音门禁的最低人声量:累计人声 ≥0.3s(10 帧)才算有语音,过滤气口 / 底噪 / 纯静音段。
@@ -1231,7 +1252,11 @@ fn detect_voiced_frames(program: &str, audio: &Path) -> Result<Vec<bool>> {
 
 /// 把逐帧人声判定折叠成间隙区间(纯函数,便于单测):
 /// 连续非人声(false)帧数 ≥ 最小间隙帧数才记一段;区间即该段首/尾帧的时间边界。
-fn gaps_from_voiced_frames(frames: &[bool], frame_secs: f64, min_gap_secs: f64) -> Vec<SilenceRange> {
+fn gaps_from_voiced_frames(
+    frames: &[bool],
+    frame_secs: f64,
+    min_gap_secs: f64,
+) -> Vec<SilenceRange> {
     let min_frames = (min_gap_secs / frame_secs).ceil() as usize;
     let mut out = Vec::new();
     let mut run_start: Option<usize> = None;
@@ -1342,10 +1367,7 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
 /// 尾段保护:切完剩余不足 MIN_CHUNK_SECS 时放弃这一刀,尾巴并入前段(略超 max_secs),
 /// 避免产出不足 1 秒的碎片段被 ASR 拒(智谱 1210)。
 fn plan_silence_cuts(duration: f64, max_secs: f64, silences: &[SilenceRange]) -> Vec<f64> {
-    let midpoints: Vec<f64> = silences
-        .iter()
-        .map(|s| (s.start + s.end) / 2.0)
-        .collect();
+    let midpoints: Vec<f64> = silences.iter().map(|s| (s.start + s.end) / 2.0).collect();
     let mut cuts = Vec::new();
     let mut start = 0.0;
     while duration - start > max_secs {
@@ -1422,10 +1444,8 @@ pub fn probe_ffmpeg(ffmpeg_path: Option<&str>) -> Option<String> {
         .unwrap_or("ffmpeg");
     let mut cmd = std::process::Command::new(program);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .arg("-version")
-        .output()
-        .ok()?;    if !output.status.success() {
+    let output = cmd.arg("-version").output().ok()?;
+    if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1466,7 +1486,13 @@ pub(crate) fn sanitize_filename(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .take(MAX_FILENAME_PREFIX_CHARS)
-        .map(|c| if ILLEGAL_FILENAME_CHARS.contains(&c) { '_' } else { c })
+        .map(|c| {
+            if ILLEGAL_FILENAME_CHARS.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = cleaned.trim().trim_matches('.');
     if trimmed.is_empty() {
@@ -1552,13 +1578,16 @@ pub async fn process_content(
                         // 过期先删旧再下新(文件不存在时删除失败可忽略);旧缩略图一并作废,
                         // 否则 ensure 命中残留 thumb,新头像会一直显示旧图
                         let _ = tokio::fs::remove_file(&path).await;
-                        let _ = tokio::fs::remove_file(crate::thumbnail::thumb_path_for(&path)).await;
+                        let _ =
+                            tokio::fs::remove_file(crate::thumbnail::thumb_path_for(&path)).await;
                         match download_to_file(avatar, &path).await {
                             Ok(()) => {
                                 crate::thumbnail::ensure(path.clone()).await;
                                 avatar_path = Some(path.to_string_lossy().into_owned());
                             }
-                            Err(e) => tracing::warn!(content_id = %content.content_id, "下载头像失败: {e}"),
+                            Err(e) => {
+                                tracing::warn!(content_id = %content.content_id, "下载头像失败: {e}")
+                            }
                         }
                     }
                 }
@@ -1750,7 +1779,11 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
         if cancelled {
             return VideoOutcome {
                 downloaded: false,
-                audio_extracted: if switches.audio_extract { Some(false) } else { None },
+                audio_extracted: if switches.audio_extract {
+                    Some(false)
+                } else {
+                    None
+                },
                 error: Some("已手动停止".into()),
                 audio_path: None,
                 video_path: None,
@@ -1814,7 +1847,11 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
             match download_to_file(audio_url, &audio_path).await {
                 Ok(()) => {
                     return VideoOutcome {
-                        downloaded: if switches.keep_video { video_downloaded } else { true },
+                        downloaded: if switches.keep_video {
+                            video_downloaded
+                        } else {
+                            true
+                        },
                         audio_extracted: Some(true),
                         // 视频落盘失败但音频成功:仍带回落盘错误供 media_error 记录
                         error: keep_error,
@@ -1889,7 +1926,11 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
         match result {
             Ok(Ok(())) => {
                 return VideoOutcome {
-                    downloaded: if switches.keep_video { video_downloaded } else { true },
+                    downloaded: if switches.keep_video {
+                        video_downloaded
+                    } else {
+                        true
+                    },
                     audio_extracted: Some(true),
                     error: keep_error,
                     audio_path: Some(audio_path.to_string_lossy().into_owned()),
@@ -1912,7 +1953,11 @@ async fn process_video(job: &VideoJob<'_>) -> VideoOutcome {
     }
 
     VideoOutcome {
-        downloaded: if switches.keep_video { video_downloaded } else { false },
+        downloaded: if switches.keep_video {
+            video_downloaded
+        } else {
+            false
+        },
         audio_extracted: Some(false),
         // 落盘与音频可能各错一处,合并呈现便于排查(任一成功都不丢另一处的失败原因)
         error: match (keep_error, last_error) {
@@ -1953,7 +1998,8 @@ mod tests {
 
     #[test]
     fn parse_duration_hh_mm_ss() {
-        let stderr = "Input #0, mp3, from 'a.mp3':\n  Duration: 01:02:03.50, start: 0.0, bitrate: 96 kb/s\n";
+        let stderr =
+            "Input #0, mp3, from 'a.mp3':\n  Duration: 01:02:03.50, start: 0.0, bitrate: 96 kb/s\n";
         let d = parse_ffmpeg_duration(stderr).unwrap();
         assert!((d - 3723.5).abs() < 1e-6);
     }
@@ -1967,7 +2013,11 @@ mod tests {
     fn plan_cuts_prefers_latest_silence_before_deadline() {
         // 上限 25s:第一刀切在 24s 的静音中点(而非 10s 或硬切 25s);
         // 第二段从 24s 起,48.8s 的静音中点 ≤ 49s 死线 → 切 48.8s
-        let cuts = plan_silence_cuts(60.0, 25.0, &[sil(9.5, 10.5), sil(23.5, 24.5), sil(48.6, 49.0)]);
+        let cuts = plan_silence_cuts(
+            60.0,
+            25.0,
+            &[sil(9.5, 10.5), sil(23.5, 24.5), sil(48.6, 49.0)],
+        );
         assert_eq!(cuts, vec![24.0, 48.8]);
     }
 

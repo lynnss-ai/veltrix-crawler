@@ -11,14 +11,14 @@
 // 账号轮换/风控降级方法待调度引擎接入,暂保留
 #![allow(dead_code)]
 
-use veltrix_core::db::entity::account::{self, Entity as AccountEntity};
-use veltrix_core::error::{CrawlerError, Result};
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, Set,
 };
+use veltrix_core::db::entity::account::{self, Entity as AccountEntity};
+use veltrix_core::error::{CrawlerError, Result};
 
 /// 账号状态。失效 / 停用需人工处理;历史版本曾有「冷却」状态,启动时已统一归并为 active。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +165,10 @@ impl CookiePool {
 
             // 乐观 CAS:只在 last_used_at 仍是候选时刻的值时更新
             let res = AccountEntity::update_many()
-                .col_expr(account::Column::LastUsedAt, sea_orm::sea_query::Expr::value(now))
+                .col_expr(
+                    account::Column::LastUsedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
                 .filter(account::Column::Id.eq(model.id.clone()))
                 .filter(account::Column::LastUsedAt.eq(snapshot_last_used))
                 .exec(&self.db)
@@ -212,7 +215,10 @@ impl CookiePool {
 
             // 乐观 CAS:只在 last_used_at 仍是候选时刻的值时更新
             let res = AccountEntity::update_many()
-                .col_expr(account::Column::LastUsedAt, sea_orm::sea_query::Expr::value(now))
+                .col_expr(
+                    account::Column::LastUsedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
                 .filter(account::Column::Id.eq(model.id.clone()))
                 .filter(account::Column::LastUsedAt.eq(snapshot_last_used))
                 .exec(&self.db)

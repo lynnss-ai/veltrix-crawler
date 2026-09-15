@@ -147,7 +147,9 @@ pub async fn send_orchestrator_message(
         )));
     }
     if let Some(g) = load_agent_guidelines(&state.config_dir, "orchestrator").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     if let Some(v) =
         crate::agent::chat::memory::memory_system_message(&state.db, &me.name, &text, "global", "")

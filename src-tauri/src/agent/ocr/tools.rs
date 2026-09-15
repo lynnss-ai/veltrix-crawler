@@ -33,7 +33,9 @@ fn blocking_result(joined: Result<Result<String, String>, tokio::task::JoinError
 fn grab_primary_screen() -> Result<image::RgbaImage, String> {
     let monitors = xcap::Monitor::all().map_err(|e| format!("枚举显示器失败: {e}"))?;
     let monitor = monitors.into_iter().next().ok_or("未找到显示器")?;
-    monitor.capture_image().map_err(|e| format!("截屏失败: {e}"))
+    monitor
+        .capture_image()
+        .map_err(|e| format!("截屏失败: {e}"))
 }
 
 struct OcrScreenTool;
@@ -134,7 +136,8 @@ fn crop_region(
 pub async fn recognize_image_text(path: &std::path::Path) -> Result<String, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let img = image::open(&path).map_err(|e| format!("打开图片失败({}): {e}", path.display()))?;
+        let img =
+            image::open(&path).map_err(|e| format!("打开图片失败({}): {e}", path.display()))?;
         recognize_rgba(&img.to_rgba8())
     })
     .await
@@ -163,10 +166,9 @@ fn recognize_rgba(image: &image::RgbaImage) -> Result<String, String> {
         .map_err(|e| format!("编码 PNG 失败: {e}"))?;
 
     // 2) PNG 字节 → InMemoryRandomAccessStream(经 DataWriter 写入并 flush,再把读指针归零)
-    let stream =
-        InMemoryRandomAccessStream::new().map_err(|e| format!("创建内存流失败: {e}"))?;
-    let writer = DataWriter::CreateDataWriter(&stream)
-        .map_err(|e| format!("创建 DataWriter 失败: {e}"))?;
+    let stream = InMemoryRandomAccessStream::new().map_err(|e| format!("创建内存流失败: {e}"))?;
+    let writer =
+        DataWriter::CreateDataWriter(&stream).map_err(|e| format!("创建 DataWriter 失败: {e}"))?;
     writer
         .WriteBytes(&png)
         .map_err(|e| format!("写入 PNG 字节失败: {e}"))?;
@@ -182,9 +184,7 @@ fn recognize_rgba(image: &image::RgbaImage) -> Result<String, String> {
         .map_err(|e| format!("等待 flush 完成失败: {e}"))?;
     // 解绑 stream:DataWriter 持有 stream 句柄,后续解码要重新从头读,先把底层流读指针归零
     let _ = writer.DetachStream();
-    stream
-        .Seek(0)
-        .map_err(|e| format!("重置流位置失败: {e}"))?;
+    stream.Seek(0).map_err(|e| format!("重置流位置失败: {e}"))?;
 
     // 3) 流 → BitmapDecoder → SoftwareBitmap
     let decoder = BitmapDecoder::CreateAsync(&stream)

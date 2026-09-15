@@ -1589,8 +1589,7 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
 #[cfg(test)]
 mod xhs_api_tests {
     use super::{
-        build_xhs_api_collect_eval, build_xhs_comment_batch_eval, XhsApiCollectSpec,
-        XhsCommentJob,
+        build_xhs_api_collect_eval, build_xhs_comment_batch_eval, XhsApiCollectSpec, XhsCommentJob,
     };
 
     #[test]

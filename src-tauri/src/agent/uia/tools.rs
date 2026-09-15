@@ -70,7 +70,12 @@ impl Tool for FindControlTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let name = args.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if name.is_empty() {
             return ToolResult::err("name 不能为空");
         }
@@ -96,7 +101,12 @@ impl Tool for ClickControlTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let name = args.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if name.is_empty() {
             return ToolResult::err("name 不能为空");
         }
@@ -145,7 +155,8 @@ mod platform_uia {
     }
 
     /// 建 IUIAutomation 实例 + 取前台窗口根元素 + ControlView 遍历器。三者打包返回供各工具复用。
-    fn root_context() -> Result<(IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker), String> {
+    fn root_context(
+    ) -> Result<(IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker), String> {
         // SAFETY: 标准 COM 调用,参数来自常量,返回值经 Result 检查。
         unsafe {
             let automation: IUIAutomation =
@@ -189,7 +200,12 @@ mod platform_uia {
             right: 0,
             bottom: 0,
         });
-        ControlInfo { name, control_type, enabled, rect }
+        ControlInfo {
+            name,
+            control_type,
+            enabled,
+            rect,
+        }
     }
 
     /// UIA 控件类型 id(50000 起)→ 可读名。覆盖常见类型,其余回退 "Type<id>"。
@@ -300,7 +316,10 @@ mod platform_uia {
                     };
                     let indent = "  ".repeat(depth);
                     let state = if info.enabled { "可用" } else { "禁用" };
-                    lines.push(format!("{indent}- [{}] {name}（{state}）", info.control_type));
+                    lines.push(format!(
+                        "{indent}- [{}] {name}（{state}）",
+                        info.control_type
+                    ));
                     true // 永不叫停,遍历至上限
                 };
                 walk(&walker, &root, 0, &mut count, &mut collect);
@@ -409,11 +428,8 @@ mod platform_uia {
         // 第二阶段(COM 作用域外):Invoke 成功直接报告;回退分支用 enigo 移动并左键点击。
         match outcome? {
             ClickOutcome::Invoked(name) => Ok(format!("已通过 InvokePattern 触发控件「{name}」")),
-            ClickOutcome::FallbackTo { name, x, y } => {
-                fallback_click(x, y).map(|_| {
-                    format!("控件「{name}」无 InvokePattern,已回退到坐标点击中心 ({x}, {y})")
-                })
-            }
+            ClickOutcome::FallbackTo { name, x, y } => fallback_click(x, y)
+                .map(|_| format!("控件「{name}」无 InvokePattern,已回退到坐标点击中心 ({x}, {y})")),
         }
     }
 
@@ -426,8 +442,8 @@ mod platform_uia {
     /// 回退点击:移动鼠标到 (x,y) 并左键单击。复用 enigo(项目已依赖),不持有 COM。
     fn fallback_click(x: i32, y: i32) -> Result<(), String> {
         use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
-        let mut e = Enigo::new(&Settings::default())
-            .map_err(|err| format!("初始化输入设备失败: {err}"))?;
+        let mut e =
+            Enigo::new(&Settings::default()).map_err(|err| format!("初始化输入设备失败: {err}"))?;
         e.move_mouse(x, y, Coordinate::Abs)
             .map_err(|err| format!("移动鼠标失败: {err}"))?;
         e.button(Button::Left, Direction::Click)

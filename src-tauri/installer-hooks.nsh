@@ -9,7 +9,8 @@
 !macro NSIS_HOOK_POSTUNINSTALL
   ; 静默运行 = 更新场景 → 直接跳过,绝不删数据
   IfSilent SkipUserData
-  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除本应用的全部数据?$\r$\n$\r$\n包含:采集内容、数据库、已下载的媒体文件、登录态与配置。$\r$\n删除后不可恢复;若打算重装并保留数据,请选「否」。" /SD IDNO IDNO SkipUserData
+  ; MB_DEFBUTTON2:默认按钮=「否」——误按回车/直接点确定不会清数据,必须显式选「是」
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时删除本应用的全部数据?$\r$\n$\r$\n包含:采集内容、数据库、已下载的媒体文件、登录态与配置。$\r$\n删除后不可恢复;只是升级/重装的话请选「否」,数据会原样保留。" /SD IDNO IDNO SkipUserData
     ; 主数据目录:%APPDATA%\<identifier>(config / veltrix.db / media / webview-data / cloud.json 都在此)
     RMDir /r "$APPDATA\com.lynns.veltrix-crawler"
     ; WebView2 / 缓存类数据可能落在 %LOCALAPPDATA%\<identifier>

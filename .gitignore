@@ -21,6 +21,9 @@ target/
 src-tauri/resources/ffmpeg.exe
 # OpenCV 运行时 DLL 同为大体积二进制,随 third_party 预编译包放置,不入库
 src-tauri/resources/opencv_*.dll
+# libav 运行时 DLL(FFmpeg DLL 集成,见 AGENTS.md「FFmpeg libav 集成」),不入库
+src-tauri/resources/av*.dll
+src-tauri/resources/sw*.dll
 
 # Editor directories and files
 .vscode/*

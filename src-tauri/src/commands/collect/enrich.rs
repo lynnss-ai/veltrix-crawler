@@ -2,8 +2,8 @@
 //! 从采集流水线拆出——独立命令 enrich_authors + 其私有辅助,自成一类。
 
 use super::{
-    account_collect_lock, account_lock_key, current_user, lock_config, random_comment_video_interval,
-    AppState,
+    account_collect_lock, account_lock_key, current_user, lock_config,
+    random_comment_video_interval, AppState,
 };
 use crate::adapter::{FetchContext, PlatformAdapter};
 use crate::model::{Author, TaskKind};
@@ -276,7 +276,9 @@ pub async fn enrich_authors(
         };
         let Some(cfg) = cfg else {
             summary.skipped += 1;
-            summary.messages.push(format!("{} · 平台未启用或不存在", a.nickname));
+            summary
+                .messages
+                .push(format!("{} · 平台未启用或不存在", a.nickname));
             continue;
         };
         // 适配器须支持画像补采
@@ -292,7 +294,9 @@ pub async fn enrich_authors(
         };
         if cfg.collect.profile_url_template.is_empty() {
             summary.skipped += 1;
-            summary.messages.push(format!("{} · 未配置主页地址", a.nickname));
+            summary
+                .messages
+                .push(format!("{} · 未配置主页地址", a.nickname));
             continue;
         }
         // 该平台可用账号:走 acquire 轮换(「最久未用」优先 + 更新 last_used_at),
@@ -318,23 +322,23 @@ pub async fn enrich_authors(
         // 本就是要在补采期间独占该账号窗口)。
         // 锁等待带 30s 超时:采集任务持锁可达数十分钟,无限等会让「画像补采」一直卡死;
         // 超时则跳过该作者继续下一个,不阻塞整批补采
-        let account_lock =
-            account_collect_lock(&state.collect_locks, &account_lock_key(&a.platform, &account_id));
-        let _guard = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            account_lock.lock(),
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                summary.skipped += 1;
-                summary
-                    .messages
-                    .push(format!("{} · 账号窗口被采集任务占用,稍后再试", a.nickname));
-                continue;
-            }
-        };
+        let account_lock = account_collect_lock(
+            &state.collect_locks,
+            &account_lock_key(&a.platform, &account_id),
+        );
+        let _guard =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), account_lock.lock())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    summary.skipped += 1;
+                    summary
+                        .messages
+                        .push(format!("{} · 账号窗口被采集任务占用,稍后再试", a.nickname));
+                    continue;
+                }
+            };
 
         // 用户手动关闭采集窗口 = 终止补采:不再为后续作者重建窗口
         // (与采集主链路「关窗即终止」语义一致),剩余作者记 Skipped。
@@ -342,9 +346,9 @@ pub async fn enrich_authors(
         if bridge.is_collect_window_closed(&cfg.id, &account_id, None) {
             let remaining = authors.len() - idx;
             summary.skipped += remaining;
-            summary
-                .messages
-                .push(format!("采集窗口已被手动关闭 · 终止补采(剩余 {remaining} 位作者跳过)"));
+            summary.messages.push(format!(
+                "采集窗口已被手动关闭 · 终止补采(剩余 {remaining} 位作者跳过)"
+            ));
             break;
         }
         // 补采持锁期间开的窗口属于自己,登记下来结束后归还

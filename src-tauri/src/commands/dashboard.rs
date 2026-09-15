@@ -174,6 +174,7 @@ pub async fn dashboard_overview(
     start: Option<i64>,
     end: Option<i64>,
 ) -> Result<DashboardOverview> {
+    let started = std::time::Instant::now();
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let self_only = me.scope == "self";
     let db = &state.db;
@@ -238,7 +239,7 @@ pub async fn dashboard_overview(
     let (trend_dates, trend_series) = trend;
     let intent_distribution = intent_dist;
 
-    Ok(DashboardOverview {
+    let overview = DashboardOverview {
         content_total,
         comment_total,
         intent_total,
@@ -259,7 +260,12 @@ pub async fn dashboard_overview(
         hot_contents,
         media_stats,
         top_keywords,
-    })
+    };
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "数据概览查询完成"
+    );
+    Ok(overview)
 }
 
 /// 补全平台细分:platform_ids 中未出现的平台补 0,并按 platform 排序稳定输出。
@@ -332,10 +338,7 @@ async fn comment_kind_counts(
         conds.push_str(" AND c.intent_level = 'high'");
     }
     if self_only {
-        conds.push_str(&format!(
-            " AND c.owner = '{}'",
-            owner.replace('\'', "''")
-        ));
+        conds.push_str(&format!(" AND c.owner = '{}'", owner.replace('\'', "''")));
     }
     let sql = format!(
         "SELECT ct.kind AS kind, COUNT(*) AS cnt FROM comments c \
@@ -477,11 +480,17 @@ async fn dashboard_trend(
          GROUP BY platform, day"
     );
     let content_rows = db
-        .query_all(Statement::from_string(db.get_database_backend(), content_sql))
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            content_sql,
+        ))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询采集趋势失败: {e}")))?;
     let comment_rows = db
-        .query_all(Statement::from_string(db.get_database_backend(), comment_sql))
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            comment_sql,
+        ))
         .await
         .map_err(|e| CrawlerError::Config(format!("查询评论趋势失败: {e}")))?;
 
@@ -518,8 +527,7 @@ async fn dashboard_trend(
     }
 
     // 合并平台(内容 / 评论并集),按平台名稳定排序
-    let mut platforms: std::collections::BTreeSet<String> =
-        content_map.keys().cloned().collect();
+    let mut platforms: std::collections::BTreeSet<String> = content_map.keys().cloned().collect();
     platforms.extend(comment_map.keys().cloned());
     let trend_series: Vec<PlatformSeries> = platforms
         .into_iter()
@@ -600,8 +608,7 @@ async fn count_content_range(
     if self_only {
         q = q.filter(content::Column::Owner.eq(owner.to_string()));
     }
-    Ok(q
-        .count(db)
+    Ok(q.count(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("统计内容失败: {e}")))? as i64)
 }
@@ -621,8 +628,7 @@ async fn count_comment_range(
     if self_only {
         q = q.filter(comment::Column::Owner.eq(owner.to_string()));
     }
-    Ok(q
-        .count(db)
+    Ok(q.count(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("统计评论失败: {e}")))? as i64)
 }
@@ -685,8 +691,7 @@ async fn today_by_platform(
         .map_err(|e| CrawlerError::Config(format!("统计今日评论失败: {e}")))?;
 
     // 按平台合并内容数 / 评论数(BTreeMap 保证平台顺序稳定)
-    let mut map: std::collections::BTreeMap<String, (i64, i64)> =
-        std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
     for (platform, count) in content_rows {
         map.entry(platform).or_default().0 = count;
     }
@@ -746,10 +751,10 @@ async fn task_status_stat(
     if self_only {
         cq = cq.filter(task::Column::Owner.eq(owner.to_string()));
     }
-    stat.completed_today = cq
-        .count(db)
-        .await
-        .map_err(|e| CrawlerError::Config(format!("统计今日完成失败: {e}")))? as i64;
+    stat.completed_today =
+        cq.count(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("统计今日完成失败: {e}")))? as i64;
     Ok(stat)
 }
 
@@ -763,25 +768,43 @@ async fn hot_contents(
     if self_only {
         q = q.filter(content::Column::Owner.eq(owner.to_string()));
     }
-    let rows = q
+    // 只取卡片需要的 6 个小字段；Content 实体含转写全文、图片列表等大字段，
+    // 冷启动时读取完整 50 行会产生大量无意义磁盘 IO。
+    let rows: Vec<(
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+    )> = q
+        .select_only()
+        .column(content::Column::Title)
+        .column(content::Column::Desc)
+        .column(content::Column::Platform)
+        .column(content::Column::AuthorNickname)
+        .column(content::Column::LikeCount)
+        .column(content::Column::CommentCount)
         .order_by_desc(content::Column::LikeCount)
-        .limit(50)
+        .limit(8)
+        .into_tuple()
         .all(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询热门内容失败: {e}")))?;
     Ok(rows
         .into_iter()
-        .map(|c| HotContent {
-            title: c
-                .title
-                .filter(|s| !s.trim().is_empty())
-                .or(c.desc)
-                .unwrap_or_default(),
-            platform: c.platform,
-            author: c.author_nickname,
-            like_count: c.like_count.unwrap_or(0),
-            comment_count: c.comment_count.unwrap_or(0),
-        })
+        .map(
+            |(title, desc, platform, author, like_count, comment_count)| HotContent {
+                title: title
+                    .filter(|s| !s.trim().is_empty())
+                    .or(desc)
+                    .unwrap_or_default(),
+                platform,
+                author,
+                like_count: like_count.unwrap_or(0),
+                comment_count: comment_count.unwrap_or(0),
+            },
+        )
         .collect())
 }
 
@@ -837,8 +860,7 @@ async fn top_topics(
         .await
         .map_err(|e| CrawlerError::Config(format!("统计热门话题失败: {e}")))?;
     // topics 是 JSON 数组字符串(如 ["#话题a","#话题b"]),展开后按出现次数计数
-    let mut counter: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut counter: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for topics_json in rows {
         let Ok(topics) = serde_json::from_str::<Vec<String>>(&topics_json) else {
             continue;

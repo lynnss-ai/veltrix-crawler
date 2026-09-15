@@ -35,7 +35,9 @@ fn protected_process_reason(pid: u32, name: &str) -> Option<&'static str> {
     }
     let stem = name.to_lowercase();
     let stem = stem.trim_end_matches(".exe");
-    const CRITICAL: &[&str] = &["system", "csrss", "wininit", "winlogon", "services", "lsass", "smss"];
+    const CRITICAL: &[&str] = &[
+        "system", "csrss", "wininit", "winlogon", "services", "lsass", "smss",
+    ];
     if CRITICAL.contains(&stem) {
         return Some("系统关键进程,结束会导致系统崩溃,已拒绝");
     }
@@ -129,7 +131,12 @@ impl Tool for ListProcessesTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let name = args.get("name_contains").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let name = args
+            .get("name_contains")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let by_cpu = args.get("sort_by").and_then(Value::as_str) == Some("cpu");
         let limit = args
             .get("limit")
@@ -141,7 +148,11 @@ impl Tool for ListProcessesTool {
         let joined = tokio::task::spawn_blocking(move || {
             let mut rows = collect_processes(&name);
             if by_cpu {
-                rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+                rows.sort_by(|a, b| {
+                    b.cpu
+                        .partial_cmp(&a.cpu)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             } else {
                 rows.sort_by_key(|r| std::cmp::Reverse(r.mem));
             }
@@ -155,9 +166,19 @@ impl Tool for ListProcessesTool {
                 if rows.is_empty() {
                     return ToolResult::ok("(无匹配进程)");
                 }
-                let mut s = format!("共 {} 个进程(按 {} 排序):\n", rows.len(), if by_cpu { "CPU" } else { "内存" });
+                let mut s = format!(
+                    "共 {} 个进程(按 {} 排序):\n",
+                    rows.len(),
+                    if by_cpu { "CPU" } else { "内存" }
+                );
                 for r in &rows {
-                    s.push_str(&format!("- {} (PID {}) CPU {:.1}% 内存 {}\n", r.name, r.pid, r.cpu, human_size(r.mem)));
+                    s.push_str(&format!(
+                        "- {} (PID {}) CPU {:.1}% 内存 {}\n",
+                        r.name,
+                        r.pid,
+                        r.cpu,
+                        human_size(r.mem)
+                    ));
                 }
                 ToolResult::ok(s)
             }
@@ -199,7 +220,13 @@ impl Tool for FindProcessTool {
                 }
                 let mut s = format!("找到 {} 个匹配进程:\n", rows.len());
                 for r in rows.iter().take(PROC_LIMIT_MAX) {
-                    s.push_str(&format!("- {} (PID {}) CPU {:.1}% 内存 {}\n", r.name, r.pid, r.cpu, human_size(r.mem)));
+                    s.push_str(&format!(
+                        "- {} (PID {}) CPU {:.1}% 内存 {}\n",
+                        r.name,
+                        r.pid,
+                        r.cpu,
+                        human_size(r.mem)
+                    ));
                 }
                 ToolResult::ok(s)
             }
@@ -214,7 +241,8 @@ impl Tool for KillProcessTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "kill_process".into(),
-            description: "按 PID 结束一个进程(请先用 find_process / list_processes 确认 PID,避免误杀)".into(),
+            description:
+                "按 PID 结束一个进程(请先用 find_process / list_processes 确认 PID,避免误杀)".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

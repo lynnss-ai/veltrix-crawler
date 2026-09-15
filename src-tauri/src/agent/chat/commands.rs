@@ -12,7 +12,9 @@ use sea_orm::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, State};
-use veltrix_core::db::entity::{chat_conversation as conv, chat_message as msg, provider as provider_entity};
+use veltrix_core::db::entity::{
+    chat_conversation as conv, chat_message as msg, provider as provider_entity,
+};
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 单会话最多回放消息数(防超长会话噎住 IPC)。
@@ -304,11 +306,7 @@ struct ChatSendContext {
 }
 
 impl ChatSendContext {
-    async fn prepare(
-        state: &AppState,
-        conversation_id: &str,
-        content: &str,
-    ) -> Result<Self> {
+    async fn prepare(state: &AppState, conversation_id: &str, content: &str) -> Result<Self> {
         let me = current_user(state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
         let text = content.trim().to_string();
 
@@ -340,7 +338,12 @@ impl ChatSendContext {
             .flatten()
             .is_some();
 
-        Ok(Self { conversation, provider, had_messages, text })
+        Ok(Self {
+            conversation,
+            provider,
+            had_messages,
+            text,
+        })
     }
 }
 
@@ -470,7 +473,13 @@ async fn finalize_chat_turn(
 ) {
     let fallback_ref = session_provider_ref(provider, &conversation.model);
 
-    spawn_memory_extraction(db, &conversation.owner, fallback_ref.clone(), user_text, reply_text);
+    spawn_memory_extraction(
+        db,
+        &conversation.owner,
+        fallback_ref.clone(),
+        user_text,
+        reply_text,
+    );
     spawn_summary_maintenance(db, conversation_id, fallback_ref.clone());
 
     // updated_at 立即更新(列表排序不等标题)
@@ -480,7 +489,14 @@ async fn finalize_chat_turn(
 
     // 首轮标题:后台生成,不阻塞 send 返回;完成后 emit conversation-title 让前端增量更新
     if !had_messages {
-        spawn_title_generation(db, app, conversation_id, fallback_ref, user_text, reply_text);
+        spawn_title_generation(
+            db,
+            app,
+            conversation_id,
+            fallback_ref,
+            user_text,
+            reply_text,
+        );
     }
 }
 
@@ -501,13 +517,17 @@ fn spawn_title_generation(
     let user_text = user_text.to_string();
     let reply_text = reply_text.to_string();
     tauri::async_runtime::spawn(async move {
-        let p = crate::commands::resolve_role_provider(&db, crate::llm::AgentRole::Summary, fallback)
-            .await;
+        let p =
+            crate::commands::resolve_role_provider(&db, crate::llm::AgentRole::Summary, fallback)
+                .await;
         let title = generate_title(&p.api_url, &p.api_key, &p.model, &user_text, &reply_text)
             .await
             .unwrap_or_else(|| truncate_title(&user_text));
         // 落库:会话可能已被删(忽略);用户若已手动改名(不再是占位「新对话」)不覆盖
-        if let Ok(Some(model)) = conv::Entity::find_by_id(conversation_id.clone()).one(&db).await {
+        if let Ok(Some(model)) = conv::Entity::find_by_id(conversation_id.clone())
+            .one(&db)
+            .await
+        {
             if model.title == "新对话" {
                 let mut am = model.into_active_model();
                 am.title = Set(title.clone());
@@ -538,7 +558,12 @@ pub async fn send_chat_message(
 
     // 先取历史(本条 user 尚未落库,history 不含当前消息),再把当前消息作为末条 append,
     // 避免与「history 已含当前消息 + 再 append」造成同一条 user 消息重复发给模型。
-    let history = fetch_history(&state.db, &conversation_id, ctx.conversation.summarized_upto_id).await?;
+    let history = fetch_history(
+        &state.db,
+        &conversation_id,
+        ctx.conversation.summarized_upto_id,
+    )
+    .await?;
     let messages = build_chat_messages(
         &state.db,
         &ctx.conversation.owner,
@@ -575,7 +600,8 @@ pub async fn send_chat_message(
     )
     .await;
 
-    let assistant = insert_assistant_message(&state.db, &conversation_id, &outcome.content, None).await?;
+    let assistant =
+        insert_assistant_message(&state.db, &conversation_id, &outcome.content, None).await?;
 
     finalize_chat_turn(
         &state.db,
@@ -646,7 +672,12 @@ pub async fn send_chat_message_stream(
     // 先取历史(本条 user 尚未落库,prior 不含当前消息),再把当前消息(多模态/文本附件内联)
     // 作为末条 append,避免同一条 user 消息重复发给模型。文本类附件内容只在此 append 中内联,
     // history_content 无法从落库行重建,故必须保留这次 append、改由「先 fetch 再落库」去重。
-    let prior = fetch_history(&state.db, &conversation_id, ctx.conversation.summarized_upto_id).await?;
+    let prior = fetch_history(
+        &state.db,
+        &conversation_id,
+        ctx.conversation.summarized_upto_id,
+    )
+    .await?;
     let current_content = build_user_content(&ctx.text, &attachments);
     let messages = build_chat_messages(
         &state.db,
@@ -698,7 +729,8 @@ pub async fn send_chat_message_stream(
     )
     .await;
 
-    let assistant = insert_assistant_message(&state.db, &conversation_id, &reply_text, reply_reasoning).await?;
+    let assistant =
+        insert_assistant_message(&state.db, &conversation_id, &reply_text, reply_reasoning).await?;
 
     finalize_chat_turn(
         &state.db,
@@ -778,12 +810,9 @@ pub(crate) fn spawn_memory_extraction(
     let user_text = user_text.to_string();
     let assistant_text = assistant_text.to_string();
     tauri::async_runtime::spawn(async move {
-        let p = crate::commands::resolve_role_provider(
-            &db,
-            crate::llm::AgentRole::Summary,
-            fallback,
-        )
-        .await;
+        let p =
+            crate::commands::resolve_role_provider(&db, crate::llm::AgentRole::Summary, fallback)
+                .await;
         crate::agent::chat::memory::extract_and_store_memories(
             &db,
             &owner,
@@ -822,12 +851,9 @@ fn spawn_summary_maintenance(
     let db = db.clone();
     let conversation_id = conversation_id.to_string();
     tauri::async_runtime::spawn(async move {
-        let p = crate::commands::resolve_role_provider(
-            &db,
-            crate::llm::AgentRole::Summary,
-            fallback,
-        )
-        .await;
+        let p =
+            crate::commands::resolve_role_provider(&db, crate::llm::AgentRole::Summary, fallback)
+                .await;
         // chat 通用对话:无场景化额外保留要求,extra_hint 传空串
         maintain_conversation_summary(&db, &conversation_id, &p.api_url, &p.api_key, &p.model, "")
             .await;
@@ -884,9 +910,32 @@ fn build_user_content(text: &str, attachments: &[ChatAttachment]) -> Value {
 fn is_text_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
-        ".txt", ".md", ".markdown", ".csv", ".json", ".log", ".yml", ".yaml", ".xml", ".html",
-        ".css", ".js", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h",
-        ".sh", ".sql", ".toml", ".ini",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".json",
+        ".log",
+        ".yml",
+        ".yaml",
+        ".xml",
+        ".html",
+        ".css",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".py",
+        ".rs",
+        ".go",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ini",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
@@ -1190,7 +1239,8 @@ pub async fn build_content_attachments(
     }
 
     // 库存素材路径可能是相对 media_root 的相对路径(新口径),读文件前统一 resolve 成绝对路径
-    let media_root = crate::media::media_root(&state.config_dir, &lock_config(&state)?.media.clone());
+    let media_root =
+        crate::media::media_root(&state.config_dir, &lock_config(&state)?.media.clone());
 
     // 封面图源只取封面;否则图文图片优先、无则退回封面
     let mut paths: Vec<String> = Vec::new();
@@ -1198,8 +1248,11 @@ pub async fn build_content_attachments(
         paths = local_image_paths(&row, &media_root);
         // 逐张挑选:仅保留指定位置(基于上面已排序的本地图片列表)
         if let Some(want) = indices.as_ref() {
-            let want: std::collections::HashSet<usize> =
-                want.iter().filter(|i| **i >= 0).map(|i| *i as usize).collect();
+            let want: std::collections::HashSet<usize> = want
+                .iter()
+                .filter(|i| **i >= 0)
+                .map(|i| *i as usize)
+                .collect();
             paths = paths
                 .into_iter()
                 .enumerate()
@@ -1273,7 +1326,10 @@ fn mime_from_ext(path: &str) -> String {
 /// 图片与封面同目录,故从 cover_path 拆出目录与 `{prefix}_cover.jpg` 前缀,扫同目录 `{prefix}_img*`。
 /// 库存 cover_path 可能是相对 media_root 的相对路径(新口径),先经 root resolve 成绝对路径。
 /// 无封面路径则无从定位(下载当天日期未落库),返回空让上层提示去下载。
-fn local_image_paths(row: &veltrix_core::db::entity::content::Model, root: &std::path::Path) -> Vec<String> {
+fn local_image_paths(
+    row: &veltrix_core::db::entity::content::Model,
+    root: &std::path::Path,
+) -> Vec<String> {
     let Some(cover) = row.cover_path.as_deref().filter(|s| !s.is_empty()) else {
         return Vec::new();
     };
@@ -1357,7 +1413,11 @@ pub async fn update_message_feedback(
         Some("like") => Some("like"),
         Some("dislike") => Some("dislike"),
         None => None,
-        _ => return Err(CrawlerError::Config("feedback 必须是 like/dislike/null".into())),
+        _ => {
+            return Err(CrawlerError::Config(
+                "feedback 必须是 like/dislike/null".into(),
+            ))
+        }
     };
 
     // 更新反馈
@@ -1377,11 +1437,7 @@ pub async fn update_message_feedback(
 }
 
 /// 异步处理反馈学习：将负面反馈记录到记忆系统，帮助未来改进。
-fn spawn_feedback_learning(
-    db: &sea_orm::DatabaseConnection,
-    owner: &str,
-    message_id: i64,
-) {
+fn spawn_feedback_learning(db: &sea_orm::DatabaseConnection, owner: &str, message_id: i64) {
     let db = db.clone();
     let owner = owner.to_string();
     tauri::async_runtime::spawn(async move {
@@ -1389,11 +1445,7 @@ fn spawn_feedback_learning(
         if let Ok(Some(_message)) = msg::Entity::find_by_id(message_id).one(&db).await {
             // 可以将负面反馈的上下文记录到记忆系统
             // 这里简化处理，实际可以更复杂
-            tracing::info!(
-                "用户 {} 对消息 {} 给出了负面反馈",
-                owner,
-                message_id
-            );
+            tracing::info!("用户 {} 对消息 {} 给出了负面反馈", owner, message_id);
         }
     });
 }

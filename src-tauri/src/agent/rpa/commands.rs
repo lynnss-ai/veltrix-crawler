@@ -67,12 +67,15 @@ pub async fn send_browser_message(
         begin_agent_turn(&state.db, &me.name, &conversation_id, &text).await?;
 
     // 工具注册表
-    let registry = browser::build_registry(app.clone(), state.webviews.clone(), conversation_id.clone());
+    let registry =
+        browser::build_registry(app.clone(), state.webviews.clone(), conversation_id.clone());
 
     // 构建上下文:系统提示词 + 滚动摘要 + live 原文窗口
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(browser::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(&state.config_dir, "rpa").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
@@ -90,11 +93,11 @@ pub async fn send_browser_message(
 
     let config = ReactConfig {
         max_iters: MAX_ITERS,
-        temperature: 0.2, // 低温:浏览器 Agent 要精准、确定的选择器与动作
-        enable_streaming: true, // 启用流式输出
-        context_window_size: 80, // 默认上下文窗口
-        enable_parallel_tools: true, // 启用工具并行执行
-        max_retries: 2, // LLM 调用失败时重试 2 次
+        temperature: 0.2,             // 低温:浏览器 Agent 要精准、确定的选择器与动作
+        enable_streaming: true,       // 启用流式输出
+        context_window_size: 80,      // 默认上下文窗口
+        enable_parallel_tools: true,  // 启用工具并行执行
+        max_retries: 2,               // LLM 调用失败时重试 2 次
         auto_fix_on_tool_error: true, // 工具失败时自动修复
     };
 
@@ -158,7 +161,9 @@ pub async fn run_rpa_subtask(
     let registry = browser::build_registry(app.clone(), pool.clone(), conversation_id.to_string());
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(browser::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(config_dir, "rpa").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     messages.push(ChatMsg::User(task.to_string()));
     let config = ReactConfig {
@@ -171,7 +176,14 @@ pub async fn run_rpa_subtask(
         auto_fix_on_tool_error: true,
     };
     let result = crate::agent::core::react::react_run(
-        db, app, conversation_id, provider_ref, config, &mut RpaHooks, &registry, &mut messages,
+        db,
+        app,
+        conversation_id,
+        provider_ref,
+        config,
+        &mut RpaHooks,
+        &registry,
+        &mut messages,
         None,
     )
     .await?;

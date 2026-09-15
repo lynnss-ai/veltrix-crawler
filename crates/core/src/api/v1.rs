@@ -5,18 +5,18 @@
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
 use axum::{
-    Json, Router,
     extract::{ConnectInfo, State},
     http::HeaderMap,
     routing::{get, post},
+    Json, Router,
 };
 use bb8_redis::redis::AsyncCommands;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use super::auth::{AuthUser, encode_user_token};
-use super::{ApiResponse, ApiState, AppError, ServerMode, commands, devices, pair, ws};
+use super::auth::{encode_user_token, AuthUser};
+use super::{commands, devices, pair, ws, ApiResponse, ApiState, AppError, ServerMode};
 use crate::db::entity;
 
 /// 登录限流:同 IP 5 分钟内失败 ≥ N 次拒绝。Cloud 模式计数存 Redis,
@@ -143,9 +143,7 @@ async fn login(
                 .unwrap_or(None)
                 .unwrap_or(0);
             if fails >= LOGIN_MAX_FAILS {
-                return Err(AppError::Unauthorized(
-                    "尝试次数过多,请稍后再试".into(),
-                ));
+                return Err(AppError::Unauthorized("尝试次数过多,请稍后再试".into()));
             }
         }
     } else if local_rate_limited(&ip) {

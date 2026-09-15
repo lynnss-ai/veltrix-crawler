@@ -6,13 +6,13 @@
 //! 3. 任一任务退出 → 断开 → 指数退避 → 回到步骤 1
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{client::IntoClientRequest, Message},
 };
 
 use super::config::CloudConfig;
@@ -105,7 +105,10 @@ impl CloudClient {
             .send()
             .await
             .map_err(|e| format!("请求失败: {e}"))?;
-        let json: Value = resp.json().await.map_err(|e| format!("响应解析失败: {e}"))?;
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("响应解析失败: {e}"))?;
         let token = json
             .get("data")
             .and_then(|d| d.get("token"))
@@ -141,7 +144,10 @@ impl CloudClient {
             .send()
             .await
             .map_err(|e| format!("请求失败: {e}"))?;
-        let json: Value = resp.json().await.map_err(|e| format!("响应解析失败: {e}"))?;
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("响应解析失败: {e}"))?;
         let data = json
             .get("data")
             .ok_or_else(|| format!("云端响应无 data: {json}"))?;
@@ -213,7 +219,10 @@ impl CloudClient {
                 continue;
             }
 
-            match self.connect_and_run(&base_url, pc_token.as_ref().unwrap()).await {
+            match self
+                .connect_and_run(&base_url, pc_token.as_ref().unwrap())
+                .await
+            {
                 Ok(_) => {
                     backoff = RECONNECT_MIN_SECS;
                 }
@@ -275,15 +284,13 @@ impl CloudClient {
                             .to_string();
                         match kind.as_str() {
                             "command" => {
-                                let id =
-                                    value.get("id").cloned().unwrap_or(Value::Null);
+                                let id = value.get("id").cloned().unwrap_or(Value::Null);
                                 let action = value
                                     .get("action")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let params =
-                                    value.get("params").cloned().unwrap_or(Value::Null);
+                                let params = value.get("params").cloned().unwrap_or(Value::Null);
                                 let result = executor.dispatch(&action, params).await;
                                 let _ = tx_for_read.send(json!({
                                     "type": "ack",

@@ -109,8 +109,7 @@ pub async fn send_with_retry(
                 }
                 let code = status.as_u16();
                 // 429(限流)与 5xx(服务端) 可重试(仅当调用方允许);其余 4xx 立即返回
-                let retryable =
-                    retry_server_errors && (code == 429 || (500..=599).contains(&code));
+                let retryable = retry_server_errors && (code == 429 || (500..=599).contains(&code));
                 if retryable && attempt < MAX_RETRIES {
                     attempt += 1;
                     // 429 优先读 Retry-After 响应头做退避时长;无头/不可解析时走指数退避

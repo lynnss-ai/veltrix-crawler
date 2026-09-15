@@ -4,10 +4,6 @@
 //! 用户密码用 argon2 哈希存储,接口一律不回传哈希。逻辑外键,无物理 FK。
 
 use crate::commands::AppState;
-use veltrix_core::db::entity::{
-    customer, industry, keyword, prompt, provider, user,
-};
-use veltrix_core::error::{CrawlerError, Result};
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -16,6 +12,8 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
+use veltrix_core::db::entity::{customer, industry, keyword, prompt, provider, user};
+use veltrix_core::error::{CrawlerError, Result};
 
 /// 单次 list 接口最多返回 N 行,防 IPC 噎住;数据量超出应改分页接口
 const LIST_HARD_CAP: u64 = 1000;
@@ -297,8 +295,7 @@ pub async fn login(
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| CrawlerError::Auth("用户名或密码错误".into()))?;
     let mut view: UserView = model.into();
-    view.is_super_admin =
-        earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
+    view.is_super_admin = earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
     Ok(view)
 }
 
@@ -361,8 +358,7 @@ pub async fn update_profile(
         .await
         .map_err(|e| CrawlerError::Config(format!("修改资料失败: {e}")))?;
     let mut view: UserView = updated.into();
-    view.is_super_admin =
-        earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
+    view.is_super_admin = earliest_user_id(&state.db).await.as_deref() == Some(view.id.as_str());
     Ok(view)
 }
 
@@ -385,7 +381,14 @@ fn mask_api_key(key: &str) -> String {
     if key.is_empty() {
         return String::new();
     }
-    let tail: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     if tail.chars().count() < key.chars().count() {
         format!("••••••{tail}")
     } else {
@@ -430,7 +433,10 @@ pub async fn upsert_provider(state: State<'_, AppState>, provider: ProviderDto) 
         .await
         .map_err(|e| CrawlerError::Config(format!("查询厂商失败: {e}")))?;
     if dup.is_some() {
-        return Err(CrawlerError::Config(format!("编码已存在: {}", provider.code)));
+        return Err(CrawlerError::Config(format!(
+            "编码已存在: {}",
+            provider.code
+        )));
     }
     let existing = provider::Entity::find_by_id(provider.id.clone())
         .one(db)
@@ -439,13 +445,12 @@ pub async fn upsert_provider(state: State<'_, AppState>, provider: ProviderDto) 
     match existing {
         Some(model) => {
             // 前端只看到打码后的 api_key;若提交的就是打码占位串,说明用户没改密钥 → 保留原值
-            let api_key_to_save = if provider.api_key.starts_with("••")
-                || provider.api_key.is_empty()
-            {
-                model.api_key.clone()
-            } else {
-                provider.api_key
-            };
+            let api_key_to_save =
+                if provider.api_key.starts_with("••") || provider.api_key.is_empty() {
+                    model.api_key.clone()
+                } else {
+                    provider.api_key
+                };
             let mut am = model.into_active_model();
             am.code = Set(provider.code);
             am.name = Set(provider.name);
@@ -670,7 +675,10 @@ pub async fn upsert_customer(state: State<'_, AppState>, customer: CustomerInput
         .await
         .map_err(|e| CrawlerError::Config(format!("查询客户失败: {e}")))?;
     if dup.is_some() {
-        return Err(CrawlerError::Config(format!("编码已存在: {}", customer.code)));
+        return Err(CrawlerError::Config(format!(
+            "编码已存在: {}",
+            customer.code
+        )));
     }
     // 标签数组序列化为 JSON 字符串落库
     let tags = serde_json::to_string(&customer.tags)
@@ -798,7 +806,10 @@ pub async fn upsert_industry(state: State<'_, AppState>, industry: IndustryInput
         .await
         .map_err(|e| CrawlerError::Config(format!("查询行业失败: {e}")))?;
     if dup.is_some() {
-        return Err(CrawlerError::Config(format!("编码已存在: {}", industry.code)));
+        return Err(CrawlerError::Config(format!(
+            "编码已存在: {}",
+            industry.code
+        )));
     }
     let existing = industry::Entity::find_by_id(industry.id.clone())
         .one(db)
@@ -893,7 +904,9 @@ pub async fn create_keywords(
     let db = &state.db;
     let now = Utc::now().timestamp();
     // 无 uuid 依赖,用纳秒时间戳 + 行业 id + 序号拼出稳定唯一的关键词 id
-    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(now * 1_000_000_000);
+    let nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(now * 1_000_000_000);
     let mut seen = std::collections::HashSet::new();
     let models: Vec<keyword::ActiveModel> = words
         .into_iter()

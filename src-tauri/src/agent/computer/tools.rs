@@ -30,11 +30,7 @@ pub const SYSTEM_PROMPT: &str = "你是一个「电脑操作」智能体,通过*
 
 /// 危险工具:不可逆或影响大,ReAct 循环在执行前应走确认链路(确认链路的接入点)。
 /// 仅含本 agent(GUI)实际挂载的工具;文件 / 进程类危险工具随模块拆走,见 local agent。
-pub const DANGEROUS_TOOLS: &[&str] = &[
-    "control_window",
-    "launch_program",
-    "click_control",
-];
+pub const DANGEROUS_TOOLS: &[&str] = &["control_window", "launch_program", "click_control"];
 
 /// 是否为危险工具(需执行前确认)。
 pub fn is_dangerous(tool_name: &str) -> bool {
@@ -67,9 +63,10 @@ impl Tool for CaptureScreenTool {
         }
     }
     async fn run(&self, _args: Value) -> ToolResult {
-        let joined =
-            tokio::task::spawn_blocking(|| crate::agent::desktop::tools::capture_screen_data_url(""))
-                .await;
+        let joined = tokio::task::spawn_blocking(|| {
+            crate::agent::desktop::tools::capture_screen_data_url("")
+        })
+        .await;
         match joined {
             Ok(Ok(data_url)) => ToolResult::ok(data_url),
             Ok(Err(e)) => ToolResult::err(format!("截屏失败: {e}")),

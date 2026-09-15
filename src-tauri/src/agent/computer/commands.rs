@@ -5,12 +5,12 @@
 
 use crate::agent::computer::tools as computer;
 use crate::agent::core::react::{ReactConfig, ReactHooks, ToolPostAction};
+use crate::agent::core::shared::AgentConfirmChannel;
 use crate::agent::core::shared::{
     begin_agent_turn, confirm_dangerous_tool, finalize_conversation_meta, insert_final_assistant,
     live_windowed_messages, load_agent_guidelines, MessageView, MAX_ITERS,
 };
 use crate::agent::core::summary as conv_summary;
-use crate::agent::core::shared::AgentConfirmChannel;
 use crate::agent::core::{ChatMsg, ProviderKind, ProviderRef, ToolResult};
 use crate::commands::{current_user, AppState};
 use async_trait::async_trait;
@@ -33,8 +33,14 @@ impl ReactHooks for ComputerHooks {
             return None; // 非危险工具,正常执行
         }
         // 危险工具:走共享确认闸门(emit agent-confirm → 等前端回执 / 超时拒绝)
-        confirm_dangerous_tool(&self.confirm_channel, &self.app, &self.conversation_id, name, args)
-            .await
+        confirm_dangerous_tool(
+            &self.confirm_channel,
+            &self.app,
+            &self.conversation_id,
+            name,
+            args,
+        )
+        .await
     }
 
     fn on_after_tool(&mut self, name: &str, _args: &Value, result: &ToolResult) -> ToolPostAction {
@@ -75,7 +81,9 @@ pub async fn send_computer_message(
     // 构建上下文:系统提示词 + 滚动摘要 + live 原文窗口
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(computer::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(&state.config_dir, "computer").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
         if let Some(summary_text) = sys.get("content").and_then(|v| v.as_str()) {
@@ -93,11 +101,11 @@ pub async fn send_computer_message(
 
     let config = ReactConfig {
         max_iters: MAX_ITERS,
-        temperature: 0.2, // 低温:电脑操作 Agent 要精准、确定的工具调用
-        enable_streaming: true, // 启用流式输出
-        context_window_size: 80, // 默认上下文窗口
-        enable_parallel_tools: true, // 启用工具并行执行
-        max_retries: 2, // LLM 调用失败时重试 2 次
+        temperature: 0.2,             // 低温:电脑操作 Agent 要精准、确定的工具调用
+        enable_streaming: true,       // 启用流式输出
+        context_window_size: 80,      // 默认上下文窗口
+        enable_parallel_tools: true,  // 启用工具并行执行
+        max_retries: 2,               // LLM 调用失败时重试 2 次
         auto_fix_on_tool_error: true, // 工具失败时自动修复
     };
 
@@ -164,7 +172,9 @@ pub async fn run_computer_subtask(
     let registry = computer::build_registry(app.clone());
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(computer::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(config_dir, "computer").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     messages.push(ChatMsg::User(task.to_string()));
     let config = ReactConfig {
@@ -182,7 +192,14 @@ pub async fn run_computer_subtask(
         conversation_id: conversation_id.to_string(),
     };
     let result = crate::agent::core::react::react_run(
-        db, app, conversation_id, provider_ref, config, &mut hooks, &registry, &mut messages,
+        db,
+        app,
+        conversation_id,
+        provider_ref,
+        config,
+        &mut hooks,
+        &registry,
+        &mut messages,
         None,
     )
     .await?;

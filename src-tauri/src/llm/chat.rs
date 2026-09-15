@@ -81,7 +81,10 @@ pub async fn chat_completion(req: ChatRequest<'_>) -> Result<ChatOutcome> {
         .get("usage")
         .map(|u| TokenUsage {
             prompt: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            completion: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            completion: u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         })
         .unwrap_or_default();
 
@@ -233,7 +236,10 @@ where
                 if let Some(u) = v.get("usage") {
                     usage = TokenUsage {
                         prompt: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        completion: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        completion: u
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32,
                     };
                 }
                 let delta = v
@@ -265,7 +271,11 @@ where
     // 用户主动取消时，即使内容为空也返回成功（不报错）
     if cancelled {
         return Ok(StreamOutcome {
-            content: if full.is_empty() { "(已停止)".to_string() } else { full },
+            content: if full.is_empty() {
+                "(已停止)".to_string()
+            } else {
+                full
+            },
             reasoning: if reasoning.is_empty() {
                 None
             } else {

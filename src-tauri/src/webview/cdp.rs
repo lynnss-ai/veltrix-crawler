@@ -82,13 +82,12 @@ async fn cdp_call(window: &WebviewWindow, method: &str, params: &str) -> Result<
         })
         .map_err(|_| anyhow!("WebView 已销毁,无法发起 CDP 调用: {method}"))?;
 
-    let json = match tokio::time::timeout(std::time::Duration::from_secs(CDP_TIMEOUT_SECS), rx)
-        .await
-    {
-        Ok(Ok(res)) => res?,
-        Ok(Err(_)) => return Err(anyhow!("CDP {method} 回调通道异常(发送端被丢弃)")),
-        Err(_) => return Err(anyhow!("CDP {method} 超时({CDP_TIMEOUT_SECS}s)")),
-    };
+    let json =
+        match tokio::time::timeout(std::time::Duration::from_secs(CDP_TIMEOUT_SECS), rx).await {
+            Ok(Ok(res)) => res?,
+            Ok(Err(_)) => return Err(anyhow!("CDP {method} 回调通道异常(发送端被丢弃)")),
+            Err(_) => return Err(anyhow!("CDP {method} 超时({CDP_TIMEOUT_SECS}s)")),
+        };
     // CDP 错误不体现在 HRESULT,而是响应 JSON 的 "error" 字段,必须解析出来
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
         if let Some(err) = v.get("error") {

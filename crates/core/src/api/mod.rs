@@ -17,8 +17,8 @@ mod ws_hub;
 pub use error::AppError;
 pub use response::ApiResponse;
 
+use axum::http::{header, HeaderValue, Method};
 use axum::Router;
-use axum::http::{HeaderValue, Method, header};
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use sea_orm::DatabaseConnection;
@@ -37,11 +37,7 @@ pub enum ServerMode {
 
 impl ServerMode {
     pub fn from_env() -> Self {
-        match std::env::var("VELTRIX_MODE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
+        match std::env::var("VELTRIX_MODE").ok().as_deref().map(str::trim) {
             Some("cloud") => Self::Cloud,
             _ => Self::Desktop,
         }
@@ -88,7 +84,9 @@ fn cors_layer(mode: ServerMode) -> CorsLayer {
         tracing::warn!(
             "Cloud 模式未配置 VELTRIX_CORS_ORIGINS,所有跨域请求将被拒绝;同源请求仍可访问"
         );
-        CorsLayer::new().allow_methods(methods).allow_headers(allow_headers)
+        CorsLayer::new()
+            .allow_methods(methods)
+            .allow_headers(allow_headers)
     } else {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))

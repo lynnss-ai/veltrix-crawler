@@ -197,7 +197,10 @@ pub async fn update_publish_account(
     category_id: String,
     label: String,
 ) -> Result<PublishAccountView> {
-    let model = state.publish.update_account(&id, &category_id, &label).await?;
+    let model = state
+        .publish
+        .update_account(&id, &category_id, &label)
+        .await?;
     Ok(model.into())
 }
 
@@ -282,9 +285,7 @@ pub async fn close_publish_account_window(state: State<'_, AppState>, id: String
 /// 收到 "in" 时就地从存活会话读出回写。
 pub(crate) async fn finalize_publish_login(
     publish: &PublishAccounts,
-    verdicts: &std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, String>>,
-    >,
+    verdicts: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     verdict_key: &str,
 ) {
     let last = verdicts.lock().ok().and_then(|mut m| m.remove(verdict_key));

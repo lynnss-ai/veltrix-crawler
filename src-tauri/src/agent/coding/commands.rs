@@ -4,7 +4,6 @@
 //! 特殊逻辑:Plan/Act 模式、自主续航、run_command 自动修复、计划续航、验证闸门。
 
 use crate::agent::coding::tools as coding;
-use crate::sandbox::{SandboxManager, SandboxOptions};
 use crate::agent::core::react::{
     FinishDecision, IterDecision, ReactConfig, ReactHooks, ToolPostAction,
 };
@@ -17,6 +16,7 @@ use crate::agent::core::{
     provider_for, ChatMsg, LlmOptions, LlmRequest, ProviderKind, ProviderRef, ToolResult,
 };
 use crate::commands::{current_user, AppState};
+use crate::sandbox::{SandboxManager, SandboxOptions};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Serialize;
 use serde_json::Value;
@@ -70,7 +70,13 @@ fn workspace_base(config_dir: &Path, custom: &str) -> PathBuf {
 fn safe_id(id: &str) -> String {
     let s: String = id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if s.is_empty() {
         "default".to_string()
@@ -90,7 +96,10 @@ pub async fn get_coding_workspace(
     state: State<'_, AppState>,
     conversation_id: Option<String>,
 ) -> Result<String> {
-    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(
+        &state.config_dir,
+        &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await,
+    );
     let p = match conversation_id {
         Some(id) if !id.trim().is_empty() => conv_workspace(&base, &id),
         _ => base,
@@ -197,14 +206,22 @@ async fn sandbox_idle_recycle_minutes(db: &sea_orm::DatabaseConnection) -> u64 {
 async fn sandbox_cpu_limit_percent(db: &sea_orm::DatabaseConnection) -> Option<u32> {
     let v = crate::commands::get_secret(db, SANDBOX_CPU_LIMIT_KEY).await;
     let p: u32 = v.trim().parse().unwrap_or(0);
-    if p == 0 { None } else { Some(p.clamp(1, 100)) }
+    if p == 0 {
+        None
+    } else {
+        Some(p.clamp(1, 100))
+    }
 }
 
 /// 读沙盒进程数上限(app_secrets;0 / 缺省 / 非法 = 不限)。
 async fn sandbox_max_processes(db: &sea_orm::DatabaseConnection) -> Option<u32> {
     let v = crate::commands::get_secret(db, SANDBOX_MAX_PROCESSES_KEY).await;
     let n: u32 = v.trim().parse().unwrap_or(0);
-    if n == 0 { None } else { Some(n) }
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
 }
 
 /// 读沙盒磁盘 IO 限速(app_secrets,KB/s;0 / 缺省 / 非法 = 不限),返回字节/秒。
@@ -270,8 +287,8 @@ pub async fn list_coding_checkpoints(
 ) -> Result<Vec<CheckpointView>> {
     let (ws, exec) = resolve_exec(&state, &conversation_id).await?;
     // 用 0x1f(单元分隔符)分隔字段,避免提交信息里的空格 / 制表符干扰解析
-    let out = coding::run_command_in(&ws, "git log -n 50 --pretty=format:%h%x1f%ct%x1f%s", &exec)
-        .await;
+    let out =
+        coding::run_command_in(&ws, "git log -n 50 --pretty=format:%h%x1f%ct%x1f%s", &exec).await;
     if out.is_error {
         return Ok(Vec::new()); // 无 git / 无提交:无版本可列
     }
@@ -474,8 +491,16 @@ fn parse_file_block(block: &[&str]) -> CheckpointFileDiff {
 
 /// 文件面板:列出工作区真实文件的上限 / 跳过目录 / 单文件预览字节上限。
 const WS_LIST_MAX_FILES: usize = 2000;
-const WS_SKIP_DIRS: &[&str] =
-    &[".git", "node_modules", "target", "dist", "build", ".next", ".cache", "vendor"];
+const WS_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "vendor",
+];
 const WS_READ_MAX_BYTES: usize = 400_000;
 
 /// 列出某会话工作区内的真实文件(相对路径,正斜杠;跳过大目录并排序)。
@@ -485,7 +510,10 @@ pub async fn list_workspace_files(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<String>> {
-    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(
+        &state.config_dir,
+        &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await,
+    );
     let root = conv_workspace(&base, &conversation_id);
     let mut files: Vec<String> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.clone()];
@@ -523,7 +551,10 @@ pub async fn read_workspace_file(
     conversation_id: String,
     path: String,
 ) -> Result<String> {
-    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(
+        &state.config_dir,
+        &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await,
+    );
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     let bytes = tokio::fs::read(&full)
@@ -550,7 +581,10 @@ pub async fn write_workspace_file(
     path: String,
     content: String,
 ) -> Result<()> {
-    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(
+        &state.config_dir,
+        &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await,
+    );
     let root = conv_workspace(&base, &conversation_id);
     let full = crate::agent::resolve_in_workspace(&root, &path)?;
     if let Some(parent) = full.parent() {
@@ -589,7 +623,10 @@ pub struct SandboxConfigView {
 /// 读取沙盒状态(工作区根路径 + 是否有沙盒进程在跑 + 各项限额配置)。
 #[tauri::command]
 pub async fn get_sandbox_config(state: State<'_, AppState>) -> Result<SandboxConfigView> {
-    let base = workspace_base(&state.config_dir, &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await);
+    let base = workspace_base(
+        &state.config_dir,
+        &crate::commands::get_secret(&state.db, CODING_WORKSPACE_KEY).await,
+    );
     let entries = state.sandbox.list();
     let running = entries.iter().any(|e| e.stats.active_processes > 0);
     let memory_limit_mb = sandbox_memory_limit_bytes(&state.db)
@@ -747,9 +784,21 @@ pub async fn get_sandbox_stats(state: State<'_, AppState>) -> Result<SandboxStat
     let running = active > 0;
     Ok(SandboxStatsView {
         running,
-        cpu_perc: if running { format!("{cpu_secs:.1}s") } else { String::new() },
-        mem_usage: if running { human_bytes(peak_mem) } else { String::new() },
-        mem_perc: if running { format!("{active} 进程") } else { String::new() },
+        cpu_perc: if running {
+            format!("{cpu_secs:.1}s")
+        } else {
+            String::new()
+        },
+        mem_usage: if running {
+            human_bytes(peak_mem)
+        } else {
+            String::new()
+        },
+        mem_perc: if running {
+            format!("{active} 进程")
+        } else {
+            String::new()
+        },
         storage_bytes,
         mem_limit_bytes: sandbox_memory_limit_bytes(&state.db).await,
         net_limit_kbps: sandbox_net_limit_bytes_per_sec(&state.db)
@@ -1085,7 +1134,8 @@ pub async fn start_dev_server(
     // (纯静态,如单个 HTML)→ 自动改用内置静态服务器托管 index.html 所在目录;空目录 → 直接报错,
     // 而不是让 npm 吐一长串 ENOENT。
     let mut is_static = false;
-    let needs_pkg = cmd.contains("npm") || cmd.contains("npx") || cmd.contains("yarn") || cmd.contains("vite");
+    let needs_pkg =
+        cmd.contains("npm") || cmd.contains("npx") || cmd.contains("yarn") || cmd.contains("vite");
     // 启动命令的工作目录(相对工作区):命中项目子目录时先 cd 进去
     let project_dir: Option<String>;
     if needs_pkg {
@@ -1234,10 +1284,22 @@ pub async fn get_dev_server_status(state: State<'_, AppState>) -> Result<DevServ
             if g.running && g.port.is_none() {
                 g.port = Some(p);
             }
-            return Ok(DevServerStatus { running, port: Some(p), command, logs, conversation_id });
+            return Ok(DevServerStatus {
+                running,
+                port: Some(p),
+                command,
+                logs,
+                conversation_id,
+            });
         }
     }
-    Ok(DevServerStatus { running, port, command, logs, conversation_id })
+    Ok(DevServerStatus {
+        running,
+        port,
+        command,
+        logs,
+        conversation_id,
+    })
 }
 
 /// 关键词启发式分类:覆盖 coding / rpa / computer / local 信号,其余归 chat。
@@ -1245,8 +1307,19 @@ fn classify_by_keywords(text: &str) -> &'static str {
     let lower = text.to_lowercase();
     // 浏览器自动化(RPA)信号优先判:这些词较明确,且可能混入 coding 词(打开 / 运行)
     const RPA_SIGNALS: &[&str] = &[
-        "浏览器自动", "网页自动", "自动点击", "自动填写", "自动填表", "模拟点击",
-        "网页操作", "网站上", "抓取网页", "爬取网页", "自动化浏览", "帮我打开网页", "rpa",
+        "浏览器自动",
+        "网页自动",
+        "自动点击",
+        "自动填写",
+        "自动填表",
+        "模拟点击",
+        "网页操作",
+        "网站上",
+        "抓取网页",
+        "爬取网页",
+        "自动化浏览",
+        "帮我打开网页",
+        "rpa",
     ];
     if RPA_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "rpa";
@@ -1254,18 +1327,76 @@ fn classify_by_keywords(text: &str) -> &'static str {
     // 网页任务再判:命中「具体网站/平台名」或「网页语境」且带「网页动作」→ RPA(本应用 RPA = 内嵌浏览器操作网页)。
     // 覆盖「打开抖音搜索…」「在淘宝查…」「访问某网址并…」这类——纯关键词难穷举,故用 站点/语境 × 动作 组合判定。
     const SITE_NAMES: &[&str] = &[
-        "抖音", "快手", "小红书", "淘宝", "天猫", "京东", "拼多多", "闲鱼", "微博", "知乎",
-        "豆瓣", "哔哩", "bilibili", "b站", "百度", "谷歌", "google", "bing", "youtube",
-        "tiktok", "今日头条", "头条", "美团", "大众点评", "携程", "12306", "公众号", "网易",
-        "搜狐", "新浪", "优酷", "腾讯视频",
+        "抖音",
+        "快手",
+        "小红书",
+        "淘宝",
+        "天猫",
+        "京东",
+        "拼多多",
+        "闲鱼",
+        "微博",
+        "知乎",
+        "豆瓣",
+        "哔哩",
+        "bilibili",
+        "b站",
+        "百度",
+        "谷歌",
+        "google",
+        "bing",
+        "youtube",
+        "tiktok",
+        "今日头条",
+        "头条",
+        "美团",
+        "大众点评",
+        "携程",
+        "12306",
+        "公众号",
+        "网易",
+        "搜狐",
+        "新浪",
+        "优酷",
+        "腾讯视频",
     ];
     const WEB_CONTEXT: &[&str] = &[
-        "网页", "网站", "官网", "网址", "url", "http", "www.", ".com", ".cn", ".net",
-        "浏览器", "平台", "页面",
+        "网页",
+        "网站",
+        "官网",
+        "网址",
+        "url",
+        "http",
+        "www.",
+        ".com",
+        ".cn",
+        ".net",
+        "浏览器",
+        "平台",
+        "页面",
     ];
     const WEB_ACTION: &[&str] = &[
-        "打开", "访问", "进入", "登录", "搜索", "搜一下", "查一下", "查找", "浏览", "点击",
-        "填写", "下单", "购买", "抓取", "爬取", "采集", "翻页", "滚动", "评论", "点赞", "关注",
+        "打开",
+        "访问",
+        "进入",
+        "登录",
+        "搜索",
+        "搜一下",
+        "查一下",
+        "查找",
+        "浏览",
+        "点击",
+        "填写",
+        "下单",
+        "购买",
+        "抓取",
+        "爬取",
+        "采集",
+        "翻页",
+        "滚动",
+        "评论",
+        "点赞",
+        "关注",
     ];
     let has_web_action = WEB_ACTION.iter().any(|k| lower.contains(k));
     if has_web_action
@@ -1278,15 +1409,47 @@ fn classify_by_keywords(text: &str) -> &'static str {
     // 让「读写删本机文件 / 查杀进程 / 跑命令」这类**不看屏**的请求落到 local,而非 GUI computer 或沙箱 coding。
     const LOCAL_SIGNALS: &[&str] = &[
         // 文件 / 磁盘
-        "本机文件", "本地文件", "读取文件", "写入文件", "写文件", "删除文件", "移动文件",
-        "重命名文件", "复制文件", "查找文件", "列目录", "列出目录", "新建文件夹", "建文件夹",
-        "d盘", "c盘", "e盘", "f盘", "磁盘", "我的电脑", "此电脑", "多少文件", "多少个文件",
-        "文件数量", "统计文件",
+        "本机文件",
+        "本地文件",
+        "读取文件",
+        "写入文件",
+        "写文件",
+        "删除文件",
+        "移动文件",
+        "重命名文件",
+        "复制文件",
+        "查找文件",
+        "列目录",
+        "列出目录",
+        "新建文件夹",
+        "建文件夹",
+        "d盘",
+        "c盘",
+        "e盘",
+        "f盘",
+        "磁盘",
+        "我的电脑",
+        "此电脑",
+        "多少文件",
+        "多少个文件",
+        "文件数量",
+        "统计文件",
         // 进程 / 系统
-        "进程", "任务管理器", "结束进程", "杀进程", "查进程", "进程列表", "环境变量",
+        "进程",
+        "任务管理器",
+        "结束进程",
+        "杀进程",
+        "查进程",
+        "进程列表",
+        "环境变量",
         "系统信息",
         // 终端(限定「本机/本地」语境,避免抢走 coding 的工作区终端请求)
-        "本机终端", "本地终端", "本机命令", "本地命令", "在本机", "在本地",
+        "本机终端",
+        "本地终端",
+        "本机命令",
+        "本地命令",
+        "在本机",
+        "在本地",
     ];
     if LOCAL_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "local";
@@ -1294,9 +1457,24 @@ fn classify_by_keywords(text: &str) -> &'static str {
     // 电脑操作(GUI:看屏 / 鼠标键盘 / 窗口 / 控件 / 启动程序),优先于 coding——
     // 避免"打开 / 运行"这类词被 coding 信号吃掉。文件 / 进程 / 终端类已在上面归 local。
     const COMPUTER_SIGNALS: &[&str] = &[
-        "截图", "截屏", "屏幕", "桌面", "鼠标", "键盘", "剪贴板", "打开程序", "启动程序",
-        "打开软件", "打开应用", "切换窗口", "关闭窗口",
-        "电脑操作", "操作电脑", "控制电脑", "识别屏幕", "看屏幕",
+        "截图",
+        "截屏",
+        "屏幕",
+        "桌面",
+        "鼠标",
+        "键盘",
+        "剪贴板",
+        "打开程序",
+        "启动程序",
+        "打开软件",
+        "打开应用",
+        "切换窗口",
+        "关闭窗口",
+        "电脑操作",
+        "操作电脑",
+        "控制电脑",
+        "识别屏幕",
+        "看屏幕",
     ];
     if COMPUTER_SIGNALS.iter().any(|k| lower.contains(k)) {
         return "computer";
@@ -1305,13 +1483,55 @@ fn classify_by_keywords(text: &str) -> &'static str {
         return "coding";
     }
     const CODING_SIGNALS: &[&str] = &[
-        "代码", "脚本", "函数", "报错", "编译", "调试", "重构", "算法", "正则",
-        "命令行", "终端", "跑一下", "运行一下", "执行命令", "写个", "实现一个",
-        "修复", "bug", "python", "rust", "golang", "java", "kotlin", "typescript",
-        "javascript", "react", "vue", "sql", "shell", "terminal", "git ", "npm ",
-        "cargo ", "bun ", "pip ", "def ", "class ", "function ", "import ",
-        "#include", "console.log", "print(", ".py", ".rs", ".ts", ".js", ".java",
-        ".go", ".sh",
+        "代码",
+        "脚本",
+        "函数",
+        "报错",
+        "编译",
+        "调试",
+        "重构",
+        "算法",
+        "正则",
+        "命令行",
+        "终端",
+        "跑一下",
+        "运行一下",
+        "执行命令",
+        "写个",
+        "实现一个",
+        "修复",
+        "bug",
+        "python",
+        "rust",
+        "golang",
+        "java",
+        "kotlin",
+        "typescript",
+        "javascript",
+        "react",
+        "vue",
+        "sql",
+        "shell",
+        "terminal",
+        "git ",
+        "npm ",
+        "cargo ",
+        "bun ",
+        "pip ",
+        "def ",
+        "class ",
+        "function ",
+        "import ",
+        "#include",
+        "console.log",
+        "print(",
+        ".py",
+        ".rs",
+        ".ts",
+        ".js",
+        ".java",
+        ".go",
+        ".sh",
     ];
     if CODING_SIGNALS.iter().any(|k| lower.contains(k)) {
         "coding"
@@ -1334,9 +1554,33 @@ const ROUTER_PROMPT: &str = "你是一个意图路由器。把用户这句话归
 /// 用一小撮祈使动作词作门槛:纯问候 / 知识问题不带这些词 → 直接走 chat,不浪费一次 LLM 往返。
 fn looks_actionable(lower: &str) -> bool {
     const ACTION_HINTS: &[&str] = &[
-        "帮我", "帮忙", "打开", "运行", "执行", "启动", "查一下", "查询", "查找", "搜一下",
-        "搜索", "找一下", "下载", "安装", "生成", "写个", "写一个", "创建", "新建", "删除",
-        "整理", "统计", "操作", "处理", "把", "给我", "自动",
+        "帮我",
+        "帮忙",
+        "打开",
+        "运行",
+        "执行",
+        "启动",
+        "查一下",
+        "查询",
+        "查找",
+        "搜一下",
+        "搜索",
+        "找一下",
+        "下载",
+        "安装",
+        "生成",
+        "写个",
+        "写一个",
+        "创建",
+        "新建",
+        "删除",
+        "整理",
+        "统计",
+        "操作",
+        "处理",
+        "把",
+        "给我",
+        "自动",
     ];
     ACTION_HINTS.iter().any(|k| lower.contains(k))
 }
@@ -1530,7 +1774,10 @@ impl ReactHooks for CodingHooks {
                 let todos_str = todos.to_string();
                 tauri::async_runtime::spawn(async move {
                     let _ = conv::Entity::update_many()
-                        .col_expr(conv::Column::PlanTodos, sea_orm::sea_query::Expr::value(todos_str))
+                        .col_expr(
+                            conv::Column::PlanTodos,
+                            sea_orm::sea_query::Expr::value(todos_str),
+                        )
                         .filter(conv::Column::Id.eq(cid))
                         .exec(&db)
                         .await;
@@ -1568,7 +1815,11 @@ impl ReactHooks for CodingHooks {
     }
 
     fn on_iter_end(&mut self, iter: usize) -> IterDecision {
-        let max_iters = if self.autonomous { MAX_AUTO_ITERS } else { MAX_ITERS };
+        let max_iters = if self.autonomous {
+            MAX_AUTO_ITERS
+        } else {
+            MAX_ITERS
+        };
         // 用户手动停止:每步检查取消令牌,命中则优雅收尾(不强杀,保证落库一致)。
         // 旧实现把此检查丢在循环外只跑一次,导致「停止」按钮对续航中的 Agent 失效。
         if self.is_cancelled() {
@@ -1639,7 +1890,9 @@ pub async fn send_coding_message(
     messages.push(ChatMsg::System(system_prompt.to_string()));
     // 用户可编辑的附加规范(<config_dir>/agent-guidelines/coding.md):有则注入
     if let Some(g) = load_agent_guidelines(&state.config_dir, "coding").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     // 会话滚动摘要
     if let Some(sys) = conv_summary::summary_system_message(&conversation.summary) {
@@ -1665,7 +1918,11 @@ pub async fn send_coding_message(
 
     // 自主续航:Act 模式默认开启
     let autonomous = matches!(agent_mode, coding::AgentMode::Act);
-    let max_iters = if autonomous { MAX_AUTO_ITERS } else { MAX_ITERS };
+    let max_iters = if autonomous {
+        MAX_AUTO_ITERS
+    } else {
+        MAX_ITERS
+    };
     // 取消令牌:每回合新建(无残留问题),守卫在回合结束(含错误路径)自动摘除
     let (cancel_token, _cancel_guard) =
         crate::agent::core::shared::begin_cancel_token(&state.cancel_tokens, &conversation_id);
@@ -1676,7 +1933,7 @@ pub async fn send_coding_message(
         enable_streaming: true, // 启用流式输出
         context_window_size: 120, // 编程场景需要更大的上下文窗口
         enable_parallel_tools: false, // 编程场景禁用并行，确保执行顺序
-        max_retries: 2, // LLM 调用失败时重试 2 次
+        max_retries: 2,   // LLM 调用失败时重试 2 次
         auto_fix_on_tool_error: false, // 编程场景已有自己的自动修复逻辑
     };
 
@@ -1760,7 +2017,9 @@ pub async fn run_coding_subtask(
 
     let mut messages: Vec<ChatMsg> = vec![ChatMsg::System(coding::SYSTEM_PROMPT.to_string())];
     if let Some(g) = load_agent_guidelines(config_dir, "coding").await {
-        messages.push(ChatMsg::System(format!("【附加规范(用户自定义,务必遵守)】\n{g}")));
+        messages.push(ChatMsg::System(format!(
+            "【附加规范(用户自定义,务必遵守)】\n{g}"
+        )));
     }
     messages.push(ChatMsg::User(task.to_string()));
 
@@ -1788,7 +2047,14 @@ pub async fn run_coding_subtask(
         latest_todos: Value::Null,
     };
     let result = crate::agent::core::react::react_run(
-        db, app, conversation_id, provider_ref, config, &mut hooks, &registry, &mut messages,
+        db,
+        app,
+        conversation_id,
+        provider_ref,
+        config,
+        &mut hooks,
+        &registry,
+        &mut messages,
         Some(cancel_token),
     )
     .await?;

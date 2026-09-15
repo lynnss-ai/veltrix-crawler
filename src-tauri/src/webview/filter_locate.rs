@@ -39,9 +39,7 @@ struct ClickPoint {
 pub async fn locate_by_labels(window: &WebviewWindow, labels: &[String]) -> Option<(i32, i32)> {
     let (raw, pt) = locate_by_labels_raw(window, labels).await;
     if pt.is_none() {
-        tracing::warn!(
-            "定位文案:页面未找到 {labels:?}(浮层未展开 / 文案不符 / 回读为空 {raw:?})"
-        );
+        tracing::warn!("定位文案:页面未找到 {labels:?}(浮层未展开 / 文案不符 / 回读为空 {raw:?})");
     }
     pt
 }

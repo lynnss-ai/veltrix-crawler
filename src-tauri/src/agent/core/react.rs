@@ -163,7 +163,12 @@ pub trait ReactHooks: Send {
     }
 
     /// 工具执行后的后处理。可用于追踪状态、注入额外消息等。
-    fn on_after_tool(&mut self, _call_name: &str, _call_args: &Value, _result: &ToolResult) -> ToolPostAction {
+    fn on_after_tool(
+        &mut self,
+        _call_name: &str,
+        _call_args: &Value,
+        _result: &ToolResult,
+    ) -> ToolPostAction {
         ToolPostAction::Continue
     }
 
@@ -283,7 +288,8 @@ pub async fn react_run(
                 &mut on_delta,
                 config.max_retries,
                 cancel,
-            ).await?
+            )
+            .await?
         };
         batcher.flush();
 
@@ -336,12 +342,7 @@ pub async fn react_run(
 
         if tool_calls.len() > 1 && config.enable_parallel_tools {
             // 并行执行多个工具
-            let results = execute_tools_parallel(
-                tool_calls,
-                hooks,
-                registry,
-                &emit,
-            ).await;
+            let results = execute_tools_parallel(tool_calls, hooks, registry, &emit).await;
 
             // 处理结果
             for (call, result) in tool_calls.iter().zip(results) {
@@ -426,7 +427,9 @@ pub async fn react_run(
         if has_tool_error {
             consecutive_tool_errors += 1;
             if config.auto_fix_on_tool_error && consecutive_tool_errors <= 2 {
-                emit(&format!("工具执行失败,自动尝试修复…(第 {consecutive_tool_errors} 次)"));
+                emit(&format!(
+                    "工具执行失败,自动尝试修复…(第 {consecutive_tool_errors} 次)"
+                ));
                 messages.push(ChatMsg::User(
                     "工具执行失败。请分析错误原因，尝试使用不同的参数或方法重试。如果多次失败，请说明原因并尝试其他方案。".to_string()
                 ));
@@ -624,13 +627,17 @@ async fn call_llm_with_retry(
                 }
                 if attempt < max_retries {
                     // 等待一段时间后重试
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (attempt + 1) as u64)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        1000 * (attempt + 1) as u64,
+                    ))
+                    .await;
                 }
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| veltrix_core::error::CrawlerError::Config("LLM 调用失败".into())))
+    Err(last_error
+        .unwrap_or_else(|| veltrix_core::error::CrawlerError::Config("LLM 调用失败".into())))
 }
 
 #[cfg(test)]

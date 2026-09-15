@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, ScreenInfo, ScreenPreview, AudioDeviceInfo, ClipSegment, ExportItem, VideoInfo, TransitionInput, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, CommentSourcePageResult, ContentLibraryStats, IndustryCounts, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView, ContentView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, ScreenInfo, ScreenPreview, AudioDeviceInfo, ClipSegment, ExportItem, VideoInfo, TransitionInput, ExportQuality, TextOverlay, CreationExportProgress, AiVideoPlanView, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, CommentSourcePageResult, ContentLibraryStats, IndustryCounts, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView, ContentView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -240,25 +240,80 @@ export const api = {
     invoke<void>("set_recording_overlay_preview", { preview }),
   stopScreenRecording: () => invoke<RecordingStatus>("stop_screen_recording"),
   getRecordingStatus: () => invoke<RecordingStatus>("get_recording_status"),
-  // 创作-视频剪辑导出:视频轨片段剪切 + 拼接(纯视频轨时后端 -ss -t -c copy 不重编码;
-  // 带音频轨叠加段时走 filter_complex 重编码混音),返回产物路径
+  // 创作-视频剪辑导出:视频轨片段剪切 + 拼接(纯视频轨无缩放时后端 -ss -t -c copy 不重编码;
+  // 带音频轨叠加段或指定分辨率时走 filter_complex 重编码混音),返回产物路径。
+  // scale 由前端按源分辨率换算(偶数宽高,不做放大),quality 映射后端 CRF 档位
   creationExportVideo: (
     inputPath: string,
     segments: ClipSegment[],
     audioSegments?: ClipSegment[],
     transition?: TransitionInput,
+    scale?: { width: number; height: number } | null,
+    quality?: ExportQuality,
+    muteOriginal?: boolean,
+    textOverlays?: TextOverlay[],
+    jobId?: string,
   ) =>
     invoke<string>("creation_export_video", {
       inputPath,
       segments,
-      audioSegments: audioSegments ?? [],
+      audioSegments: (audioSegments ?? []).map(({ start, end, position, inputPath: segmentInputPath }) => ({
+        start,
+        end,
+        position,
+        inputPath: segmentInputPath,
+      })),
       transition: transition ?? null,
+      scale: scale ?? null,
+      quality: quality ?? null,
+      muteOriginal: muteOriginal ?? null,
+      textOverlays: textOverlays ?? [],
+      jobId: jobId ?? crypto.randomUUID(),
     }),
+  creationCancelExport: (jobId: string) =>
+    invoke<void>("creation_cancel_export", { jobId }),
+  // 后台队列导出：命令只负责入队并立即返回，进度与结果走 creation-export-progress 事件。
+  creationStartExport: (input: {
+    inputPath: string;
+    segments: ClipSegment[];
+    audioSegments?: ClipSegment[];
+    transition?: TransitionInput;
+    scale?: { width: number; height: number } | null;
+    quality?: ExportQuality;
+    muteOriginal?: boolean;
+    textOverlays?: TextOverlay[];
+    jobId: string;
+  }) =>
+    invoke<void>("creation_start_export", {
+      input: {
+        ...input,
+        audioSegments: (input.audioSegments ?? []).map(
+          ({ start, end, position, inputPath }) => ({ start, end, position, inputPath }),
+        ),
+        transition: input.transition ?? null,
+        scale: input.scale ?? null,
+        quality: input.quality ?? null,
+        muteOriginal: input.muteOriginal ?? null,
+        textOverlays: input.textOverlays ?? [],
+      },
+    }),
+  creationListActiveExports: () =>
+    invoke<CreationExportProgress[]>("creation_list_active_exports"),
+  creationDismissExportJob: (jobId: string) =>
+    invoke<void>("creation_dismiss_export_job", { jobId }),
   // 剪辑历史:导出目录扫描,按时间倒序
   creationListExports: () => invoke<ExportItem[]>("creation_list_exports"),
+  creationDeleteExport: (name: string) =>
+    invoke<void>("creation_delete_export", { name }),
   // 视频元信息(帧率 / 码率 / 编码,后端 ffmpeg -i 解析)
   creationVideoInfo: (inputPath: string) =>
     invoke<VideoInfo>("creation_video_info", { inputPath }),
+  // 流式生成音频峰值；不会把大视频完整读入 WebView 内存。
+  creationAudioPeaks: (inputPath: string, buckets: number) =>
+    invoke<number[]>("creation_audio_peaks", { inputPath, buckets }),
+  // 剪辑播放器专用短 GOP 代理;返回 media_root 相对路径,导出仍使用原始素材。
+  creationVideoProxy: (inputPath: string) =>
+    invoke<string>("creation_video_proxy", { inputPath }),
   // 时间轴胶片条缩略图(返回 media_root 相对路径数组,mediaFileUrl 解地址)
   creationVideoThumbs: (inputPath: string) =>
     invoke<string[]>("creation_video_thumbs", { inputPath }),
@@ -268,6 +323,14 @@ export const api = {
       inputPath,
       threshold: threshold ?? null,
     }),
+  creationAiPlan: (input: {
+    inputPath: string;
+    scenes: Array<{ start: number; end: number }>;
+    platform: string;
+    goal: string;
+    brief: string;
+    targetDuration: number;
+  }) => invoke<AiVideoPlanView>("creation_ai_plan", { input }),
   // 录屏停止后:把视频以附件方式加入指定对话(引用本地路径),返回新消息
   attachRecordingMessage: (conversationId: string, path: string) =>
     invoke<ChatMessageView>("attach_recording_message", { conversationId, path }),
@@ -655,4 +718,4 @@ export const api = {
     invoke<void>("close_publish_account_window", { id }),
 };
 
-
+

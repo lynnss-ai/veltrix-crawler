@@ -16,12 +16,12 @@ pub mod tiktok;
 pub mod xhs;
 pub mod youtube;
 
-use veltrix_core::error::{CrawlerError, Result};
 use crate::model::{Author, Comment, Content, TaskKind};
 use crate::webview::InterceptedResponse;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use veltrix_core::error::{CrawlerError, Result};
 
 /// 适配器单次解析的产出。RPA 滚动已在一次会话内收集全量响应,故不再有分页游标。
 #[derive(Debug, Default)]

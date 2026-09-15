@@ -3,11 +3,11 @@
 
 use crate::commands::{current_user, AppState};
 use chrono::Utc;
-use std::path::Path;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
     Set,
 };
+use std::path::Path;
 use tauri::State;
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -24,7 +24,9 @@ pub async fn set_obsidian_vault(state: State<'_, AppState>, vault_path: String) 
         if !p.is_absolute() {
             return Err(CrawlerError::Config("vault 路径必须是绝对路径".into()));
         }
-        if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(CrawlerError::Config("vault 路径不允许包含「..」".into()));
         }
         if !p.is_dir() {
@@ -80,9 +82,12 @@ async fn record_synced(
         vault_path: Set(vault.to_string()),
     })
     .on_conflict(
-        OnConflict::columns([csu_entity::Column::ContentId, csu_entity::Column::SyncedUser])
-            .update_columns([csu_entity::Column::SyncedAt, csu_entity::Column::VaultPath])
-            .to_owned(),
+        OnConflict::columns([
+            csu_entity::Column::ContentId,
+            csu_entity::Column::SyncedUser,
+        ])
+        .update_columns([csu_entity::Column::SyncedAt, csu_entity::Column::VaultPath])
+        .to_owned(),
     )
     .exec(db)
     .await?;
@@ -259,8 +264,14 @@ pub(super) async fn sync_task_to_obsidian(
                         return false;
                     }
                 };
-                if let Err(e) =
-                    crate::obsidian::sync_one(&vault_path, &content, &comments, &industry, &media_root).await
+                if let Err(e) = crate::obsidian::sync_one(
+                    &vault_path,
+                    &content,
+                    &comments,
+                    &industry,
+                    &media_root,
+                )
+                .await
                 {
                     tracing::warn!(content_id = %content.id, "自动同步 Obsidian 写盘失败: {e}");
                     return false;

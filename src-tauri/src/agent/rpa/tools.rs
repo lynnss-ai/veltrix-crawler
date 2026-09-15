@@ -60,7 +60,11 @@ pub const SYSTEM_PROMPT: &str = "你是一个浏览器自动化 Agent,在应用�
 - 全部完成后用简洁中文总结「做了哪些操作、最终页面/结果如何」(此时不再调用工具)。";
 
 /// 构造浏览器 Agent 的工具注册表。所有工具共享同一会话子 webview(按 conversation_id 隔离)。
-pub fn build_registry(app: AppHandle, pool: Arc<WebviewPool>, conversation_id: String) -> ToolRegistry {
+pub fn build_registry(
+    app: AppHandle,
+    pool: Arc<WebviewPool>,
+    conversation_id: String,
+) -> ToolRegistry {
     let ctx = AgentCtx {
         app,
         pool,
@@ -123,7 +127,10 @@ async fn eval_action(
 
 /// 取 JSON 对象里某字符串字段(缺省空串)。
 fn val_str(data: &Value, key: &str) -> String {
-    data.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    data.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 取 JSON 对象里某布尔字段(缺省 false)。
@@ -149,7 +156,8 @@ impl Tool for NavigateTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "navigate".into(),
-            description: "在内嵌浏览器里导航到一个网址(仅支持 http/https),返回落地页标题与 URL".into(),
+            description: "在内嵌浏览器里导航到一个网址(仅支持 http/https),返回落地页标题与 URL"
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -185,7 +193,11 @@ impl Tool for NavigateTool {
                 let landed = val_str(&v, "url");
                 ToolResult::ok(format!(
                     "已导航。当前页面:{}({})",
-                    if title.is_empty() { "(无标题)" } else { &title },
+                    if title.is_empty() {
+                        "(无标题)"
+                    } else {
+                        &title
+                    },
                     if landed.is_empty() { url } else { &landed }
                 ))
             }
@@ -207,7 +219,14 @@ impl Tool for ReadPageTool {
         }
     }
     async fn run(&self, _args: Value) -> ToolResult {
-        match eval_action(&self.ctx, None, 0, &build_agent_read_eval(AGENT_READ_ELEMENT_CAP)).await {
+        match eval_action(
+            &self.ctx,
+            None,
+            0,
+            &build_agent_read_eval(AGENT_READ_ELEMENT_CAP),
+        )
+        .await
+        {
             Ok(v) => {
                 if let Some(err) = v.get("error").and_then(Value::as_str) {
                     return ToolResult::err(format!("读取页面失败:{err}"));
@@ -225,7 +244,11 @@ fn format_page(data: &Value) -> String {
     let url = val_str(data, "url");
     let mut s = format!(
         "当前页面:{}\nURL:{}\n",
-        if title.is_empty() { "(无标题)" } else { &title },
+        if title.is_empty() {
+            "(无标题)"
+        } else {
+            &title
+        },
         url
     );
     let elements = data.get("elements").and_then(Value::as_array);
@@ -237,10 +260,18 @@ fn format_page(data: &Value) -> String {
                 let ty = val_str(el, "type");
                 let text = val_str(el, "text");
                 let selector = val_str(el, "selector");
-                let kind = if ty.is_empty() { tag.clone() } else { format!("{tag}:{ty}") };
+                let kind = if ty.is_empty() {
+                    tag.clone()
+                } else {
+                    format!("{tag}:{ty}")
+                };
                 s.push_str(&format!(
                     "- [{kind}] {}  →  {selector}\n",
-                    if text.is_empty() { "(无文本)" } else { &text }
+                    if text.is_empty() {
+                        "(无文本)"
+                    } else {
+                        &text
+                    }
                 ));
             }
         }
@@ -290,11 +321,21 @@ impl Tool for ClickTool {
                     let text = val_str(&v, "text");
                     ToolResult::ok(format!(
                         "已点击命中元素 {selector}{}{}",
-                        if tag.is_empty() { String::new() } else { format!(" <{tag}>") },
-                        if text.is_empty() { String::new() } else { format!(":{text}") }
+                        if tag.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" <{tag}>")
+                        },
+                        if text.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":{text}")
+                        }
                     ))
                 } else {
-                    ToolResult::err(format!("未找到元素 {selector},点击未执行(可先 read_page 看可用元素)"))
+                    ToolResult::err(format!(
+                        "未找到元素 {selector},点击未执行(可先 read_page 看可用元素)"
+                    ))
                 }
             }
             Err(e) => ToolResult::err(format!("点击失败:{e}")),
@@ -329,7 +370,11 @@ impl Tool for TypeTool {
         if selector.is_empty() {
             return ToolResult::err("selector 不能为空");
         }
-        let text = args.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         match eval_action(&self.ctx, None, 0, &build_agent_type_eval(&selector, &text)).await {
             Ok(v) => {
                 if let Some(err) = v.get("error").and_then(Value::as_str) {
@@ -338,7 +383,9 @@ impl Tool for TypeTool {
                 if val_bool(&v, "matched") {
                     ToolResult::ok(format!("已向 {selector} 写入文本"))
                 } else {
-                    ToolResult::err(format!("未找到输入框 {selector}(可先 read_page 看可用元素)"))
+                    ToolResult::err(format!(
+                        "未找到输入框 {selector}(可先 read_page 看可用元素)"
+                    ))
                 }
             }
             Err(e) => ToolResult::err(format!("输入失败:{e}")),
@@ -391,7 +438,11 @@ impl Tool for WaitForTool {
                         let text = val_str(&v, "text");
                         return ToolResult::ok(format!(
                             "元素已出现:{selector}{}",
-                            if text.is_empty() { String::new() } else { format!("({text})") }
+                            if text.is_empty() {
+                                String::new()
+                            } else {
+                                format!("({text})")
+                            }
                         ));
                     }
                 }
@@ -444,14 +495,22 @@ impl Tool for GetNetworkTool {
         if matched.is_empty() {
             return ToolResult::ok(format!(
                 "(没有匹配的接口响应{})",
-                if needle.is_empty() { "" } else { ",试试去掉或更换过滤词" }
+                if needle.is_empty() {
+                    ""
+                } else {
+                    ",试试去掉或更换过滤词"
+                }
             ));
         }
         let total = matched.len();
         let shown = total.min(NET_SHOW_MAX);
         let mut s = format!("拦截到 {total} 条接口响应,显示最近 {shown} 条:\n\n");
         for r in matched.iter().rev().take(NET_SHOW_MAX).rev() {
-            s.push_str(&format!("● {}\n{}\n\n", r.url, truncate_chars(&r.body, NET_BODY_CAP)));
+            s.push_str(&format!(
+                "● {}\n{}\n\n",
+                r.url,
+                truncate_chars(&r.body, NET_BODY_CAP)
+            ));
         }
         ToolResult::ok(s)
     }
@@ -473,9 +532,10 @@ impl Tool for CaptureScreenTool {
     }
     async fn run(&self, _args: Value) -> ToolResult {
         // 截屏是阻塞调用,放 blocking 线程;复用 desktop 模块的截屏→data URL 能力
-        let joined =
-            tokio::task::spawn_blocking(|| crate::agent::desktop::tools::capture_screen_data_url(""))
-                .await;
+        let joined = tokio::task::spawn_blocking(|| {
+            crate::agent::desktop::tools::capture_screen_data_url("")
+        })
+        .await;
         match joined {
             Ok(Ok(data_url)) => ToolResult::ok(data_url),
             Ok(Err(e)) => ToolResult::err(format!("截屏失败: {e}")),

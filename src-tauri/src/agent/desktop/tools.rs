@@ -164,7 +164,8 @@ impl Tool for MouseClickTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "mouse_click".into(),
-            description: "在当前(或指定 x,y)位置点击鼠标。button:left/right/middle;double=true 为双击".into(),
+            description:
+                "在当前(或指定 x,y)位置点击鼠标。button:left/right/middle;double=true 为双击".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -225,7 +226,11 @@ impl Tool for MouseScrollTool {
         let joined = tokio::task::spawn_blocking(move || {
             use enigo::{Axis, Mouse};
             let mut e = new_enigo()?;
-            let axis = if horizontal { Axis::Horizontal } else { Axis::Vertical };
+            let axis = if horizontal {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            };
             e.scroll(amount as i32, axis)
                 .map_err(|err| format!("滚动失败: {err}"))?;
             Ok(format!("已滚动 {amount} 步"))
@@ -296,14 +301,19 @@ impl Tool for TypeTextTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let text = args.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if text.is_empty() {
             return ToolResult::err("text 不能为空");
         }
         let joined = tokio::task::spawn_blocking(move || {
             use enigo::Keyboard;
             let mut e = new_enigo()?;
-            e.text(&text).map_err(|err| format!("输入文本失败: {err}"))?;
+            e.text(&text)
+                .map_err(|err| format!("输入文本失败: {err}"))?;
             Ok(format!("已输入 {} 个字符", text.chars().count()))
         })
         .await;
@@ -317,9 +327,10 @@ impl Tool for PressKeysTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "press_keys".into(),
-            description: "按下一个组合键。keys 用 + 连接,如 `ctrl+c`、`alt+tab`、`ctrl+shift+s`、`enter`。\
+            description:
+                "按下一个组合键。keys 用 + 连接,如 `ctrl+c`、`alt+tab`、`ctrl+shift+s`、`enter`。\
                 修饰键(ctrl/alt/shift/cmd)按住,最后一个为主键点击后再松开修饰键。"
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -330,12 +341,21 @@ impl Tool for PressKeysTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let keys = args.get("keys").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let keys = args
+            .get("keys")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if keys.is_empty() {
             return ToolResult::err("keys 不能为空");
         }
         // 解析:最后一段是主键,前面都是修饰键
-        let parts: Vec<&str> = keys.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = keys
+            .split('+')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         let Some((main_name, mod_names)) = parts.split_last() else {
             return ToolResult::err("keys 解析为空");
         };
@@ -353,9 +373,12 @@ impl Tool for PressKeysTool {
             use enigo::{Direction, Keyboard};
             let mut e = new_enigo()?;
             for m in &mods {
-                e.key(*m, Direction::Press).map_err(|err| format!("按下修饰键失败: {err}"))?;
+                e.key(*m, Direction::Press)
+                    .map_err(|err| format!("按下修饰键失败: {err}"))?;
             }
-            let main_res = e.key(main_key, Direction::Click).map_err(|err| format!("按主键失败: {err}"));
+            let main_res = e
+                .key(main_key, Direction::Click)
+                .map_err(|err| format!("按主键失败: {err}"));
             // 无论主键是否成功,都要松开已按下的修饰键,避免卡键
             for m in mods.iter().rev() {
                 let _ = e.key(*m, Direction::Release);
@@ -411,10 +434,15 @@ impl Tool for WriteClipboardTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let text = args.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let joined = tokio::task::spawn_blocking(move || {
             let mut cb = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败: {e}"))?;
-            cb.set_text(text.clone()).map_err(|e| format!("写入剪贴板失败: {e}"))?;
+            cb.set_text(text.clone())
+                .map_err(|e| format!("写入剪贴板失败: {e}"))?;
             Ok(format!("已写入剪贴板({} 字符)", text.chars().count()))
         })
         .await;
@@ -450,7 +478,12 @@ impl Tool for ScreenshotTool {
             Ok(d) => d.join("agent-screenshots"),
             Err(e) => return ToolResult::err(format!("定位数据目录失败: {e}")),
         };
-        let target = args.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let joined = tokio::task::spawn_blocking(move || capture_to_file(&dir, &target)).await;
         blocking_result(joined)
     }
@@ -484,7 +517,9 @@ fn capture_to_file(dir: &std::path::Path, target: &str) -> Result<String, String
     let file = dir.join(format!("shot-{}.png", uuid::Uuid::new_v4()));
     let image = grab_image(target)?;
     let (w, h) = (image.width(), image.height());
-    image.save(&file).map_err(|e| format!("保存 PNG 失败: {e}"))?;
+    image
+        .save(&file)
+        .map_err(|e| format!("保存 PNG 失败: {e}"))?;
     Ok(format!("已截图 {}x{},保存到:{}", w, h, file.display()))
 }
 
@@ -534,7 +569,11 @@ fn list_windows_text() -> Result<String, String> {
             continue; // 跳过无标题的系统窗口
         }
         let app = w.app_name().unwrap_or_default();
-        let min = if w.is_minimized().unwrap_or(false) { " [最小化]" } else { "" };
+        let min = if w.is_minimized().unwrap_or(false) {
+            " [最小化]"
+        } else {
+            ""
+        };
         lines.push(format!("- {title}（{app}）{min}"));
         if lines.len() >= WINDOW_LIST_CAP {
             break;
@@ -543,7 +582,11 @@ fn list_windows_text() -> Result<String, String> {
     if lines.is_empty() {
         return Ok("(未发现可见窗口)".to_string());
     }
-    Ok(format!("当前窗口({} 个):\n{}", lines.len(), lines.join("\n")))
+    Ok(format!(
+        "当前窗口({} 个):\n{}",
+        lines.len(),
+        lines.join("\n")
+    ))
 }
 
 // ===================== 窗口控制(focus / 最大化 / 最小化 / 关闭) =====================
@@ -565,11 +608,17 @@ impl Tool for FocusWindowTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if title.is_empty() {
             return ToolResult::err("title 不能为空");
         }
-        let joined = tokio::task::spawn_blocking(move || platform_window::control(&title, "focus")).await;
+        let joined =
+            tokio::task::spawn_blocking(move || platform_window::control(&title, "focus")).await;
         blocking_result(joined)
     }
 }
@@ -592,12 +641,23 @@ impl Tool for ControlWindowTool {
         }
     }
     async fn run(&self, args: Value) -> ToolResult {
-        let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if title.is_empty() || action.is_empty() {
             return ToolResult::err("缺少参数 title / action");
         }
-        let joined = tokio::task::spawn_blocking(move || platform_window::control(&title, &action)).await;
+        let joined =
+            tokio::task::spawn_blocking(move || platform_window::control(&title, &action)).await;
         blocking_result(joined)
     }
 }
@@ -610,7 +670,8 @@ impl Tool for LaunchProgramTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "launch_program".into(),
-            description: "启动一个本机程序(可带参数),不等待其退出。如 notepad、code、/usr/bin/firefox".into(),
+            description:
+                "启动一个本机程序(可带参数),不等待其退出。如 notepad、code、/usr/bin/firefox".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -632,7 +693,11 @@ impl Tool for LaunchProgramTool {
         let extra: Vec<String> = args
             .get("args")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let joined = tokio::task::spawn_blocking(move || {
             std::process::Command::new(&program)
@@ -652,7 +717,9 @@ impl Tool for OpenPathTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "open_path".into(),
-            description: "用系统默认方式打开文件 / 文件夹 / URL(Windows→start,macOS→open,Linux→xdg-open)".into(),
+            description:
+                "用系统默认方式打开文件 / 文件夹 / URL(Windows→start,macOS→open,Linux→xdg-open)"
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -675,7 +742,9 @@ impl Tool for OpenPathTool {
                 // 直接 spawn explorer.exe(target 作单个 argv,不经 cmd):避免 `cmd /C start`
                 // 让 cmd 重新解析 & | > ^ 等元字符导致命令注入(BatBadBut / CVE-2024-24576 类)。
                 // explorer 不是 shell,对文件/文件夹/URL 都按关联程序打开。
-                std::process::Command::new("explorer.exe").arg(&target).spawn()
+                std::process::Command::new("explorer.exe")
+                    .arg(&target)
+                    .spawn()
             } else if cfg!(target_os = "macos") {
                 std::process::Command::new("open").arg(&target).spawn()
             } else {
@@ -795,7 +864,8 @@ mod platform_window {
         let script = [
             format!("set theNeedle to \"{needle}\""),
             "tell application \"System Events\"".to_string(),
-            "repeat with theProc in (application processes whose background only is false)".to_string(),
+            "repeat with theProc in (application processes whose background only is false)"
+                .to_string(),
             "repeat with theWin in (windows of theProc)".to_string(),
             "if name of theWin contains theNeedle then".to_string(),
             op.to_string(),
@@ -832,6 +902,9 @@ mod platform_window {
 #[cfg(not(any(windows, target_os = "macos")))]
 mod platform_window {
     pub fn control(_title: &str, _action: &str) -> Result<String, String> {
-        Err("当前平台暂未实现窗口控制(focus / 最大化 / 关闭),可用 list_windows 查看窗口".to_string())
+        Err(
+            "当前平台暂未实现窗口控制(focus / 最大化 / 关闭),可用 list_windows 查看窗口"
+                .to_string(),
+        )
     }
 }

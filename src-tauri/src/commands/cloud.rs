@@ -24,9 +24,7 @@ pub async fn cloud_get_config(state: State<'_, AppState>) -> Result<CloudConfig,
 }
 
 #[tauri::command]
-pub async fn cloud_get_status(
-    state: State<'_, AppState>,
-) -> Result<ConnectionState, String> {
+pub async fn cloud_get_status(state: State<'_, AppState>) -> Result<ConnectionState, String> {
     Ok(state.cloud.get_state().await)
 }
 

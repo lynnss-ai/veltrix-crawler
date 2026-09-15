@@ -5,17 +5,17 @@
 //! - device:bind:{device_id} → pair_id(单值,覆盖即踢旧手机)
 
 use axum::{
-    Json, Router,
     extract::{ConnectInfo, State},
     http::HeaderMap,
     routing::post,
+    Json, Router,
 };
 use bb8_redis::redis::AsyncCommands;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use super::auth::{AuthUser, encode_mobile_token, encode_pc_token};
+use super::auth::{encode_mobile_token, encode_pc_token, AuthUser};
 use super::{ApiResponse, ApiState, AppError};
 
 /// 配对码有效期(秒)
@@ -75,7 +75,9 @@ fn gen_pair_code() -> String {
     format!("{:06}", n)
 }
 
-async fn redis_conn(state: &ApiState) -> Result<bb8::PooledConnection<'_, bb8_redis::RedisConnectionManager>, AppError> {
+async fn redis_conn(
+    state: &ApiState,
+) -> Result<bb8::PooledConnection<'_, bb8_redis::RedisConnectionManager>, AppError> {
     let pool = state
         .redis
         .as_ref()
@@ -161,9 +163,7 @@ async fn pair_confirm(
         .map_err(|e| AppError::Internal(format!("Redis 查询失败计数失败: {e}")))?
         .unwrap_or(0);
     if fails >= CONFIRM_MAX_FAILS {
-        return Err(AppError::Unauthorized(
-            "尝试次数过多,请稍后再试".into(),
-        ));
+        return Err(AppError::Unauthorized("尝试次数过多,请稍后再试".into()));
     }
 
     let code_key = format!("pair:code:{code}");

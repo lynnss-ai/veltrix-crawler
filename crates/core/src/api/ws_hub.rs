@@ -6,7 +6,7 @@
 
 use dashmap::DashMap;
 use serde_json::Value;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{channel, Sender};
 
 /// 服务端 → 客户端的消息(走 JSON,字段 flatten 即可)
 pub type Outbound = Value;
@@ -31,10 +31,7 @@ impl WsHub {
     }
 
     /// 注册 PC,返回 receiver。若同 device_id 已有连接,旧连接 channel 关闭(让旧 socket 自然退出)
-    pub fn register_pc(
-        &self,
-        device_id: &str,
-    ) -> tokio::sync::mpsc::Receiver<Outbound> {
+    pub fn register_pc(&self, device_id: &str) -> tokio::sync::mpsc::Receiver<Outbound> {
         let (tx, rx) = channel(CHANNEL_BUFFER);
         if let Some(old) = self.pcs.insert(device_id.to_string(), tx) {
             drop(old);

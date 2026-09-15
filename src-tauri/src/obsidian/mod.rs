@@ -62,7 +62,11 @@ fn kind_cn(k: &str) -> &str {
 /// Unix 秒 → 本地时区「YYYY-MM-DD HH:MM」。
 fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+        .map(|dt| {
+            dt.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -79,7 +83,9 @@ fn fmt_duration(secs: i64) -> String {
 fn yaml_str(s: &str) -> String {
     format!(
         "\"{}\"",
-        s.replace('\\', " ").replace('"', "'").replace(['\n', '\r'], " ")
+        s.replace('\\', " ")
+            .replace('"', "'")
+            .replace(['\n', '\r'], " ")
     )
 }
 
@@ -163,7 +169,10 @@ fn render_markdown(
     if let Some(p) = c.published_at {
         md.push_str(&format!("发布时间: {}\n", yaml_str(&fmt_ts(p))));
     }
-    md.push_str(&format!("采集时间: {}\n", yaml_str(&fmt_ts(c.collected_at))));
+    md.push_str(&format!(
+        "采集时间: {}\n",
+        yaml_str(&fmt_ts(c.collected_at))
+    ));
     // 链接放笔记属性(Obsidian 属性面板里可点击跳转)
     if let Some(u) = share_url {
         md.push_str(&format!("原内容链接: {}\n", yaml_str(u)));
@@ -228,7 +237,12 @@ fn render_markdown(
     if let Some(f) = &assets.audio {
         audio_text.push(format!("![[{f}]]"));
     }
-    if let Some(tr) = c.transcript.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(tr) = c
+        .transcript
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         audio_text.push(tr.to_string());
     }
     if !audio_text.is_empty() {

@@ -158,7 +158,8 @@ impl LocalSandbox {
 // ===================== 环境变量净化(平台共享) =====================
 
 /// 疑似密钥变量的名字特征(大写后子串匹配)。PATH / SystemRoot / HOME 等基础设施变量天然不含这些词。
-const SENSITIVE_ENV_MARKERS: &[&str] = &["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTH"];
+const SENSITIVE_ENV_MARKERS: &[&str] =
+    &["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTH"];
 
 /// 过滤环境变量(纯函数,便于单测):剔除名字命中疑似密钥特征的变量,白名单(大写精确名)豁免。
 /// 剔除时只记变量名(debug 日志),绝不记值。
@@ -190,7 +191,8 @@ where
 /// 以当前进程环境为输入做净化(非 Unicode 名 / 值的变量直接跳过,cmd.env 反正也灌不进)。
 fn scrubbed_env(keep: &[String]) -> Vec<(String, String)> {
     filter_env(
-        std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
         keep,
     )
 }
@@ -203,19 +205,18 @@ mod imp_impl {
     use std::io;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject,
-        SetInformationJobObject, SetIoRateControlInformationJobObject, TerminateJobObject,
-        JOBOBJECTINFOCLASS, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
-        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOBOBJECT_IO_RATE_CONTROL_INFORMATION, JOBOBJECT_NET_RATE_CONTROL_INFORMATION,
-        JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_CPU_RATE_CONTROL,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAndIoAccountingInformation,
+        JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+        JobObjectNetRateControlInformation, QueryInformationJobObject, SetInformationJobObject,
+        SetIoRateControlInformationJobObject, TerminateJobObject, JOBOBJECTINFOCLASS,
+        JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECT_IO_RATE_CONTROL_INFORMATION,
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+        JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_IO_RATE_CONTROL_ENABLE, JOB_OBJECT_LIMIT,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_CPU_RATE_CONTROL,
         JOB_OBJECT_LIMIT_IO_RATE_CONTROL, JOB_OBJECT_LIMIT_JOB_MEMORY,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_NET_RATE_CONTROL,
-        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-        JOB_OBJECT_IO_RATE_CONTROL_ENABLE, JOB_OBJECT_NET_RATE_CONTROL_ENABLE,
-        JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH, JobObjectBasicAndIoAccountingInformation,
-        JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
-        JobObjectNetRateControlInformation,
+        JOB_OBJECT_NET_RATE_CONTROL_ENABLE, JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH,
     };
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
@@ -279,21 +280,26 @@ mod imp_impl {
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 ) {
                     if !has_rate_limit {
-                        return Err(io::Error::other(format!("SetInformationJobObject 失败: {e}")));
+                        return Err(io::Error::other(format!(
+                            "SetInformationJobObject 失败: {e}"
+                        )));
                     }
                     // 降级:摘掉 NET/CPU/IO rate-control 位重试;rate 信息本身(下面各自的
                     // SetInformationJobObject / SetIoRateControlInformationJobObject)仍可正常设置
                     tracing::warn!(
                         "Job extended limit 带 rate-control 位被拒绝({e}),摘掉后重试(限速仍会设置)"
                     );
-                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT(flags.0 & !rate_flags.0);
+                    info.BasicLimitInformation.LimitFlags =
+                        JOB_OBJECT_LIMIT(flags.0 & !rate_flags.0);
                     SetInformationJobObject(
                         job,
                         JobObjectExtendedLimitInformation,
                         &info as *const _ as *const _,
                         size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                     )
-                    .map_err(|e2| io::Error::other(format!("SetInformationJobObject 失败: {e2}")))?;
+                    .map_err(|e2| {
+                        io::Error::other(format!("SetInformationJobObject 失败: {e2}"))
+                    })?;
                 }
                 if let Some(net) = net_limit_bytes_per_sec {
                     // 出站带宽限速(Windows 10+ 原生,无需管理员):ENABLE | MAX_BANDWIDTH
@@ -345,7 +351,9 @@ mod imp_impl {
                         )));
                     }
                 }
-                Ok(Self { job: OwnedHandle(job) })
+                Ok(Self {
+                    job: OwnedHandle(job),
+                })
             }
         }
 
@@ -358,8 +366,9 @@ mod imp_impl {
                 let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
                     .map_err(|e| io::Error::other(format!("OpenProcess({pid}) 失败: {e}")))?;
                 let proc = OwnedHandle(proc);
-                AssignProcessToJobObject(self.job.0, proc.0)
-                    .map_err(|e| io::Error::other(format!("AssignProcessToJobObject({pid}) 失败: {e}")))
+                AssignProcessToJobObject(self.job.0, proc.0).map_err(|e| {
+                    io::Error::other(format!("AssignProcessToJobObject({pid}) 失败: {e}"))
+                })
             }
         }
 
@@ -391,11 +400,12 @@ mod imp_impl {
                 JobObjectBasicAndIoAccountingInformation,
             ) {
                 // TotalXxxTime 单位是 100ns
-                s.cpu_secs = (acc.BasicInfo.TotalUserTime + acc.BasicInfo.TotalKernelTime) as f64 / 1e7;
+                s.cpu_secs =
+                    (acc.BasicInfo.TotalUserTime + acc.BasicInfo.TotalKernelTime) as f64 / 1e7;
                 s.active_processes = acc.BasicInfo.ActiveProcesses;
             }
-            if let Some(lim) =
-                self.query::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(JobObjectExtendedLimitInformation)
+            if let Some(lim) = self
+                .query::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(JobObjectExtendedLimitInformation)
             {
                 s.peak_mem_bytes = lim.PeakJobMemoryUsed as u64;
             }
@@ -524,7 +534,9 @@ pub fn dir_size(root: &Path) -> u64 {
     let mut entries = 0usize;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             entries += 1;
             if entries > DIR_SIZE_MAX_ENTRIES {
@@ -547,9 +559,19 @@ pub fn dir_size(root: &Path) -> u64 {
 fn audit_file_name(sandbox_id: &str) -> String {
     let s: String = sandbox_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if s.is_empty() { "default".to_string() } else { s }
+    if s.is_empty() {
+        "default".to_string()
+    } else {
+        s
+    }
 }
 
 /// 审计文件路径:<config_dir>/sandbox-audit/<sandbox_id>.jsonl。
@@ -585,7 +607,10 @@ pub fn audit(
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         writeln!(f, "{line}")?;
         Ok(())
     })();
@@ -679,8 +704,22 @@ impl SandboxManager {
 
     /// 经 manager 写一条审计(等价 free fn audit,省传 config_dir)。
     #[allow(dead_code)] // 当前调用点走 free fn(tools.rs 只有 exec.config_dir),此便捷方法预留
-    pub fn audit(&self, sandbox_id: &str, command: &str, exit_code: Option<i32>, duration_ms: u128, timeout: bool) {
-        audit(&self.config_dir, sandbox_id, command, exit_code, duration_ms, timeout);
+    pub fn audit(
+        &self,
+        sandbox_id: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        duration_ms: u128,
+        timeout: bool,
+    ) {
+        audit(
+            &self.config_dir,
+            sandbox_id,
+            command,
+            exit_code,
+            duration_ms,
+            timeout,
+        );
     }
 
     /// 取或建某 id 的沙盒。已存在直接返回(**忽略本次 opts**:内存上限等选项在建 Job 时固化,
@@ -820,7 +859,8 @@ mod tests {
     /// 存储占用统计:嵌套目录求和正确。
     #[test]
     fn dir_size_sums_nested_files() {
-        let root = std::env::temp_dir().join(format!("veltrix-sandbox-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("veltrix-sandbox-test-{}", std::process::id()));
         let sub = root.join("a/b");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(root.join("f1.bin"), vec![0u8; 1000]).unwrap();
@@ -846,7 +886,10 @@ mod tests {
         assert!(!names.contains(&"MY_API_KEY"), "KEY 应被剔除");
         assert!(!names.contains(&"OAUTH_TOKEN"), "TOKEN/AUTH 应被剔除");
         assert!(names.contains(&"db_password"), "白名单应豁免");
-        assert!(names.contains(&"NORMAL_VAR") && names.contains(&"PATH"), "普通变量应保留");
+        assert!(
+            names.contains(&"NORMAL_VAR") && names.contains(&"PATH"),
+            "普通变量应保留"
+        );
     }
 
     /// 审计:写入后 read_audit 能按尾部 limit 读回;不存在返回空。
@@ -861,7 +904,11 @@ mod tests {
         assert_eq!(all.len(), 6);
         let tail = read_audit(&dir, "conv-1", 2);
         assert_eq!(tail.len(), 2);
-        assert!(tail[0].contains("cmd-4"), "尾部第 1 条应为 cmd-4: {}", tail[0]);
+        assert!(
+            tail[0].contains("cmd-4"),
+            "尾部第 1 条应为 cmd-4: {}",
+            tail[0]
+        );
         assert!(tail[1].contains("npm run dev") && tail[1].contains("\"exit_code\":null"));
         assert!(read_audit(&dir, "nonexistent", 10).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -870,7 +917,11 @@ mod tests {
     /// 清存储护栏:拒绝根 / 浅层路径;正常目录清空内容但保留目录。
     #[test]
     fn clear_storage_dir_guard_and_clear() {
-        let root = if cfg!(windows) { Path::new("C:\\") } else { Path::new("/") };
+        let root = if cfg!(windows) {
+            Path::new("C:\\")
+        } else {
+            Path::new("/")
+        };
         assert!(clear_storage_dir(root).is_err(), "根目录必须被拒");
         // 正常目录:清内容、留目录
         let base = std::env::temp_dir()
@@ -881,7 +932,10 @@ mod tests {
         std::fs::write(base.join("f.txt"), b"x").unwrap();
         clear_storage_dir(&base).unwrap();
         assert!(base.exists());
-        assert!(std::fs::read_dir(&base).unwrap().next().is_none(), "内容应已清空");
+        assert!(
+            std::fs::read_dir(&base).unwrap().next().is_none(),
+            "内容应已清空"
+        );
         let _ = std::fs::remove_dir_all(base.parent().unwrap().parent().unwrap());
     }
 
@@ -950,7 +1004,10 @@ mod win_tests {
         // 等孙进程起来
         std::thread::sleep(std::time::Duration::from_millis(2000));
         let tree = process_tree(pid);
-        assert!(tree.len() >= 2, "应至少有 cmd + powershell 两个进程: {tree:?}");
+        assert!(
+            tree.len() >= 2,
+            "应至少有 cmd + powershell 两个进程: {tree:?}"
+        );
 
         sb.terminate();
         // 给内核一点时间完成清理

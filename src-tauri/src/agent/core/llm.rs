@@ -366,8 +366,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 if let Some(u) = v.get("usage") {
                     usage = TokenUsage {
                         prompt: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        completion: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0)
-                            as u32,
+                        completion: u
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32,
                     };
                 }
             }
@@ -393,7 +395,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
         Ok(LlmResponse {
             content: if text.is_empty() { None } else { Some(text) },
-            reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_calls,
             finish_reason: finish,
             usage,
@@ -438,7 +444,10 @@ fn msg_to_openai(m: &ChatMsg) -> Value {
             }
             v
         }
-        ChatMsg::Tool { tool_call_id, content } => json!({
+        ChatMsg::Tool {
+            tool_call_id,
+            content,
+        } => json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "content": content,
@@ -494,7 +503,11 @@ fn parse_openai_response(payload: &Value) -> Result<LlmResponse> {
                     let args_str = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
                     let arguments = serde_json::from_str(args_str)
                         .unwrap_or_else(|_| Value::Object(Default::default()));
-                    Some(ToolCall { id, name, arguments })
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    })
                 })
                 .collect()
         })
@@ -510,7 +523,10 @@ fn parse_openai_response(payload: &Value) -> Result<LlmResponse> {
         .get("usage")
         .map(|u| TokenUsage {
             prompt: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            completion: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            completion: u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         })
         .unwrap_or_default();
 
@@ -646,7 +662,10 @@ fn msgs_to_anthropic(messages: &[ChatMsg]) -> (String, Vec<Value>) {
                     out.push(json!({ "role": "assistant", "content": blocks }));
                 }
             }
-            ChatMsg::Tool { tool_call_id, content } => push_user(
+            ChatMsg::Tool {
+                tool_call_id,
+                content,
+            } => push_user(
                 &mut out,
                 json!({
                     "type": "tool_result",
@@ -684,7 +703,9 @@ fn parse_anthropic_response(payload: &Value) -> Result<LlmResponse> {
     let blocks = payload
         .get("content")
         .and_then(Value::as_array)
-        .ok_or_else(|| CrawlerError::Config("Anthropic 响应缺少 content(可能被风控或鉴权失败)".into()))?;
+        .ok_or_else(|| {
+            CrawlerError::Config("Anthropic 响应缺少 content(可能被风控或鉴权失败)".into())
+        })?;
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -702,11 +723,23 @@ fn parse_anthropic_response(payload: &Value) -> Result<LlmResponse> {
                 }
             }
             Some("tool_use") => {
-                let id = b.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-                let name = b.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let id = b
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = b
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let arguments = b.get("input").cloned().unwrap_or_else(|| json!({}));
                 if !name.is_empty() {
-                    tool_calls.push(ToolCall { id, name, arguments });
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
                 }
             }
             _ => {}
@@ -727,7 +760,11 @@ fn parse_anthropic_response(payload: &Value) -> Result<LlmResponse> {
         .unwrap_or_default();
     Ok(LlmResponse {
         content: if text.is_empty() { None } else { Some(text) },
-        reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
         tool_calls,
         finish_reason,
         usage,
@@ -745,10 +782,16 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -797,7 +840,11 @@ impl ToolRegistry {
     }
     /// 按 name 执行;未知工具返回 is_error 结果(回灌模型而非中断)。
     pub async fn run(&self, name: &str, args: Value) -> ToolResult {
-        match self.name_index.get(name).and_then(|&idx| self.tools.get(idx)) {
+        match self
+            .name_index
+            .get(name)
+            .and_then(|&idx| self.tools.get(idx))
+        {
             Some(t) => t.run(args).await,
             None => ToolResult::err(format!("未知工具: {name}")),
         }

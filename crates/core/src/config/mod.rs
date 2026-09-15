@@ -291,9 +291,16 @@ fn default_rpa_steps(platform_id: &str) -> Vec<RpaStep> {
 /// 真实参数名/值需本机抓包核对(与 search_url / intercept_patterns 同属「骨架待抓包」)。
 fn builtin_search_query(
     id: &str,
-) -> (String, BTreeMap<String, String>, String, BTreeMap<String, String>) {
+) -> (
+    String,
+    BTreeMap<String, String>,
+    String,
+    BTreeMap<String, String>,
+) {
     let pair = |arr: &[(&str, &str)]| -> BTreeMap<String, String> {
-        arr.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        arr.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     };
     match id {
         // 抖音搜索 URL:sort_type 0综合/1最多点赞/2最新;publish_time 0不限/1一天/7一周/180半年
@@ -318,7 +325,12 @@ fn builtin_search_query(
             String::new(),
             BTreeMap::new(),
         ),
-        _ => (String::new(), BTreeMap::new(), String::new(), BTreeMap::new()),
+        _ => (
+            String::new(),
+            BTreeMap::new(),
+            String::new(),
+            BTreeMap::new(),
+        ),
     }
 }
 
@@ -346,13 +358,28 @@ fn builtin_verify_signals(id: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
                 "#captcha-verify-image".into(),
                 ".captcha-verify-container".into(),
             ],
-            vec!["请完成下列验证后继续".into(), "完成安全验证".into(), "拖动下方滑块".into(), "按住左边按钮拖动完成上方拼图".into(), "向右滑动".into()],
-            vec!["/captcha/".into(), "verifycenter".into(), "secsdk".into(), "vc_captcha".into()],
+            vec![
+                "请完成下列验证后继续".into(),
+                "完成安全验证".into(),
+                "拖动下方滑块".into(),
+                "按住左边按钮拖动完成上方拼图".into(),
+                "向右滑动".into(),
+            ],
+            vec![
+                "/captcha/".into(),
+                "verifycenter".into(),
+                "secsdk".into(),
+                "vc_captcha".into(),
+            ],
         ),
         // 小红书:滑块验证容器 + captcha 接口
         "xhs" => (
             vec![".captcha-container".into(), ".red-captcha".into()],
-            vec!["滑动验证".into(), "请完成安全验证".into(), "向右滑动".into()],
+            vec![
+                "滑动验证".into(),
+                "请完成安全验证".into(),
+                "向右滑动".into(),
+            ],
             vec!["/captcha".into(), "/web/v1/verify".into()],
         ),
         // 快手:验证码弹层
@@ -374,7 +401,9 @@ fn builtin_profile_url(id: &str) -> &'static str {
         // 抖音主页用 sec_uid,无需 token;搜索响应不含粉丝/关注/获赞/属地,需打开主页补采
         "douyin" => "https://www.douyin.com/user/{id}",
         // 小红书主页需 xsec_token(由最近一条该作者内容的 author_xsec_token 提供)
-        "xhs" => "https://www.xiaohongshu.com/user/profile/{id}?xsec_token={token}&xsec_source=pc_search",
+        "xhs" => {
+            "https://www.xiaohongshu.com/user/profile/{id}?xsec_token={token}&xsec_source=pc_search"
+        }
         "kuaishou" => "https://www.kuaishou.com/profile/{id}",
         "bilibili" => "https://space.bilibili.com/{id}",
         "youtube" => "https://www.youtube.com/channel/{id}",
@@ -970,8 +999,7 @@ impl AppConfig {
                 builtin_search_query(id);
             let (verify_selectors, verify_texts, verify_url_patterns) = builtin_verify_signals(id);
             // 搜索/评论拦截特征 + 画像接口特征合并(去重),作者补采复用同一套拦截
-            let mut all_patterns: Vec<String> =
-                patterns.into_iter().map(str::to_string).collect();
+            let mut all_patterns: Vec<String> = patterns.into_iter().map(str::to_string).collect();
             for p in builtin_profile_patterns(id) {
                 if !all_patterns.iter().any(|x| x == p) {
                     all_patterns.push(p.to_string());

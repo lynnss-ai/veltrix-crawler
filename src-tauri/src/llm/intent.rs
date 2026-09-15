@@ -83,8 +83,11 @@ fn parse_verdicts(content: &str) -> Vec<IntentVerdict> {
     arr.iter()
         .filter_map(|v| {
             let comment_id = v.get("comment_id").and_then(Value::as_str)?.to_string();
-            let level =
-                normalize_level(v.get("intent_level").and_then(Value::as_str).unwrap_or("none"));
+            let level = normalize_level(
+                v.get("intent_level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none"),
+            );
             let reason = v
                 .get("reason")
                 .and_then(Value::as_str)

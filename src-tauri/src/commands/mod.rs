@@ -7,6 +7,7 @@ pub mod billing;
 pub mod cloud;
 pub mod collect;
 pub mod creation;
+pub mod creation_ai;
 pub mod creation_vision;
 pub mod dashboard;
 pub mod publish;
@@ -14,9 +15,7 @@ pub mod task;
 // 再导出采集执行引擎的全部命令与类型,保持 commands::X 路径不变(lib.rs invoke_handler 依赖)。
 pub use collect::*;
 
-use veltrix_core::config::{AppConfig, PlatformConfig};
 use crate::cookie::{Account, AccountStatus, CookiePool};
-use veltrix_core::error::{CrawlerError, Result};
 use crate::webview::pool::WebviewPool;
 use crate::webview::{CollectControl, InterceptChannel, RpaChannel};
 use chrono::Utc;
@@ -28,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use veltrix_core::config::{AppConfig, PlatformConfig};
+use veltrix_core::error::{CrawlerError, Result};
 
 /// 后端会话内的「当前登录用户」。桌面端走 IPC、无 JWT,
 /// 故用进程内内存态替代鉴权上下文:name=用户名(业务数据 owner),scope="all"/"self"。
@@ -169,9 +170,7 @@ pub async fn get_database_size(state: State<'_, AppState>) -> Result<i64> {
              (SELECT page_size FROM pragma_page_size()) AS size"
         }
         DatabaseBackend::Postgres => "SELECT pg_database_size(current_database()) AS size",
-        DatabaseBackend::MySql => {
-            return Err(CrawlerError::Config("不支持的数据库后端".into()))
-        }
+        DatabaseBackend::MySql => return Err(CrawlerError::Config("不支持的数据库后端".into())),
     };
     let row = db
         .query_one(Statement::from_string(backend, sql.to_owned()))
@@ -211,14 +210,20 @@ pub async fn get_file_server_prefix() -> Result<String> {
     let ip = tauri::async_runtime::spawn_blocking(media_lan_ipv4)
         .await
         .map_err(|e| CrawlerError::Config(format!("识别内网地址失败: {e}")))??;
-    Ok(format!("http://{ip}:{}/files", crate::file_server::DEFAULT_PORT))
+    Ok(format!(
+        "http://{ip}:{}/files",
+        crate::file_server::DEFAULT_PORT
+    ))
 }
 
 /// 本机渲染专用前缀(loopback):与 get_file_server_prefix(LAN,供内网分享)不同,
 /// 不识别网卡、不启动 PowerShell,本机 WebView 渲染图片恒走 127.0.0.1。
 #[tauri::command]
 pub fn get_local_file_server_prefix() -> Result<String> {
-    Ok(format!("http://127.0.0.1:{}/files", crate::file_server::DEFAULT_PORT))
+    Ok(format!(
+        "http://127.0.0.1:{}/files",
+        crate::file_server::DEFAULT_PORT
+    ))
 }
 
 /// 代理 TUN 可能接管默认路由,文件分享优先选择已联网的物理网卡。
@@ -242,7 +247,9 @@ fn media_lan_ipv4() -> Result<String> {
                 }
             }
         }
-        return Err(CrawlerError::Config("未找到已连接的内网网卡,请连接 Wi-Fi 或有线网络后重试".into()));
+        return Err(CrawlerError::Config(
+            "未找到已连接的内网网卡,请连接 Wi-Fi 或有线网络后重试".into(),
+        ));
     }
     #[cfg(not(windows))]
     lan_ipv4()
@@ -250,7 +257,10 @@ fn media_lan_ipv4() -> Result<String> {
 
 /// 把数据库里的本机媒体路径转换成内网文件服务 URL;文件不在媒体根目录时返回 None。
 #[tauri::command]
-pub async fn get_media_file_url(state: State<'_, AppState>, path: String) -> Result<Option<String>> {
+pub async fn get_media_file_url(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<String>> {
     let prefix = get_file_server_prefix().await?;
     let cfg = lock_config(&state)?;
     Ok(crate::file_server::public_url_for_path(
@@ -442,7 +452,8 @@ pub async fn migrate_sqlite_to_pg(
         .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT table_name, column_name FROM information_schema.columns \
-             WHERE table_schema='public' AND data_type='boolean'".to_owned(),
+             WHERE table_schema='public' AND data_type='boolean'"
+                .to_owned(),
         ))
         .await
         .map_err(|e| CrawlerError::Config(format!("读取目标库结构失败: {e}")))?
@@ -519,7 +530,12 @@ pub async fn migrate_sqlite_to_pg(
                 table_written: 0,
                 phase: "done",
             });
-            report.push(TableMigrationView { table, read: 0, written: 0, skipped: true });
+            report.push(TableMigrationView {
+                table,
+                read: 0,
+                written: 0,
+                skipped: true,
+            });
             continue;
         }
         let cols: Vec<(String, String)> = src_cols
@@ -571,10 +587,18 @@ pub async fn migrate_sqlite_to_pg(
                     let is_bool_target = bool_cols.contains(&(table.clone(), name.clone()));
                     // 按 SQLite 声明类型取裸值;目标是布尔列时把 0/1 转 bool
                     let v: Value = if is_bool_target {
-                        Value::from(row.try_get::<Option<i64>>("", name).ok().flatten().map(|n| n != 0))
+                        Value::from(
+                            row.try_get::<Option<i64>>("", name)
+                                .ok()
+                                .flatten()
+                                .map(|n| n != 0),
+                        )
                     } else if decl.contains("INT") || decl.contains("BOOL") {
                         Value::from(row.try_get::<Option<i64>>("", name).ok().flatten())
-                    } else if decl.contains("REAL") || decl.contains("FLOA") || decl.contains("DOUB") {
+                    } else if decl.contains("REAL")
+                        || decl.contains("FLOA")
+                        || decl.contains("DOUB")
+                    {
                         Value::from(row.try_get::<Option<f64>>("", name).ok().flatten())
                     } else if decl.contains("BLOB") {
                         Value::from(row.try_get::<Option<Vec<u8>>>("", name).ok().flatten())
@@ -632,7 +656,8 @@ pub async fn migrate_sqlite_to_pg(
         .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT table_name, column_name FROM information_schema.columns \
-             WHERE table_schema='public' AND column_default LIKE 'nextval%'".to_owned(),
+             WHERE table_schema='public' AND column_default LIKE 'nextval%'"
+                .to_owned(),
         ))
         .await
         .map_err(|e| CrawlerError::Config(format!("读取目标序列失败: {e}")))?;
@@ -845,7 +870,11 @@ pub async fn set_media_proxy(state: State<'_, AppState>, proxy: String) -> Resul
 }
 
 // 密钥读写(api_key 存数据库 app_secrets,不落配置文件)
-pub(crate) async fn set_secret(db: &sea_orm::DatabaseConnection, key: &str, value: &str) -> Result<()> {
+pub(crate) async fn set_secret(
+    db: &sea_orm::DatabaseConnection,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::Set;
     use veltrix_core::db::entity::app_secret;
@@ -954,9 +983,24 @@ pub async fn get_role_models(state: State<'_, AppState>) -> Result<RoleModelConf
 /// 保存角色模型配置(空串=清空映射,回退会话模型)。用 set_secret 持久化到 app_secrets。
 #[tauri::command]
 pub async fn set_role_models(state: State<'_, AppState>, config: RoleModelConfig) -> Result<()> {
-    set_secret(&state.db, &AgentRole::Classify.secret_key(), config.classify_model.trim()).await?;
-    set_secret(&state.db, &AgentRole::Summary.secret_key(), config.summary_model.trim()).await?;
-    set_secret(&state.db, &AgentRole::Apply.secret_key(), config.apply_model.trim()).await?;
+    set_secret(
+        &state.db,
+        &AgentRole::Classify.secret_key(),
+        config.classify_model.trim(),
+    )
+    .await?;
+    set_secret(
+        &state.db,
+        &AgentRole::Summary.secret_key(),
+        config.summary_model.trim(),
+    )
+    .await?;
+    set_secret(
+        &state.db,
+        &AgentRole::Apply.secret_key(),
+        config.apply_model.trim(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -972,11 +1016,7 @@ pub fn list_provider_capabilities() -> Vec<crate::llm::ProviderCapability> {
 /// - 必须以「应用数据目录」为前缀(防写到任意系统位置)
 /// - 不允许 `..` 越界
 #[tauri::command]
-pub fn save_text_file(
-    state: State<'_, AppState>,
-    path: String,
-    content: String,
-) -> Result<()> {
+pub fn save_text_file(state: State<'_, AppState>, path: String, content: String) -> Result<()> {
     let target = PathBuf::from(&path);
     if !target.is_absolute() {
         return Err(CrawlerError::Config("路径必须是绝对路径".into()));
@@ -988,23 +1028,23 @@ pub fn save_text_file(
         return Err(CrawlerError::Config("路径包含非法的 .. 段".into()));
     }
     // 规范化前缀(必须在 app 数据目录之下)
-    let allowed_root = state.config_dir.canonicalize().unwrap_or_else(|_| {
-        state.config_dir.clone()
-    });
-    let target_parent = target.parent().ok_or_else(|| {
-        CrawlerError::Config("路径缺少父目录".into())
-    })?;
-    let parent_canon = target_parent.canonicalize().unwrap_or_else(|_| {
-        target_parent.to_path_buf()
-    });
+    let allowed_root = state
+        .config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state.config_dir.clone());
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| CrawlerError::Config("路径缺少父目录".into()))?;
+    let parent_canon = target_parent
+        .canonicalize()
+        .unwrap_or_else(|_| target_parent.to_path_buf());
     if !parent_canon.starts_with(&allowed_root) {
         return Err(CrawlerError::Config(format!(
             "拒绝写入应用数据目录之外的路径: {}",
             target.display()
         )));
     }
-    std::fs::write(&target, content)
-        .map_err(|e| CrawlerError::Config(format!("保存文件失败: {e}")))
+    std::fs::write(&target, content).map_err(|e| CrawlerError::Config(format!("保存文件失败: {e}")))
 }
 
 /// 导出文件:把 base64 内容写到经系统保存对话框选定的绝对路径(导出 Excel 等)。
@@ -1042,8 +1082,7 @@ pub async fn clear_business_data(
     use veltrix_core::db::entity::{
         author as author_entity, collect_log as collect_log_entity,
         collect_record as collect_record_entity, comment as comment_entity,
-        content as content_entity,
-        task as task_entity,
+        content as content_entity, task as task_entity,
     };
 
     // 必须已登录:以会话用户名校验密码,杜绝无身份直接清库
@@ -1107,17 +1146,15 @@ fn clear_dir_contents(dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir)
         .map_err(|e| CrawlerError::Config(format!("读取素材目录失败: {e}")))?
     {
-        let entry =
-            entry.map_err(|e| CrawlerError::Config(format!("遍历素材目录失败: {e}")))?;
+        let entry = entry.map_err(|e| CrawlerError::Config(format!("遍历素材目录失败: {e}")))?;
         let path = entry.path();
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
         };
-        removed.map_err(|e| {
-            CrawlerError::Config(format!("删除素材 {} 失败: {e}", path.display()))
-        })?;
+        removed
+            .map_err(|e| CrawlerError::Config(format!("删除素材 {} 失败: {e}", path.display())))?;
     }
     Ok(())
 }
@@ -1246,7 +1283,10 @@ pub async fn upsert_account(state: State<'_, AppState>, account: AccountInput) -
         .await
         .map_err(|e| CrawlerError::Account(format!("查询账号失败: {e}")))?;
     if dup.is_some() {
-        return Err(CrawlerError::Config(format!("编码已存在: {}", account.code)));
+        return Err(CrawlerError::Config(format!(
+            "编码已存在: {}",
+            account.code
+        )));
     }
     let existing = account_entity::Entity::find_by_id(account.id.clone())
         .one(db)
@@ -1404,14 +1444,10 @@ pub fn open_login_window(
                             if acc.starts_with(crate::publish::LOGIN_REPORT_PREFIX) {
                                 publish::finalize_publish_login(&publish, &verdicts, &acc).await;
                                 use tauri::Emitter;
-                                let _ = app
-                                    .emit(crate::publish::ACCOUNT_UPDATED_EVENT, &platform);
+                                let _ = app.emit(crate::publish::ACCOUNT_UPDATED_EVENT, &platform);
                                 return;
                             }
-                            let last = verdicts
-                                .lock()
-                                .ok()
-                                .and_then(|mut m| m.remove(&acc));
+                            let last = verdicts.lock().ok().and_then(|mut m| m.remove(&acc));
                             let result = if last.as_deref() == Some("out") {
                                 cookies.mark_invalid(&acc).await
                             } else {
@@ -1433,4 +1469,3 @@ pub fn open_login_window(
     });
     Ok(())
 }
-

@@ -66,10 +66,7 @@ impl DouyinAdapter {
         // 归类:有图集即图文;有视频直链即视频;无直链但确有 video.play_addr 结构 = 视频被风控降级,
         // 仍归 Video 以便走「视频缺直链 → 标记媒体失败可重试」(否则会变 Unknown 假成功、转写永久缺失且无重试标记);
         // 完全无图、也无 video.play_addr 字段才按未知(避免图文 / 纯异常项被误判为视频去采音频)。
-        let has_video_field = info
-            .get("video")
-            .and_then(|v| v.get("play_addr"))
-            .is_some();
+        let has_video_field = info.get("video").and_then(|v| v.get("play_addr")).is_some();
         let kind = if !image_urls.is_empty() {
             ContentKind::Image
         } else if video_url.is_some() || has_video_field {
@@ -185,7 +182,10 @@ impl DouyinAdapter {
                 .unwrap_or_default()
                 .to_string(),
             avatar,
-            signature: a.get("signature").and_then(Value::as_str).map(str::to_string),
+            signature: a
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             follower_count: a.get("follower_count").and_then(Value::as_i64),
             following_count: a.get("following_count").and_then(Value::as_i64),
             extra: serde_json::json!({
@@ -395,7 +395,10 @@ impl DouyinAdapter {
                     .unwrap_or_default()
                     .to_string(),
                 avatar,
-                signature: user.get("signature").and_then(Value::as_str).map(str::to_string),
+                signature: user
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 follower_count: user.get("follower_count").and_then(Value::as_i64),
                 following_count: user.get("following_count").and_then(Value::as_i64),
                 extra: serde_json::json!({

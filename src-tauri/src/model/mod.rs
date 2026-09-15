@@ -24,7 +24,6 @@ pub enum ContentKind {
     Unknown,
 }
 
-
 /// 作者 / 博主。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Author {

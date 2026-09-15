@@ -276,187 +276,198 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            let setup_started = std::time::Instant::now();
             let base = app.path().app_config_dir()?;
             let config_dir = config::resolve_config_dir(&base);
             let mut cfg = config::AppConfig::load_or_default(&config_dir)?;
 
-            // 连接数据库(运行时二选一 SQLite / PG)并建表;setup 为同步上下文,阻塞等待完成
+            // 连接数据库(运行时二选一 SQLite / PG)并建表;setup 为同步上下文,阻塞等待完成。
+            // 这是唯一必须在 setup 内完成的初始化(AppState 与所有命令依赖表结构),
+            // 其余存量迁移/回填在下方整体后台化,避免占住主线程让首批 invoke 排队。
+            let db_connect_started = std::time::Instant::now();
             let db = tauri::async_runtime::block_on(db::connect(&config_dir, &cfg.database))?;
+            tracing::info!(
+                "数据库连接与建表完成: {}ms",
+                db_connect_started.elapsed().as_millis()
+            );
 
-            // 存量迁移:contents 表本地素材路径统一改写为相对 media_root 的相对路径(幂等,失败仅告警)
+            // 存量迁移与回填整体后台化:下面这些步骤全部是幂等的存量修正
+            // (素材路径相对化、残留任务/执行历史状态重置、作者/话题回填、provider 迁移与种子),
+            // 原先逐个 block_on 会把 setup(主线程)阻塞数秒,窗口首帧后前端发出的
+            // 首批 invoke(hasUsers / 概览查询等)只能排队干等。建表是命令的唯一硬前置
+            // (上方已完成),这些修正与页面加载并行执行即可;极端情况下前端会短暂看到
+            // 旧状态(如残留「进行中」任务),由随后的状态重置自愈。
             {
-                let mroot = crate::media::media_root(&config_dir, &cfg.media);
-                let migrate_db = db.clone();
-                tauri::async_runtime::block_on(async move {
-                    crate::media::migrate_media_paths_to_relative(&migrate_db, &mroot).await;
-                });
-            }
+                let bg_db = db.clone();
+                let bg_config_dir = config_dir.clone();
+                let bg_media = cfg.media.clone();
+                tauri::async_runtime::spawn(async move {
+                    let bg_started = std::time::Instant::now();
 
-            // 应用重启后内存里的采集 spawn 已丢失:把残留的「进行中」任务标记为中断,
-            // 避免界面一直显示假进度(运行中 / 评论采集中 / 意向分析中 / 素材下载中)。
-            {
-                use sea_orm::sea_query::Expr;
-                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-                use veltrix_core::db::entity::task;
-                let reset_db = db.clone();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    task::Entity::update_many()
-                        .col_expr(task::Column::Status, Expr::value("failed"))
-                        .col_expr(
-                            task::Column::ErrorMessage,
-                            Expr::value("应用重启,采集已中断,可重新运行"),
-                        )
-                        .filter(task::Column::Status.is_in([
-                            "running",
-                            "collecting_comments",
-                            "analyzing_comments",
-                            "downloading_media",
-                        ]))
-                        .exec(&reset_db)
-                        .await
-                }) {
-                    tracing::warn!("重置残留进行中任务失败: {e}");
-                }
-            }
+                    // 存量迁移:contents 表本地素材路径统一改写为相对 media_root 的相对路径(幂等,失败仅告警)
+                    let mroot = crate::media::media_root(&bg_config_dir, &bg_media);
+                    crate::media::migrate_media_paths_to_relative(&bg_db, &mroot).await;
 
-            // 同步收尾残留的「进行中」执行历史(task_run):finalize_task_run 只在线上路径跑,
-            // 重启后这些行会永远停在 running、finished_at=NULL,执行历史里像「永远跑不完」
-            {
-                use sea_orm::sea_query::Expr;
-                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-                use veltrix_core::db::entity::task_run;
-                let reset_db = db.clone();
-                let now = chrono::Utc::now().timestamp();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    task_run::Entity::update_many()
-                        .col_expr(task_run::Column::Status, Expr::value("failed"))
-                        .col_expr(task_run::Column::FinishedAt, Expr::value(now))
-                        .col_expr(
-                            task_run::Column::ErrorMessage,
-                            Expr::value("应用重启,采集已中断"),
-                        )
-                        .filter(task_run::Column::Status.eq("running"))
-                        .exec(&reset_db)
-                        .await
-                }) {
-                    tracing::warn!("重置残留进行中执行历史失败: {e}");
-                }
-            }
-
-            // 作者表存量回填:authors 为空时,从 content 历史数据回填一次(幂等)
-            {
-                let migrate_db = db.clone();
-                tauri::async_runtime::block_on(async {
-                    commands::task::migrate_authors_from_contents(&migrate_db).await;
-                });
-            }
-
-            // 话题存量回填:历史内容 topics 为空但正文含 #话题 的,从正文补提取一次(幂等,不改正文)
-            {
-                let backfill_db = db.clone();
-                tauri::async_runtime::block_on(async {
-                    commands::task::backfill_empty_topics(&backfill_db).await;
-                });
-            }
-
-            // 旧版 provider.code 为随机值(PRV-XXXX);本次起改用标准厂商 code
-            // (deepseek/qwen/mimo/glm/minimax),语音转写按 code 判 ASR。这里按 name / api_url
-            // 关键词把旧 provider 的 code 迁移为标准值,使已有的 MiMo 等厂商在转写配置里可被识别;
-            // 匹配不到的保留原值(视为非标准厂商,不支持 ASR)。
-            {
-                use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
-                use veltrix_core::db::entity::provider;
-                let migrate_db = db.clone();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    for p in provider::Entity::find().all(&migrate_db).await? {
-                        if matches!(
-                            p.code.as_str(),
-                            "deepseek" | "qwen" | "mimo" | "glm" | "minimax"
-                        ) {
-                            continue;
-                        }
-                        let hay = format!("{} {}", p.name, p.api_url).to_lowercase();
-                        // 注意:MiMo 的 api.xiaomimimo.com 含 "mimo",能命中
-                        let mapped = if hay.contains("deepseek") {
-                            Some("deepseek")
-                        } else if hay.contains("qwen")
-                            || hay.contains("千问")
-                            || hay.contains("通义")
-                            || hay.contains("dashscope")
+                    // 应用重启后内存里的采集 spawn 已丢失:把残留的「进行中」任务标记为中断,
+                    // 避免界面一直显示假进度(运行中 / 评论采集中 / 意向分析中 / 素材下载中)。
+                    {
+                        use sea_orm::sea_query::Expr;
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+                        use veltrix_core::db::entity::task;
+                        if let Err(e) = task::Entity::update_many()
+                            .col_expr(task::Column::Status, Expr::value("failed"))
+                            .col_expr(
+                                task::Column::ErrorMessage,
+                                Expr::value("应用重启,采集已中断,可重新运行"),
+                            )
+                            .filter(task::Column::Status.is_in([
+                                "running",
+                                "collecting_comments",
+                                "analyzing_comments",
+                                "downloading_media",
+                            ]))
+                            .exec(&bg_db)
+                            .await
                         {
-                            Some("qwen")
-                        } else if hay.contains("mimo") || hay.contains("小米") {
-                            Some("mimo")
-                        } else if hay.contains("glm")
-                            || hay.contains("智谱")
-                            || hay.contains("bigmodel")
-                        {
-                            Some("glm")
-                        } else if hay.contains("minimax") {
-                            Some("minimax")
-                        } else {
-                            None
-                        };
-                        if let Some(code) = mapped {
-                            let mut am = p.into_active_model();
-                            am.code = Set(code.to_string());
-                            am.update(&migrate_db).await?;
+                            tracing::warn!("重置残留进行中任务失败: {e}");
                         }
                     }
-                    Ok::<(), sea_orm::DbErr>(())
-                }) {
-                    tracing::warn!("迁移 provider code 失败(忽略): {e}");
-                }
-            }
 
-            // 首次启动初始化 5 家标准模型厂商(apiKey/models 留空待用户配),按 id 幂等跳过已有
-            {
-                use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-                use veltrix_core::db::entity::provider;
-                let seed_db = db.clone();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    use sea_orm::{ColumnTrait, QueryFilter};
-                    let now = chrono::Utc::now().timestamp();
-                    for cap in llm::all_capabilities() {
-                        // 按 code 判重:用户可能已手动加过该厂商(id 不同),避免重复初始化
-                        let exists = provider::Entity::find()
-                            .filter(provider::Column::Code.eq(cap.code.as_str()))
-                            .one(&seed_db)
-                            .await?
-                            .is_some();
-                        if !exists {
-                            provider::ActiveModel {
-                                id: Set(format!("prv-{}", cap.code)),
-                                code: Set(cap.code),
-                                name: Set(cap.name),
-                                api_url: Set(cap.api_url),
-                                api_key: Set(String::new()),
-                                models: Set(String::new()),
-                                created_at: Set(now),
-                                updated_at: Set(now),
+                    // 同步收尾残留的「进行中」执行历史(task_run):finalize_task_run 只在线上路径跑,
+                    // 重启后这些行会永远停在 running、finished_at=NULL,执行历史里像「永远跑不完」
+                    {
+                        use sea_orm::sea_query::Expr;
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+                        use veltrix_core::db::entity::task_run;
+                        let now = chrono::Utc::now().timestamp();
+                        if let Err(e) = task_run::Entity::update_many()
+                            .col_expr(task_run::Column::Status, Expr::value("failed"))
+                            .col_expr(task_run::Column::FinishedAt, Expr::value(now))
+                            .col_expr(
+                                task_run::Column::ErrorMessage,
+                                Expr::value("应用重启,采集已中断"),
+                            )
+                            .filter(task_run::Column::Status.eq("running"))
+                            .exec(&bg_db)
+                            .await
+                        {
+                            tracing::warn!("重置残留进行中执行历史失败: {e}");
+                        }
+                    }
+
+                    // 作者表存量回填:authors 为空时,从 content 历史数据回填一次(幂等)
+                    commands::task::migrate_authors_from_contents(&bg_db).await;
+
+                    // 话题存量回填:历史内容 topics 为空但正文含 #话题 的,从正文补提取一次(幂等,不改正文)
+                    commands::task::backfill_empty_topics(&bg_db).await;
+
+                    // 旧版 provider.code 为随机值(PRV-XXXX);本次起改用标准厂商 code
+                    // (deepseek/qwen/mimo/glm/minimax),语音转写按 code 判 ASR。这里按 name / api_url
+                    // 关键词把旧 provider 的 code 迁移为标准值,使已有的 MiMo 等厂商在转写配置里可被识别;
+                    // 匹配不到的保留原值(视为非标准厂商,不支持 ASR)。
+                    {
+                        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+                        use veltrix_core::db::entity::provider;
+                        if let Err(e) = async {
+                            for p in provider::Entity::find().all(&bg_db).await? {
+                                if matches!(
+                                    p.code.as_str(),
+                                    "deepseek" | "qwen" | "mimo" | "glm" | "minimax"
+                                ) {
+                                    continue;
+                                }
+                                let hay = format!("{} {}", p.name, p.api_url).to_lowercase();
+                                // 注意:MiMo 的 api.xiaomimimo.com 含 "mimo",能命中
+                                let mapped = if hay.contains("deepseek") {
+                                    Some("deepseek")
+                                } else if hay.contains("qwen")
+                                    || hay.contains("千问")
+                                    || hay.contains("通义")
+                                    || hay.contains("dashscope")
+                                {
+                                    Some("qwen")
+                                } else if hay.contains("mimo") || hay.contains("小米") {
+                                    Some("mimo")
+                                } else if hay.contains("glm")
+                                    || hay.contains("智谱")
+                                    || hay.contains("bigmodel")
+                                {
+                                    Some("glm")
+                                } else if hay.contains("minimax") {
+                                    Some("minimax")
+                                } else {
+                                    None
+                                };
+                                if let Some(code) = mapped {
+                                    let mut am = p.into_active_model();
+                                    am.code = Set(code.to_string());
+                                    am.update(&bg_db).await?;
+                                }
                             }
-                            .insert(&seed_db)
-                            .await?;
+                            Ok::<(), sea_orm::DbErr>(())
+                        }
+                        .await
+                        {
+                            tracing::warn!("迁移 provider code 失败(忽略): {e}");
                         }
                     }
-                    Ok::<(), sea_orm::DbErr>(())
-                }) {
-                    tracing::warn!("初始化标准厂商失败(忽略): {e}");
-                }
+
+                    // 首次启动初始化 5 家标准模型厂商(apiKey/models 留空待用户配),按 id 幂等跳过已有
+                    {
+                        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+                        use veltrix_core::db::entity::provider;
+                        if let Err(e) = async {
+                            use sea_orm::{ColumnTrait, QueryFilter};
+                            let now = chrono::Utc::now().timestamp();
+                            for cap in llm::all_capabilities() {
+                                // 按 code 判重:用户可能已手动加过该厂商(id 不同),避免重复初始化
+                                let exists = provider::Entity::find()
+                                    .filter(provider::Column::Code.eq(cap.code.as_str()))
+                                    .one(&bg_db)
+                                    .await?
+                                    .is_some();
+                                if !exists {
+                                    provider::ActiveModel {
+                                        id: Set(format!("prv-{}", cap.code)),
+                                        code: Set(cap.code),
+                                        name: Set(cap.name),
+                                        api_url: Set(cap.api_url),
+                                        api_key: Set(String::new()),
+                                        models: Set(String::new()),
+                                        created_at: Set(now),
+                                        updated_at: Set(now),
+                                    }
+                                    .insert(&bg_db)
+                                    .await?;
+                                }
+                            }
+                            Ok::<(), sea_orm::DbErr>(())
+                        }
+                        .await
+                        {
+                            tracing::warn!("初始化标准厂商失败(忽略): {e}");
+                        }
+                    }
+
+                    tracing::info!(
+                        "后台启动迁移/回填完成: {}ms",
+                        bg_started.elapsed().as_millis()
+                    );
+                });
             }
 
             let cookies = Arc::new(cookie::CookiePool::new(db.clone()));
             let publish = Arc::new(publish::PublishAccounts::new(db.clone()));
             tracing::info!(
                 platforms = cfg.platforms.len(),
+                setup_ms = setup_started.elapsed().as_millis(),
                 "配置与账号池就绪,数据目录: {}",
                 config_dir.display()
             );
 
             // 采集日志落库:有界通道 + 后台 writer,攒批插入减轻 SQLite 写锁竞争。
             // 通道满时限流丢弃(emit 走 try_send),优先保障采集吞吐。
-            let (log_tx, mut log_rx) =
-                tokio::sync::mpsc::channel::<webview::CollectLog>(1024);
+            let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<webview::CollectLog>(1024);
             webview::init_log_sink(log_tx);
             let log_db = db.clone();
             tauri::async_runtime::spawn(async move {
@@ -472,8 +483,10 @@ pub fn run() {
                     match first {
                         Ok(Some(log)) => {
                             // 收到第一条,先入批
-                            let entry_json =
-                                log.entry.as_ref().and_then(|e| serde_json::to_string(e).ok());
+                            let entry_json = log
+                                .entry
+                                .as_ref()
+                                .and_then(|e| serde_json::to_string(e).ok());
                             batch.push(collect_log::ActiveModel {
                                 task_id: Set(log.task_id),
                                 ts: Set(log.ts),
@@ -578,7 +591,14 @@ pub fn run() {
                 tracing::warn!("配置的 ffmpeg 路径不存在,回退内置 ffmpeg: {configured}");
                 cfg.media.ffmpeg_path = None;
             }
-            if cfg.media.ffmpeg_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            if cfg
+                .media
+                .ffmpeg_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
                 if let Some(p) = crate::media::bundled_ffmpeg_path(app.handle()) {
                     tracing::info!("使用内置 ffmpeg: {}", p.display());
                     cfg.media.ffmpeg_path = Some(p.to_string_lossy().into_owned());
@@ -586,12 +606,13 @@ pub fn run() {
                 }
             }
 
-            // 启动时探测一次 ffmpeg 可用性,写入录屏状态;后续录屏命令直接读标记,不再每次启子进程探测。
-            // 配置路径探测失败再试系统 PATH(与 check_ffmpeg 的兜底口径一致)
-            let ffmpeg_available =
-                crate::media::probe_ffmpeg(cfg.media.ffmpeg_path.as_deref()).is_some()
-                    || crate::media::probe_ffmpeg(None).is_some();
-            tracing::info!("ffmpeg 启动探测:可用={ffmpeg_available}");
+            // 绝对路径存在即可先标记可用；真正启动 ffmpeg 的编码器/设备探测全部在 manage 后后台执行，
+            // 避免首批前端 invoke 因等待子进程而一直显示骨架屏。系统 PATH 兜底也由后台预热补判。
+            let ffmpeg_available = cfg
+                .media
+                .ffmpeg_path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).is_file());
 
             // 全局沙盒管理器(审计日志根目录 = config_dir;回收循环与 AppState 共享同一实例)
             let sandbox_manager = Arc::new(sandbox::SandboxManager::new(config_dir.clone()));
@@ -837,10 +858,18 @@ pub fn run() {
             commands::creation::upsert_shot_prompt,
             commands::creation::remove_shot_prompt,
             commands::creation::creation_export_video,
+            commands::creation::creation_start_export,
+            commands::creation::creation_list_active_exports,
+            commands::creation::creation_dismiss_export_job,
+            commands::creation::creation_cancel_export,
             commands::creation::creation_list_exports,
+            commands::creation::creation_delete_export,
             commands::creation::creation_video_info,
+            commands::creation::creation_audio_peaks,
+            commands::creation::creation_video_proxy,
             commands::creation::creation_video_thumbs,
             commands::creation_vision::creation_detect_scenes,
+            commands::creation_ai::creation_ai_plan,
             commands::list_platforms,
             commands::upsert_platform,
             commands::remove_platform,

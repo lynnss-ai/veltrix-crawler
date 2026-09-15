@@ -17,8 +17,8 @@ pub mod shell;
 pub mod system;
 pub mod uia;
 
-use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
+use std::path::{Component, Path, PathBuf};
 use tauri::AppHandle;
 use veltrix_core::error::{CrawlerError, Result};
 
@@ -41,9 +41,7 @@ pub fn resolve_in_workspace(workspace: &Path, input: &str) -> Result<PathBuf> {
                 return Err(CrawlerError::Config("路径包含非法的 .. 段".into()));
             }
             Component::Prefix(_) | Component::RootDir => {
-                return Err(CrawlerError::Config(
-                    "路径不能包含盘符或根目录前缀".into(),
-                ));
+                return Err(CrawlerError::Config("路径不能包含盘符或根目录前缀".into()));
             }
         }
     }
@@ -64,7 +62,9 @@ pub struct AgentToolInfo {
 /// 不落盘,直接把画面回传给调用方——前端可 `<img src>` 显示,或将来作为多模态消息喂给视觉模型。
 /// `target` 留空=主显示器全屏;填窗口标题子串=截该窗口。Windows 首要支持(xcap 本身跨平台)。
 #[tauri::command]
-pub async fn capture_desktop_screenshot(target: Option<String>) -> std::result::Result<String, String> {
+pub async fn capture_desktop_screenshot(
+    target: Option<String>,
+) -> std::result::Result<String, String> {
     let target = target.unwrap_or_default();
     // 截屏是阻塞调用,放 blocking 线程,避免占用 async 执行器
     tokio::task::spawn_blocking(move || desktop::tools::capture_screen_data_url(&target))
