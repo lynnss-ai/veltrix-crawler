@@ -19,6 +19,7 @@
 pub mod cdp;
 pub mod cookies;
 pub mod filter_locate;
+pub mod jev_filter;
 pub mod native_intercept;
 pub mod pool;
 pub mod script_eval;

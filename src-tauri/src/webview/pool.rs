@@ -185,7 +185,7 @@ async fn open_filter_panel(window: &WebviewWindow, platform_id: &str, real: bool
             "🎛️ 展开「筛选」浮层…"
         },
     ));
-    let _ = click_filter_labels(window, &panel_lbls, real).await;
+    let _ = click_filter_labels(window, platform_id, &panel_lbls, real).await;
     let ready_lbls = filter_panel_ready_labels(platform_id);
     if ready_lbls.is_empty() {
         // 无标志文案的平台:退回固定等待
@@ -241,11 +241,11 @@ async fn click_filter_with_retry(
             .await
             .is_some()
         {
-            return click_filter_labels(window, labels, real).await;
+            return click_filter_labels(window, platform_id, labels, real).await;
         }
     }
     // 重试仍找不到:走原路径(内部会再定位一次、告警并做合成兜底),行为与旧版一致
-    click_filter_labels(window, labels, real).await
+    click_filter_labels(window, platform_id, labels, real).await
 }
 
 /// 该平台的筛选点击是否需要真实 OS 鼠标:抖音 / TikTok 走 secsdk 体系,会校验事件 isTrusted,
@@ -257,10 +257,23 @@ fn needs_real_click(platform_id: &str) -> bool {
 /// 点击筛选文案:secsdk 平台(抖音)走窗口消息级点击(PostMessage 到渲染子窗口,Chromium 视为
 /// 真实输入、绕过 isTrusted 校验,且不动真光标/不要求前台);定位不到或非该类平台则回退合成点击。
 /// 返回是否走了消息级真实点击(供日志标注)。
-async fn click_filter_labels(window: &WebviewWindow, labels: &[String], real: bool) -> bool {
+async fn click_filter_labels(
+    window: &WebviewWindow,
+    platform_id: &str,
+    labels: &[String],
+    real: bool,
+) -> bool {
     let label0 = labels.first().map(String::as_str).unwrap_or("");
     // 先回读定位:定位不到 = 浮层里没找到该文案(没展开到 / 文案不符 / 被同名元素抢先),HUD 告警
     let located = crate::webview::filter_locate::locate_by_labels(window, labels).await;
+    // 页面文案改版时才请求 Jev;模型只选当前可见控件,点击仍走下面的窗口输入路径。
+    let (located, jev_selected) = match located {
+        Some(point) => (Some(point), false),
+        None => (
+            crate::webview::jev_filter::locate(window, platform_id, labels).await,
+            true,
+        ),
+    };
     let Some((cx, cy)) = located else {
         let _ = window.eval(build_hud_log_eval(
             "warn",
@@ -269,7 +282,7 @@ async fn click_filter_labels(window: &WebviewWindow, labels: &[String], real: bo
         let _ = window.eval(build_select_eval(labels));
         return false;
     };
-    if real {
+    if real || jev_selected {
         // 视口 CSS 坐标 × scale = 渲染子窗口客户区物理坐标(渲染窗口客户区原点即视口 0,0)
         let scale = window.scale_factor().unwrap_or(1.0);
         let px = (cx as f64 * scale).round() as i32;
