@@ -17,6 +17,7 @@
 use crate::adapter::{FetchContext, PlatformAdapter};
 use crate::model::TaskKind;
 use crate::webview::native_intercept::{self, ResponseSink};
+use crate::webview::jev_risk;
 use crate::webview::{
     build_comment_scroll_eval, build_detail_eval, build_hud_init_script, build_hud_keyword_eval,
     build_hud_log_eval, build_hud_session_eval, build_hud_status_eval, build_hud_status_eval_state,
@@ -4535,8 +4536,8 @@ impl CollectBridge {
                 .get("error")
                 .and_then(|x| x.as_str())
                 .unwrap_or("bad-result");
-            tracing::warn!("评论直采回传格式异常(无 jobs 数组) session 结果: {result}");
-            return Some((CommentApiOutcome::Fallback, error.to_string()));
+            tracing::warn!(kind = jev_risk::error_kind(error), "评论直采回传格式异常(无 jobs 数组)");
+            return Some((CommentApiOutcome::Fallback, jev_risk::error_kind(error).to_string()));
         };
         // 跨批串号防护:上一批的脚本被中止后仍可能延迟回传,任一 awemeId 不在本批
         // 即残留结果,整包丢弃继续等(不能误判为本批失败)
@@ -4563,8 +4564,9 @@ impl CollectBridge {
                 .get("noComments")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
+            let error_kind = if error.is_empty() { "none" } else { jev_risk::error_kind(error) };
             tracing::info!(
-                "评论直采回传 aweme_id={id} used={used} pages={pages} comments={comments} noComments={no_comments} error={error}"
+                "评论直采回传 aweme_id={id} used={used} pages={pages} comments={comments} noComments={no_comments} error_kind={error_kind}"
             );
             if used {
                 any_used = true;
@@ -4575,7 +4577,7 @@ impl CollectBridge {
                 };
                 let _ = window.eval(build_hud_log_eval("info", &msg));
             } else if first_err.is_empty() {
-                first_err = error.to_string();
+                first_err = error_kind.to_string();
             }
         }
         if any_used {
@@ -4729,7 +4731,6 @@ impl CollectBridge {
         // 故验证态不计停滞、整体超时顺延。验证态的置位依赖页内链路(初始化脚本全帧运行,
         // 验证码 iframe 子帧 postMessage 到顶层 → report_collect_verify):原生拦截缓冲只收
         // intercept_patterns 命中的 URL,captcha 请求不进缓冲,响应侧扫描不可行,勿在此加。
-        let mut verify_logged = false;
         // 回读兜底的分频计数:每 4 轮(≈2s)eval 一次 __veltrixCommentApiResult
         let mut poll_tick: u32 = 0;
         let wait_outcome: (CommentApiOutcome, String) = loop {
@@ -4742,24 +4743,33 @@ impl CollectBridge {
                 return CommentApiOutcome::Aborted;
             }
             if self.control.is_verifying(session_id) {
-                if !verify_logged {
-                    verify_logged = true;
-                    // 验证需要人工操作,把窗口带到前台(复用窗口平时不抢焦点,见 bring_to_front)
-                    focus_collect_window(window);
-                    let _ = window.eval(build_hud_log_eval(
-                        "warn",
-                        "🛡️ 检测到安全验证(滑块)· 请在采集窗口中完成,完成后自动继续",
-                    ));
+                let verify_eval = crate::webview::build_verify_check_eval(
+                    session_id,
+                    &cfg.collect.verify_selectors,
+                    &cfg.collect.verify_texts,
+                    &cfg.collect.verify_url_patterns,
+                );
+                if !self.wait_verify_cleared(
+                    window,
+                    session_id,
+                    &verify_eval,
+                    &cfg.collect.verify_url_patterns,
+                    &cfg.id,
+                ).await {
+                    let _ = window.eval("window.__veltrixCommentApiAbort = true;");
+                    if !self.control.is_stopping(session_id) {
+                        self.control.set_verifying(session_id, false);
+                    }
+                    return if self.control.is_stopping(session_id) {
+                        CommentApiOutcome::Aborted
+                    } else {
+                        CommentApiOutcome::Fallback
+                    };
                 }
                 last_growth = std::time::Instant::now();
                 deadline =
                     std::time::Instant::now() + Duration::from_secs(COMMENT_API_MAX_WAIT_SECS);
-                tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
                 continue;
-            }
-            if verify_logged {
-                verify_logged = false;
-                let _ = window.eval(build_hud_log_eval("info", "✅ 安全验证已通过 · 继续直采"));
             }
             if let Some(result) = self.control.take_api_done(session_id) {
                 match self.handle_comment_api_result(window, batch, &result) {
@@ -4906,7 +4916,8 @@ impl CollectBridge {
         // 重读仍无(msToken 被风控清掉/从未生成):导航本视频详情页让页面 JS 重新生成
         // msToken 后再试一次——凭空构造的请求缺 msToken 必被拒,导航是唯一环境修复手段。
         let (outcome, err) = wait_outcome;
-        tracing::info!("评论直采收尾 session={session_id} outcome={outcome:?} error={err}");
+        let kind = jev_risk::error_kind(&err);
+        tracing::info!("评论直采收尾 session={session_id} outcome={outcome:?} error_kind={kind}");
         if !refreshed
             && matches!(outcome, CommentApiOutcome::Fallback)
             && err.starts_with("blocked-html")
@@ -4975,6 +4986,44 @@ impl CollectBridge {
                     tracing::info!(
                         "评论直采 session={session_id} blocked-html 后仍无 msToken,放弃重试"
                     );
+            }
+        }
+        if !refreshed
+            && matches!(outcome, CommentApiOutcome::Fallback)
+            && jev_risk::should_retry(kind, last_hits).await
+        {
+            refreshed = true;
+            let (nav_id, nav_token) = (batch[0].0, batch[0].1);
+            if !cfg.collect.detail_url_template.is_empty()
+                && window.eval(build_detail_eval(&cfg.collect.detail_url_template, nav_id, nav_token)).is_ok()
+            {
+                let _ = window.eval(build_hud_log_eval("info", "🔄 页面环境可能失效 · 导航详情页后重试一次"));
+                self.wait_page_ready(window, session_id).await;
+                let _ = window.eval(build_set_session_eval(session_id));
+                let verify_eval = crate::webview::build_verify_check_eval(
+                    session_id,
+                    &cfg.collect.verify_selectors,
+                    &cfg.collect.verify_texts,
+                    &cfg.collect.verify_url_patterns,
+                );
+                if !verify_eval.is_empty() { let _ = window.eval(&verify_eval); }
+                if self.control.is_verifying(session_id)
+                    && !self.wait_verify_cleared(window, session_id, &verify_eval,
+                        &cfg.collect.verify_url_patterns, &cfg.id).await
+                {
+                    if !self.control.is_stopping(session_id) {
+                        self.control.set_verifying(session_id, false);
+                    }
+                    return CommentApiOutcome::Fallback;
+                }
+                let cookies2 = native_intercept::get_cookies(
+                    window.as_ref(), "https://www.douyin.com/", &["msToken", "s_v_web_id"]
+                ).await;
+                let fresh = find_cookie(&cookies2, "msToken");
+                if !fresh.is_empty() { ms_token = fresh; }
+                let fresh_fp = find_cookie(&cookies2, "s_v_web_id");
+                if !fresh_fp.is_empty() { fp = fresh_fp; }
+                continue 'retry;
             }
         }
         return outcome;

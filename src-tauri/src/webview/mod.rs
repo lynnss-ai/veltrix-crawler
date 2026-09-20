@@ -20,6 +20,7 @@ pub mod cdp;
 pub mod cookies;
 pub mod filter_locate;
 pub mod jev_filter;
+pub mod jev_risk;
 pub mod native_intercept;
 pub mod pool;
 pub mod script_eval;
@@ -1829,26 +1830,16 @@ pub fn build_comment_api_collect_eval(
       }} catch (pe) {{
         // 非 JSON 响应:风控 / WAF 常直接回 HTML 验证页(HTTP 200、不跳转,
         // 下面的 blocked-redirect 检不到)。同参数重试必败,判硬拒立即收尾;
-        // 并把状态码 + content-type + 页面标题打进日志,一眼区分滑块页 /
-        // WAF 拦截页 / 网关错误页
+        // 回传只带错误类别和状态码,避免验证页正文进入日志或模型输入。
         var head = (text || '').replace(/\s+/g, ' ');
         if (head.charAt(0) === '<') {{
-          // title 可能在头部 160 字符之外,放大取样范围再匹配
-          var tm = head.slice(0, 4000).match(/<title[^>]*>([^<]*)<\/title>/i);
-          var ct = '';
-          try {{ ct = resp.headers.get('content-type') || ''; }} catch (he) {{}}
-          // 带上重定向标记与最终 URL 路径:区分「WAF 直回验证页」与「被 302 到落地页」
-          var finalPath = '';
-          try {{ finalPath = new URL(resp.url).pathname; }} catch (ue) {{}}
-          failReason = 'blocked-html(http-' + resp.status + (ct ? ' ' + ct : '') +
-            (resp.redirected ? ', redirected→' + finalPath : '') +
-            (tm ? ', title=' + tm[1] : ', ' + head.slice(0, 80)) + ')';
+          failReason = 'blocked-html(http-' + resp.status + ')';
         }} else {{
-          failReason = 'bad-json(http-' + resp.status + ', ' + head.slice(0, 80) + ')';
+          failReason = 'bad-json(http-' + resp.status + ')';
         }}
       }}
     }} catch (e) {{
-      failReason = (e && e.name === 'AbortError') ? 'timeout' : String(e);
+      failReason = (e && e.name === 'AbortError') ? 'timeout' : 'network-error';
     }}
     // 风控硬拒:被 302 到搜索页/验证页(resp.url 离开接口路径;后台 fetch 不渲染滑块,
     // 同参数重试必败)——立即收尾交回 Rust 补发重试,不占 30×5s 重试空等
@@ -1856,7 +1847,7 @@ pub fn build_comment_api_collect_eval(
     if (!failReason && resp && !resp.ok) failReason = 'http-' + resp.status;
     if (!failReason && !json) failReason = 'bad-json';
     if (!failReason && json.status_code !== undefined && json.status_code !== 0) {{
-      failReason = 'status-' + json.status_code + (json.status_msg ? ': ' + json.status_msg : '');
+      failReason = 'status-' + json.status_code;
     }}
     // 首页空评论的区分:接口返回 total=0 = 该视频真的没有评论(或全被平台过滤),
     // 正常结束、不重试;total>0 或缺省但列表空 = 风控静默吞的概率高,按失败重试。
