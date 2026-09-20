@@ -103,9 +103,44 @@ fn schedule_tray_popup(app: &tauri::AppHandle, click_pos: tauri::PhysicalPositio
     });
 }
 
+// 惰性创建托盘面板窗口:setup 里同步建第二个 WebView2 要几秒,是启动白屏的大头之一,
+// 改为首次需要时现场创建。建窗在主线程,首次点托盘时面板会晚出现约 1~2s(之后即开即显)。
+fn ensure_tray_popup(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) {
+        return Some(popup);
+    }
+    // 无边框 / 透明 / 不进任务栏 / 置顶,隐藏待用。
+    // 右键托盘图标时由 on_tray_icon_event 定位并显示,替代传统系统右键菜单。
+    let popup = WebviewWindowBuilder::new(
+        app,
+        TRAY_POPUP_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Veltrix")
+    .inner_size(200.0, 224.0)
+    .decorations(false)
+    .transparent(true)
+    .skip_taskbar(true)
+    .always_on_top(true)
+    .resizable(false)
+    .shadow(false)
+    .visible(false)
+    .build()
+    .map_err(|e| tracing::error!("创建托盘面板窗口失败: {e}"))
+    .ok()?;
+    // 面板失焦自动隐藏(点击面板外即收起)
+    let popup_for_event = popup.clone();
+    popup.on_window_event(move |event| {
+        if let WindowEvent::Focused(false) = event {
+            let _ = popup_for_event.hide();
+        }
+    });
+    Some(popup)
+}
+
 // 在托盘图标附近弹出自定义面板:默认放点击点左上方,并夹在点击所在显示器内,避免错位 / 移出屏幕。
 fn show_tray_popup(app: &tauri::AppHandle, click_pos: tauri::PhysicalPosition<f64>) {
-    let Some(popup) = app.get_webview_window(TRAY_POPUP_LABEL) else {
+    let Some(popup) = ensure_tray_popup(app) else {
         return;
     };
     // 取点击点所在显示器(多屏 / 高 DPI 下定位才正确)
@@ -283,14 +318,9 @@ pub fn run() {
             // 连接数据库(运行时二选一 SQLite / PG)并建表;setup 为同步上下文,阻塞等待完成
             let db = tauri::async_runtime::block_on(db::connect(&config_dir, &cfg.database))?;
 
-            // 存量迁移:contents 表本地素材路径统一改写为相对 media_root 的相对路径(幂等,失败仅告警)
-            {
-                let mroot = crate::media::media_root(&config_dir, &cfg.media);
-                let migrate_db = db.clone();
-                tauri::async_runtime::block_on(async move {
-                    crate::media::migrate_media_paths_to_relative(&migrate_db, &mroot).await;
-                });
-            }
+            // 注意:存量迁移 / 回填(素材路径、作者、话题、provider)统一挪到下方后台任务,
+            // 不在 setup 阻塞链上——全表扫描是秒级开销,放这里会卡住事件循环启动,
+            // 前端页面迟迟加载不了,表现为启动白屏十几秒(实测 7~21s)。
 
             // 应用重启后内存里的采集 spawn 已丢失:把残留的「进行中」任务标记为中断,
             // 避免界面一直显示假进度(运行中 / 评论采集中 / 意向分析中 / 素材下载中)。
@@ -340,108 +370,6 @@ pub fn run() {
                         .await
                 }) {
                     tracing::warn!("重置残留进行中执行历史失败: {e}");
-                }
-            }
-
-            // 作者表存量回填:authors 为空时,从 content 历史数据回填一次(幂等)
-            {
-                let migrate_db = db.clone();
-                tauri::async_runtime::block_on(async {
-                    commands::task::migrate_authors_from_contents(&migrate_db).await;
-                });
-            }
-
-            // 话题存量回填:历史内容 topics 为空但正文含 #话题 的,从正文补提取一次(幂等,不改正文)
-            {
-                let backfill_db = db.clone();
-                tauri::async_runtime::block_on(async {
-                    commands::task::backfill_empty_topics(&backfill_db).await;
-                });
-            }
-
-            // 旧版 provider.code 为随机值(PRV-XXXX);本次起改用标准厂商 code
-            // (deepseek/qwen/mimo/glm/minimax),语音转写按 code 判 ASR。这里按 name / api_url
-            // 关键词把旧 provider 的 code 迁移为标准值,使已有的 MiMo 等厂商在转写配置里可被识别;
-            // 匹配不到的保留原值(视为非标准厂商,不支持 ASR)。
-            {
-                use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
-                use veltrix_core::db::entity::provider;
-                let migrate_db = db.clone();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    for p in provider::Entity::find().all(&migrate_db).await? {
-                        if matches!(
-                            p.code.as_str(),
-                            "deepseek" | "qwen" | "mimo" | "glm" | "minimax"
-                        ) {
-                            continue;
-                        }
-                        let hay = format!("{} {}", p.name, p.api_url).to_lowercase();
-                        // 注意:MiMo 的 api.xiaomimimo.com 含 "mimo",能命中
-                        let mapped = if hay.contains("deepseek") {
-                            Some("deepseek")
-                        } else if hay.contains("qwen")
-                            || hay.contains("千问")
-                            || hay.contains("通义")
-                            || hay.contains("dashscope")
-                        {
-                            Some("qwen")
-                        } else if hay.contains("mimo") || hay.contains("小米") {
-                            Some("mimo")
-                        } else if hay.contains("glm")
-                            || hay.contains("智谱")
-                            || hay.contains("bigmodel")
-                        {
-                            Some("glm")
-                        } else if hay.contains("minimax") {
-                            Some("minimax")
-                        } else {
-                            None
-                        };
-                        if let Some(code) = mapped {
-                            let mut am = p.into_active_model();
-                            am.code = Set(code.to_string());
-                            am.update(&migrate_db).await?;
-                        }
-                    }
-                    Ok::<(), sea_orm::DbErr>(())
-                }) {
-                    tracing::warn!("迁移 provider code 失败(忽略): {e}");
-                }
-            }
-
-            // 首次启动初始化 5 家标准模型厂商(apiKey/models 留空待用户配),按 id 幂等跳过已有
-            {
-                use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-                use veltrix_core::db::entity::provider;
-                let seed_db = db.clone();
-                if let Err(e) = tauri::async_runtime::block_on(async {
-                    use sea_orm::{ColumnTrait, QueryFilter};
-                    let now = chrono::Utc::now().timestamp();
-                    for cap in llm::all_capabilities() {
-                        // 按 code 判重:用户可能已手动加过该厂商(id 不同),避免重复初始化
-                        let exists = provider::Entity::find()
-                            .filter(provider::Column::Code.eq(cap.code.as_str()))
-                            .one(&seed_db)
-                            .await?
-                            .is_some();
-                        if !exists {
-                            provider::ActiveModel {
-                                id: Set(format!("prv-{}", cap.code)),
-                                code: Set(cap.code),
-                                name: Set(cap.name),
-                                api_url: Set(cap.api_url),
-                                api_key: Set(String::new()),
-                                models: Set(String::new()),
-                                created_at: Set(now),
-                                updated_at: Set(now),
-                            }
-                            .insert(&seed_db)
-                            .await?;
-                        }
-                    }
-                    Ok::<(), sea_orm::DbErr>(())
-                }) {
-                    tracing::warn!("初始化标准厂商失败(忽略): {e}");
                 }
             }
 
@@ -586,18 +514,18 @@ pub fn run() {
                 }
             }
 
-            // 启动时探测一次 ffmpeg 可用性,写入录屏状态;后续录屏命令直接读标记,不再每次启子进程探测。
-            // 配置路径探测失败再试系统 PATH(与 check_ffmpeg 的兜底口径一致)
-            let ffmpeg_available =
-                crate::media::probe_ffmpeg(cfg.media.ffmpeg_path.as_deref()).is_some()
-                    || crate::media::probe_ffmpeg(None).is_some();
-            tracing::info!("ffmpeg 启动探测:可用={ffmpeg_available}");
+            // ffmpeg 可用性探测(起子进程,实测 0.5~2.5s)挪到启动后台,结果回填录屏状态;
+            // setup 里同步探测会拖长白屏。录屏命令读 RecordingState 标记,探测完成前按不可用处理。
+            let ffmpeg_probe_path = cfg.media.ffmpeg_path.clone();
 
             // 全局沙盒管理器(审计日志根目录 = config_dir;回收循环与 AppState 共享同一实例)
             let sandbox_manager = Arc::new(sandbox::SandboxManager::new(config_dir.clone()));
             // 空闲回收循环用的句柄(db 随后 move 进 AppState,先克隆)
             let recycle_db = db.clone();
             let recycle_sandbox = sandbox_manager.clone();
+            // 后台存量迁移 / 回填用的句柄(db / config 随后 move 进 AppState,先备好)
+            let migrate_db = db.clone();
+            let migrate_media_root = crate::media::media_root(&config_dir, &cfg.media);
 
             app.manage(AppState {
                 config: std::sync::Mutex::new(cfg),
@@ -624,11 +552,120 @@ pub fn run() {
                 cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 chat_send_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 agent_confirm: Arc::new(agent::core::shared::AgentConfirmChannel::new()),
-                recording: {
-                    let rec = agent::computer::recorder::RecordingState::new();
-                    rec.set_ffmpeg_available(ffmpeg_available);
-                    rec
-                },
+                recording: agent::computer::recorder::RecordingState::new(),
+            });
+            // ffmpeg 启动探测(配置路径失败再试系统 PATH,与 check_ffmpeg 的兜底口径一致),
+            // 起子进程属阻塞操作,放后台线程跑完回填标记
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let available = tokio::task::spawn_blocking(move || {
+                        crate::media::probe_ffmpeg(ffmpeg_probe_path.as_deref()).is_some()
+                            || crate::media::probe_ffmpeg(None).is_some()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    tracing::info!("ffmpeg 启动探测:可用={available}");
+                    handle
+                        .state::<commands::AppState>()
+                        .recording
+                        .set_ffmpeg_available(available);
+                });
+            }
+            // 存量迁移 / 回填:幂等、失败仅告警,但涉及全表扫描,统一在后台跑,不挡首屏。
+            // 含素材路径相对化、作者表回填、话题回填、provider code 迁移与标准厂商 seed。
+            tauri::async_runtime::spawn(async move {
+                crate::media::migrate_media_paths_to_relative(&migrate_db, &migrate_media_root)
+                    .await;
+                commands::task::migrate_authors_from_contents(&migrate_db).await;
+                commands::task::backfill_empty_topics(&migrate_db).await;
+
+                // 旧版 provider.code 为随机值(PRV-XXXX);本次起改用标准厂商 code
+                // (deepseek/qwen/mimo/glm/minimax),语音转写按 code 判 ASR。这里按 name / api_url
+                // 关键词把旧 provider 的 code 迁移为标准值,使已有的 MiMo 等厂商在转写配置里可被识别;
+                // 匹配不到的保留原值(视为非标准厂商,不支持 ASR)。
+                {
+                    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+                    use veltrix_core::db::entity::provider;
+                    if let Err(e) = async {
+                        for p in provider::Entity::find().all(&migrate_db).await? {
+                            if matches!(
+                                p.code.as_str(),
+                                "deepseek" | "qwen" | "mimo" | "glm" | "minimax"
+                            ) {
+                                continue;
+                            }
+                            let hay = format!("{} {}", p.name, p.api_url).to_lowercase();
+                            // 注意:MiMo 的 api.xiaomimimo.com 含 "mimo",能命中
+                            let mapped = if hay.contains("deepseek") {
+                                Some("deepseek")
+                            } else if hay.contains("qwen")
+                                || hay.contains("千问")
+                                || hay.contains("通义")
+                                || hay.contains("dashscope")
+                            {
+                                Some("qwen")
+                            } else if hay.contains("mimo") || hay.contains("小米") {
+                                Some("mimo")
+                            } else if hay.contains("glm")
+                                || hay.contains("智谱")
+                                || hay.contains("bigmodel")
+                            {
+                                Some("glm")
+                            } else if hay.contains("minimax") {
+                                Some("minimax")
+                            } else {
+                                None
+                            };
+                            if let Some(code) = mapped {
+                                let mut am = p.into_active_model();
+                                am.code = Set(code.to_string());
+                                am.update(&migrate_db).await?;
+                            }
+                        }
+                        Ok::<(), sea_orm::DbErr>(())
+                    }
+                    .await
+                    {
+                        tracing::warn!("迁移 provider code 失败(忽略): {e}");
+                    }
+                }
+
+                // 首次启动初始化 5 家标准模型厂商(apiKey/models 留空待用户配),按 code 幂等跳过已有
+                {
+                    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+                    use veltrix_core::db::entity::provider;
+                    if let Err(e) = async {
+                        let now = chrono::Utc::now().timestamp();
+                        for cap in llm::all_capabilities() {
+                            // 按 code 判重:用户可能已手动加过该厂商(id 不同),避免重复初始化
+                            let exists = provider::Entity::find()
+                                .filter(provider::Column::Code.eq(cap.code.as_str()))
+                                .one(&migrate_db)
+                                .await?
+                                .is_some();
+                            if !exists {
+                                provider::ActiveModel {
+                                    id: Set(format!("prv-{}", cap.code)),
+                                    code: Set(cap.code),
+                                    name: Set(cap.name),
+                                    api_url: Set(cap.api_url),
+                                    api_key: Set(String::new()),
+                                    models: Set(String::new()),
+                                    created_at: Set(now),
+                                    updated_at: Set(now),
+                                }
+                                .insert(&migrate_db)
+                                .await?;
+                            }
+                        }
+                        Ok::<(), sea_orm::DbErr>(())
+                    }
+                    .await
+                    {
+                        tracing::warn!("初始化标准厂商失败(忽略): {e}");
+                    }
+                }
             });
             // 后台预热录屏探测缓存(麦克风枚举 / 硬编实测 / ddagrab 探测,都要起 ffmpeg 子进程),
             // 提前在启动空闲期做掉,用户第一次点「开始录制」直接读缓存
@@ -691,33 +728,8 @@ pub fn run() {
                 }
             });
 
-            // 托盘弹出面板窗口:无边框 / 透明 / 不进任务栏 / 置顶,隐藏待用。
-            // 右键托盘图标时由 on_tray_icon_event 定位并显示,替代传统系统右键菜单。
-            let popup = WebviewWindowBuilder::new(
-                app,
-                TRAY_POPUP_LABEL,
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("Veltrix")
-            .inner_size(200.0, 224.0)
-            .decorations(false)
-            .transparent(true)
-            .skip_taskbar(true)
-            .always_on_top(true)
-            .resizable(false)
-            .shadow(false)
-            .visible(false)
-            .build()?;
-
-            // 面板失焦自动隐藏(点击面板外即收起)
-            {
-                let popup_for_event = popup.clone();
-                popup.on_window_event(move |event| {
-                    if let WindowEvent::Focused(false) = event {
-                        let _ = popup_for_event.hide();
-                    }
-                });
-            }
+            // 托盘弹出面板窗口不在 setup 同步创建(第二个 WebView2 初始化要几秒,拖长白屏),
+            // 改为 ensure_tray_popup 惰性创建:首次右键托盘时现场建窗显示。
 
             let mut tray_builder = TrayIconBuilder::new()
                 .tooltip("VeltrixLoop")
@@ -821,6 +833,12 @@ pub fn run() {
             commands::admin::list_customers,
             commands::admin::upsert_customer,
             commands::admin::remove_customer,
+            commands::admin::list_projects,
+            commands::admin::upsert_project,
+            commands::admin::remove_project,
+            commands::admin::list_teams,
+            commands::admin::upsert_team,
+            commands::admin::remove_team,
             // 行业类别 / 关键词
             commands::admin::list_industries,
             commands::admin::upsert_industry,
@@ -836,11 +854,6 @@ pub fn run() {
             commands::creation::list_shot_prompts,
             commands::creation::upsert_shot_prompt,
             commands::creation::remove_shot_prompt,
-            commands::creation::creation_export_video,
-            commands::creation::creation_list_exports,
-            commands::creation::creation_video_info,
-            commands::creation::creation_video_thumbs,
-            commands::creation_vision::creation_detect_scenes,
             commands::list_platforms,
             commands::upsert_platform,
             commands::remove_platform,
@@ -876,6 +889,9 @@ pub fn run() {
             commands::task::upsert_task,
             commands::task::update_task_status,
             commands::task::remove_task,
+            commands::task::remove_task_only,
+            commands::task::remove_task_keyword,
+            commands::task::remove_task_run,
             commands::task::list_contents_page,
             commands::task::list_contents_full,
             commands::task::list_comments_page,
@@ -987,9 +1003,11 @@ pub fn run() {
             agent::computer::recorder::start_screen_recording,
             agent::computer::recorder::stop_screen_recording,
             agent::computer::recorder::toggle_recording_pause,
+            agent::computer::recorder::toggle_recording_mic,
             agent::computer::recorder::list_audio_devices,
+            agent::computer::recorder::list_cameras,
+            agent::computer::recorder::dismiss_cam_preview,
             agent::computer::recorder::test_recording_audio,
-            agent::computer::recorder::set_recording_overlay_panel,
             agent::computer::recorder::get_recording_status,
             agent::computer::recorder::list_screens,
             agent::computer::recorder::recording_preview_all,

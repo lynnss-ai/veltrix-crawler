@@ -7,7 +7,6 @@ pub mod billing;
 pub mod cloud;
 pub mod collect;
 pub mod creation;
-pub mod creation_vision;
 pub mod dashboard;
 pub mod publish;
 pub mod task;

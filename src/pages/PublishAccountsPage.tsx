@@ -106,7 +106,7 @@ const accountFilterFn: FilterFn<PublishAccountView> = (
 // 「未关联客户」为兜底分组(选中态的伪 id):旧数据 / 客户被删导致的悬空账号在此可见,便于编辑后重新归属。
 const ORPHAN_KEY = "__orphan__";
 
-// 客户账号(主从):左侧 CRM 客户列表(运营 > 客户管理维护,此处只读)、右侧该客户的发布账号。
+// 客户账号(主从):左侧 CRM 客户列表(数据采集 > 客户管理维护,此处只读)、右侧该客户的发布账号。
 export function PublishAccountsPage() {
   const [sbCollapsed, setSbCollapsed] = useResponsiveCollapse();
   const [platforms, setPlatforms] = useState<PublishPlatformView[]>([]);
@@ -386,7 +386,7 @@ export function PublishAccountsPage() {
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       <div className="flex min-h-0 flex-1 gap-4">
-        {/* 左侧:客户(只读,来自运营 > 客户管理;可收起,窄屏自动收起) */}
+        {/* 左侧:客户(只读,来自数据采集 > 客户管理;可收起,窄屏自动收起) */}
         {!sbCollapsed && (
           <div className="flex w-56 shrink-0 flex-col overflow-hidden rounded-xl border bg-card lg:w-64">
             <div className="flex h-10 items-center justify-between border-b px-4">
@@ -405,11 +405,11 @@ export function PublishAccountsPage() {
             <div className="flex-1 space-y-0.5 overflow-auto p-2">
               {customers.length === 0 && (
                 <p className="px-2 py-8 text-center text-xs text-muted-foreground">
-                  暂无客户,请先在 运营 &gt; 客户管理 中新增客户
+                  暂无客户,请先在 数据采集 &gt; 客户管理 中新增客户
                 </p>
               )}
               {customers.map((c) => (
-                // 客户条目:名称 + 编码 + 账号数(右对齐);客户的增删改在运营 > 客户管理,此处只读
+                // 客户条目:名称 + 编码 + 账号数(右对齐);客户的增删改在数据采集 > 客户管理,此处只读
                 <div
                   key={c.id}
                   onClick={() => setSelectedCustomer(c.id)}
@@ -476,7 +476,7 @@ export function PublishAccountsPage() {
                       还没有客户
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      发布账号必须归属客户,请先在 运营 &gt; 客户管理 中新增客户
+                      发布账号必须归属客户,请先在 数据采集 &gt; 客户管理 中新增客户
                     </p>
                   </>
                 ) : (
@@ -527,7 +527,7 @@ export function PublishAccountsPage() {
                     onClick={() => {
                       // 账号必须归属客户:一个客户都没有时引导去客户管理
                       if (customers.length === 0) {
-                        toast.info("请先在 运营 > 客户管理 中新增客户");
+                        toast.info("请先在 数据采集 > 客户管理 中新增客户");
                         return;
                       }
                       setEditingAccount(null);

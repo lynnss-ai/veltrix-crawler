@@ -11,7 +11,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 use tauri::State;
-use veltrix_core::db::entity::{comment, content, task};
+use veltrix_core::db::entity::{account, collect_record, comment, content, task};
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 数据概览(首页):全量库 / 评论库 / 意向客资 计数(含平台细分)+ 可选区间的多平台采集趋势。
@@ -55,6 +55,48 @@ pub struct DashboardOverview {
     pub media_stats: MediaStat,
     /// 热门关键词 Top N(按采集量)
     pub top_keywords: Vec<KeywordCount>,
+    /// 账号池健康度
+    pub account_health: AccountHealth,
+    /// 关键词采集榜 Top N(按任务关键词聚合内容数,带主平台)
+    pub top_collect_keywords: Vec<CollectKeywordCount>,
+    /// 近期新增(近 7 / 30 天,含上一个 7 天环比)
+    pub recent_growth: RecentGrowth,
+    /// 去重台账概况
+    pub dedup_stats: DedupStat,
+}
+
+/// 账号池健康度(采集账号)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountHealth {
+    pub total: i64,
+    pub active: i64,
+    pub invalid: i64,
+    pub disabled: i64,
+    /// 各平台可用(active)账号数
+    pub active_by_platform: Vec<PlatformCount>,
+}
+
+/// 近期新增统计。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentGrowth {
+    pub last7_contents: i64,
+    pub last7_comments: i64,
+    /// 上一个 7 天(周环比基准)
+    pub prev7_contents: i64,
+    pub prev7_comments: i64,
+    pub last30_contents: i64,
+    pub last30_comments: i64,
+}
+
+/// 去重台账概况(全局,不按 owner 过滤——台账本身无归属)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupStat {
+    pub total: i64,
+    /// 近 90 天登记量(去重判重的有效窗口)
+    pub recent90: i64,
 }
 
 /// 意向分布。
@@ -124,6 +166,15 @@ pub struct MediaStat {
 pub struct KeywordCount {
     pub keyword: String,
     pub count: i64,
+}
+
+/// 关键词采集榜条目:关键词 + 总内容数 + 主平台(该关键词下内容数最多的平台)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectKeywordCount {
+    pub keyword: String,
+    pub count: i64,
+    pub platform: String,
 }
 
 /// 平台计数(卡片细分用)。
@@ -207,6 +258,10 @@ pub async fn dashboard_overview(
         hot_contents,
         media_stats,
         top_keywords,
+        account_health,
+        top_collect_keywords,
+        recent_growth,
+        dedup_stats,
     ) = tokio::try_join!(
         content_platform_counts(db, self_only, &owner),
         comment_platform_counts(db, self_only, &owner, false),
@@ -221,6 +276,10 @@ pub async fn dashboard_overview(
         hot_contents(db, self_only, &owner),
         media_stat(db, self_only, &owner),
         top_topics(db, self_only, &owner),
+        account_health_stat(db, self_only, &owner, &platform_ids),
+        top_collect_keywords(db, self_only, &owner),
+        recent_growth_stat(db, self_only, &owner),
+        dedup_stat(db),
     )?;
 
     // 三项计数:平台细分(补全所有平台,没数据补 0;总数由实际值求和)
@@ -259,6 +318,10 @@ pub async fn dashboard_overview(
         hot_contents,
         media_stats,
         top_keywords,
+        account_health,
+        top_collect_keywords,
+        recent_growth,
+        dedup_stats,
     })
 }
 
@@ -709,7 +772,7 @@ async fn task_status_stat(
     self_only: bool,
     owner: &str,
 ) -> Result<TaskStatusStat> {
-    let mut q = task::Entity::find();
+    let mut q = task::Entity::find().filter(task::Column::Deleted.eq(false));
     if self_only {
         q = q.filter(task::Column::Owner.eq(owner.to_string()));
     }
@@ -741,6 +804,7 @@ async fn task_status_stat(
     // 今日完成:completed 且 finished_at 落在今天(本地自然日)
     let today0 = local_today_start_ts();
     let mut cq = task::Entity::find()
+        .filter(task::Column::Deleted.eq(false))
         .filter(task::Column::Status.eq("completed"))
         .filter(task::Column::FinishedAt.gte(today0));
     if self_only {
@@ -858,4 +922,152 @@ async fn top_topics(
         .into_iter()
         .map(|(keyword, count)| KeywordCount { keyword, count })
         .collect())
+}
+
+/// 账号池健康度:按状态分组计数 + 各平台可用(active)账号数(补全平台,缺省补 0)。
+async fn account_health_stat(
+    db: &sea_orm::DatabaseConnection,
+    self_only: bool,
+    owner: &str,
+    platform_ids: &[String],
+) -> Result<AccountHealth> {
+    let mut q = account::Entity::find();
+    if self_only {
+        q = q.filter(account::Column::Owner.eq(owner.to_string()));
+    }
+    let rows: Vec<(String, String, i64)> = q
+        .select_only()
+        .column(account::Column::Platform)
+        .column(account::Column::Status)
+        .column_as(account::Column::Id.count(), "count")
+        .group_by(account::Column::Platform)
+        .group_by(account::Column::Status)
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计账号池失败: {e}")))?;
+    let mut stat = AccountHealth {
+        total: 0,
+        active: 0,
+        invalid: 0,
+        disabled: 0,
+        active_by_platform: Vec::new(),
+    };
+    let mut active_map: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for (platform, status, count) in rows {
+        stat.total += count;
+        match status.as_str() {
+            "active" => {
+                stat.active += count;
+                *active_map.entry(platform).or_insert(0) += count;
+            }
+            "invalid" => stat.invalid += count,
+            "disabled" => stat.disabled += count,
+            _ => {}
+        }
+    }
+    stat.active_by_platform = fill_platform_counts(
+        active_map
+            .into_iter()
+            .map(|(platform, count)| PlatformCount { platform, count })
+            .collect(),
+        platform_ids,
+    );
+    Ok(stat)
+}
+
+/// 关键词采集榜 Top 20:按任务关键词聚合全量库内容数(空关键词除外)。
+/// 定向采集(按链接逐条抓取)的占位词「定向采集」不是真实搜索词,一并剔除。
+/// 同一关键词可能跨平台采集,平台取该关键词下内容数最多的主平台(榜单打平台标签用)。
+async fn top_collect_keywords(
+    db: &sea_orm::DatabaseConnection,
+    self_only: bool,
+    owner: &str,
+) -> Result<Vec<CollectKeywordCount>> {
+    let mut q = content::Entity::find()
+        .filter(content::Column::Keyword.ne(""))
+        .filter(content::Column::Keyword.ne("定向采集"));
+    if self_only {
+        q = q.filter(content::Column::Owner.eq(owner.to_string()));
+    }
+    let rows: Vec<(String, String, i64)> = q
+        .select_only()
+        .column(content::Column::Keyword)
+        .column(content::Column::Platform)
+        .column_as(content::Column::Id.count(), "count")
+        .group_by(content::Column::Keyword)
+        .group_by(content::Column::Platform)
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计关键词采集榜失败: {e}")))?;
+    // keyword → (总数, 主平台, 主平台计数)
+    let mut merged: std::collections::HashMap<String, (i64, String, i64)> =
+        std::collections::HashMap::new();
+    for (keyword, platform, count) in rows {
+        let entry = merged
+            .entry(keyword)
+            .or_insert_with(|| (0, platform.clone(), 0));
+        entry.0 += count;
+        if count > entry.2 {
+            entry.1 = platform;
+            entry.2 = count;
+        }
+    }
+    let mut list: Vec<CollectKeywordCount> = merged
+        .into_iter()
+        .map(|(keyword, (count, platform, _))| CollectKeywordCount {
+            keyword,
+            count,
+            platform,
+        })
+        .collect();
+    list.sort_by_key(|item| std::cmp::Reverse(item.count));
+    list.truncate(20);
+    Ok(list)
+}
+
+/// 近期新增:近 7 天 / 上一个 7 天(周环比)/ 近 30 天的内容 + 评论数。
+async fn recent_growth_stat(
+    db: &sea_orm::DatabaseConnection,
+    self_only: bool,
+    owner: &str,
+) -> Result<RecentGrowth> {
+    let today0 = local_today_start_ts();
+    let d7 = today0 - 7 * 86_400;
+    let d14 = today0 - 14 * 86_400;
+    let d30 = today0 - 30 * 86_400;
+    // 近 7 天含今天:[d7, ∞);上一个 7 天:[d14, d7);近 30 天:[d30, ∞)
+    let (l7c, l7m, p7c, p7m, l30c, l30m) = tokio::try_join!(
+        count_content_range(db, self_only, owner, d7, None),
+        count_comment_range(db, self_only, owner, d7, None),
+        count_content_range(db, self_only, owner, d14, Some(d7)),
+        count_comment_range(db, self_only, owner, d14, Some(d7)),
+        count_content_range(db, self_only, owner, d30, None),
+        count_comment_range(db, self_only, owner, d30, None),
+    )?;
+    Ok(RecentGrowth {
+        last7_contents: l7c,
+        last7_comments: l7m,
+        prev7_contents: p7c,
+        prev7_comments: p7m,
+        last30_contents: l30c,
+        last30_comments: l30m,
+    })
+}
+
+/// 去重台账概况:累计登记量 + 近 90 天登记量(判重有效窗口,见采集数据流的去重约定)。
+async fn dedup_stat(db: &sea_orm::DatabaseConnection) -> Result<DedupStat> {
+    let total = collect_record::Entity::find()
+        .count(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计去重台账失败: {e}")))? as i64;
+    let recent0 = Utc::now().timestamp() - 90 * 86_400;
+    let recent90 = collect_record::Entity::find()
+        .filter(collect_record::Column::CreatedAt.gte(recent0))
+        .count(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("统计去重台账失败: {e}")))? as i64;
+    Ok(DedupStat { total, recent90 })
 }

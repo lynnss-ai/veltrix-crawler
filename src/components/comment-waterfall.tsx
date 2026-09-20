@@ -1,17 +1,16 @@
 // 评论库瀑布流视图:数据由后端按来源分组返回(list_comment_sources_page,
 // 每组含评论总数 + 点赞倒序前 N 条预览),前端只渲染不再分组/截断。
-// 加载方式与图片库瀑布流一致:@tanstack/react-virtual 分 lane 虚拟化(只挂载可视区
-// 附近卡片)+ IntersectionObserver 哨兵滚动 append;卡片 = 来源封面/标题/作者 + 预览评论,
-// 「查看全部 N 条」开右侧抽屉(游标分页,可加载更多)。
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+// 布局用 CSS 多列瀑布流(columns + break-inside-avoid):评论卡片是纯文本、高度方差大,
+// 此前用 @tanstack/react-virtual 分 lane 虚拟化,测量高度与真实高度偏差会导致卡片相互
+// 重叠;CSS columns 由浏览器自动排高,无测量环节。加载方式不变——IntersectionObserver
+// 哨兵滚动 append;卡片 = 来源封面/标题/作者 + 预览评论,「查看全部 N 条」开右侧抽屉。
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Heart, Loader2, MessageCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { api, type CommentSourceGroup, type CommentView } from "@/lib/api";
 import { useMediaFileUrl, mediaThumbPath } from "@/lib/media-file-url";
 import { formatTimestamp } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/EmptyState";
 import {
   Sheet,
@@ -123,57 +122,7 @@ export function CommentWaterfall({
   const [drawerSource, setDrawerSource] = useState<CommentSourceGroup | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  // 列数交给 JS(断点与旧 CSS columns 一致:sm=2 / xl=3 / 2xl=4),虚拟器才能分配 lane。
-  // 首次数据未返回时容器尚未挂载,默认值本身必须是可用的桌面布局。
-  const [layout, setLayout] = useState({ columns: 3, width: 0 });
   const hasMore = groups.length < total;
-  const hasItems = groups.length > 0;
-
-  useLayoutEffect(() => {
-    const element = scrollRef.current;
-    if (!element) return;
-    const update = (width: number) => {
-      if (width <= 0) return;
-      const columns =
-        width >= 1536 ? 4 : width >= 1280 ? 3 : width >= 640 ? 2 : 1;
-      setLayout((prev) =>
-        prev.columns === columns && prev.width === width
-          ? prev
-          : { columns, width },
-      );
-    };
-    update(element.clientWidth);
-    const observer = new ResizeObserver((entries) => {
-      const width = Math.round(entries[0]?.contentRect.width ?? element.clientWidth);
-      update(width);
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-    // 首次请求期间 scrollRef 尚不存在;数据回来、容器真正挂载后必须重新绑定。
-  }, [hasItems]);
-
-  const gap = 12;
-  const virtualizer = useVirtualizer({
-    count: groups.length,
-    getScrollElement: () => scrollRef.current,
-    getItemKey: (index) => {
-      const g = groups[index];
-      return g ? `${g.platform}-${g.contentId}` : index;
-    },
-    // 卡片 = 来源头 + 预览评论(评论文本行数不定)+ 查看全部钮;
-    // 首次估算后由 measureElement 实测校正。
-    estimateSize: () => 430,
-    lanes: layout.columns,
-    gap,
-    overscan: layout.columns * 2,
-    useAnimationFrameWithResizeObserver: true,
-  });
-  const virtualItems = virtualizer.getVirtualItems();
-
-  // 列数或列宽变化后清掉旧测量值,否则窗口拉伸后沿用旧卡片高度会重叠/留白
-  useEffect(() => {
-    if (layout.width > 0) virtualizer.measure();
-  }, [layout.columns, layout.width, virtualizer]);
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
@@ -212,14 +161,9 @@ export function CommentWaterfall({
         ref={scrollRef}
         className="veltrix-thin-scrollbar min-h-0 flex-1 overflow-y-auto pr-1"
       >
-        {/* 只挂载可视区附近的卡片;已加载批次再多,DOM/头像解码量保持稳定 */}
-        <div
-          className="relative w-full"
-          style={{ height: virtualizer.getTotalSize() }}
-        >
-          {virtualItems.map((virtualItem) => {
-            const g = groups[virtualItem.index];
-            if (!g) return null;
+        {/* CSS 多列瀑布流:卡片按列自动排高,高度再悬殊也不会重叠;断点 sm=2 / xl=3 / 2xl=4 */}
+        <div className="columns-1 gap-3 sm:columns-2 xl:columns-3 2xl:columns-4">
+          {groups.map((g, index) => {
             const meta = metaOf(g);
             // 列表小图用缩略图(缺失时文件服务惰性生成),原图留给详情
             const cover = meta.coverPath
@@ -233,24 +177,13 @@ export function CommentWaterfall({
                   : meta.kind === "article"
                     ? "文章"
                     : "";
-            const lane = virtualItem.lane;
-            const widthPercent = 100 / layout.columns;
-            const widthGap = (gap * (layout.columns - 1)) / layout.columns;
             return (
               <div
-                key={virtualItem.key}
-                ref={virtualizer.measureElement}
-                data-index={virtualItem.index}
-                className="absolute left-0 top-0 min-w-0"
-                style={{
-                  // 宽度由父容器百分比决定,首次测量为 0 时也能正常铺开。
-                  width: `calc(${widthPercent}% - ${widthGap}px)`,
-                  // translate 百分比基于卡片自身:每跨一列移动 100% 自身宽度 + 一个 gap
-                  transform: `translate3d(calc(${lane * 100}% + ${lane * gap}px), ${virtualItem.start}px, 0)`,
-                }}
+                key={`${g.platform}-${g.contentId}`}
+                className="mb-3 break-inside-avoid"
               >
                 <div
-                  className={`rounded-lg border p-3 ${CARD_TINTS[virtualItem.index % CARD_TINTS.length]}`}
+                  className={`rounded-lg border p-3 ${CARD_TINTS[index % CARD_TINTS.length]}`}
                 >
                   {/* 来源:封面 + 标题 + 作者 + 平台 */}
                   <div className="flex items-center gap-2.5">
@@ -389,6 +322,24 @@ function SourceCommentsDrawer({
     void loadMore(source, null, false);
   }, [source, loadMore]);
 
+  // 自动翻页:滚动到底部哨兵进入视口即续拉下一页(替代手动「加载更多」按钮)
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !source || !cursor || loading) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          void loadMore(source, cursor, true);
+        }
+      },
+      // 提前 200px 触发,滚动到底前就开始拉,体感无断档
+      { rootMargin: "0px 0px 200px 0px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [source, cursor, loading, loadMore]);
+
   const meta = source ? metaOf(source) : null;
 
   return (
@@ -428,15 +379,12 @@ function SourceCommentsDrawer({
               该来源暂无评论
             </div>
           )}
-          {cursor && !loading && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="mx-auto"
-              onClick={() => source && void loadMore(source, cursor, true)}
-            >
-              加载更多({items.length}/{total})
-            </Button>
+          {/* 自动翻页哨兵:进入视口即续拉;到底后提示已全部加载 */}
+          {cursor && <div ref={sentinelRef} className="h-px" />}
+          {!cursor && items.length > 0 && (
+            <div className="py-2 text-center text-xs text-muted-foreground">
+              已全部加载 · 共 {items.length} 条
+            </div>
           )}
         </div>
       </SheetContent>

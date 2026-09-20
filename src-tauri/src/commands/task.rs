@@ -223,9 +223,11 @@ const LOG_HARD_CAP: u64 = 2000;
 
 #[tauri::command]
 pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
-    // 按 dataScope 过滤;self 仅看自己,all 看全部
+    // 按 dataScope 过滤;self 仅看自己,all 看全部;假删除(deleted)的任务一律不出现
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
-    let mut q = task::Entity::find().order_by_desc(task::Column::UpdatedAt);
+    let mut q = task::Entity::find()
+        .filter(task::Column::Deleted.eq(false))
+        .order_by_desc(task::Column::UpdatedAt);
     if me.scope == "self" {
         q = q.filter(task::Column::Owner.eq(me.name.clone()));
     }
@@ -472,6 +474,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 retry_count: Set(0),
                 next_retry_at: Set(None),
                 archived: Set(false),
+                deleted: Set(false),
                 status: Set("pending".into()),
                 progress: Set(0),
                 media_total: Set(0),
@@ -548,15 +551,455 @@ pub async fn update_task_status(
 }
 
 #[tauri::command]
-/// 删除任务:仅删除任务行,contents/comments/logs 成为孤儿数据。
-/// 全量库按 task_id 穿透仍能看见内容但行业关联为空。
-/// 需要完整清理可先调 remove_contents 再删任务,或在 DB 层直接 DELETE CASCADE。
+/// 删除任务并级联清理:contents / comments / 采集日志 / 执行历史 / Obsidian 同步标记,
+/// 以及已落盘的媒体文件(封面/音频/视频/图集及其缩略图;头像按作者共享,不删)。
+/// 去重台账(collect_records,平台+内容ID 关联)**保留**:删任务不清台账,避免误删跨任务共享的
+/// 去重依据(删子任务 / 删执行历史仍会清对应台账条目)。
+/// 进行中任务拒绝删除,需先停止。dataScope=self 只能删自己 owner 的任务。
 pub async fn remove_task(state: State<'_, AppState>, id: String) -> Result<()> {
-    task::Entity::delete_by_id(id)
-        .exec(&state.db)
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let Some(task_row) = task::Entity::find_by_id(&id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
+    else {
+        return Ok(()); // 不存在则幂等
+    };
+    if me.scope == "self" && task_row.owner != me.name {
+        return Err(CrawlerError::Config("无权删除该任务".into()));
+    }
+    ensure_task_not_active(&task_row.status)?;
+    let media_root = {
+        let cfg = crate::commands::lock_config(&state)?;
+        crate::media::media_root(&state.config_dir, &cfg.media)
+    };
+
+    let db = &state.db;
+    let rows = fetch_content_media_rows(db, &id, None, None).await?;
+    // 先子表后父表,与逻辑外键依赖方向一致
+    comment::Entity::delete_many()
+        .filter(comment::Column::TaskId.eq(&id))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除任务评论失败: {e}")))?;
+    content::Entity::delete_many()
+        .filter(content::Column::TaskId.eq(&id))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除任务内容失败: {e}")))?;
+    collect_log::Entity::delete_many()
+        .filter(collect_log::Column::TaskId.eq(&id))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除采集日志失败: {e}")))?;
+    task_run::Entity::delete_many()
+        .filter(task_run::Column::TaskId.eq(&id))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除执行历史失败: {e}")))?;
+    // 只清同步标记;去重台账(collect_records)保留——删任务不动平台+内容ID 关联表
+    delete_sync_marks(db, &rows).await?;
+    task::Entity::delete_by_id(&id)
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除任务失败: {e}")))?;
+    delete_media_files(media_root, rows).await;
+    Ok(())
+}
+
+#[tauri::command]
+/// 只删除任务本体(假删除:置 tasks.deleted=true):不触碰采集数据(contents / comments / 落盘媒体)、
+/// 执行历史、采集日志、同步标记与去重台账——与「删除数据」的级联删除相对。
+/// 进行中任务拒绝删除,需先停止。dataScope=self 只能删自己 owner 的任务。
+pub async fn remove_task_only(state: State<'_, AppState>, id: String) -> Result<()> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let Some(task_row) = task::Entity::find_by_id(&id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
+    else {
+        return Ok(()); // 不存在则幂等
+    };
+    if me.scope == "self" && task_row.owner != me.name {
+        return Err(CrawlerError::Config("无权删除该任务".into()));
+    }
+    ensure_task_not_active(&task_row.status)?;
+    let mut am = task_row.into_active_model();
+    am.deleted = Set(true);
+    am.updated_at = Set(Utc::now().timestamp());
+    am.update(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("删除任务失败: {e}")))?;
     Ok(())
+}
+
+/// 删除子任务(单个关键词)的返回结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveKeywordOutcome {
+    /// 删除的是任务最后一个关键词时,任务本体也一并删除
+    pub task_deleted: bool,
+    pub contents_removed: u64,
+    pub comments_removed: u64,
+}
+
+#[tauri::command]
+/// 删除子任务(任务下单个关键词):级联删除该关键词采到的内容 / 评论 / Obsidian 同步标记 /
+/// 去重台账条目与落盘媒体文件,并把关键词从任务中移除、回减任务的内容 / 评论计数。
+/// 删除的是最后一个关键词时,任务本体连带删除(同日志 / 执行历史)。
+pub async fn remove_task_keyword(
+    state: State<'_, AppState>,
+    task_id: String,
+    keyword: String,
+) -> Result<RemoveKeywordOutcome> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let Some(task_row) = task::Entity::find_by_id(&task_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
+    else {
+        return Ok(RemoveKeywordOutcome {
+            task_deleted: true,
+            contents_removed: 0,
+            comments_removed: 0,
+        });
+    };
+    if me.scope == "self" && task_row.owner != me.name {
+        return Err(CrawlerError::Config("无权删除该任务的子任务".into()));
+    }
+    ensure_task_not_active(&task_row.status)?;
+    let media_root = {
+        let cfg = crate::commands::lock_config(&state)?;
+        crate::media::media_root(&state.config_dir, &cfg.media)
+    };
+
+    let db = &state.db;
+    let rows = fetch_content_media_rows(db, &task_id, Some(&keyword), None).await?;
+    let keys: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.task_id.as_str(), r.platform.as_str(), r.content_id.as_str()))
+        .collect();
+    let comments_removed = cascade_delete_comments(db, &keys).await?;
+    let contents_removed = content::Entity::delete_many()
+        .filter(content::Column::TaskId.eq(&task_id))
+        .filter(content::Column::Keyword.eq(&keyword))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除子任务内容失败: {e}")))?
+        .rows_affected;
+    delete_sync_marks_and_ledger(db, &rows).await?;
+
+    // 关键词从任务定义中移除,计数同步回减;最后一个关键词被删时任务本体连带删除
+    let mut keywords: Vec<String> = serde_json::from_str(&task_row.keywords).unwrap_or_default();
+    keywords.retain(|k| k != &keyword);
+    let mut task_deleted = false;
+    if keywords.is_empty() {
+        collect_log::Entity::delete_many()
+            .filter(collect_log::Column::TaskId.eq(&task_id))
+            .exec(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("删除采集日志失败: {e}")))?;
+        task_run::Entity::delete_many()
+            .filter(task_run::Column::TaskId.eq(&task_id))
+            .exec(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("删除执行历史失败: {e}")))?;
+        task::Entity::delete_by_id(&task_id)
+            .exec(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("删除任务失败: {e}")))?;
+        task_deleted = true;
+    } else {
+        let mut am = task_row.into_active_model();
+        am.keywords = Set(serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into()));
+        am.content_count = Set((am.content_count.take().unwrap_or(0) - contents_removed as i64).max(0));
+        am.comment_count = Set((am.comment_count.take().unwrap_or(0) - comments_removed as i64).max(0));
+        am.update(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("更新任务失败: {e}")))?;
+    }
+
+    delete_media_files(media_root, rows).await;
+    Ok(RemoveKeywordOutcome {
+        task_deleted,
+        contents_removed,
+        comments_removed,
+    })
+}
+
+/// 删除执行历史(单次运行)的返回结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRunOutcome {
+    pub contents_removed: u64,
+    pub comments_removed: u64,
+}
+
+#[tauri::command]
+/// 删除一条执行历史(单次运行):按该运行的时间窗 [started_at, finished_at ?? 现在] 级联删除
+/// 窗内采集的内容 / 评论 / Obsidian 同步标记 / 去重台账条目 / 落盘媒体文件与运行日志,
+/// 回减任务计数,最后删执行记录本体。时间窗口径与「查看内容」穿透 / 导出 Excel 一致。
+/// 运行中的记录拒绝删除(其采集窗口 / 后台 spawn 仍存活)。
+pub async fn remove_task_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<RemoveRunOutcome> {
+    let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
+    let Some(run) = task_run::Entity::find_by_id(&run_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询执行记录失败: {e}")))?
+    else {
+        return Ok(RemoveRunOutcome {
+            contents_removed: 0,
+            comments_removed: 0,
+        });
+    };
+    if me.scope == "self" && run.owner != me.name {
+        return Err(CrawlerError::Config("无权删除该执行记录".into()));
+    }
+    if run.status == "running" {
+        return Err(CrawlerError::Config(
+            "该次运行仍在进行中,请先停止再删除".into(),
+        ));
+    }
+    let media_root = {
+        let cfg = crate::commands::lock_config(&state)?;
+        crate::media::media_root(&state.config_dir, &cfg.media)
+    };
+    let end = run.finished_at.unwrap_or_else(|| Utc::now().timestamp());
+
+    let db = &state.db;
+    let rows = fetch_content_media_rows(db, &run.task_id, None, Some((run.started_at, end)))
+        .await?;
+    let keys: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.task_id.as_str(), r.platform.as_str(), r.content_id.as_str()))
+        .collect();
+    let comments_removed = cascade_delete_comments(db, &keys).await?;
+    let contents_removed = content::Entity::delete_many()
+        .filter(content::Column::TaskId.eq(&run.task_id))
+        .filter(content::Column::CollectedAt.gte(run.started_at))
+        .filter(content::Column::CollectedAt.lte(end))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除运行窗口内容失败: {e}")))?
+        .rows_affected;
+    delete_sync_marks_and_ledger(db, &rows).await?;
+    // 运行日志按同一时间窗切删(与 list_run_logs 口径一致)
+    collect_log::Entity::delete_many()
+        .filter(collect_log::Column::TaskId.eq(&run.task_id))
+        .filter(collect_log::Column::Ts.gte(run.started_at))
+        .filter(collect_log::Column::Ts.lte(end))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除运行日志失败: {e}")))?;
+    // 回减任务计数(任务可能已被删除,查无此行则跳过)
+    if let Some(task_row) = task::Entity::find_by_id(&run.task_id)
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
+    {
+        let mut am = task_row.into_active_model();
+        am.content_count =
+            Set((am.content_count.take().unwrap_or(0) - contents_removed as i64).max(0));
+        am.comment_count =
+            Set((am.comment_count.take().unwrap_or(0) - comments_removed as i64).max(0));
+        am.update(db)
+            .await
+            .map_err(|e| CrawlerError::Config(format!("更新任务计数失败: {e}")))?;
+    }
+    task_run::Entity::delete_by_id(&run_id)
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除执行记录失败: {e}")))?;
+
+    delete_media_files(media_root, rows).await;
+    Ok(RemoveRunOutcome {
+        contents_removed,
+        comments_removed,
+    })
+}
+
+/// 进行中(含暂停,采集窗口仍存活)的任务禁止删除:窗口 / 账号锁 / 后台 spawn 都还在,
+/// 此时删库会让采集结果写到已删任务下,且媒体阶段会踩空目录。
+fn ensure_task_not_active(status: &str) -> Result<()> {
+    if matches!(
+        status,
+        "running" | "collecting_comments" | "analyzing_comments" | "downloading_media" | "paused"
+    ) {
+        return Err(CrawlerError::Config(
+            "任务进行中,请先停止再删除".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 待删内容的轻量行:只取级联删除与媒体清理所需的列,不拉 transcript 等大字段。
+struct ContentMediaRow {
+    id: String,
+    task_id: String,
+    platform: String,
+    content_id: String,
+    cover_path: Option<String>,
+    audio_path: Option<String>,
+    video_path: Option<String>,
+    image_paths: Option<String>,
+}
+
+/// 取某任务(可选限定关键词 / collected_at 时间窗)下全部内容的轻量行。
+async fn fetch_content_media_rows(
+    db: &sea_orm::DatabaseConnection,
+    task_id: &str,
+    keyword: Option<&str>,
+    window: Option<(i64, i64)>,
+) -> Result<Vec<ContentMediaRow>> {
+    let mut q = content::Entity::find()
+        .select_only()
+        .column(content::Column::Id)
+        .column(content::Column::TaskId)
+        .column(content::Column::Platform)
+        .column(content::Column::ContentId)
+        .column(content::Column::CoverPath)
+        .column(content::Column::AudioPath)
+        .column(content::Column::VideoPath)
+        .column(content::Column::ImagePaths)
+        .filter(content::Column::TaskId.eq(task_id));
+    if let Some(kw) = keyword {
+        q = q.filter(content::Column::Keyword.eq(kw));
+    }
+    if let Some((start, end)) = window {
+        q = q
+            .filter(content::Column::CollectedAt.gte(start))
+            .filter(content::Column::CollectedAt.lte(end));
+    }
+    q.into_tuple::<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>()
+    .all(db)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(
+                |(id, task_id, platform, content_id, cover_path, audio_path, video_path, image_paths)| {
+                    ContentMediaRow {
+                        id,
+                        task_id,
+                        platform,
+                        content_id,
+                        cover_path,
+                        audio_path,
+                        video_path,
+                        image_paths,
+                    }
+                },
+            )
+            .collect()
+    })
+    .map_err(|e| CrawlerError::Config(format!("查询待删内容失败: {e}")))
+}
+
+/// 删除待删内容的 Obsidian 同步标记(content_synced_users,按内容主键)。
+async fn delete_sync_marks(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[ContentMediaRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    use veltrix_core::db::entity::content_synced_user as csu;
+    csu::Entity::delete_many()
+        .filter(csu::Column::ContentId.is_in(rows.iter().map(|r| r.id.clone())))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除同步标记失败: {e}")))?;
+    Ok(())
+}
+
+/// 删除待删内容对应的去重台账条目(collect_records,按 platform+content_id):
+/// 删子任务 / 删执行历史时清,否则重跑同关键词会被「去重跳过」全拦。
+/// 删任务本体不调本函数——台账保留,平台+内容ID 关联不随任务删除而失效。
+async fn delete_collect_ledger(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[ContentMediaRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    use veltrix_core::db::entity::collect_record;
+    let mut cond = Condition::any();
+    for r in rows {
+        cond = cond.add(
+            Condition::all()
+                .add(collect_record::Column::Platform.eq(r.platform.as_str()))
+                .add(collect_record::Column::ContentId.eq(r.content_id.as_str())),
+        );
+    }
+    collect_record::Entity::delete_many()
+        .filter(cond)
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除去重台账失败: {e}")))?;
+    Ok(())
+}
+
+/// 同步标记 + 去重台账一并清理(删子任务 / 删执行历史用;删任务只清同步标记,台账保留)。
+async fn delete_sync_marks_and_ledger(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[ContentMediaRow],
+) -> Result<()> {
+    delete_sync_marks(db, rows).await?;
+    delete_collect_ledger(db, rows).await
+}
+
+/// 删除一批内容落盘的媒体文件:封面 / 音频 / 视频 / 图集及各自 `_thumb.jpg` 缩略图。
+/// 头像按作者共享({platform}/avatar/{uid}.jpg),可能被其他内容引用,不删。
+/// 文件删除失败仅告警:库记录已删,残留文件不阻断命令。大量文件放阻塞线程,不占异步运行时。
+async fn delete_media_files(media_root: std::path::PathBuf, rows: Vec<ContentMediaRow>) {
+    if rows.is_empty() {
+        return;
+    }
+    let removed = tokio::task::spawn_blocking(move || {
+        let mut removed = 0usize;
+        let mut delete_one = |stored: &str| {
+            let path = crate::media::resolve_media_path(&media_root, stored);
+            for p in [path.clone(), crate::thumbnail::thumb_path_for(&path)] {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("删除媒体文件失败 {}: {e}", p.display()),
+                }
+            }
+        };
+        for row in &rows {
+            for stored in [&row.cover_path, &row.audio_path, &row.video_path]
+                .into_iter()
+                .flatten()
+            {
+                delete_one(stored);
+            }
+            if let Some(json) = &row.image_paths {
+                if let Ok(paths) = serde_json::from_str::<Vec<String>>(json) {
+                    for stored in &paths {
+                        delete_one(stored);
+                    }
+                }
+            }
+        }
+        removed
+    })
+    .await
+    .unwrap_or(0);
+    if removed > 0 {
+        tracing::info!("任务删除级联清理媒体文件 {removed} 个");
+    }
 }
 
 /// 全量库内容视图。image_urls 在库里是 JSON 字符串,前端按数组消费。
@@ -1290,13 +1733,23 @@ pub async fn set_author_monitored(
 
 /// 一次性回填:历史内容 topics 为空但正文含 #话题 的,从正文(标题 + desc)补提取话题写回 topics。
 /// 只补话题、不改正文(剥离正文有误删风险,故保守保留)。幂等:仅处理 topics 为空的行,可安全重跑。
+/// 注意只取 id/title/desc 三列:该回填每次启动都在后台跑,整行拉取会把 transcript 等大字段一并读出。
 pub async fn backfill_empty_topics(db: &sea_orm::DatabaseConnection) {
-    use sea_orm::Condition;
+    use sea_orm::{Condition, QuerySelect};
     let empty = Condition::any()
         .add(content::Column::Topics.eq("[]"))
         .add(content::Column::Topics.eq(""))
         .add(content::Column::Topics.is_null());
-    let rows = match content::Entity::find().filter(empty).all(db).await {
+    let rows = match content::Entity::find()
+        .select_only()
+        .column(content::Column::Id)
+        .column(content::Column::Title)
+        .column(content::Column::Desc)
+        .filter(empty)
+        .into_tuple::<(String, Option<String>, Option<String>)>()
+        .all(db)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("回填话题:读 content 失败: {e}");
@@ -1304,14 +1757,14 @@ pub async fn backfill_empty_topics(db: &sea_orm::DatabaseConnection) {
         }
     };
     let mut fixed = 0u64;
-    for row in rows {
+    for (id, title, desc) in rows {
         // 抖音无独立标题,正文在 desc;其他平台标题/正文都可能含话题,一并提取
         let mut text = String::new();
-        if let Some(title) = &row.title {
+        if let Some(title) = &title {
             text.push_str(title);
             text.push(' ');
         }
-        if let Some(desc) = &row.desc {
+        if let Some(desc) = &desc {
             text.push_str(desc);
         }
         let topics = crate::adapter::extract_hashtags(&text);
@@ -1321,8 +1774,11 @@ pub async fn backfill_empty_topics(db: &sea_orm::DatabaseConnection) {
         let Ok(json) = serde_json::to_string(&topics) else {
             continue;
         };
-        let mut am: content::ActiveModel = row.into();
-        am.topics = Set(json);
+        let am = content::ActiveModel {
+            id: Set(id),
+            topics: Set(json),
+            ..Default::default()
+        };
         if let Err(e) = am.update(db).await {
             tracing::warn!("回填话题:更新失败: {e}");
             continue;
@@ -1424,7 +1880,7 @@ pub async fn migrate_authors_from_contents(db: &sea_orm::DatabaseConnection) {
 }
 
 /// 删除一条采集内容(全量库 / 内容库的「删除」操作)。仅删库记录,媒体文件不动;
-/// 级联删除该内容的评论,避免评论库留下无关联的孤儿数据。
+/// 级联删除该内容的评论与 Obsidian 同步标记,避免留下无关联的孤儿数据。
 #[tauri::command]
 pub async fn remove_content(state: State<'_, AppState>, id: String) -> Result<()> {
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
@@ -1444,11 +1900,12 @@ pub async fn remove_content(state: State<'_, AppState>, id: String) -> Result<()
         .await
         .map_err(|e| CrawlerError::Config(format!("删除内容失败: {e}")))?;
     cascade_delete_comments(&state.db, &[(&row.task_id, &row.platform, &row.content_id)]).await?;
+    delete_sync_marks_by_content_pks(&state.db, std::slice::from_ref(&id)).await?;
     Ok(())
 }
-
 /// 批量删除采集内容(全量库多选删除)。仅删库记录,媒体文件不动;级联删除这些内容的
-/// 评论。dataScope=self 的用户只能删自己 owner 的内容(越权 id 静默跳过)。返回实际删除条数。
+/// 评论与 Obsidian 同步标记。dataScope=self 的用户只能删自己 owner 的内容(越权 id 静默跳过)。
+/// 返回实际删除条数。
 #[tauri::command]
 pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Result<u64> {
     if ids.is_empty() {
@@ -1477,17 +1934,39 @@ pub async fn remove_contents(state: State<'_, AppState>, ids: Vec<String>) -> Re
         .map(|r| (r.task_id.as_str(), r.platform.as_str(), r.content_id.as_str()))
         .collect();
     cascade_delete_comments(&state.db, &keys).await?;
+    delete_sync_marks_by_content_pks(
+        &state.db,
+        &rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+    )
+    .await?;
     Ok(res.rows_affected)
 }
 
+/// 按内容主键删除 Obsidian 同步标记(content_synced_users)。
+async fn delete_sync_marks_by_content_pks(
+    db: &sea_orm::DatabaseConnection,
+    content_pks: &[String],
+) -> Result<()> {
+    if content_pks.is_empty() {
+        return Ok(());
+    }
+    use veltrix_core::db::entity::content_synced_user as csu;
+    csu::Entity::delete_many()
+        .filter(csu::Column::ContentId.is_in(content_pks.iter().cloned()))
+        .exec(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除同步标记失败: {e}")))?;
+    Ok(())
+}
+
 /// 级联删除一批内容的评论:按 (task_id, platform, content_id) 三元组精确匹配,
-/// 与评论落库 / fill_comment_views 的关联口径一致。
+/// 与评论落库 / fill_comment_views 的关联口径一致。返回实际删除条数。
 async fn cascade_delete_comments(
     db: &sea_orm::DatabaseConnection,
     keys: &[(&str, &str, &str)],
-) -> Result<()> {
+) -> Result<u64> {
     if keys.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut cond = Condition::any();
     for (task_id, platform, content_id) in keys {
@@ -1498,12 +1977,12 @@ async fn cascade_delete_comments(
                 .add(comment::Column::ContentId.eq(*content_id)),
         );
     }
-    comment::Entity::delete_many()
+    let res = comment::Entity::delete_many()
         .filter(cond)
         .exec(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("级联删除评论失败: {e}")))?;
-    Ok(())
+    Ok(res.rows_affected)
 }
 
 /// 评论库视图。author_avatar 从完整作者 JSON 解析(实体只单列了 uid/nickname)。
@@ -1796,7 +2275,7 @@ fn content_filter(query: &ContentListQuery, self_only: bool, owner: &str) -> Fil
         and_cond(
             &mut conds,
             &mut values,
-            "(lower(contents.title) LIKE lower(?) ESCAPE '\\' OR lower(contents.keyword) LIKE lower(?) ESCAPE '\\' OR lower(contents.desc) LIKE lower(?) ESCAPE '\\')",
+            "(lower(contents.title) LIKE lower(?) ESCAPE '\\' OR lower(contents.keyword) LIKE lower(?) ESCAPE '\\' OR lower(contents.\"desc\") LIKE lower(?) ESCAPE '\\')",
             pattern.clone().into(),
         );
         values.push(pattern.clone().into());
@@ -2021,9 +2500,11 @@ const LIST_PREVIEW_LEN: usize = 100;
 /// 列表瘦身查询的 SELECT:剔 transcript / cover_ocr_text / image_paths 等整文列,
 /// 三态与摘要在 SQL 内算好(substr/length 在 SQLite 与 PG 均按字符计),整文不出库也不过 IPC;
 /// author_json / image_urls / extra 仍需读出供 Rust 派生小字段(头像/首图/xsec_token),但不外发。
+/// 注意 `desc` 是 PG 保留字,手写 SQL 中必须带双引号(SQLite 同样接受),两处(本 SELECT 与
+/// content_filter 的搜索条件)要保持一致;`try_get` 按列名取值不受影响。
 fn content_list_select_sql(placeholders: &str) -> String {
     format!(
-        "SELECT id, task_id, platform, content_id, keyword, kind, title, desc, \
+        "SELECT id, task_id, platform, content_id, keyword, kind, title, \"desc\", \
          author_uid, author_nickname, author_json, \
          like_count, comment_count, collect_count, share_count, play_count, published_at, \
          video_url, cover_url, image_urls, extra, duration, topics, owner, collected_at, \

@@ -8,6 +8,8 @@ import {
 import {
   Activity,
   CalendarDays,
+  Flame,
+  Hash,
   Inbox,
   CheckCircle2,
   Clock,
@@ -15,7 +17,11 @@ import {
   FileText,
   ListChecks,
   MessageCircle,
+  Search,
+  ShieldCheck,
   Sparkles,
+  TrendingUp,
+  Users,
   X,
   XCircle,
 } from "lucide-react";
@@ -190,7 +196,7 @@ export function DashboardPage() {
   }
 
   return (
-    <div className="veltrix-no-scrollbar min-h-0 flex-1 space-y-2.5 overflow-y-auto p-1">
+    <div className="veltrix-no-scrollbar veltrix-dashboard-bg min-h-0 flex-1 space-y-2.5 overflow-y-auto p-1">
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       {/* 累计计数 + 平台细分 */}
@@ -207,6 +213,7 @@ export function DashboardPage() {
           platformName={platformName}
           color="text-sky-600 dark:text-sky-400"
           bg="bg-sky-500/10"
+          tint="from-sky-500/10 to-transparent"
           kindStats={
             data
               ? { video: data.contentVideo, image: data.contentImage }
@@ -222,6 +229,7 @@ export function DashboardPage() {
           platformName={platformName}
           color="text-violet-600 dark:text-violet-400"
           bg="bg-violet-500/10"
+          tint="from-violet-500/10 to-transparent"
           kindStats={
             data
               ? { video: data.commentVideo, image: data.commentImage }
@@ -237,6 +245,7 @@ export function DashboardPage() {
           platformName={platformName}
           color="text-emerald-600 dark:text-emerald-400"
           bg="bg-emerald-500/10"
+          tint="from-emerald-500/10 to-transparent"
           kindStats={
             data
               ? { video: data.intentVideo, image: data.intentImage }
@@ -251,10 +260,12 @@ export function DashboardPage() {
         style={{ animationDelay: "70ms" }}
       >
         <div className="veltrix-card p-5">
-          <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-            <CalendarDays className="size-4 text-muted-foreground" />
-            今日采集
-          </h3>
+          <SectionHeader
+            icon={CalendarDays}
+            title="今日采集"
+            chip="bg-sky-500/10 text-sky-600 dark:text-sky-400"
+            className="mb-4"
+          />
           <div className="grid grid-cols-2 gap-2.5">
             <TodayMetric
               icon={FileText}
@@ -276,15 +287,19 @@ export function DashboardPage() {
           {/* 今日各平台采集细分:每行两个平台,平台名左,内容 / 评论定宽右对齐成列 */}
           {data && platforms.length > 0 && (
             <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-1.5 border-t pt-3 text-xs">
-              {platforms.map((platform) => {
+              {platforms.map((platform, i) => {
                 // byPlatform 只含今日采到数据的平台;未采到的补 0 也列出,平台一览更完整
                 const stat = data.today.byPlatform.find(
                   (p) => p.platform === platform.id,
                 );
                 return (
                   <div key={platform.id} className="flex items-center gap-2">
-                    <span className="flex-1 truncate text-muted-foreground">
-                      {platformName(platform.id)}
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5 text-muted-foreground">
+                      <span
+                        className="size-1.5 shrink-0 rounded-full"
+                        style={{ background: platformColor(platform.id, i) }}
+                      />
+                      <span className="truncate">{platformName(platform.id)}</span>
                     </span>
                     <span className="flex w-16 justify-between">
                       <span className="text-muted-foreground">内容</span>
@@ -305,10 +320,12 @@ export function DashboardPage() {
           )}
         </div>
         <div className="veltrix-card flex flex-col p-5">
-          <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-            <ListChecks className="size-4 text-muted-foreground" />
-            任务状态
-          </h3>
+          <SectionHeader
+            icon={ListChecks}
+            title="任务状态"
+            chip="bg-indigo-500/10 text-indigo-600 dark:text-indigo-400"
+            className="mb-4"
+          />
           <div className="grid flex-1 grid-cols-4 grid-rows-1 gap-2">
             <StatusTile
               icon={Activity}
@@ -432,15 +449,171 @@ export function DashboardPage() {
         <DonutCard title="素材下载概况" data={mediaDonut} />
       </div>
 
+      {/* 采集运营:账号池健康 + 近期新增(合并卡)/ 关键词采集榜(双列) */}
+      <div
+        className="veltrix-enter grid grid-cols-1 gap-2.5 lg:grid-cols-2"
+        style={{ animationDelay: "260ms" }}
+      >
+        <div className="veltrix-card p-5">
+          <SectionHeader
+            icon={Users}
+            title="账号池健康"
+            chip="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+            className="mb-4"
+          />
+          <div className="grid grid-cols-4 gap-2 text-center">
+            <MiniStat label="总数" value={data?.accountHealth.total} />
+            <MiniStat
+              label="可用"
+              value={data?.accountHealth.active}
+              valueClass="text-emerald-600 dark:text-emerald-400"
+            />
+            <MiniStat
+              label="失效"
+              value={data?.accountHealth.invalid}
+              valueClass="text-rose-600 dark:text-rose-400"
+            />
+            <MiniStat
+              label="禁用"
+              value={data?.accountHealth.disabled}
+              valueClass="text-slate-500 dark:text-slate-400"
+            />
+          </div>
+          {data && (
+            <div className="mt-3 grid grid-cols-3 gap-x-4 gap-y-1 border-t pt-2.5 text-xs">
+              {data.accountHealth.activeByPlatform.map((p, i) => (
+                <div key={p.platform} className="flex items-center gap-2">
+                  <span className="flex min-w-0 flex-1 items-center gap-1.5 text-muted-foreground">
+                    <span
+                      className="size-1.5 shrink-0 rounded-full"
+                      style={{ background: platformColor(p.platform, i) }}
+                    />
+                    <span className="truncate">{platformName(p.platform)}</span>
+                  </span>
+                  <span className="font-mono text-foreground">
+                    <AnimatedNumber value={p.count} />
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <SectionHeader
+            icon={TrendingUp}
+            title="近期新增"
+            chip="bg-amber-500/10 text-amber-600 dark:text-amber-400"
+            className="mb-4 mt-5 border-t pt-4"
+          />
+          <div className="space-y-2.5 text-sm">
+            <GrowthRow
+              label="近 7 天内容"
+              value={data?.recentGrowth.last7Contents}
+              delta={
+                data
+                  ? data.recentGrowth.last7Contents -
+                    data.recentGrowth.prev7Contents
+                  : undefined
+              }
+            />
+            <GrowthRow
+              label="近 7 天评论"
+              value={data?.recentGrowth.last7Comments}
+              delta={
+                data
+                  ? data.recentGrowth.last7Comments -
+                    data.recentGrowth.prev7Comments
+                  : undefined
+              }
+            />
+            <div className="flex items-center gap-2 border-t pt-2.5 text-xs text-muted-foreground">
+              <span className="flex-1">近 30 天</span>
+              <span>
+                内容{" "}
+                <span className="font-mono text-foreground">
+                  <AnimatedNumber value={data?.recentGrowth.last30Contents} />
+                </span>
+              </span>
+              <span>
+                评论{" "}
+                <span className="font-mono text-foreground">
+                  <AnimatedNumber value={data?.recentGrowth.last30Comments} />
+                </span>
+              </span>
+            </div>
+            <div className="flex items-center gap-2 border-t pt-2.5 text-xs text-muted-foreground">
+              <ShieldCheck className="size-3.5 shrink-0" />
+              <span className="flex-1">去重台账</span>
+              <span>
+                累计{" "}
+                <span className="font-mono text-foreground">
+                  <AnimatedNumber value={data?.dedupStats.total} />
+                </span>
+              </span>
+              <span title="近 90 天登记量(去重判重的有效窗口)">
+                近 90 天{" "}
+                <span className="font-mono text-foreground">
+                  <AnimatedNumber value={data?.dedupStats.recent90} />
+                </span>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="veltrix-card p-5">
+          <SectionHeader
+            icon={Search}
+            title={`关键词采集榜 Top ${data?.topCollectKeywords.length ?? 0}`}
+            chip="bg-violet-500/10 text-violet-600 dark:text-violet-400"
+          />
+          {data && data.topCollectKeywords.length > 0 ? (
+            <AutoScrollList count={data.topCollectKeywords.length}>
+              <ul className="grid grid-cols-1 gap-x-5 gap-y-2.5 sm:grid-cols-2">
+                {data.topCollectKeywords.map((k, i) => {
+                  const max = data.topCollectKeywords[0]?.count || 1;
+                  return (
+                    <li key={k.keyword} className="text-sm">
+                      <div className="flex items-center gap-2">
+                        <span className="w-4 shrink-0 text-center font-mono text-xs text-muted-foreground">
+                          {i + 1}
+                        </span>
+                        <span className="shrink-0 rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
+                          {platformName(k.platform)}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-foreground">
+                          {k.keyword}
+                        </span>
+                        <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                          {k.count.toLocaleString()}
+                        </span>
+                      </div>
+                      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500"
+                          style={{ width: `${(k.count / max) * 100}%` }}
+                        />
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </AutoScrollList>
+          ) : (
+            <EmptyLine text="暂无关键词数据" />
+          )}
+        </div>
+      </div>
+
       {/* 热门内容 / 热门关键词 */}
       <div
         className="veltrix-enter grid grid-cols-1 gap-2.5 lg:grid-cols-2"
-        style={{ animationDelay: "280ms" }}
+        style={{ animationDelay: "330ms" }}
       >
         <div className="veltrix-card p-5">
-          <h3 className="mb-3 text-sm font-semibold text-foreground">
-            热门内容 Top {data?.hotContents.length ?? 0}
-          </h3>
+          <SectionHeader
+            icon={Flame}
+            title={`热门内容 Top ${data?.hotContents.length ?? 0}`}
+            chip="bg-rose-500/10 text-rose-600 dark:text-rose-400"
+          />
           {data && data.hotContents.length > 0 ? (
             <AutoScrollList count={data.hotContents.length}>
               <ol className="space-y-2">
@@ -468,9 +641,11 @@ export function DashboardPage() {
         </div>
 
         <div className="veltrix-card p-5">
-          <h3 className="mb-3 text-sm font-semibold text-foreground">
-            热门话题 Top {data?.topKeywords.length ?? 0}
-          </h3>
+          <SectionHeader
+            icon={Hash}
+            title={`热门话题 Top ${data?.topKeywords.length ?? 0}`}
+            chip="bg-sky-500/10 text-sky-600 dark:text-sky-400"
+          />
           {data && data.topKeywords.length > 0 ? (
             <AutoScrollList count={data.topKeywords.length}>
               <ul className="space-y-2.5">
@@ -488,7 +663,7 @@ export function DashboardPage() {
                     </div>
                     <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
                       <div
-                        className="h-full rounded-full bg-primary"
+                        className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500"
                         style={{ width: `${(k.count / max) * 100}%` }}
                       />
                     </div>
@@ -506,7 +681,7 @@ export function DashboardPage() {
   );
 }
 
-// 概览卡片:彩色图标块 + 大数字 + 平台细分 chips
+// 概览卡片:彩色图标块 + 大数字 + 平台细分 chips;tint 为卡片主题色渐变晕染
 const OverviewCard = memo(function OverviewCard({
   icon: Icon,
   label,
@@ -516,6 +691,7 @@ const OverviewCard = memo(function OverviewCard({
   platformName,
   color,
   bg,
+  tint,
   kindStats,
 }: {
   icon: ComponentType<{ className?: string }>;
@@ -526,10 +702,11 @@ const OverviewCard = memo(function OverviewCard({
   platformName: (id: string) => string;
   color: string;
   bg: string;
+  tint: string;
   kindStats?: { video: number; image: number };
 }) {
   return (
-    <div className="veltrix-card p-5">
+    <div className={`veltrix-card bg-gradient-to-br p-5 ${tint}`}>
       <div className="flex items-center gap-3">
         <div
           className={`flex size-10 shrink-0 items-center justify-center rounded-xl ${bg} ${color}`}
@@ -558,11 +735,12 @@ const OverviewCard = memo(function OverviewCard({
         {/* 平台分布 */}
         {byPlatform && byPlatform.length > 0 ? (
           <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-            {byPlatform.map((p) => (
+            {byPlatform.map((p, i) => (
               <KV
                 key={p.platform}
                 label={platformName(p.platform)}
                 value={p.count}
+                dot={platformColor(p.platform, i)}
               />
             ))}
           </div>
@@ -575,10 +753,44 @@ const OverviewCard = memo(function OverviewCard({
 });
 
 // 形态 / 平台共用键值项:标签左、数字右对齐,使两行数字成列对齐
-const KV = memo(function KV({ label, value }: { label: string; value: number }) {
+// 区块标题:彩色图标徽章 + 文案(chip 为主题色徽章类,如 bg-sky-500/10 text-sky-600)
+const SectionHeader = memo(function SectionHeader({
+  icon: Icon,
+  title,
+  chip,
+  className,
+}: {
+  icon: ComponentType<{ className?: string }>;
+  title: string;
+  chip: string;
+  className?: string;
+}) {
+  return (
+    <h3
+      className={`flex items-center gap-2 text-sm font-semibold text-foreground ${className ?? "mb-3"}`}
+    >
+      <span
+        className={`flex size-6 shrink-0 items-center justify-center rounded-lg ${chip}`}
+      >
+        <Icon className="size-3.5" />
+      </span>
+      {title}
+    </h3>
+  );
+});
+
+const KV = memo(function KV({ label, value, dot }: { label: string; value: number; dot?: string }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="truncate text-muted-foreground">{label}</span>
+      <span className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+        {dot && (
+          <span
+            className="size-1.5 shrink-0 rounded-full"
+            style={{ background: dot }}
+          />
+        )}
+        <span className="truncate">{label}</span>
+      </span>
       <span className="shrink-0 font-mono font-medium text-foreground">
         <AnimatedNumber value={value} />
       </span>
@@ -637,7 +849,7 @@ const StatusTile = memo(function StatusTile({
   bg: string;
 }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
+    <div className="flex h-full flex-col items-center justify-center gap-1.5 rounded-xl bg-muted/40 px-2 py-4 text-center transition-colors hover:bg-muted/60">
       <div
         className={`flex size-14 items-center justify-center rounded-xl ${bg} ${color}`}
       >
@@ -651,11 +863,11 @@ const StatusTile = memo(function StatusTile({
   );
 });
 
-// 环比徽章(较昨日)
-const DeltaBadge = memo(function DeltaBadge({ delta }: { delta: number | undefined }) {
+// 环比徽章(默认较昨日,可通过 period 改口径,如「较上周」)
+const DeltaBadge = memo(function DeltaBadge({ delta, period = "较昨日" }: { delta: number | undefined; period?: string }) {
   if (delta === undefined) return null;
   if (delta === 0)
-    return <span className="text-muted-foreground">较昨日持平</span>;
+    return <span className="text-muted-foreground">{period}持平</span>;
   const up = delta > 0;
   return (
     <span
@@ -665,8 +877,53 @@ const DeltaBadge = memo(function DeltaBadge({ delta }: { delta: number | undefin
           : "text-rose-600 dark:text-rose-400"
       }
     >
-      {up ? "↑" : "↓"} {Math.abs(delta).toLocaleString()} 较昨日
+      {up ? "↑" : "↓"} {Math.abs(delta).toLocaleString()} {period}
     </span>
+  );
+});
+
+// 账号池健康小格:大数字 + 标签(纯数字版 StatusTile)
+const MiniStat = memo(function MiniStat({
+  label,
+  value,
+  valueClass,
+}: {
+  label: string;
+  value: number | undefined;
+  valueClass?: string;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div
+        className={`font-mono text-xl font-semibold leading-none ${valueClass ?? "text-foreground"}`}
+      >
+        <AnimatedNumber value={value} />
+      </div>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  );
+});
+
+// 近期新增行:标签 + 大数字 + 周环比徽章
+const GrowthRow = memo(function GrowthRow({
+  label,
+  value,
+  delta,
+}: {
+  label: string;
+  value: number | undefined;
+  delta: number | undefined;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex-1 text-muted-foreground">{label}</span>
+      <span className="font-mono text-base font-semibold text-foreground">
+        <AnimatedNumber value={value} />
+      </span>
+      <span className="w-28 shrink-0 text-right text-[11px]">
+        <DeltaBadge delta={delta} period="较上周" />
+      </span>
+    </div>
   );
 });
 

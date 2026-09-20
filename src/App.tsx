@@ -60,6 +60,12 @@ const IndustryPage = lazy(() =>
 const CustomersPage = lazy(() =>
   import("@/pages/CustomersPage").then((m) => ({ default: m.CustomersPage })),
 );
+const ProjectsPage = lazy(() =>
+  import("@/pages/ProjectsPage").then((m) => ({ default: m.ProjectsPage })),
+);
+const TeamsPage = lazy(() =>
+  import("@/pages/TeamsPage").then((m) => ({ default: m.TeamsPage })),
+);
 const AuthorLibraryPage = lazy(() =>
   import("@/pages/AuthorLibraryPage").then((m) => ({
     default: m.AuthorLibraryPage,
@@ -101,8 +107,8 @@ const UserCenterPage = lazy(() =>
     default: m.UserCenterPage,
   })),
 );
-const CreationPage = lazy(() =>
-  import("@/pages/CreationPage").then((m) => ({ default: m.CreationPage })),
+const PromptsPage = lazy(() =>
+  import("@/pages/PromptsPage").then((m) => ({ default: m.PromptsPage })),
 );
 
 // 登录态持久化键:桌面端走 IPC、不发 token,登录用户存 localStorage,刷新 / 重开免登录
@@ -154,12 +160,20 @@ function renderPage(
   onNavigate: (key: PageKey, ctx?: TaskContentFilter) => void,
   navCtx: TaskContentFilter | null,
   drillSource: PageKey | null,
+  collectDetailId: string | null,
+  onCollectDetailChange: (id: string | null) => void,
 ): ReactNode {
   switch (active) {
     case "dashboard":
       return <DashboardPage />;
     case "collect-tasks":
-      return <CollectPage onNavigate={onNavigate} />;
+      return (
+        <CollectPage
+          onNavigate={onNavigate}
+          detailId={collectDetailId}
+          onDetailChange={onCollectDetailChange}
+        />
+      );
     case "accounts":
       return <AccountsPage currentUser={loggedUser.username} />;
     case "publish-dashboard":
@@ -195,32 +209,18 @@ function renderPage(
       return <IndustryPage />;
     case "customers":
       return <CustomersPage currentUser={loggedUser.username} />;
+    case "projects":
+      return <ProjectsPage currentUser={loggedUser.username} />;
     case "chat-sessions":
       return <ConversationShell />;
     case "chat-history":
       return <ConversationsPage onNavigate={onNavigate} />;
     case "memory-center":
       return <MemoryCenterPage />;
-    case "cowork-video":
-      return <CreationPage tool="video" />;
-    case "cowork-copy":
-      return <CreationPage tool="copy" />;
-    case "cowork-assets":
-      return <CreationPage tool="assets" />;
-    case "cowork-project":
-      return (
-        <PlaceholderPage
-          title="项目管理"
-          description="创作模块建设中。后续接入项目与任务协作管理。"
-        />
-      );
+    case "cowork-prompts":
+      return <PromptsPage />;
     case "cowork-team":
-      return (
-        <PlaceholderPage
-          title="团队成员"
-          description="创作模块建设中。后续接入成员与权限管理。"
-        />
-      );
+      return <TeamsPage currentUser={loggedUser.username} />;
     // 三个库共用组件,必须用 key 强制各自独立挂载:
     // 否则路由切换时 React 复用实例,上一个库的筛选/视图状态会带到下一个库
     case "assets-all":
@@ -276,9 +276,12 @@ function App() {
   const [workspace, setWorkspace] = useState<Workspace>(
     storedNav?.workspace ?? "management",
   );
-  // 旧版「工作空间」页(cowork-space)已拆成 视频剪辑/文案撰写/素材管理,存量导航记录映射到视频剪辑
-  const storedActive = storedNav?.active === ("cowork-space" as string)
-    ? ("cowork-video" as PageKey)
+  // 旧版工作空间 / 视频剪辑 / 文案撰写 / 素材管理页已移除，存量导航记录回退到仍可用的创作页。
+  const storedActive = storedNav?.active === ("cowork-space" as string) ||
+    storedNav?.active === ("cowork-video" as string) ||
+    storedNav?.active === ("cowork-copy" as string) ||
+    storedNav?.active === ("cowork-assets" as string)
+    ? ("cowork-prompts" as PageKey)
     : storedNav?.active;
   const [active, setActive] = useState<PageKey>(storedActive ?? "dashboard");
   // 记住进入脱离侧栏页面(系统设置/个人中心)前的来源页,供关闭返回
@@ -354,6 +357,9 @@ function App() {
   const [navCtx, setNavCtx] = useState<TaskContentFilter | null>(null);
   // 数据穿透来源页:带 ctx 跳转视为穿透,记下出发页,供穿透目标页「返回」回到原处
   const [drillSource, setDrillSource] = useState<PageKey | null>(null);
+  // 任务调度详情页 id 提升到 App:CollectPage 穿透跳走会卸载,本地 state 丢失,
+  // 从详情穿透再返回时会掉回列表;由 App 持有即可「从哪穿透回哪去」
+  const [collectDetailId, setCollectDetailId] = useState<string | null>(null);
   // 进入「系统设置 / 个人中心」等脱离侧栏的页面前记住来源页,关闭时返回该页
   function handleNavigate(next: PageKey, ctx?: TaskContentFilter) {
     if (isOffNavPage(next) && !isOffNavPage(active)) {
@@ -513,13 +519,13 @@ function App() {
             {active === "chat-sessions" ? (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <Suspense fallback={<PageLoading variant="workspace" />}>
-                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
+                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource, collectDetailId, setCollectDetailId)}
                 </Suspense>
               </div>
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 p-2.5">
-                {/* 自带头部结构的页面不再重复显示标题:视频剪辑(工具页)、数据概览(页内自有标题区) */}
-                {active !== "cowork-video" && active !== "dashboard" && (
+                {/* 自带头部结构的数据概览页不再重复显示标题。 */}
+                {active !== "dashboard" && (
                 <div className="flex shrink-0 items-center justify-between gap-3">
                   {/* 关闭入口统一放在标题左侧、标题前面(脱离侧栏的单页面:系统设置/个人中心/对话记录等) */}
                   <div className="flex min-w-0 items-center gap-2">
@@ -542,7 +548,7 @@ function App() {
                 </div>
                 )}
                 <Suspense fallback={<PageLoading />}>
-                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource)}
+                  {renderPage(active, loggedUser, handleProfileUpdated, handleNavigate, navCtx, drillSource, collectDetailId, setCollectDetailId)}
                 </Suspense>
               </div>
             )}

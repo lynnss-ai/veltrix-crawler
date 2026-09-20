@@ -308,12 +308,24 @@ export interface EmbeddingConfigView {
   hasApiKey: boolean;
 }
 
-// 提示词
+// 提示词(创作 - 提示词管理;提交与视图同构,时间字段后端维护)
 export interface PromptDto {
   id: string;
   code: string;
   name: string;
+  // 类型:image(图片)/ video(视频);旧数据为空串或 adapt
+  kind: string;
   content: string;
+  // 来源(下拉选项,如 opennana)
+  source: string;
+  // 来源数据 id(取材的内容 / 数据记录 id)
+  sourceDataId: string;
+  // 示例链接(图片或视频 URL)
+  example: string;
+  // 适配模型(tag 多值)
+  models: string[];
+  createdAt: number;
+  updatedAt: number;
 }
 
 // 客户(列表视图,tags 为数组)
@@ -352,6 +364,55 @@ export interface CustomerInput {
   status: string;
   owner: string;
   remark: string;
+}
+
+// 项目信息(运营 - 客户管理):customerId 关联 customers.id,客户删除后悬空,前端兜底「未关联客户」
+export interface ProjectView {
+  id: string;
+  code: string;
+  name: string;
+  customerId: string;
+  // YYYY-MM-DD,空串 = 未设
+  startDate: string;
+  endDate: string;
+  remark: string;
+  owner: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// 项目提交(无时间字段,后端补)
+export interface ProjectInput {
+  id: string;
+  code: string;
+  name: string;
+  customerId: string;
+  startDate: string;
+  endDate: string;
+  remark: string;
+  owner: string;
+}
+
+// 团队(创作 - 团队管理):memberIds 关联 users.id,用户删除后悬空 id 前端过滤
+export interface TeamView {
+  id: string;
+  code: string;
+  name: string;
+  memberIds: string[];
+  remark: string;
+  owner: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// 团队提交(无时间字段,后端补)
+export interface TeamInput {
+  id: string;
+  code: string;
+  name: string;
+  memberIds: string[];
+  remark: string;
+  owner: string;
 }
 
 // 行业类别
@@ -459,6 +520,19 @@ export interface TaskView {
   // 累计采集总量(库里该任务去重后全部内容/评论数);list_tasks 填充,事件推送时为 0
   totalContents: number;
   totalComments: number;
+}
+
+// 删除子任务(remove_task_keyword)的返回:taskDeleted=删除的是最后一个关键词,任务本体已连带删除
+export interface RemoveKeywordOutcome {
+  taskDeleted: boolean;
+  contentsRemoved: number;
+  commentsRemoved: number;
+}
+
+// 删除执行历史(remove_task_run)的返回
+export interface RemoveRunOutcome {
+  contentsRemoved: number;
+  commentsRemoved: number;
 }
 
 export interface TaskInput {
@@ -944,6 +1018,34 @@ export interface KeywordCount {
   keyword: string;
   count: number;
 }
+// 关键词采集榜条目:关键词 + 总数 + 主平台
+export interface CollectKeywordCount {
+  keyword: string;
+  count: number;
+  platform: string;
+}
+// 账号池健康度(采集账号)
+export interface AccountHealth {
+  total: number;
+  active: number;
+  invalid: number;
+  disabled: number;
+  activeByPlatform: PlatformCount[];
+}
+// 近期新增(近 7 / 30 天,prev7 为周环比基准)
+export interface RecentGrowth {
+  last7Contents: number;
+  last7Comments: number;
+  prev7Contents: number;
+  prev7Comments: number;
+  last30Contents: number;
+  last30Comments: number;
+}
+// 去重台账概况
+export interface DedupStat {
+  total: number;
+  recent90: number;
+}
 export interface DashboardOverview {
   contentTotal: number;
   commentTotal: number;
@@ -965,6 +1067,10 @@ export interface DashboardOverview {
   hotContents: HotContent[];
   mediaStats: MediaStat;
   topKeywords: KeywordCount[];
+  accountHealth: AccountHealth;
+  topCollectKeywords: CollectKeywordCount[];
+  recentGrowth: RecentGrowth;
+  dedupStats: DedupStat;
 }
 
 // 云端连接相关
@@ -1017,14 +1123,27 @@ export interface AudioDeviceInfo {
   recommended: boolean;
 }
 
+// 摄像头设备(对应后端 CameraDeviceInfo,录屏设置面板的摄像头选择器用)
+export interface CameraDeviceInfo {
+  // dshow 设备名(开始录制按它回选)
+  name: string;
+  // 是否推荐设备(列表首个)
+  recommended: boolean;
+}
+
+// 摄像头画中画落位(四角)
+export type CamPosition = "topLeft" | "topRight" | "bottomLeft" | "bottomRight";
+
 // 屏幕录制状态(对应后端 RecordingStatus)
 export interface RecordingStatus {
   // 是否正在录制
   recording: boolean;
   // 本次录制的屏幕下标;null = 全部屏幕
   screenIndex: number | null;
-  // 是否在采麦克风(录制中展示用;启动后不可改)
+  // 是否在录麦克风(= 是否存在音频轨;启动后不可改)
   withMic: boolean;
+  // 麦克风当前是否开启(录制中可随时切换;关闭 = 记入静音区间,成片对应区间无声)
+  micOn: boolean;
   // 开始时间(Unix 秒);未录制为 null
   startedAt: number | null;
   // 输出 MP4 路径;未录制为 null
@@ -1033,63 +1152,6 @@ export interface RecordingStatus {
   paused: boolean;
   // 已录制的活跃秒数(不含暂停时段);悬浮窗计时以此为基准本地走秒
   elapsedSecs: number;
-}
-
-// ===================== 创作 =====================
-
-// 视频剪辑片段(秒;对应后端 ClipSegment)
-export interface ClipSegment {
-  start: number;
-  end: number;
-}
-
-// 剪辑轨道类型(对齐专业 NLE:视频 / 音频 / 字幕)
-export type TrackType = "video" | "audio" | "text";
-
-// 视频元信息(后端 ffmpeg -i 解析;<video> 元素拿不到的帧率 / 码率 / 编码走这里)
-export interface VideoInfo {
-  durationSecs: number;
-  width: number;
-  height: number;
-  fps: number;
-  videoCodec: string;
-  audioCodec: string;
-  bitrateKbps: number;
-}
-
-// 导出转场参数:kind = dissolve(叠化)/ fade(淡黑);不传 = 不加转场(流拷贝快路径)
-export interface TransitionInput {
-  kind: "dissolve" | "fade";
-  durationSecs: number;
-}
-
-// 轨道上的片段
-export interface TrackClip extends ClipSegment {
-  id: string;
-}
-
-// 剪辑轨道(草稿持久化用,前端模型,无后端表)
-export interface EditorTrack {
-  id: string;
-  type: TrackType;
-  name: string;
-  clips: TrackClip[];
-  // 轨道开关(随草稿持久化):锁定=禁增删片段/删轨;隐藏=不参与导出;静音=音频轨不混音
-  locked?: boolean;
-  hidden?: boolean;
-  muted?: boolean;
-}
-
-// 剪辑历史条目(对应后端 ExportItem;导出目录扫描,文件即记录)
-export interface ExportItem {
-  // 文件名(clip-<时间戳>.mp4)
-  name: string;
-  // 绝对路径
-  path: string;
-  // 文件大小(字节)
-  size: number;
-  // 导出时间(Unix 秒)
-  createdAt: number;
 }
 
 // ===================== 发布服务 =====================

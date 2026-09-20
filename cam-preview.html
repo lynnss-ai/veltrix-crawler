@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>摄像头</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        /* 不透明深色底:透明窗口会迫使 WebView2 走软件合成,视频极易掉帧卡顿 */
+        background: #000;
+        overflow: hidden;
+        box-sizing: border-box;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+      }
+      video,
+      canvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        pointer-events: none;
+      }
+      /* 整窗拖拽层:盖在视频上吃掉鼠标事件(data-tauri-drag-region) */
+      #drag {
+        position: fixed;
+        inset: 0;
+        cursor: move;
+      }
+      #msg {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        color: #bbb;
+        font: 12px/1.5 system-ui, sans-serif;
+        padding: 8px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <video id="cam" autoplay muted playsinline></video>
+    <canvas id="stage"></canvas>
+    <div id="msg"></div>
+    <div id="drag" data-tauri-drag-region></div>
+    <script type="module">
+      import { invoke } from "@tauri-apps/api/core";
+
+      const video = document.getElementById("cam");
+      const canvas = document.getElementById("stage");
+      const msg = document.getElementById("msg");
+
+      // 取流失败:提示一瞬后自关闭,录制继续(成片无画中画);不拖累录屏
+      function fail(text) {
+        video.remove();
+        canvas.remove();
+        msg.textContent = text;
+        msg.style.display = "flex";
+        setTimeout(() => invoke("dismiss_cam_preview").catch(() => {}), 1500);
+      }
+
+      // ?device=<名称>:与 webview 枚举到的设备标签做包含匹配;枚举不出标签(未授权前)或
+      // 匹配不上就用系统默认摄像头。显式给宽高帧率:无约束时 WebView2 常拿到高分辨率
+      // MJPEG 档,软解吃力导致预览与成片卡顿;640x480@30 是基线档,足够画中画观感
+      const want = new URLSearchParams(location.search).get("device") ?? "";
+      try {
+        let constraint = {
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30, min: 15 },
+        };
+        if (want) {
+          try {
+            const devs = await navigator.mediaDevices.enumerateDevices();
+            const hit = devs.find(
+              (d) => d.kind === "videoinput" && d.label.includes(want),
+            );
+            if (hit)
+              constraint = {
+                deviceId: { exact: hit.deviceId },
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                frameRate: { ideal: 30, min: 15 },
+              };
+          } catch {}
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: constraint,
+        });
+        video.srcObject = stream;
+        // 关键:video 走 Windows 硬件覆盖层(MPO)直接上屏,桌面复制 API 抓不到——
+        // 录像里会没有摄像头画面。改成 canvas 逐帧重绘(普通合成路径,必被采到)。
+        const ctx = canvas.getContext("2d");
+        const fit = () => {
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 480;
+        };
+        video.addEventListener("loadedmetadata", fit);
+        fit();
+        const draw = () => {
+          if (video.videoWidth > 0) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          }
+          requestAnimationFrame(draw);
+        };
+        draw();
+      } catch {
+        fail("无法访问摄像头");
+      }
+    </script>
+  </body>
+</html>

@@ -112,15 +112,8 @@ export function TaskFormSheet({
       });
   }, [platform]);
 
-  // 封面文字识别仅小红书开放:切到小红书时新建任务默认开(编辑态保留原值,不覆盖用户设置);
-  // 切到其他平台强制关,避免开关残留到不支持的平台随 payload 提交
-  useEffect(() => {
-    if (platform === "xhs") {
-      if (!initial) setCoverOcr(true);
-    } else {
-      setCoverOcr(false);
-    }
-  }, [platform]);
+  // 封面文字识别全平台开放:新建任务默认开(编辑态保留原值,见 useState 初始值),
+  // 切换平台不再强制改动开关
   const [keywordsRaw, setKeywordsRaw] = useState(() => {
     if (!initial) return "";
     // 定向任务关键词存占位词「定向采集」(仅展示用),目标链接存 targetUrls;老数据可能没有该字段
@@ -177,8 +170,8 @@ export function TaskFormSheet({
   const [keepVideo, setKeepVideo] = useState(
     initial?.keepVideo ?? DEFAULT_STRATEGY.keepVideo,
   );
-  // 封面文字识别:与其他开关独立、无联动
-  const [coverOcr, setCoverOcr] = useState(initial?.coverOcr ?? false);
+  // 封面文字识别:全平台开放,新建任务默认开;与其他开关独立、无联动
+  const [coverOcr, setCoverOcr] = useState(initial?.coverOcr ?? true);
   const [aiExtract, setAiExtract] = useState(
     initial?.aiExtract ?? DEFAULT_STRATEGY.aiExtract,
   );
@@ -746,9 +739,8 @@ export function TaskFormSheet({
               className="scale-125"
             />
           </div>
-          {/* 封面文字识别:仅小红书开放(封面带字是小红书图文笔记的典型形态);
+          {/* 封面文字识别:全平台开放(各平台封面 / 图集首图都可能带字);
               采集完成后对封面图做 OCR,与音频/视频开关独立 */}
-          {platform === "xhs" && (
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
               <Label htmlFor="task-cover-ocr" className="cursor-pointer">
@@ -765,7 +757,6 @@ export function TaskFormSheet({
               className="scale-125"
             />
           </div>
-          )}
           <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
             <div className="space-y-0.5">
               <div className="flex flex-wrap items-center gap-1">

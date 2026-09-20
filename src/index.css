@@ -110,6 +110,20 @@ body {
     animation: veltrix-fade-up 0.4s ease-out both;
   }
 
+  /* 数据概览页背景:三色径向渐变薄雾(天蓝 / 紫 / 青),只铺氛围不抢内容 */
+  .veltrix-dashboard-bg {
+    background:
+      radial-gradient(55% 38% at 0% 0%, rgb(14 165 233 / 0.08), transparent 70%),
+      radial-gradient(48% 34% at 100% 0%, rgb(139 92 246 / 0.08), transparent 70%),
+      radial-gradient(52% 42% at 50% 100%, rgb(16 185 129 / 0.07), transparent 70%);
+  }
+  .dark .veltrix-dashboard-bg {
+    background:
+      radial-gradient(55% 38% at 0% 0%, rgb(14 165 233 / 0.13), transparent 70%),
+      radial-gradient(48% 34% at 100% 0%, rgb(139 92 246 / 0.13), transparent 70%),
+      radial-gradient(52% 42% at 50% 100%, rgb(99 102 241 / 0.11), transparent 70%);
+  }
+
   /* 隐藏滚动条但保留滚动能力(含编程式 scrollTop) */
   .veltrix-no-scrollbar {
     scrollbar-width: none;

@@ -1,7 +1,7 @@
 // Tauri IPC 命令的前端封装(api 对象);数据类型(DTO)定义见 api-types.ts,本文件一并再导出供各页面复用。
 import { invoke } from "@tauri-apps/api/core";
 import { sortByPlatform } from "@/lib/platforms";
-import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, ScreenInfo, ScreenPreview, AudioDeviceInfo, ClipSegment, ExportItem, VideoInfo, TransitionInput, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, CommentSourcePageResult, ContentLibraryStats, IndustryCounts, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView, ContentView } from "./api-types";
+import type { PlatformConfig, AccountView, CollectResult, AppConfig, AccountInput, UserView, UserInput, ProviderDto, RoleModelConfig, ConversationView, ChatAttachment, ChatMessageView, CheckpointView, CheckpointDiffView, NetworkEntryView, DevServerStatus, SandboxConfigView, SandboxStatsView, SandboxConfigInput, ChatMemoryView, EmbeddingConfigView, PromptDto, CustomerView, CustomerInput, ProjectView, ProjectInput, TeamView, TeamInput, IndustryView, IndustryInput, KeywordDto, TaskView, TaskInput, TaskStatusPatch, RemoveKeywordOutcome, RemoveRunOutcome, AuthorView, EnrichSummary, RecollectCommentsSummary, ContentDetailView, MediaStatusView, CommentPageView, TaskRunView, RunDataView, CollectLogEntry, DashboardOverview, CloudConfigView, CloudConnectionState, CloudPairView, RecordingStatus, ScreenInfo, ScreenPreview, AudioDeviceInfo, CameraDeviceInfo, CamPosition, BillingOverview, ContentListQuery, CommentListQuery, ContentListResult, CommentListResult, CommentSourcePageResult, ContentLibraryStats, IndustryCounts, TableMigrationView, PublishPlatformView, PublishCustomerView, PublishAccountView, ContentView } from "./api-types";
 export * from "./api-types";
 
 export const api = {
@@ -204,32 +204,32 @@ export const api = {
   // 屏幕录制:打开悬浮条(不录制)/ 取消 / 开始(最小化主窗口 + ffmpeg 录全屏)/ 停止 / 查状态
   openRecordingOverlay: () => invoke<void>("open_recording_overlay"),
   cancelRecordingOverlay: () => invoke<void>("cancel_recording_overlay"),
-  // withMic:是否采麦克风(降噪 + 动态放大在后端滤镜链完成;无麦克风设备自动降级纯视频);
-  // includeApp:为真时不最小化主窗口,本程序的操作一并入镜(演示本软件用);
-  // micDevice:设置面板选定的麦克风设备名,空串 = 自动挑默认设备
-  startScreenRecording: (
-    withMic: boolean,
-    screenIndex: number | null,
-    includeApp: boolean,
-    micDevice: string,
-  ) =>
-    invoke<RecordingStatus>("start_screen_recording", {
-      withMic,
-      screenIndex,
-      includeApp,
-      micDevice,
-    }),
+  // 开始录制选项(打包成 options 传给后端):
+  // micOn:是否采麦克风(录制中可随时开关);includeApp:为真时不最小化主窗口,本程序一并入镜;
+  // micDevice / camDevice:面板选定的设备名,空串 = 自动;camOn:摄像头画中画(未检测到设备自动忽略);
+  // camPosition:画中画落位四角之一
+  startScreenRecording: (options: {
+    micOn: boolean;
+    screenIndex: number | null;
+    includeApp: boolean;
+    micDevice: string;
+    camOn: boolean;
+    camDevice: string;
+    camPosition: CamPosition;
+    grabber: string | null;
+  }) => invoke<RecordingStatus>("start_screen_recording", { options }),
+  // 摄像头枚举:面板摄像头开关与设备选择用;空数组 = 未检测到摄像头
+  listCameras: () => invoke<CameraDeviceInfo[]>("list_cameras"),
   // 音频设备选择器:枚举可用输入设备(推荐设备标 recommended)
   listAudioDevices: () => invoke<AudioDeviceInfo[]>("list_audio_devices"),
   // 音频测试:用选中设备录 3 秒(与正式录制同一滤镜链),返回 m4a data URL 直接回放
   testRecordingAudio: (device: string | null) =>
     invoke<string>("test_recording_audio", { device }),
-  // 展开 / 收起设置面板(窗口加高;悬浮窗无窗口控制权限,缩放走后端)
-  setRecordingOverlayPanel: (open: boolean) =>
-    invoke<void>("set_recording_overlay_panel", { open }),
   // 暂停 / 继续(分段实现:暂停收尾当前段,继续起新段,停止时拼接;暂停时段不进成片)
   toggleRecordingPause: () =>
     invoke<RecordingStatus>("toggle_recording_pause"),
+  // 录制中随时开 / 关麦克风(静音区间方案:不重启 ffmpeg,分段收尾时应用到音轨)
+  toggleRecordingMic: () => invoke<RecordingStatus>("toggle_recording_mic"),
   // 列出可录制的显示器(悬浮条屏幕选择用;单屏时前端隐藏选择器)
   listScreens: () => invoke<ScreenInfo[]>("list_screens"),
   // 录屏预览:截取所有显示器的缩略图(平铺选屏用),开始前的确认弹层用
@@ -240,34 +240,6 @@ export const api = {
     invoke<void>("set_recording_overlay_preview", { preview }),
   stopScreenRecording: () => invoke<RecordingStatus>("stop_screen_recording"),
   getRecordingStatus: () => invoke<RecordingStatus>("get_recording_status"),
-  // 创作-视频剪辑导出:视频轨片段剪切 + 拼接(纯视频轨时后端 -ss -t -c copy 不重编码;
-  // 带音频轨叠加段时走 filter_complex 重编码混音),返回产物路径
-  creationExportVideo: (
-    inputPath: string,
-    segments: ClipSegment[],
-    audioSegments?: ClipSegment[],
-    transition?: TransitionInput,
-  ) =>
-    invoke<string>("creation_export_video", {
-      inputPath,
-      segments,
-      audioSegments: audioSegments ?? [],
-      transition: transition ?? null,
-    }),
-  // 剪辑历史:导出目录扫描,按时间倒序
-  creationListExports: () => invoke<ExportItem[]>("creation_list_exports"),
-  // 视频元信息(帧率 / 码率 / 编码,后端 ffmpeg -i 解析)
-  creationVideoInfo: (inputPath: string) =>
-    invoke<VideoInfo>("creation_video_info", { inputPath }),
-  // 时间轴胶片条缩略图(返回 media_root 相对路径数组,mediaFileUrl 解地址)
-  creationVideoThumbs: (inputPath: string) =>
-    invoke<string[]>("creation_video_thumbs", { inputPath }),
-  // 智能剪辑:OpenCV 场景检测,返回切点秒数(升序)
-  creationDetectScenes: (inputPath: string, threshold?: number) =>
-    invoke<number[]>("creation_detect_scenes", {
-      inputPath,
-      threshold: threshold ?? null,
-    }),
   // 录屏停止后:把视频以附件方式加入指定对话(引用本地路径),返回新消息
   attachRecordingMessage: (conversationId: string, path: string) =>
     invoke<ChatMessageView>("attach_recording_message", { conversationId, path }),
@@ -454,6 +426,15 @@ export const api = {
   upsertCustomer: (customer: CustomerInput) =>
     invoke<void>("upsert_customer", { customer }),
   removeCustomer: (id: string) => invoke<void>("remove_customer", { id }),
+  // 项目信息(运营 - 客户管理)
+  listProjects: () => invoke<ProjectView[]>("list_projects"),
+  upsertProject: (project: ProjectInput) =>
+    invoke<void>("upsert_project", { project }),
+  removeProject: (id: string) => invoke<void>("remove_project", { id }),
+  // 团队管理(创作)
+  listTeams: () => invoke<TeamView[]>("list_teams"),
+  upsertTeam: (team: TeamInput) => invoke<void>("upsert_team", { team }),
+  removeTeam: (id: string) => invoke<void>("remove_team", { id }),
 
   // 行业类别
   listIndustries: () => invoke<IndustryView[]>("list_industries"),
@@ -476,6 +457,15 @@ export const api = {
   updateTaskStatus: (patch: TaskStatusPatch) =>
     invoke<void>("update_task_status", { patch }),
   removeTask: (id: string) => invoke<void>("remove_task", { id }),
+  // 只删任务本体:采集数据 / 执行历史 / 媒体文件 / 去重台账全部保留
+  removeTaskOnly: (id: string) => invoke<void>("remove_task_only", { id }),
+  // 删除子任务(单个关键词):级联删该关键词的内容/评论/媒体文件,关键词从任务中移除;
+  // 最后一个关键词被删时任务本体连带删除(taskDeleted=true)
+  removeTaskKeyword: (taskId: string, keyword: string) =>
+    invoke<RemoveKeywordOutcome>("remove_task_keyword", { taskId, keyword }),
+  // 删除执行历史(单次运行):按运行时间窗级联删窗内内容/评论/媒体文件与运行日志,回减任务计数
+  removeTaskRun: (runId: string) =>
+    invoke<RemoveRunOutcome>("remove_task_run", { runId }),
   // 启动任务采集:后端选账号 + 后台遍历关键词(自动开窗 + 拟人 RPA),立即返回
   runTask: (taskId: string) => invoke<void>("run_task", { taskId }),
   // 终止任务:登记停止标记,运行中的采集滚动 / 素材下载 / 语音转写各阶段据此中断
@@ -655,4 +645,4 @@ export const api = {
     invoke<void>("close_publish_account_window", { id }),
 };
 
-
+

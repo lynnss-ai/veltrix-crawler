@@ -19,6 +19,7 @@ export function generateCode(prefix: string): string {
 }
 
 // 只读编码输入框 + 刷新(重新生成) + 复制。供行业/提示词/厂商等编码字段复用。
+// onRegenerate 不传时隐藏「重新生成」按钮:创建后不允许再改编码的场景(如团队编码)。
 export function CodeField({
   id,
   value,
@@ -26,7 +27,7 @@ export function CodeField({
 }: {
   id?: string;
   value: string;
-  onRegenerate: () => void;
+  onRegenerate?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -44,18 +45,20 @@ export function CodeField({
   return (
     <div className="flex items-center gap-2">
       <Input id={id} value={value} readOnly className="font-mono" />
-      <SimpleTooltip content="重新生成">
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          className="shrink-0"
-          aria-label="重新生成"
-          onClick={onRegenerate}
-        >
-          <RefreshCw />
-        </Button>
-      </SimpleTooltip>
+      {onRegenerate && (
+        <SimpleTooltip content="重新生成">
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="shrink-0"
+            aria-label="重新生成"
+            onClick={onRegenerate}
+          >
+            <RefreshCw />
+          </Button>
+        </SimpleTooltip>
+      )}
       <SimpleTooltip content={copied ? "已复制" : "复制"}>
         <Button
           type="button"

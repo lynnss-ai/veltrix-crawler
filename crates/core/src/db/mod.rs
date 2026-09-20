@@ -211,6 +211,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     create_table(db, &schema, entity::industry::Entity, "industries").await?;
     create_table(db, &schema, entity::keyword::Entity, "keywords").await?;
     create_table(db, &schema, entity::customer::Entity, "customers").await?;
+    create_table(db, &schema, entity::project::Entity, "projects").await?;
+    create_table(db, &schema, entity::team::Entity, "teams").await?;
     create_table(db, &schema, entity::provider::Entity, "providers").await?;
     create_table(db, &schema, entity::prompt::Entity, "prompts").await?;
     create_table(db, &schema, entity::prompt_category::Entity, "prompt_categories").await?;
@@ -278,6 +280,24 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         .await
     {
         tracing::warn!("归并历史 cooldown 账号失败(忽略): {e}");
+    }
+
+    // 兼容旧版 prompts 表:提示词管理扩展列(类型 / 来源 / 适配模型 JSON)
+    for (col, ddl) in [
+        ("kind", "ALTER TABLE prompts ADD COLUMN kind TEXT NOT NULL DEFAULT ''"),
+        ("source", "ALTER TABLE prompts ADD COLUMN source TEXT NOT NULL DEFAULT ''"),
+        ("source_data_id", "ALTER TABLE prompts ADD COLUMN source_data_id TEXT NOT NULL DEFAULT ''"),
+        ("models", "ALTER TABLE prompts ADD COLUMN models TEXT NOT NULL DEFAULT '[]'"),
+        ("example", "ALTER TABLE prompts ADD COLUMN example TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !column_exists(db, "prompts", col).await {
+            if let Err(e) = db
+                .execute(Statement::from_string(backend, ddl.to_owned()))
+                .await
+            {
+                tracing::warn!("ALTER prompts.{col} 失败(忽略): {e}");
+            }
+        }
     }
 
     // 兼容已建的 contents 表:补 keyword 列(全量库按采集关键词筛选)
@@ -412,6 +432,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         ("keep_video", "ALTER TABLE tasks ADD COLUMN keep_video BOOLEAN NOT NULL DEFAULT FALSE"),
         // 「封面文字识别」开关:采集后对封面图做 OCR(智谱),旧行回填 FALSE(不识别)
         ("cover_ocr", "ALTER TABLE tasks ADD COLUMN cover_ocr BOOLEAN NOT NULL DEFAULT FALSE"),
+        // 假删除标记(「删除任务」只删任务本体);旧行回填 FALSE(未删除)
+        ("deleted", "ALTER TABLE tasks ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE"),
     ] {
         if !column_exists(db, "tasks", col).await {
             if let Err(e) = db
@@ -575,6 +597,9 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_tasks_owner_updated ON tasks(owner, updated_at)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
         "CREATE INDEX IF NOT EXISTS idx_customers_owner ON customers(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_customer ON projects(customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_teams_owner ON teams(owner)",
         "CREATE INDEX IF NOT EXISTS idx_keywords_industry ON keywords(industry_id)",
         "CREATE INDEX IF NOT EXISTS idx_prompt_categories_owner ON prompt_categories(owner)",
         "CREATE INDEX IF NOT EXISTS idx_shot_prompts_owner ON shot_prompts(owner)",

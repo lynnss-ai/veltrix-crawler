@@ -1,18 +1,18 @@
 # 数据库结构文档
 
-**版本:v2(2026-09-08 更新,对应实体 24 个)**
+**版本:v2(2026-09-16 更新,对应实体 26 个)**
 
-本文档描述 veltrix-crawler 的数据库表结构,数据源为 `crates/core/src/db/entity/` 下的 24 个 SeaORM 实体文件与 `crates/core/src/db/mod.rs` 的 `init_schema` 函数。相对 v1(`docs/database-schema.md`,23 个实体口径)的主要变化:新增 `publish_accounts` 表(发布账号池);`contents` 追加 `image_paths` / `cover_ocr_text` / `cover_ocr_error` / `video_path` 列;`tasks` 追加 `keep_video` / `cover_ocr` 列;文末补充两张遗留表说明。
+本文档描述 veltrix-crawler 的数据库表结构,数据源为 `crates/core/src/db/entity/` 下的 26 个 SeaORM 实体文件与 `crates/core/src/db/mod.rs` 的 `init_schema` 函数。相对上一版(2026-09-08,24 个实体口径)的主要变化:新增 `teams`(团队表)与 `projects`(项目表)两张实体表;`prompts` 表追加 `kind` / `source` / `source_data_id` / `example` / `models` 五列(提示词管理扩展,均走迁移追加);章节重排——`customers` / `projects` / `teams` 归入「客户与项目管理」域,`industries` / `keywords` 独立为「行业与关键词」域。
 
 ## 总览
 
-- **实体与表数量**:`crates/core/src/db/entity/` 下共 **24 个实体**,对应 24 张业务表,全部由 `init_schema` 建表(若不存在)。用户真实库中可能另有 2 张遗留表(`publish_account_categories` / `update_history`),实体代码已移除、仅旧库存在,见文末「遗留表」一节——旧库全库合计 26 张表。
-- **双后端**:数据库后端由连接串决定——`sqlite://...` 走本地 SQLite(默认,数据目录下的 `veltrix.db`),`postgres://...` / `postgresql://...` 走 PostgreSQL。连接串优先级:环境变量 `VELTRIX_DATABASE_URL` > 配置文件 > 默认本地 SQLite。同一套 SeaORM 实体跨两种后端复用,建表 DDL 由 `Schema::create_table_from_entity` 按后端方言生成。
+- **实体与表数量**:`crates/core/src/db/entity/` 下共 **26 个实体**,对应 26 张业务表,全部由 `init_schema` 建表(若不存在)。用户真实库中可能另有 2 张遗留表(`publish_account_categories` / `update_history`),实体代码已移除、仅旧库存在,见文末「遗留表」一节——旧库全库合计 28 张表。
+- **双后端**:数据库后端由连接串决定——`sqlite://...` 走本地 SQLite(默认,数据目录下的 `veltrix.db`),`postgres://...` / `postgresql://...` 走 PostgreSQL。连接串优先级:环境变量 `VELTRIX_DATABASE_URL` > 配置文件 > 默认本地 SQLite。同一套 SeaORM 实体跨两种后端复用,建表 DDL 由 `Schema::create_table_from_entity` 按后端方言生成。PG 连接串自动追加 `options[lc_messages]=C`(强制服务端回 ASCII 错误消息,避免中文 Windows 上 GBK 错误消息解码失败吞掉真实原因);PG 目标库不存在时自动建库再重连;连接失败时回退默认本地 SQLite(error 级日志)。
 - **逻辑外键**:表间关联全部靠字段值关联(实体 `Relation` 均为空枚举),**不建物理外键(FK)**,关联完整性由应用层保证。
 - **数据归属**:业务表带 `owner` 字段(记录归属用户名);用户实体有 `data_scope` 字段(`all` / `self`),`list_*` 命令按 scope 过滤数据可见范围。配置类表(行业、提示词、厂商、密钥等)不分归属、全员共用。
 - **类型约定**:实体刻意只用基础标量类型,保证两种后端 DDL 通用。`String` → `TEXT`(SeaORM `String` 默认映射为 `VARCHAR`,SQLite 下实为 TEXT 亲和;`column_type = "Text"` 的显式为 TEXT);`i64` → `BIGINT`(SQLite 为 `INTEGER`);`i32` → `INTEGER`;`bool` → `BOOLEAN`(SQLite 存 0/1 整数)。**所有时间字段均为 Unix 秒时间戳(整数),不使用 TIMESTAMP 类型**。JSON 复合字段一律序列化为字符串存 TEXT。
-- **迁移方式**:新建库走实体 DDL;已存在的旧库由 `init_schema` 通过 `ALTER TABLE ... ADD COLUMN ... DEFAULT` 追加新列(下方各表中标注「迁移追加」),索引用 `CREATE INDEX IF NOT EXISTS`(标注「迁移索引」),均可幂等重跑。布尔列的迁移默认值一律用 `FALSE` 字面量而非 `0`(PG 布尔列不接受整数默认值,SQLite ≥3.23 两种写法都认)。
-- **SQLite 连接参数**:开启 `journal_mode=WAL`、`busy_timeout=5000`、`synchronous=NORMAL`,支撑采集期并发写。
+- **迁移方式**:新建库走实体 DDL;已存在的旧库由 `init_schema` 通过 `ALTER TABLE ... ADD COLUMN ... DEFAULT` 追加新列(下方各表中标注「迁移追加」),索引用 `CREATE INDEX IF NOT EXISTS`(标注「迁移索引」),均可幂等重跑。布尔列的迁移默认值一律用 `FALSE` 字面量而非 `0`(PG 布尔列不接受整数默认值,SQLite ≥3.23 两种写法都认)。个别迁移追加后附带一次性数据回填(如 `tasks.audio_extract` 按 `ai_extract` 回填、`accounts` 历史 cooldown 状态归并),见各表说明。
+- **SQLite 连接参数**:开启 `journal_mode=WAL`、`busy_timeout=5000`、`synchronous=NORMAL`,支撑采集期并发写;PRAGMA 挂在连接选项上,池内每条连接建连即执行。
 
 **主键 / 唯一约束一览**:`users.username` 有唯一索引(`idx_users_username`);`collect_records.id`(platform + content_id 拼接)与 `content_synced_users` 的复合主键 `(content_id, synced_user)` 保证天然去重;其余表仅有主键约束。各表主键在字段表中以 **(PK)** 标出。
 
@@ -40,7 +40,7 @@
 | updated_at | BIGINT | 否 | 无 | 更新时间(Unix 秒) |
 | deleted_at | BIGINT | 否 | 无 | 软删除标记,0 表示未删除 |
 
-逻辑关联:`username` 被各业务表的 `owner` 字段弱关联。
+逻辑关联:`username` 被各业务表的 `owner` 字段弱关联;`id` 被 `teams.member_ids` JSON 数组弱关联。
 
 ### accounts(账号表)
 
@@ -62,6 +62,8 @@
 | owner | TEXT | 否 | `''` | 归属用户(创建者),用于按用户隔离数据(迁移追加) |
 
 索引:`idx_accounts_platform_last_used(platform, last_used_at)`、`idx_accounts_owner(owner)`(迁移索引)。
+
+启动迁移附带回填:冷却机制已下线,`init_schema` 每次启动执行 `UPDATE accounts SET status='active', cooldown_until=0 WHERE status='cooldown'`,把历史 cooldown 账号一次性归并为可用(幂等)。
 
 逻辑关联:`owner` → `users.username`;被 `tasks.account_id` 弱关联。
 
@@ -88,7 +90,7 @@
 | time_range | TEXT | 否 | 无 | 发布时间范围:any / 1d / 1w / 6m |
 | per_keyword_limit | INTEGER | 否 | 无 | 每个关键词最多返回条数 |
 | min_likes | INTEGER | 否 | 无 | 最低点赞数(<该值丢弃) |
-| audio_extract | BOOLEAN | 否 | 0 | 是否启用音频提取(视频下载并转 mp3 留存;AI 文案提取开启时隐含开启)(迁移追加;追加时按 `ai_extract=1` 回填一次) |
+| audio_extract | BOOLEAN | 否 | 0 | 是否启用音频提取(视频下载并转 mp3 留存;AI 文案提取开启时隐含开启)(迁移追加;列添加当次启动按 `ai_extract=TRUE` 回填一次,之后不再回填,尊重用户后续单独关音频) |
 | keep_video | BOOLEAN | 否 | 0 | 是否保留视频文件:采集后视频落盘不清理(路径回写 `contents.video_path`),供发布服务复用素材;默认关,发布后源文件由发布侧管理(迁移追加) |
 | ai_extract | BOOLEAN | 否 | 无 | 是否启用 AI 文案提取(依赖音频提取:转音频后做语音转写) |
 | cover_ocr | BOOLEAN | 否 | 0 | 是否启用封面文字识别(采集后对封面图做 OCR,智谱;结果存 `contents.cover_ocr_text`)(迁移追加) |
@@ -96,7 +98,7 @@
 | comment_time_range | TEXT | 否 | `'any'` | 评论发布时间范围过滤:3d / 7d / 14d / any(不限)(迁移追加) |
 | comment_limit | INTEGER | 否 | 0 | 单视频一级评论采集上限,0 表示不限(迁移追加) |
 | analyze_comment_intent | BOOLEAN | 否 | 0 | 是否对评论做 AI 意图分析(迁移追加) |
-| status | TEXT | 否 | 无 | 运行状态:pending / running / collecting_comments / downloading_media / completed / failed / cancelled |
+| status | TEXT | 否 | 无 | 运行状态:pending / running / collecting_comments(评论采集中)/ downloading_media(素材下载中)/ completed / failed / cancelled |
 | progress | INTEGER | 否 | 无 | 进度 0-100 |
 | media_total | INTEGER | 否 | 0 | 素材下载总数(进入 downloading_media 时确定 = 去重后待下载内容数,0 表示无素材)(迁移追加) |
 | media_done | INTEGER | 否 | 0 | 素材已处理数(成功 + 失败均计入),= media_total 时任务转 completed(迁移追加) |
@@ -112,7 +114,7 @@
 | auto_sync_obsidian | BOOLEAN | 否 | 0 | 采集完成后是否自动同步内容到发起者(owner)的 Obsidian vault(迁移追加) |
 | extra_filters | TEXT | 否 | `'{}'` | 平台专属额外筛选维度(如抖音:视频时长 / 搜索范围 / 内容形式),JSON 对象 `{维度id: 选中文案}`,空对象 = 全「不限」;采集时在结果页「筛选」浮层按选中文案点击应用(迁移追加) |
 | target_urls | TEXT | 否 | `'[]'` | 定向采集目标链接 JSON 数组(视频链接 / 作者主页链接);空数组 = 关键词搜索任务(迁移追加) |
-| max_retries | INTEGER | 否 | 0 | 失败自动重试次数上限(0=不自动重试);失败后按 1min / 5min / 15min 指数退避重跑,只重试「瞬时可恢复」的失败(开窗失败 / 导航无响应 / 网络抖动)(迁移追加) |
+| max_retries | INTEGER | 否 | 0 | 失败自动重试次数上限(0=不自动重试);失败后按 1min / 5min / 15min 指数退避重跑,只重试「瞬时可恢复」的失败(开窗失败 / 导航无响应 / 网络抖动),重试仍失败则落终态(迁移追加) |
 | retry_count | INTEGER | 否 | 0 | 当前失败序列已自动重试的次数(成功或手动重跑新序列后归零)(迁移追加) |
 | next_retry_at | BIGINT | 是 | NULL | 下次自动重试时间(Unix 秒);None=未排期(未开重试 / 已耗尽 / 运行中 / 成功)(迁移追加) |
 | created_at | BIGINT | 否 | 无 | 创建时间(Unix 秒) |
@@ -139,7 +141,7 @@
 | error_message | TEXT | 是 | 无 | 失败原因;None 表示无 |
 | metrics_json | TEXT | 是 | NULL | 本次运行的采集指标 JSON(拦截响应数 / 解析失败数 / 入库数 / 各阶段耗时等),供事后排查与横向对比;老数据为 None(迁移追加) |
 
-逻辑关联:`task_id` → `tasks.id`;`owner` → `users.username`。「采集日志」按时间范围 `(started_at, finished_at)` 关联 `collect_logs`(同账号采集串行,时间不重叠)。
+逻辑关联:`task_id` → `tasks.id`;`owner` → `users.username`。「采集日志」按时间范围 `(started_at, finished_at)` 关联 `collect_logs`(同账号采集串行,两次运行时间不重叠,故时间范围切分准确)。
 
 ### collect_logs(采集日志表)
 
@@ -179,7 +181,7 @@
 
 ### contents(采集内容表)
 
-平台适配器解析出的统一内容模型落库;与任务绑定,同任务重采前按 task_id 清旧再插新,保证为最近一次采集快照。
+平台适配器解析出的统一内容模型落库;与任务绑定,同任务重采前按 task_id 清旧再插新,保证为最近一次采集快照。author / image_urls / extra 等复合字段序列化为 JSON 字符串存 TEXT,跨 SQLite/PG 通用。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -209,13 +211,13 @@
 | extra | TEXT | 否 | 无 | 平台特有字段原始 JSON |
 | owner | TEXT | 否 | 无 | 数据归属:继承任务 owner(users.username 弱关联) |
 | collected_at | BIGINT | 否 | 无 | 采集时间(Unix 秒) |
-| media_status | TEXT | 是 | NULL | 素材下载状态:pending / success / failed;None=旧数据,未跑过下载(迁移追加) |
+| media_status | TEXT | 是 | NULL | 素材下载状态:pending(待处理)/ success(成功)/ failed(失败);None=旧数据,未跑过下载(迁移追加) |
 | audio_extracted | BOOLEAN | 是 | NULL | 音频是否提取成功:仅「视频 + 开启音频提取」时有意义,其余为 None(迁移追加) |
 | media_error | TEXT | 是 | NULL | 素材失败原因(视频 403 / ffmpeg 转码失败等),供前端展示与失败重试判断(迁移追加) |
-| cover_path | TEXT | 是 | NULL | 封面本地绝对路径(下载成功后回写);前端本地优先显示,None=未下载/失败回退外链(迁移追加) |
-| avatar_path | TEXT | 是 | NULL | 作者头像本地绝对路径(下载成功/已存在后回写);None=未下载/失败回退外链(迁移追加) |
-| audio_path | TEXT | 是 | NULL | 视频转出音频(mp3 等)本地绝对路径;仅「视频 + 音频提取成功」时有值,详情页播放用(迁移追加) |
-| transcript | TEXT | 是 | NULL | 视频语音转写文本;仅视频且转写成功时有值,None=未转写/非视频/失败(迁移追加) |
+| cover_path | TEXT | 是 | NULL | 封面本地路径(下载成功后回写,相对 media_root 的相对路径);前端本地优先显示,None=未下载/失败回退外链(迁移追加) |
+| avatar_path | TEXT | 是 | NULL | 作者头像本地路径(下载成功/已存在后回写);None=未下载/失败回退外链(迁移追加) |
+| audio_path | TEXT | 是 | NULL | 视频转出音频(mp3 等)本地路径;仅「视频 + 音频提取成功」时有值,详情页播放用(迁移追加) |
+| transcript | TEXT | 是 | NULL | 视频语音转写文本。三态:NULL=未转写/转写失败(可重试)、空串=已转写但未识别到语音(空文案)、非空=文案(迁移追加) |
 | transcript_error | TEXT | 是 | NULL | 转写失败原因(供前端区分「未转写」与「转写失败」)(迁移追加) |
 | cover_ocr_text | TEXT | 是 | NULL | 封面图 OCR 识别文本(智谱 OCR,任务开「封面文字识别」时)。三态:NULL=未识别或识别失败、空串=已识别但无文字、非空=封面文案(迁移追加) |
 | cover_ocr_error | TEXT | 是 | NULL | 封面 OCR 失败原因(供前端区分「未识别」与「识别失败」)(迁移追加) |
@@ -260,7 +262,7 @@
 
 ### authors(作者表)
 
-平台创作者去重档案,按 (owner, platform, uid) upsert 刷新最新画像。content/comment 仍各存作者快照(采集那一刻),本表提供「一个作者一行、可更新、可监控」的聚合视角。
+平台创作者去重档案,采集时按 (owner, platform, uid) upsert 刷新最新画像(粉丝/获赞/属地等)。content/comment 仍各存作者快照(采集那一刻),本表提供「一个作者一行、可更新、可监控」的聚合视角。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -303,11 +305,11 @@
 
 ---
 
-## 四、客户与行业
+## 四、客户与项目管理
 
 ### customers(客户表)
 
-客户管理 / CRM,tags 以 JSON 字符串存多标签。发布账号(`publish_accounts.category_id`)按本表客户分组,不再单独维护发布分类表。
+客户管理 / CRM,tags 以 JSON 字符串存多标签。发布账号(`publish_accounts.category_id`)按本表客户分组,不再单独维护发布分类表;项目(`projects.customer_id`)也挂在本表客户下。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -330,7 +332,51 @@
 
 索引:`idx_customers_owner(owner)`(迁移索引)。
 
-逻辑关联:`owner` → `users.username`;`industry` 与 `industries`(名称或 code)弱关联;被 `publish_accounts.category_id` 关联。
+逻辑关联:`owner` → `users.username`;`industry` 与 `industries`(名称或 code)弱关联;被 `projects.customer_id`、`publish_accounts.category_id` 关联。
+
+### projects(项目表)
+
+运营 - 客户管理 / 项目信息:客户下的项目档案。`customer_id` 为逻辑外键(关联 customers.id),客户删除后悬空,前端按「未关联客户」兜底显示。
+
+| 字段名 | 类型 | 可空 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| id **(PK)** | TEXT | 否 | 无 | 项目唯一 ID |
+| code | TEXT | 否 | 无 | 项目编码(如 PRJ-XXXX),系统生成,全表唯一 |
+| name | TEXT | 否 | 无 | 项目名称 |
+| customer_id | TEXT | 否 | 无 | 所属客户(customers.id 的逻辑外键) |
+| start_date | TEXT | 否 | 无 | 项目开始日期(YYYY-MM-DD,空串 = 未设) |
+| end_date | TEXT | 否 | 无 | 项目结束日期(YYYY-MM-DD,空串 = 未设) |
+| remark | TEXT | 否 | 无 | 备注 |
+| owner | TEXT | 否 | 无 | 归属用户(创建人) |
+| created_at | BIGINT | 否 | 无 | 创建时间(Unix 秒) |
+| updated_at | BIGINT | 否 | 无 | 更新时间(Unix 秒) |
+
+索引:`idx_projects_owner(owner)`、`idx_projects_customer(customer_id)`(迁移索引)。
+
+逻辑关联:`owner` → `users.username`;`customer_id` → `customers.id`。
+
+### teams(团队表)
+
+创作 - 团队管理:用户分组。`member_ids` 以 JSON 字符串存成员用户 id 数组(关联 users.id,逻辑外键,同 customer.tags 口径);用户被删除后成员 id 悬空,前端按现有用户列表过滤显示。
+
+| 字段名 | 类型 | 可空 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| id **(PK)** | TEXT | 否 | 无 | 团队唯一 ID |
+| code | TEXT | 否 | 无 | 团队编码(如 TEAM-XXXX),系统生成,全表唯一 |
+| name | TEXT | 否 | 无 | 团队名称 |
+| member_ids | TEXT | 否 | 无 | 成员用户 id 数组,JSON 字符串存储(如 ["u1","u2"]) |
+| remark | TEXT | 否 | 无 | 备注 |
+| owner | TEXT | 否 | 无 | 归属用户(创建人) |
+| created_at | BIGINT | 否 | 无 | 创建时间(Unix 秒) |
+| updated_at | BIGINT | 否 | 无 | 更新时间(Unix 秒) |
+
+索引:`idx_teams_owner(owner)`(迁移索引)。
+
+逻辑关联:`owner` → `users.username`;`member_ids` JSON 数组元素 → `users.id`。
+
+---
+
+## 五、行业与关键词
 
 ### industries(行业表)
 
@@ -364,7 +410,7 @@
 
 ---
 
-## 五、AI 对话与用量
+## 六、AI 对话与用量
 
 ### chat_conversations(AI 对话会话表)
 
@@ -391,7 +437,7 @@
 
 ### chat_messages(AI 对话消息表)
 
-每条消息属于一个会话。
+每条消息属于一个会话(chat_conversations.id 逻辑外键)。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -402,8 +448,8 @@
 | tool_calls | TEXT | 是 | NULL | assistant 要求调用的工具(JSON 数组 [{id,name,arguments}]);纯文本回复为 None(迁移追加) |
 | tool_call_id | TEXT | 是 | NULL | role=tool 时:对应的工具调用 id(关联上一条 assistant 的某次 tool_call)(迁移追加) |
 | tool_name | TEXT | 是 | NULL | role=tool 时:工具名(便于前端展示)(迁移追加) |
-| attachments | TEXT | 是 | NULL | user 消息携带的附件元数据(JSON 数组 `[{name,mime,path}]`;图片 path 为本地绝对路径,供历史渲染与多轮多模态重建;非图片附件 path 为空,仅作文件名展示)(迁移追加) |
-| reasoning | TEXT | 是 | NULL | assistant 的思考过程(Claude thinking 块 / DeepSeek reasoning_content),仅推理型模型非空;供前端「思考过程」折叠块展示(迁移追加) |
+| attachments | TEXT | 是 | NULL | user 消息携带的附件元数据(JSON 数组 `[{name,mime,path}]`;图片 path 为本地绝对路径,仅图片落盘并带 path,供历史渲染与多轮多模态重建;非图片附件 path 为空,仅作文件名展示)(迁移追加) |
+| reasoning | TEXT | 是 | NULL | assistant 的思考过程(模型推理内容:Claude thinking 块 / DeepSeek reasoning_content),仅推理型模型非空;供前端「思考过程」折叠块展示,历史里也能看到完整推理(迁移追加) |
 | feedback | TEXT | 是 | NULL | 用户反馈:like / dislike / null(未反馈),用于学习与适应功能(迁移追加) |
 | created_at | BIGINT | 否 | 无 | 创建时间(Unix 秒) |
 
@@ -413,7 +459,7 @@
 
 ### chat_memories(AI 对话长期记忆表)
 
-跨会话、按用户归属的记忆条目,发消息前把启用的记忆拼成 system 消息注入上下文。来源:`auto`(LLM 每轮自动从对话中提取)/ `manual`(用户在设置页手动维护)。
+跨会话、按用户(owner)归属的记忆条目,发消息前把启用的记忆拼成 system 消息注入上下文,让 AI 跨会话记住用户。来源:`auto`(LLM 每轮自动从对话中提取)/ `manual`(用户在设置页手动维护)。支持记忆层级化:global(全局)/ project(项目)/ conversation(会话)。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -437,7 +483,7 @@
 
 索引:`idx_chat_memories_owner(owner, updated_at)`(迁移索引)。
 
-逻辑关联:`owner` → `users.username`;`scope_id`(scope=conversation 时)→ `chat_conversations.id`。
+逻辑关联:`owner` → `users.username`;`scope_id`(scope=conversation 时)→ `chat_conversations.id`,(scope=project 时)→ `projects.id`。
 
 ### model_usage_records(模型用量记录表)
 
@@ -481,20 +527,27 @@
 
 ---
 
-## 六、提示词与厂商配置
+## 七、提示词与厂商配置
 
 ### prompts(提示词表)
 
-系统配置 - 提示词;配置类数据,不分归属。
+创作 - 提示词管理:图像 / 视频生成类提示词库。配置类数据,不分归属。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | id **(PK)** | TEXT | 否 | 无 | 提示词唯一 ID |
 | code | TEXT | 否 | 无 | 业务编码(如 PRM-XXXX),系统生成 |
 | name | TEXT | 否 | 无 | 提示词名称 |
+| kind | TEXT | 否 | `''` | 提示词类型:image(图片)/ video(视频);旧数据为空串或 adapt(迁移追加) |
 | content | TEXT | 否 | 无 | 提示词正文 |
+| source | TEXT | 否 | `''` | 提示词来源(下拉选项,如 opennana)(迁移追加) |
+| source_data_id | TEXT | 否 | `''` | 来源数据 id(该提示词取材的内容 / 数据记录 id,自由关联)(迁移追加) |
+| example | TEXT | 否 | `''` | 示例链接(图片或视频 URL)(迁移追加) |
+| models | TEXT | 否 | `'[]'` | 适配模型数组,以 JSON 字符串存储(如 ["deepseek-v4-pro","qwen-max"])(迁移追加) |
 | created_at | BIGINT | 否 | 无 | 创建时间(Unix 秒) |
 | updated_at | BIGINT | 否 | 无 | 更新时间(Unix 秒) |
+
+索引:无(`init_schema` 未为本表建二级索引)。
 
 ### prompt_categories(提示词分类目录表)
 
@@ -515,7 +568,7 @@
 
 ### shot_prompts(分镜镜头提示词表)
 
-每条提示词归属一个分类目录。
+每条提示词归属一个分类目录(category_id);按 owner 分归属。
 
 | 字段名 | 类型 | 可空 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -560,7 +613,7 @@
 
 ---
 
-## 七、发布服务
+## 八、发布服务
 
 ### publish_accounts(发布账号表)
 
@@ -570,7 +623,7 @@
 | --- | --- | --- | --- | --- |
 | id **(PK)** | TEXT | 否 | 无 | 账号唯一 ID,业务侧生成,不自增 |
 | platform | TEXT | 否 | 无 | 平台 id(douyin / xhs 等,platforms.id 的弱关联) |
-| category_id | TEXT | 否 | 无 | 所属客户(customers.id 的逻辑外键):发布账号按 CRM 客户分组 |
+| category_id | TEXT | 否 | 无 | 所属客户(customers.id 的逻辑外键,禁物理 FK):发布账号按 CRM 客户分组,不再单独维护分类表 |
 | label | TEXT | 否 | 无 | 备注名(用户起的展示名,与平台昵称解耦,昵称变了不影响识别) |
 | nickname | TEXT | 否 | `''` | 平台侧昵称,导入后可能未回填 |
 | avatar | TEXT | 否 | `''` | 平台侧头像地址 |
@@ -606,10 +659,12 @@
 - `authors.owner` → `users.username`
 - `content_synced_users.content_id` → `contents.id`;`content_synced_users.synced_user` → `users.username`
 - `customers.owner` → `users.username`;`customers.industry` → `industries`(名称或 code)
+- `projects.owner` → `users.username`;`projects.customer_id` → `customers.id`
+- `teams.owner` → `users.username`;`teams.member_ids`(JSON 数组元素)→ `users.id`
 - `keywords.industry_id` → `industries.id`
 - `chat_conversations.owner` → `users.username`;`chat_conversations.provider_id` → `providers.id`
 - `chat_messages.conversation_id` → `chat_conversations.id`
-- `chat_memories.owner` → `users.username`;`scope=conversation` 时 `scope_id` → `chat_conversations.id`
+- `chat_memories.owner` → `users.username`;`scope=conversation` 时 `scope_id` → `chat_conversations.id`;`scope=project` 时 `scope_id` → `projects.id`
 - `model_usage_records.owner` → `users.username`;`model_usage_records.provider_id` → `providers.id`
 - `agent_route_logs.owner` → `users.username`
 - `prompt_categories.owner` → `users.username`
@@ -622,7 +677,7 @@
 
 ## 遗留表(代码已移除,仅旧库存在)
 
-以下两张表在 `crates/core/src/db/entity/` 中已无对应实体,`init_schema` 不再建表,仅存在于历史创建的库中。连同 24 张实体表,旧库全库合计 26 张表。
+以下两张表在 `crates/core/src/db/entity/` 中已无对应实体,`init_schema` 不再建表,仅存在于历史创建的库中。连同 26 张实体表,旧库全库合计 28 张表。
 
 ### publish_account_categories(发布账号分类表,遗留)
 

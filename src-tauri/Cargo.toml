@@ -1,6 +1,6 @@
 [package]
 name = "veltrix-crawler"
-version = "1.0.5"
+version = "1.0.9"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -133,9 +133,6 @@ windows = { version = "0.61", features = [
 ] }
 # WebView2 原生网络拦截:与 Tauri 内部对齐的版本,避免 ICoreWebView2 类型冲突
 webview2-com = "0.38"
-# OpenCV(智能剪辑-场景检测):预编译包路径见 .cargo/config.toml [env];
-# 0.94 起不再按模块分 feature,绑定按头文件全量生成(首次构建较慢)
-opencv = { version = "0.94" }
 
 # macOS / Linux 编程本地沙盒:killpg 杀进程组(Windows 侧走 Job Object,见上)
 [target.'cfg(unix)'.dependencies]

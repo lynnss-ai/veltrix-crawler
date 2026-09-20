@@ -332,6 +332,10 @@ pub async fn run_task(
         .await
         .map_err(|e| CrawlerError::Config(format!("查询任务失败: {e}")))?
         .ok_or_else(|| CrawlerError::Config(format!("任务不存在: {task_id}")))?;
+    // 假删除(「删除任务」)的任务不启动
+    if model.deleted {
+        return Err(CrawlerError::Config("任务已删除,无法启动".into()));
+    }
 
     // 防重复启动:任务已在进行中(双击「运行」/ 前端状态滞后)时再 spawn 一份采集,
     // 两份会写同一任务的进度与状态互相覆盖,直接拒绝
@@ -2520,6 +2524,7 @@ pub async fn run_due_scheduled_tasks(app: &tauri::AppHandle) {
     let now = chrono::Local::now();
     let tasks = match task_entity::Entity::find()
         .filter(task_entity::Column::Archived.eq(false))
+        .filter(task_entity::Column::Deleted.eq(false))
         .filter(task_entity::Column::TriggerType.is_in(["daily", "watching"]))
         .all(&state.db)
         .await
@@ -2556,6 +2561,7 @@ pub async fn run_due_scheduled_tasks(app: &tauri::AppHandle) {
     let now_ts = now.timestamp();
     let retry_tasks = match task_entity::Entity::find()
         .filter(task_entity::Column::Archived.eq(false))
+        .filter(task_entity::Column::Deleted.eq(false))
         .filter(task_entity::Column::Status.eq("failed"))
         .filter(task_entity::Column::NextRetryAt.is_not_null())
         .all(&state.db)
@@ -7479,6 +7485,7 @@ mod tests {
             error_message: None,
             owner: "tester".into(),
             archived: false,
+            deleted: false,
             auto_sync_obsidian: false,
             extra_filters: "{}".into(),
             target_urls: "[]".into(),

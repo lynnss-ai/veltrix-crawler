@@ -75,6 +75,9 @@ pub struct Model {
     pub owner: String,
     /// 是否已归档(手动归档后移入归档 tab;终止/失败不自动归档)
     pub archived: bool,
+    /// 假删除标记(任务调度「删除任务」):只隐藏任务本体,采集数据/执行历史/媒体文件全部保留;
+    /// 列表 / 调度器 / 仪表盘统计均过滤,run_task 拒绝启动
+    pub deleted: bool,
     /// 采集完成后是否自动同步内容到发起者(owner)的 Obsidian vault
     pub auto_sync_obsidian: bool,
     /// 平台专属额外筛选维度(如抖音:视频时长 / 搜索范围 / 内容形式),

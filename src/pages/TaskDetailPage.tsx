@@ -8,10 +8,13 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   CalendarClock,
+  Database,
   Eye,
   FileSpreadsheet,
   Infinity as InfinityIcon,
   Loader2,
+  MoreHorizontal,
+  Trash2,
   Zap,
 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -21,6 +24,13 @@ import { sortLabelOf, timeLabelOf, extraFilterChipsOf, nextRunTs, formatCountdow
 import type { PageKey } from "@/components/app-sidebar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Progress } from "@/components/ui/progress";
 import { DataTable } from "@/components/DataTable";
 import { DataTableColumnHeader } from "@/components/DataTableColumnHeader";
@@ -36,6 +46,16 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   api,
   type CollectLogEntry,
@@ -170,7 +190,9 @@ function NextRunCountdown({ task }: { task: TaskView }) {
 
 interface SubTask {
   id: string;
+  // 展示名(定向任务的链接显示为「定向采集」);rawKeyword 为任务里的原始关键词,删除时以后端匹配用
   keyword: string;
+  rawKeyword: string;
   status: TaskView["status"];
   contentCount: number;
   commentCount: number;
@@ -184,6 +206,7 @@ function deriveSubTasks(task: TaskView): SubTask[] {
   return task.keywords.map((kw, idx) => ({
     id: `${task.id}-sub-${idx}`,
     keyword: displayKeyword(kw),
+    rawKeyword: kw,
     // 简化:把父任务整体状态投射到每个子任务
     status: task.status,
     contentCount: Math.round(task.contentCount / Math.max(1, task.keywords.length)),
@@ -211,15 +234,25 @@ export function TaskDetailPage({
   platformName,
   onBack,
   onNavigate,
+  onRefresh,
 }: {
   task: TaskView;
   platformName: (id: string) => string;
   onBack: () => void;
   // 数据穿透:跳全量库查看本任务 / 单次运行采集的内容
   onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
+  // 子任务删除后刷新任务列表(详情页的 task 由父组件从列表派生)
+  onRefresh?: () => void;
 }) {
   const [tab, setTab] = useState<"sub" | "history">("sub");
   const [runs, setRuns] = useState<TaskRunView[]>([]);
+  // 删除子任务:确认弹窗目标 + 删除进行中标记(防重复点击)
+  const [deleteTarget, setDeleteTarget] = useState<SubTask | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  // 删除执行历史:确认弹窗目标(复用 deleting 防重复点击)
+  const [deleteRunTarget, setDeleteRunTarget] = useState<TaskRunView | null>(
+    null,
+  );
   // 查看日志:当前查看的运行 + 其采集日志(右侧抽屉显示)
   const [viewRun, setViewRun] = useState<TaskRunView | null>(null);
   const [runLogs, setRunLogs] = useState<CollectLogEntry[]>([]);
@@ -398,22 +431,83 @@ export function TaskDetailPage({
         id: "actions",
         header: () => <div className="text-right">操作</div>,
         enableSorting: false,
-        cell: () => (
+        cell: ({ row }) => (
           <div className="flex justify-end">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 cursor-pointer px-2"
-              onClick={() => setTab("history")}
-            >
-              查看执行历史
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon-xs" className="cursor-pointer">
+                  <MoreHorizontal />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-32">
+                <DropdownMenuItem
+                  className="cursor-pointer"
+                  onClick={() => setTab("history")}
+                >
+                  <Eye className="size-3.5" />
+                  查看执行历史
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="cursor-pointer text-destructive focus:text-destructive"
+                  disabled={isInProgress(task)}
+                  title={
+                    isInProgress(task)
+                      ? "任务进行中,请先停止再删除"
+                      : "删除该子任务及其采集数据"
+                  }
+                  onClick={() => setDeleteTarget(row.original)}
+                >
+                  <Trash2 className="size-3.5" />
+                  删除数据
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         ),
       },
     ],
-    [onNavigate, task.id, task.name],
+    [onNavigate, task.id, task.name, task.status],
   );
+
+  // 删除子任务(单个关键词):后端级联删内容/评论/媒体文件并把关键词移出任务;
+  // 删的是最后一个关键词时任务本体连带删除,直接返回列表页
+  const confirmDeleteSubTask = useCallback(() => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    api
+      .removeTaskKeyword(task.id, deleteTarget.rawKeyword)
+      .then((out) => {
+        toast.success(
+          out.taskDeleted
+            ? "子任务已删除;任务已无关键词,一并删除"
+            : `子任务已删除:内容 ${out.contentsRemoved} 条 / 评论 ${out.commentsRemoved} 条`,
+        );
+        setDeleteTarget(null);
+        onRefresh?.();
+        if (out.taskDeleted) onBack();
+      })
+      .catch((e) => toast.error(`删除失败: ${e}`))
+      .finally(() => setDeleting(false));
+  }, [deleteTarget, deleting, task.id, onRefresh, onBack]);
+
+  // 删除执行历史(单次运行):后端按运行时间窗级联删窗内内容/评论/媒体文件与运行日志
+  const confirmDeleteRun = useCallback(() => {
+    if (!deleteRunTarget || deleting) return;
+    setDeleting(true);
+    api
+      .removeTaskRun(deleteRunTarget.id)
+      .then((out) => {
+        toast.success(
+          `执行记录已删除:内容 ${out.contentsRemoved} 条 / 评论 ${out.commentsRemoved} 条`,
+        );
+        setRuns((rs) => rs.filter((r) => r.id !== deleteRunTarget.id));
+        setDeleteRunTarget(null);
+        onRefresh?.();
+      })
+      .catch((e) => toast.error(`删除失败: ${e}`))
+      .finally(() => setDeleting(false));
+  }, [deleteRunTarget, deleting, onRefresh]);
 
   const historyColumns = useMemo<ColumnDef<TaskRunView>[]>(
     () => [
@@ -495,53 +589,77 @@ export function TaskDetailPage({
         id: "actions",
         header: () => <div className="text-right">操作</div>,
         enableSorting: false,
-        cell: ({ row }) => (
-          <div className="flex justify-end gap-1">
-            {/* 导出本次运行采集的内容 + 评论为 Excel(双 sheet) */}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 cursor-pointer px-2"
-              disabled={exportingRunId === row.original.id}
-              onClick={() => exportRunExcel(row.original)}
-            >
-              {exportingRunId === row.original.id ? (
-                <Loader2 className="animate-spin" />
-              ) : (
-                <FileSpreadsheet />
-              )}
-              导出
-            </Button>
-            {/* 单次任务穿透:跳全量库,按本任务 + 该次运行时间范围(collectedAt)过滤,看本次新增内容 */}
-            {onNavigate && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 cursor-pointer px-2"
-                onClick={() =>
-                  onNavigate("assets-all", {
-                    taskId: task.id,
-                    taskName: task.name,
-                    runStart: row.original.startedAt,
-                    runEnd:
-                      row.original.finishedAt ??
-                      Math.floor(Date.now() / 1000),
-                  })
-                }
-              >
-                查看内容
-              </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 cursor-pointer px-2"
-              onClick={() => openRunLogs(row.original)}
-            >
-              查看日志
-            </Button>
-          </div>
-        ),
+        cell: ({ row }) => {
+          const r = row.original;
+          return (
+            <div className="flex justify-end">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="cursor-pointer"
+                  >
+                    <MoreHorizontal />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-32">
+                  {/* 导出本次运行采集的内容 + 评论为 Excel(双 sheet) */}
+                  <DropdownMenuItem
+                    className="cursor-pointer"
+                    disabled={exportingRunId === r.id}
+                    onClick={() => exportRunExcel(r)}
+                  >
+                    {exportingRunId === r.id ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <FileSpreadsheet className="size-3.5" />
+                    )}
+                    导出
+                  </DropdownMenuItem>
+                  {/* 单次运行穿透:跳全量库,按本任务 + 该次运行时间范围过滤 */}
+                  {onNavigate && (
+                    <DropdownMenuItem
+                      className="cursor-pointer"
+                      onClick={() =>
+                        onNavigate("assets-all", {
+                          taskId: task.id,
+                          taskName: task.name,
+                          runStart: r.startedAt,
+                          runEnd: r.finishedAt ?? Math.floor(Date.now() / 1000),
+                        })
+                      }
+                    >
+                      <Database className="size-3.5" />
+                      查看内容
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem
+                    className="cursor-pointer"
+                    onClick={() => openRunLogs(r)}
+                  >
+                    <Eye className="size-3.5" />
+                    查看日志
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="cursor-pointer text-destructive focus:text-destructive"
+                    disabled={r.status === "running"}
+                    title={
+                      r.status === "running"
+                        ? "该次运行仍在进行中,请先停止再删除"
+                        : "删除该执行记录及其时间窗内采集的数据"
+                    }
+                    onClick={() => setDeleteRunTarget(r)}
+                  >
+                    <Trash2 className="size-3.5" />
+                    删除数据
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          );
+        },
       },
     ],
     [openRunLogs, exportRunExcel, exportingRunId, onNavigate, task.id, task.name],
@@ -845,6 +963,78 @@ export function TaskDetailPage({
           </div>
         </SheetContent>
       </Sheet>
+
+      {/* 删除子任务确认:级联删该关键词的内容/评论/媒体文件,关键词从任务中移除 */}
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除数据</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除子任务「{deleteTarget?.keyword}
+              」采集的全部内容、评论与已下载的媒体文件(封面 / 音频 / 视频 /
+              图集),并把该关键词从任务中移除;若这是任务的最后一个关键词,任务本体也会一并删除。此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer" disabled={deleting}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="cursor-pointer bg-destructive text-white hover:bg-destructive/90"
+              disabled={deleting}
+              onClick={(e) => {
+                // AlertDialog 默认点击即关闭;删除是异步的,阻止自动关闭,完成后自行关
+                e.preventDefault();
+                confirmDeleteSubTask();
+              }}
+            >
+              {deleting && <Loader2 className="size-3.5 animate-spin" />}
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 删除执行历史确认:按运行时间窗级联删窗内采集数据 + 媒体文件 + 运行日志 */}
+      <AlertDialog
+        open={deleteRunTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteRunTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除数据</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除 {formatTimestamp(deleteRunTarget?.startedAt ?? null)}{" "}
+              这次运行的执行记录,及其时间窗内采集的内容(约{" "}
+              {deleteRunTarget?.contentDelta ?? 0} 条)、评论(约{" "}
+              {deleteRunTarget?.commentDelta ?? 0} 条)与已下载的媒体文件、运行日志,此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer" disabled={deleting}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="cursor-pointer bg-destructive text-white hover:bg-destructive/90"
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault();
+                confirmDeleteRun();
+              }}
+            >
+              {deleting && <Loader2 className="size-3.5 animate-spin" />}
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

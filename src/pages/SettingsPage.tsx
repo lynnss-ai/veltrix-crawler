@@ -951,7 +951,7 @@ function GeneralSection({
     <>
       <SettingsCard
         title="菜单顺序"
-        description="拖动调整侧边栏顶部工作区(运营 / 对话 / 创作)的排列顺序,松手即时生效。发布服务是独立产品,入口在侧栏 Logo 右侧的「切换平台」。"
+        description="拖动调整侧边栏顶部工作区(数据采集 / 对话 / 内容创作)的排列顺序,松手即时生效。发布服务是独立产品,入口在侧栏 Logo 右侧的「切换平台」。"
       >
         <WorkspaceOrderEditor />
       </SettingsCard>

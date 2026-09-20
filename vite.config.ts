@@ -14,12 +14,13 @@ export default defineConfig(async () => ({
     },
   },
 
-  // 多页入口:主应用 + 录屏悬浮条独立轻量入口(悬浮窗只加载后者,秒开)
+  // 多页入口:主应用 + 录屏悬浮条独立轻量入口(悬浮窗只加载后者,秒开)+ 摄像头预览窗
   build: {
     rollupOptions: {
       input: {
         main: path.resolve(__dirname, "index.html"),
         "recording-overlay": path.resolve(__dirname, "recording-overlay.html"),
+        "cam-preview": path.resolve(__dirname, "cam-preview.html"),
       },
     },
   },
@@ -30,16 +31,16 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    port: 1430,
     strictPort: true,
     // 显式绑 IPv4:Node 17+ DNS 解析 localhost 优先返回 ::1,只绑 IPv6 时
-    // WebView2 访问 devUrl(http://localhost:1420)走 IPv4 会被拒,窗口白屏
+    // WebView2 访问 devUrl(http://localhost:1430)走 IPv4 会被拒,窗口白屏
     host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: 1431,
         }
       : undefined,
     watch: {

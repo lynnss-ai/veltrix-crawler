@@ -8,8 +8,6 @@ import {
   Contact,
   Database,
   FileStack,
-  Clapperboard,
-  FileText,
   FolderKanban,
   Grip,
   Images,
@@ -17,6 +15,7 @@ import {
   LayoutDashboard,
   LogOut,
   MoreVertical,
+  ScrollText,
   Radar,
   Receipt,
   Rocket,
@@ -90,6 +89,7 @@ export type PageKey =
   | "assets-author"
   | "industry"
   | "customers"
+  | "projects"
   | "users"
   | "billing"
   | "system-config"
@@ -98,10 +98,7 @@ export type PageKey =
   | "chat-assistant"
   | "chat-history"
   | "memory-center"
-  | "cowork-video"
-  | "cowork-copy"
-  | "cowork-assets"
-  | "cowork-project"
+  | "cowork-prompts"
   | "cowork-team";
 
 interface SubItem {
@@ -137,6 +134,13 @@ const MENU_GROUPS: MenuGroup[] = [
     ],
   },
   {
+    title: "客户管理",
+    items: [
+      { key: "customers", label: "客户信息", icon: Contact },
+      { key: "projects", label: "项目信息", icon: FolderKanban },
+    ],
+  },
+  {
     title: "基础设施",
     items: [
       { key: "industry", label: "行业类别", icon: Tags },
@@ -147,6 +151,8 @@ const MENU_GROUPS: MenuGroup[] = [
     title: "系统管理",
     items: [
       { key: "users", label: "用户管理", icon: UserCog },
+      // 团队管理:成员即系统用户(users.id),与用户管理同属组织管理,故放这里而非内容创作
+      { key: "cowork-team", label: "团队管理", icon: Users },
       // 「账单计费」移至用户下拉(系统设置上方);「系统配置」同样从侧栏移除,统一从用户下拉进入
     ],
   },
@@ -172,9 +178,9 @@ export type Workspace = "management" | "chat" | "cowork";
 
 // 工作区元数据(标签固定);展示顺序由 useWorkspaceOrder 控制,可在系统配置调整。
 export const WORKSPACES: { key: Workspace; label: string }[] = [
-  { key: "management", label: "运营" },
+  { key: "management", label: "数据采集" },
   { key: "chat", label: "对话" },
-  { key: "cowork", label: "创作" },
+  { key: "cowork", label: "内容创作" },
 ];
 
 // 侧栏顶部「服务」切换项 = 协作平台的工作区(运营/对话/创作)+ 独立产品(发布服务)。
@@ -207,12 +213,7 @@ const WORKSPACE_MENUS: Record<Workspace, MenuGroup[]> = {
       // 标题留空不渲染分组名(菜单项直接平铺)
       title: "",
       items: [
-        { key: "cowork-video", label: "视频剪辑", icon: Clapperboard },
-        { key: "cowork-copy", label: "文案撰写", icon: FileText },
-        { key: "cowork-assets", label: "素材管理", icon: Images },
-        { key: "cowork-project", label: "项目管理", icon: FolderKanban },
-        { key: "customers", label: "客户管理", icon: Contact },
-        { key: "cowork-team", label: "团队成员", icon: Users },
+        { key: "cowork-prompts", label: "提示词", icon: ScrollText },
       ],
     },
   ],
@@ -551,10 +552,15 @@ export function AppSidebar({
   const orderedServices = wsOrder
     .map((key) => SERVICES.find((w) => w.key === key))
     .filter((w): w is (typeof SERVICES)[number] => Boolean(w));
-  // 服务栏只平铺工作区(运营/对话/创作);发布服务是独立产品,入口在 Logo 右侧「切换平台」
-  const visibleServices = orderedServices.filter((sv) => sv.key !== "publish");
+  // 服务栏只平铺运营 / 创作两个 tab;对话挪到 Logo 右侧「切换平台」菜单作为平台入口,
+  // 发布服务同样是独立产品,入口也在那里
+  const visibleServices = orderedServices.filter(
+    (sv) => sv.key !== "publish" && sv.key !== "chat",
+  );
   // 当前激活的服务:发布服务产品激活 "publish"(服务栏无对应 tab,故无高亮),协作平台产品激活当前工作区
   const activeService: ServiceKey = product === "publish" ? "publish" : workspace;
+  // 对话视作独立平台入口:处于对话工作区时,Grip 菜单高亮「对话」而非「协作平台」,Logo 副标题同步
+  const chatCurrent = product === "crawler" && workspace === "chat";
 
   // 当前产品(用于 Logo 副标题与产品切换高亮)
   const currentProduct = PRODUCTS.find((p) => p.key === product) ?? PRODUCTS[0];
@@ -614,7 +620,7 @@ export function AppSidebar({
               <div className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-semibold">VeltrixLoop</span>
                 <span className="truncate text-xs text-muted-foreground">
-                  {currentProduct.name}
+                  {chatCurrent ? "对话" : currentProduct.name}
                 </span>
               </div>
             </SidebarMenuButton>
@@ -641,7 +647,10 @@ export function AppSidebar({
                 <DropdownMenuSeparator />
                 {PRODUCTS.map((item) => {
                   const Icon = item.icon;
-                  const isCurrent = item.key === product;
+                  // 对话工作区视为独立平台:此时「协作平台」不再标当前,改由下方「对话」项高亮
+                  const isCurrent =
+                    item.key === product &&
+                    !(item.key === "crawler" && chatCurrent);
                   return (
                     <DropdownMenuItem
                       key={item.key}
@@ -667,13 +676,34 @@ export function AppSidebar({
                     </DropdownMenuItem>
                   );
                 })}
+                {/* 对话:不占服务 tab,作为平台入口放在这里(切到协作平台的对话工作区) */}
+                <DropdownMenuItem
+                  disabled={chatCurrent}
+                  className={
+                    chatCurrent
+                      ? "data-[disabled]:opacity-100 text-primary focus:text-primary bg-primary/10"
+                      : ""
+                  }
+                  onClick={() => {
+                    if (chatCurrent) return;
+                    onServiceChange("chat");
+                  }}
+                >
+                  <MessageSquare className={chatCurrent ? "text-primary" : ""} />
+                  <span className="flex-1">对话</span>
+                  {chatCurrent && (
+                    <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                      当前
+                    </span>
+                  )}
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </SidebarMenuItem>
         </SidebarMenu>
 
-        {/* 服务切换:运营 / 对话 / 创作平铺;发布服务是独立产品,
-            入口在 Logo 右侧「切换平台」,不进服务栏;顺序在系统设置「菜单顺序」治理 */}
+        {/* 服务切换:运营 / 创作平铺;对话与发布服务是平台级入口,
+            在 Logo 右侧「切换平台」菜单里,不占服务 tab;顺序在系统设置「菜单顺序」治理 */}
         <div className="-mb-2 flex gap-1 rounded-lg bg-sidebar-accent/50 p-1 group-data-[collapsible=icon]:hidden">
           {visibleServices.map((sv) => (
             <button

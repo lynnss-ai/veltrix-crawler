@@ -5,7 +5,7 @@
 
 use crate::commands::AppState;
 use veltrix_core::db::entity::{
-    customer, industry, keyword, prompt, provider, user,
+    customer, industry, keyword, project, prompt, provider, team, user,
 };
 use veltrix_core::error::{CrawlerError, Result};
 use argon2::password_hash::rand_core::OsRng;
@@ -493,7 +493,27 @@ pub struct PromptDto {
     pub id: String,
     pub code: String,
     pub name: String,
+    /// 类型:image(图片)/ video(视频);旧数据为空串或 adapt
+    #[serde(default)]
+    pub kind: String,
     pub content: String,
+    /// 来源(下拉选项,如 opennana)
+    #[serde(default)]
+    pub source: String,
+    /// 来源数据 id(取材的内容 / 数据记录 id)
+    #[serde(default)]
+    pub source_data_id: String,
+    /// 示例链接(图片或视频 URL)
+    #[serde(default)]
+    pub example: String,
+    /// 适配模型(tag 多值)
+    #[serde(default)]
+    pub models: Vec<String>,
+    // 提交时前端可不带时间(后端自填),故给默认值
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl From<prompt::Model> for PromptDto {
@@ -502,7 +522,14 @@ impl From<prompt::Model> for PromptDto {
             id: m.id,
             code: m.code,
             name: m.name,
+            kind: m.kind,
             content: m.content,
+            source: m.source,
+            source_data_id: m.source_data_id,
+            example: m.example,
+            models: serde_json::from_str(&m.models).unwrap_or_default(),
+            created_at: m.created_at,
+            updated_at: m.updated_at,
         }
     }
 }
@@ -536,12 +563,20 @@ pub async fn upsert_prompt(state: State<'_, AppState>, prompt: PromptDto) -> Res
         .one(db)
         .await
         .map_err(|e| CrawlerError::Config(format!("查询提示词失败: {e}")))?;
+    // 适配模型数组序列化为 JSON 字符串落库(同 customer.tags 口径)
+    let models = serde_json::to_string(&prompt.models)
+        .map_err(|e| CrawlerError::Config(format!("序列化适配模型失败: {e}")))?;
     match existing {
         Some(model) => {
             let mut am = model.into_active_model();
             am.code = Set(prompt.code);
             am.name = Set(prompt.name);
+            am.kind = Set(prompt.kind);
             am.content = Set(prompt.content);
+            am.source = Set(prompt.source);
+            am.source_data_id = Set(prompt.source_data_id);
+            am.example = Set(prompt.example);
+            am.models = Set(models);
             am.updated_at = Set(now);
             am.update(db)
                 .await
@@ -552,7 +587,12 @@ pub async fn upsert_prompt(state: State<'_, AppState>, prompt: PromptDto) -> Res
                 id: Set(prompt.id),
                 code: Set(prompt.code),
                 name: Set(prompt.name),
+                kind: Set(prompt.kind),
                 content: Set(prompt.content),
+                source: Set(prompt.source),
+                source_data_id: Set(prompt.source_data_id),
+                example: Set(prompt.example),
+                models: Set(models),
                 created_at: Set(now),
                 updated_at: Set(now),
             };
@@ -737,6 +777,276 @@ pub async fn remove_customer(state: State<'_, AppState>, id: String) -> Result<(
         .exec(&state.db)
         .await
         .map_err(|e| CrawlerError::Config(format!("删除客户失败: {e}")))?;
+    Ok(())
+}
+
+// ===================== 项目信息 =====================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectView {
+    pub id: String,
+    pub code: String,
+    pub name: String,
+    /// 所属客户(customers.id,逻辑外键;客户删除后悬空,前端兜底显示「未关联客户」)
+    pub customer_id: String,
+    /// YYYY-MM-DD,空串 = 未设
+    pub start_date: String,
+    pub end_date: String,
+    pub remark: String,
+    pub owner: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<project::Model> for ProjectView {
+    fn from(m: project::Model) -> Self {
+        Self {
+            id: m.id,
+            code: m.code,
+            name: m.name,
+            customer_id: m.customer_id,
+            start_date: m.start_date,
+            end_date: m.end_date,
+            remark: m.remark,
+            owner: m.owner,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInput {
+    pub id: String,
+    pub code: String,
+    pub name: String,
+    pub customer_id: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub remark: String,
+    pub owner: String,
+}
+
+#[tauri::command]
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectView>> {
+    let user = super::current_user(&state);
+    let mut query = project::Entity::find().order_by_asc(project::Column::CreatedAt);
+    // scope=="self" 只返回自己创建的;"all" 或未登录返回全部(与客户列表同口径)
+    if let Some(u) = &user {
+        if u.scope == "self" {
+            query = query.filter(project::Column::Owner.eq(u.name.clone()));
+        }
+    }
+    let rows = query
+        .limit(LIST_HARD_CAP)
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询项目失败: {e}")))?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub async fn upsert_project(state: State<'_, AppState>, project: ProjectInput) -> Result<()> {
+    let db = &state.db;
+    let now = Utc::now().timestamp();
+    // 项目编码须全表唯一(排除自身)
+    let dup = project::Entity::find()
+        .filter(project::Column::Code.eq(project.code.clone()))
+        .filter(project::Column::Id.ne(project.id.clone()))
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询项目失败: {e}")))?;
+    if dup.is_some() {
+        return Err(CrawlerError::Config(format!("编码已存在: {}", project.code)));
+    }
+    // 开始 / 结束日期必填,且开始不能晚于结束;前端校验外后端兜底
+    if project.start_date.is_empty() || project.end_date.is_empty() {
+        return Err(CrawlerError::Config("开始日期与结束日期均为必填".into()));
+    }
+    if project.start_date > project.end_date {
+        return Err(CrawlerError::Config("开始日期不能晚于结束日期".into()));
+    }
+    let existing = project::Entity::find_by_id(project.id.clone())
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询项目失败: {e}")))?;
+    match existing {
+        Some(model) => {
+            // 编辑:owner 不随编辑变更,保留原值
+            let mut am = model.into_active_model();
+            am.code = Set(project.code);
+            am.name = Set(project.name);
+            am.customer_id = Set(project.customer_id);
+            am.start_date = Set(project.start_date);
+            am.end_date = Set(project.end_date);
+            am.remark = Set(project.remark);
+            am.updated_at = Set(now);
+            am.update(db)
+                .await
+                .map_err(|e| CrawlerError::Config(format!("更新项目失败: {e}")))?;
+        }
+        None => {
+            // 新建归属由后端会话决定:有当前用户则记其用户名,无则回退前端传值(兼容)
+            let owner = super::current_user(&state)
+                .map(|u| u.name)
+                .unwrap_or(project.owner);
+            let am = project::ActiveModel {
+                id: Set(project.id),
+                code: Set(project.code),
+                name: Set(project.name),
+                customer_id: Set(project.customer_id),
+                start_date: Set(project.start_date),
+                end_date: Set(project.end_date),
+                remark: Set(project.remark),
+                owner: Set(owner),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            am.insert(db)
+                .await
+                .map_err(|e| CrawlerError::Config(format!("创建项目失败: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_project(state: State<'_, AppState>, id: String) -> Result<()> {
+    project::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除项目失败: {e}")))?;
+    Ok(())
+}
+
+// ===================== 团队管理 =====================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamView {
+    pub id: String,
+    pub code: String,
+    pub name: String,
+    /// 成员用户 id 数组(关联 users.id;用户删除后悬空 id 由前端过滤)
+    pub member_ids: Vec<String>,
+    pub remark: String,
+    pub owner: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<team::Model> for TeamView {
+    fn from(m: team::Model) -> Self {
+        Self {
+            id: m.id,
+            code: m.code,
+            name: m.name,
+            member_ids: serde_json::from_str(&m.member_ids).unwrap_or_default(),
+            remark: m.remark,
+            owner: m.owner,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamInput {
+    pub id: String,
+    pub code: String,
+    pub name: String,
+    pub member_ids: Vec<String>,
+    pub remark: String,
+    pub owner: String,
+}
+
+#[tauri::command]
+pub async fn list_teams(state: State<'_, AppState>) -> Result<Vec<TeamView>> {
+    let user = super::current_user(&state);
+    let mut query = team::Entity::find().order_by_asc(team::Column::CreatedAt);
+    // scope=="self" 只返回自己创建的;"all" 或未登录返回全部(与客户 / 项目同口径)
+    if let Some(u) = &user {
+        if u.scope == "self" {
+            query = query.filter(team::Column::Owner.eq(u.name.clone()));
+        }
+    }
+    let rows = query
+        .limit(LIST_HARD_CAP)
+        .all(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询团队失败: {e}")))?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub async fn upsert_team(state: State<'_, AppState>, team: TeamInput) -> Result<()> {
+    let db = &state.db;
+    let now = Utc::now().timestamp();
+    // 团队编码须全表唯一(排除自身)
+    let dup = team::Entity::find()
+        .filter(team::Column::Code.eq(team.code.clone()))
+        .filter(team::Column::Id.ne(team.id.clone()))
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询团队失败: {e}")))?;
+    if dup.is_some() {
+        return Err(CrawlerError::Config(format!("编码已存在: {}", team.code)));
+    }
+    // 至少一名成员,前端校验外后端兜底
+    if team.member_ids.is_empty() {
+        return Err(CrawlerError::Config("团队至少需要一名成员".into()));
+    }
+    // 成员 id 数组序列化为 JSON 字符串落库(同 customer.tags 口径)
+    let member_ids = serde_json::to_string(&team.member_ids)
+        .map_err(|e| CrawlerError::Config(format!("序列化成员失败: {e}")))?;
+    let existing = team::Entity::find_by_id(team.id.clone())
+        .one(db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("查询团队失败: {e}")))?;
+    match existing {
+        Some(model) => {
+            // 编辑:owner 与 code 均不随编辑变更,保留原值(团队编码创建后不可改)
+            let mut am = model.into_active_model();
+            am.name = Set(team.name);
+            am.member_ids = Set(member_ids);
+            am.remark = Set(team.remark);
+            am.updated_at = Set(now);
+            am.update(db)
+                .await
+                .map_err(|e| CrawlerError::Config(format!("更新团队失败: {e}")))?;
+        }
+        None => {
+            // 新建归属由后端会话决定:有当前用户则记其用户名,无则回退前端传值(兼容)
+            let owner = super::current_user(&state)
+                .map(|u| u.name)
+                .unwrap_or(team.owner);
+            let am = team::ActiveModel {
+                id: Set(team.id),
+                code: Set(team.code),
+                name: Set(team.name),
+                member_ids: Set(member_ids),
+                remark: Set(team.remark),
+                owner: Set(owner),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            am.insert(db)
+                .await
+                .map_err(|e| CrawlerError::Config(format!("创建团队失败: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_team(state: State<'_, AppState>, id: String) -> Result<()> {
+    team::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await
+        .map_err(|e| CrawlerError::Config(format!("删除团队失败: {e}")))?;
     Ok(())
 }
 

@@ -33,7 +33,6 @@ veltrix-crawler 是抖音 / 小红书 / 快手 / Bilibili / TikTok / YouTube 等
 
 构建辅助:`.cargo/config.toml` 在 Windows 下用 `rust-lld.exe` 替代 MSVC link.exe 加速增量链接;根 `Cargo.toml` 的 dev profile 为 `debug = "line-tables-only"`(保留行号级调试信息,加速 codegen 与链接)。
 
-**OpenCV 构建环境(智能剪辑-场景检测,仅 Windows)**:预编译包在 `third_party/opencv/`(不进 git,首次需下载 opencv-4.10.0-windows.exe 自解压);`.cargo/config.toml [env]` 已配 `OPENCV_*`。绑定生成依赖 clang 工具链(全部走 scripts/.venv 的 pip 包,无需管理员):`CLANG_PATH` 指向 `third_party/clang-shim/clang.cmd`(ziglang 的 zig cc -target x86_64-windows-msvc 充当 clang 驱动;**`ziglang/lib/include` 已替换为 llvmorg-18.1.1 的 clang 内建头**,与 pip libclang 18.1.1 版本对齐,源包抽自 `third_party/llvm-project-llvmorg-18.1.1/`);`LIBCLANG_PATH` 指向 libclang pip 包,链接期 `libclang.lib` 由 pefile 导符号 + `zig dlltool` 生成(已放 libclang.dll 同目录,dll 另拷 target/debug 与 deps 供构建脚本加载);`OPENCV_CLANG_ARGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`(pip libclang 18 过本机 VS 18 STL 的 clang≥20 版本检查)。运行时依赖 `opencv_world4100.dll` 等 3 个 DLL(dev 已拷 target/debug;打包走 `src-tauri/resources/`,tauri.conf bundle.resources 已含)。
 
 ## 仓库结构与模块划分
 
@@ -65,19 +64,19 @@ docs/            设计文档(agent-platform-design.md 等)
 src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程平台域名 invoke
 ```
 
-数据库实体在 `crates/core/src/db/entity/`(account、content、comment、task、collect_record、chat_*、customer、publish_account 等 24 张表)。
+数据库实体在 `crates/core/src/db/entity/`(account、content、comment、task、collect_record、chat_*、customer、project、team、publish_account 等 26 张表)。
 
 ## 采集数据流(核心,改采集前先读懂)
 
 1. `commands::run_task` 选该平台一个可用账号,后台 `spawn` 异步采集,命令立即返回。
 2. `webview::pool` 复用该账号的 WebView 窗口(**per-account 数据目录隔离** = 多账号互不串登录态),导航到搜索页,注入脚本 hook fetch/XHR。
-3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底 / 网络无响应 / 手动停 即结束。计数排除库中已有 content_id;**去重跳过**:本任务已采 ∪ 去重台账 `collect_records`(同平台、近 90 天)的内容整体跳过,删单条内容不清台账,「清空业务数据」连带清台账。
+3. 命中平台 `intercept_patterns` 的响应被拦截回传;`run_legacy_scroll` 边滚动边交给 adapter 解析、按去重 `content_id` 计数——**智能停止**:达目标数 / 连续到底 / 网络无响应 / 手动停 即结束。计数排除库中已有 content_id;**去重跳过**:本任务已采 ∪ 去重台账 `collect_records`(同平台、近 90 天)的内容整体跳过,删单条内容不清台账,「清空业务数据」连带清台账;**删子任务(关键词)/ 删执行历史连带清对应台账条目**(否则删完重跑会被去重跳过全拦),**删任务保留台账**(平台+内容ID 关联不随任务删除失效)。
 4. adapter(`DouyinAdapter` / `XhsAdapter` 等,注册在 `lib.rs`)把响应解析为统一 `Content` / `Comment`,**只解析、不发请求**。
 5. 边采边入库(on-conflict upsert)。阶段顺序:内容采集 → 作者画像补采 → 评论采集 → 直链补取(开「音频提取」时;刻意排在评论后)→ 素材下载(并发 10 路;**采集窗口保活、账号锁延后到下载结束才释放**——每个并发批从存活窗口取一次轮换后的新会话 Cookie,用户关窗即终止)→ 关窗放锁 → 语音转写 → 封面文字识别(开「封面 OCR」时;智谱 files/ocr,图源为已落盘封面/图集首图,结果落 `contents.cover_ocr_text`,三态同转写:NULL=未识别/失败、空串=无文字)→ 评论意向分析 → Obsidian 同步 → 落 `completed`。
 
 **新增平台** = 加平台配置 + 实现 `PlatformAdapter` trait + 在 `lib.rs` 注册,不改调度/模型/上报。
 
-桌面启动编排(`lib.rs` setup):加载配置 → 连库建表(阻塞)→ spawn 内嵌 HTTP API(`127.0.0.1:8787`)→ spawn 云端 WS 客户端(有 pc_token 则自动拉起)→ 注册适配器 → 建系统托盘(**关闭主窗口是隐藏到托盘,不退进程**)。
+桌面启动编排(`lib.rs` setup):加载配置 → 连库建表(阻塞)→ 重置残留进行中任务/task_run → spawn 云端 WS 客户端(有 pc_token 则自动拉起)→ 注册适配器 → 建系统托盘(**关闭主窗口是隐藏到托盘,不退进程**)。**setup 必须尽快返回**——它卡住事件循环启动,直接决定白屏时长(曾实测 7~21s):存量迁移/回填(素材路径相对化、作者、话题、provider code 迁移与厂商 seed)、ffmpeg 探测、缩略图回填、文件服务(8788)全部在后台 spawn;托盘面板 WebView 也不在 setup 同步创建,由 `ensure_tray_popup` 首次右键托盘时惰性建窗(首个面板会晚约 1~2s 出现)。
 
 ## 关键约定(不易从单文件看出)
 
@@ -86,12 +85,13 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 - **数据归属**:业务数据记 `owner`(用户名);用户有 `dataScope`(all/self),`list_*` 命令按 scope 过滤。配置类数据(平台/行业/提示词等)共用,不分归属。
 - **桌面鉴权**:桌面端登录**不发 token**,登录态存前端 localStorage + 后端 `AppState.current_user`;JWT 仅用于对外 HTTP API(`/api/v1`)。密码哈希用 argon2。
 - **任务状态机**:pending → running → downloading_media → completed(失败/手动停为 failed/cancelled)。**completed 算活跃、留在任务列表**,只有 failed/cancelled 进归档 tab。进度靠后端 `task-progress` 事件实时推送 + 前端 2s 轮询兜底(轮询条件必须含 running 与 downloading_media)。
+- **任务/子任务删除是级联删除**:`remove_task`(任务调度「删除数据」)会连带删 contents / comments / collect_logs / task_runs / content_synced_users 与落盘媒体文件(封面/音频/视频/图集 + `_thumb.jpg`;**头像按作者共享不删**),但**不清 collect_records 台账**——平台+内容ID 关联保留,删任务后重采仍按台账去重;`remove_task_only`(任务调度「删除任务」)是**假删除**:置 `tasks.deleted=true`(迁移列,旧行回填 FALSE),采集数据/执行历史/日志/同步标记/台账/媒体文件全部保留;`list_tasks` / 调度器(daily/watching/失败重试扫描)/ 仪表盘任务统计一律过滤 deleted,`run_task` 拒绝启动已删除任务;`remove_task_keyword`(详情页子任务「删除数据」)在 `remove_task` 基础上**连带清对应 collect_records 台账条目**;进行中(含 paused)任务拒绝删除,需先停止;dataScope=self 只能删自己 owner 的任务。删子任务会把关键词移出任务定义并回减 content_count/comment_count,删的是最后一个关键词时任务本体连带删除。`remove_task_run`(执行历史「删除」)按运行时间窗 [started_at, finished_at] 级联删窗内内容/评论/同步标记/台账/媒体文件/运行日志并回减任务计数,口径与「查看内容」穿透一致;running 状态的记录拒绝删除。对比:`remove_content` / `remove_contents`(内容库删除)只删库记录 + 评论 + 同步标记,不动媒体文件与台账。
 - **转写三态**:`contents.transcript` NULL=未转写/转写失败(可重试,`transcript_error` 存原因),**空串=已转写但未识别到语音**(空文案标记,前端显「空文案」徽章,不再进「待转写」统计与批量重试),非空=文案。「有文案」口径(`require_transcript` 筛选、导出、Obsidian 同步)仍排除空串。
 - **列表瘦身视图**:内容库列表(`list_contents_page`)返回 `ContentListView`——不携带 transcript / cover_ocr_text / image_urls / image_paths 等大字段,改由 SQL 端派生 `transcriptState` / `coverOcrState`(`"none"|"empty"|"has"`,与转写三态一一对应)、`transcriptPreview` / `coverOcrOcrPreview`(约 100 字摘要)、`firstImageUrl` / `imageCount`;需要全文的场景(详情、导出 Excel、对话插入文案)走 `getContentDetail` / `list_contents_full`。新增列表字段时同步 `src/lib/api-types.ts` 的 `ContentListView`。
 - **平台配置是抓包起点**:`crates/core/src/config/mod.rs` 的 `builtin_default` 里 `search_url_template` / `intercept_patterns` 只是开箱骨架,真实接口路径需本机 `bun run tauri dev` 抓包核对后调整(代码注释已标注)。
 - **Tauri 命令注册**:每个新 `#[tauri::command]` 都要加进 `lib.rs` 的 `invoke_handler![]` 列表才能被前端 invoke。
 - **采集 WebView 的远程权限**:`src-tauri/capabilities/collect-remote.json` 显式授权小红书/抖音/快手域名 invoke(回传拦截响应与 RPA 结果),新增平台域名要同步加这里。
-- **发布账号池独立于采集账号池**:发布账号存 `publish_accounts`,按 CRM 客户分组(`category_id` 存 customers.id,客户在创作 > 客户管理维护,发布侧只读、不再单独建分类表;悬空账号在前端「未关联客户」兜底分组可见),不复用 cookie/ 的轮换/acquire。发布窗口 label 为 `veltrix-pub-{platform}-{accountId}`(保留 `veltrix-` 前缀吃 capabilities 通配,数据目录与采集账号隔离);登录检测脚本 account_id 带 `pub:` 前缀,`login_status_report` 按前缀路由到 `publish::PublishAccounts`,状态机 active / invalid / limited / disabled。
+- **发布账号池独立于采集账号池**:发布账号存 `publish_accounts`,按 CRM 客户分组(`category_id` 存 customers.id,客户在运营 > 客户管理 > 客户信息维护,发布侧只读、不再单独建分类表;悬空账号在前端「未关联客户」兜底分组可见),不复用 cookie/ 的轮换/acquire。发布窗口 label 为 `veltrix-pub-{platform}-{accountId}`(保留 `veltrix-` 前缀吃 capabilities 通配,数据目录与采集账号隔离);登录检测脚本 account_id 带 `pub:` 前缀,`login_status_report` 按前缀路由到 `publish::PublishAccounts`,状态机 active / invalid / limited / disabled。
 - **视频落盘**:任务开 `keep_video`(TaskFormSheet「保留视频」)时媒体阶段把 mp4 落盘到 `{media_root}/{platform}/{date}/video/{content_id}.mp4` 并回写 `contents.video_path`(默认只抽音频不留视频);发布服务复用此素材。
 - **素材路径入库口径**:contents 表本地素材路径列(cover_path/avatar_path/audio_path/video_path/image_paths)统一存相对 media_root 的正斜杠相对路径;读端用 `media::resolve_media_path` 还原为绝对路径(兼容存量绝对路径);写端在回写边界用 `media::to_media_rel` 转换(内存中 MediaOutcome 仍是绝对路径);启动时 `migrate_media_paths_to_relative` 幂等迁移旧数据;前端统一经本地文件服务(端口 8788,/files 前缀,`mediaFileUrl`)访问;本机渲染前缀走 `get_local_file_server_prefix`(恒 `127.0.0.1:8788`,不识别网卡),LAN 前缀 `get_file_server_prefix` 仅留给设置页内网分享展示。
 - **素材缩略图**:与源文件同目录,命名 = 源文件名去扩展名 + `_thumb.jpg`(宽 480px 等比、JPEG q80,`thumbnail.rs` 统一实现,纯 Rust image crate 不走 ffmpeg);封面 / 图集 / 头像落盘成功即同步生成(头像换新时旧 thumb 一并作废),文件服务对不存在的 `_thumb.jpg` 请求惰性现生成(生成失败或源图 >20MB 回源),启动时 `thumbnail::backfill_missing` 后台限流回填存量(4 路并发);前端列表 / 卡片 / 作者库头像只加载缩略图,作者库头像本地路径由 AuthorView.avatarPath 按落盘约定({platform}/avatar/{uid}.jpg)探测回填,缺失回退 CDN。文件服务(8788)带协商缓存:弱 ETag `W/"{len:x}-{mtime_secs:x}"` + Last-Modified,命中回 304。
@@ -101,6 +101,7 @@ src-tauri/capabilities/ Tauri 权限:采集 WebView(veltrix-*)显式授权远程
 - 代码注释与文档统一使用**中文**;注释解释「为什么」而非「做什么」(如 Cargo.toml 中依赖旁的设计权衡注释)。
 - Rust:错误处理 anyhow(应用层)/ thiserror(库层);日志用 `tracing`(tracing-appender 滚动落盘);异步 trait 用 `async-trait`(dyn 安全)。
 - 前端:路径别名 `@` → `src/`;UI 用 shadcn/ui + Tailwind;日期用 date-fns;图标用 lucide-react。
+- **按钮一律圆角矩形,禁止胶囊形(用户明确要求,永久有效,勿再犯)**:带文字的操作按钮(提交 / 取消 / 开始 / 退出等)一律用圆角(`rounded-lg`,对齐 `components/ui/button.tsx` 基准),**不要用 `rounded-full` 做成子弹头 / 胶囊形**;正圆形(`rounded-full` + 等宽高)仅用于纯图标小按钮。写任何新按钮时直接按此执行,不需要用户再次提醒。
 - 遵循项目规范:函数参数 ≤ 4 个(多了封装为结构体,见 `docs/agent-platform-design.md` 中的示例)。
 
 ## 安全注意事项

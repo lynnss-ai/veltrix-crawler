@@ -15,33 +15,64 @@
 
 use std::io::Write;
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::commands::{lock_config, AppState};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 前端 invoke 传入的 options 载荷(camelCase)必须能被 RecordOptions 正确反序列化,
+    /// 字段名对不上会导致「开始录制」静默无响应(悬浮窗吞错)。
+    #[test]
+    fn record_options_camel_case_deserializes() {
+        let o: RecordOptions = serde_json::from_str(
+            r#"{"micOn":true,"screenIndex":0,"includeApp":true,"micDevice":"",
+                "camOn":true,"camDevice":"USB2.0 HD UVC WebCam","camPosition":"bottomLeft"}"#,
+        )
+        .expect("camelCase 载荷应可反序列化");
+        assert!(o.mic_on && o.include_app && o.cam_on);
+        assert_eq!(o.screen_index, Some(0));
+        assert_eq!(o.cam_device.as_deref(), Some("USB2.0 HD UVC WebCam"));
+        assert_eq!(o.cam_position.as_deref(), Some("bottomLeft"));
+
+        // 全屏(null 屏幕)与省略可选字段
+        let o: RecordOptions = serde_json::from_str(
+            r#"{"micOn":false,"screenIndex":null,"includeApp":false}"#,
+        )
+        .expect("null 屏幕与缺省字段应可反序列化");
+        assert!(o.screen_index.is_none() && !o.cam_on && o.mic_device.is_none());
+    }
+}
+
 /// 主窗口 label(与 lib.rs 中保持一致;最小化 / 还原目标)。
 const MAIN_WINDOW_LABEL: &str = "main";
 /// 录屏悬浮窗 label(前端 main.tsx 按此渲染 RecordingOverlay)。
 pub const RECORDING_OVERLAY_LABEL: &str = "recording-overlay";
+/// 摄像头预览窗 label(app-* 前缀吃 main-window 能力:整窗拖拽等窗口控制)。
+pub const CAM_PREVIEW_LABEL: &str = "app-cam-preview";
 
 /// 悬浮窗逻辑尺寸(与前端 RecordingOverlay 容器一致;尽量小巧)。
 /// 高度要比卡片本身略高,给居中卡片的圆角上下边留出空隙,否则边框会被窗口边缘裁掉(看不见上下线)。
 /// 宽度 260:开始 + 麦克风开关 + 含本程序开关 + 屏幕选择 + 取消 五个控件。
 const OVERLAY_W: f64 = 260.0;
 const OVERLAY_H: f64 = 52.0;
-/// 设置面板展开时窗口增加的高度(含本程序开关 + 音频设备选择 + 音频测试)。
-const PANEL_H: f64 = 220.0;
-/// 预览确认态的悬浮窗逻辑尺寸(平铺各屏缩略图,点开始录制前选择)。
-const PREVIEW_W: f64 = 600.0;
-const PREVIEW_H: f64 = 540.0;
+/// 配置面板态的悬浮窗逻辑尺寸(左右结构:左列设备配置 + 选屏,右列所选屏预览)。
+/// 小条 ↔ 面板是一次性整体切换,不存在在原窗口上继续拉高的中间态。
+const PREVIEW_W: f64 = 624.0;
+const PREVIEW_H: f64 = 500.0;
 /// 单屏预览缩略图最大宽度(物理像素),超出等比缩小:缩略图不需要原尺寸,控制 base64 载荷。
 const PREVIEW_MAX_W: u32 = 480;
+/// 悬浮窗距主显示器顶部的偏移(逻辑像素):应用自绘标题栏高 2.25rem(36px,见 App.tsx
+/// 的 --titlebar-h),再加 12px 间距——悬浮窗(小条 / 配置面板)一律从标题栏下方开始,不遮挡标题栏。
+const OVERLAY_TOP_OFFSET: f64 = 48.0;
 /// 录制帧率:15fps 兼顾流畅度与 CPU / 文件体积。
 const FRAMERATE: &str = "15";
 /// 停止时等待 ffmpeg 正常收尾的上限,超时则强杀(避免界面卡在「停止中」)。
@@ -64,8 +95,17 @@ struct RecordingSession {
     next_part: u32,
     /// 开始时间(Unix 秒),展示用。
     started_at: i64,
-    /// 本次是否在采麦克风(悬浮窗录制中状态据此显示麦克风指示;启动后不可改,ffmpeg 输入已固定)。
+    /// 本次是否录麦克风(= 是否存在音频轨;悬浮窗录制中状态据此显示,启动后不可改)。
     with_mic: bool,
+    /// 麦克风当前是否开启:录制中可随时切换。音轨全程采集,「关」只是把当前媒体时间记入
+    /// 静音区间,分段收尾时把区间应用到音轨(仅音频重编码)——界面瞬时生效,录制不中断。
+    mic_on: bool,
+    /// 当前分段的媒体时间起点(分段内静音区间的时间基准;每起一段重置,分段内无暂停)。
+    segment_since: Instant,
+    /// 开放中的静音区间起点(Some = 当前处于静音;分段内媒体秒)。
+    mute_open_at: Option<f64>,
+    /// 已闭合的静音区间(分段内媒体秒;分段收尾时应用到音轨后清空)。
+    mute_windows: Vec<(f64, f64)>,
     /// 本次录制的屏幕下标;None = 全部屏幕。
     screen_index: Option<u32>,
     /// 恢复录制时重建 ffmpeg 命令所需的材料(与 start 时一致,分段参数完全相同才能 -c copy 拼接)
@@ -73,7 +113,7 @@ struct RecordingSession {
     mic: Option<String>,
     region: Option<ScreenRegion>,
     encoder: VideoEncoder,
-    ddagrab: bool,
+    grabber: Grabber,
     /// 计时:累计活跃时长 + 本次活跃起点(暂停时 None);显示时长 = 两者之和
     active_elapsed: Duration,
     active_since: Option<Instant>,
@@ -107,11 +147,27 @@ impl RecordingSession {
         self.dir.join(name)
     }
 
+    /// 当前分段的媒体秒数(分段起点至今;分段内无暂停——暂停即收尾该段)。
+    fn segment_elapsed(&self) -> f64 {
+        self.segment_since.elapsed().as_secs_f64()
+    }
+
+    /// 收尾当前分段的静音材料:闭合开放中的区间,返回区间列表并清空分段内状态。
+    /// 返回 None = 本段无静音区间,收尾时无需处理音轨。
+    fn take_mute_windows(&mut self) -> Option<Vec<(f64, f64)>> {
+        let mut windows = std::mem::take(&mut self.mute_windows);
+        if let Some(at) = self.mute_open_at.take() {
+            windows.push((at, self.segment_elapsed().max(at)));
+        }
+        (!windows.is_empty()).then_some(windows)
+    }
+
     /// 组装回传前端的录制状态。
     fn status(&self) -> RecordingStatus {
         RecordingStatus {
             recording: true,
             with_mic: self.with_mic,
+            mic_on: self.mic_on,
             screen_index: self.screen_index,
             started_at: Some(self.started_at),
             output_path: Some(self.current_path.to_string_lossy().to_string()),
@@ -176,8 +232,8 @@ pub struct RecordingState {
     /// 视频编码器选择(启动后后台实测初始化探测:nvenc / qsv / amf,皆不可用回退 libx264)。
     /// 硬编把 4K 编码从 CPU 挪到 GPU,是慢机录高分辨率不卡的关键
     video_encoder: Mutex<VideoEncoder>,
-    /// ddagrab(DDA 桌面复制抓屏)是否可用:比 gdigrab 的 GDI BitBlt 省 CPU,可用则优先
-    ddagrab_ok: AtomicBool,
+    /// 抓屏方式(启动预热探测;DDA 优先,GDI 兜底)
+    grabber: AtomicU8,
     /// 编码器 / 抓屏方式是否已探测过(未探测时开始录制现场探测并回填)
     video_probed: AtomicBool,
 }
@@ -190,7 +246,7 @@ impl RecordingState {
             default_mic: Mutex::new(None),
             mic_probed: AtomicBool::new(false),
             video_encoder: Mutex::new(VideoEncoder::Software),
-            ddagrab_ok: AtomicBool::new(false),
+            grabber: AtomicU8::new(Grabber::Gdi.to_stored()),
             video_probed: AtomicBool::new(false),
         }
     }
@@ -223,7 +279,7 @@ impl RecordingState {
     }
 
     /// 读取编码器 / 抓屏方式探测结果:None = 尚未探测(调用方需现场探测并回填)。
-    pub fn probed_video(&self) -> Option<(VideoEncoder, bool)> {
+    pub fn probed_video(&self) -> Option<(VideoEncoder, Grabber)> {
         if !self.video_probed.load(Ordering::Relaxed) {
             return None;
         }
@@ -232,15 +288,18 @@ impl RecordingState {
             .lock()
             .map(|e| *e)
             .unwrap_or(VideoEncoder::Software);
-        Some((enc, self.ddagrab_ok.load(Ordering::Relaxed)))
+        Some((
+            enc,
+            Grabber::from_stored(self.grabber.load(Ordering::Relaxed)),
+        ))
     }
 
     /// 写入编码器 / 抓屏方式探测结果(启动预热 / 现场探测回填)。
-    pub fn set_video_probe(&self, encoder: VideoEncoder, ddagrab: bool) {
+    pub fn set_video_probe(&self, encoder: VideoEncoder, grabber: Grabber) {
         if let Ok(mut e) = self.video_encoder.lock() {
             *e = encoder;
         }
-        self.ddagrab_ok.store(ddagrab, Ordering::Relaxed);
+        self.grabber.store(grabber.to_stored(), Ordering::Relaxed);
         self.video_probed.store(true, Ordering::Relaxed);
     }
 }
@@ -257,8 +316,10 @@ impl Default for RecordingState {
 pub struct RecordingStatus {
     /// 是否正在录制。
     pub recording: bool,
-    /// 是否在采麦克风(录制中状态展示用;启动后不可改)。
+    /// 是否在录麦克风(= 是否存在音频轨;启动后不可改)。
     pub with_mic: bool,
+    /// 麦克风当前是否开启(录制中可随时切换;关 = 记入静音区间,成片对应区间无声)。
+    pub mic_on: bool,
     /// 本次录制的屏幕下标;null = 全部屏幕。
     pub screen_index: Option<u32>,
     /// 开始时间(Unix 秒),未录制为 null。
@@ -276,6 +337,7 @@ impl RecordingStatus {
         Self {
             recording: false,
             with_mic: false,
+            mic_on: false,
             screen_index: None,
             started_at: None,
             output_path: None,
@@ -352,20 +414,55 @@ pub fn list_screens(app: AppHandle) -> Vec<ScreenInfo> {
         .collect()
 }
 
+/// 「开始录制」的前端选项(camelCase 对齐 invoke 入参;打包成结构体守住函数参数 ≤4 的约定)。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordOptions {
+    /// 是否采麦克风(录制中可随时开关,见 toggle_recording_mic)。
+    #[serde(default)]
+    mic_on: bool,
+    /// Some = 只录该显示器;None = 全部屏幕。
+    screen_index: Option<u32>,
+    /// 为真时不最小化主窗口,本程序一并入镜。
+    #[serde(default)]
+    include_app: bool,
+    /// 指定麦克风设备名,空 / None = 自动挑默认设备。
+    mic_device: Option<String>,
+    /// 是否开摄像头画中画(未检测到设备时自动忽略)。
+    #[serde(default)]
+    cam_on: bool,
+    /// 指定摄像头设备名,空 / None = 用列表首个。
+    cam_device: Option<String>,
+    /// 画中画落位(topLeft / topRight / bottomLeft / bottomRight),未知值回退右上。
+    cam_position: Option<String>,
+    /// 抓屏方式覆盖:"gdi" = 强制 gdigrab——DDA 会话的建立 / 释放会在部分驱动上
+    /// 闪一下黑屏,GDI 没有会话概念可规避(CPU 占用略高);None / 其他 = 自动(DDA 优先)。
+    #[serde(default)]
+    grabber: Option<String>,
+}
+
 /// 开始录屏:校验 ffmpeg → (默认)最小化主窗口 → 起 ffmpeg → 弹悬浮窗。
-/// `with_mic` 为真时采麦克风;`screen_index` 为 Some 时只录该显示器,None 录全部屏幕;
+/// `mic_on` 为真时采麦克风(录制中可随时开关);`screen_index` 为 Some 时只录该显示器,None 录全部屏幕;
 /// `include_app` 为真时不最小化主窗口——本程序的界面与操作一并入镜(演示本软件用),
 /// 悬浮条自身已排除出捕获,任何模式下都不会被录进去;
-/// `mic_device` 指定麦克风设备名(设置面板里选的),空 / None = 自动挑默认设备。
+/// `mic_device` / `cam_device` 指定设备名(面板里选的),空 / None = 自动挑;
+/// `cam_on` 为真且检测到摄像头时把画面画中画合成进视频,落位 `cam_position` 四角可选。
 #[tauri::command]
 pub async fn start_screen_recording(
     state: State<'_, AppState>,
     app: AppHandle,
-    with_mic: bool,
-    screen_index: Option<u32>,
-    include_app: bool,
-    mic_device: Option<String>,
+    options: RecordOptions,
 ) -> std::result::Result<RecordingStatus, String> {
+    let RecordOptions {
+        mic_on,
+        screen_index,
+        include_app,
+        mic_device,
+        cam_on,
+        cam_device,
+        cam_position,
+        grabber: grabber_override,
+    } = options;
     // 已在录制:直接返回当前状态,避免起第二个 ffmpeg
     {
         let guard = state
@@ -448,83 +545,116 @@ pub async fn start_screen_recording(
         },
         None => (None, None),
     };
-    // 麦克风:用户在设置面板指定了设备就直接用(不走默认缓存);
-    // 未指定走启动预热缓存(枚举要起一次 ffmpeg 设备列表子进程,是「开始」等待的大头);
-    // 缓存未就绪(启动后立刻点录屏)才现场枚举并回填。枚举不到设备降级纯视频。
-    let mic = if with_mic {
-        match mic_device.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(named) => Some(named.to_string()),
-            None => match state.recording.probed_mic() {
-                Some(cached) => cached,
-                None => {
-                    let p = program.clone();
-                    let mic = tauri::async_runtime::spawn_blocking(move || default_microphone(&p))
-                        .await
-                        .ok()
-                        .flatten();
-                    state.recording.set_default_mic(mic.clone());
-                    mic
-                }
-            },
-        }
-    } else {
-        None
+    // 麦克风设备:只要枚举得到就全程采集(哪怕本次以「关闭」起步)——录制中随时开关依赖
+    // 音轨常在,开关只是静音区间标记;枚举不到设备才纯视频(中途不可开启)。
+    // 用户在设置面板指定了设备就直接用(不走默认缓存);未指定走启动预热缓存
+    // (枚举要起一次 ffmpeg 设备列表子进程,是「开始」等待的大头);
+    // 缓存未就绪(启动后立刻点录屏)才现场枚举并回填。
+    let mic = match mic_device.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(named) => Some(named.to_string()),
+        None => match state.recording.probed_mic() {
+            Some(cached) => cached,
+            None => {
+                let p = program.clone();
+                let mic = tauri::async_runtime::spawn_blocking(move || default_microphone(&p))
+                    .await
+                    .ok()
+                    .flatten();
+                state.recording.set_default_mic(mic.clone());
+                mic
+            }
+        },
     };
-    if with_mic && mic.is_none() {
-        tracing::warn!("未找到可用麦克风设备,本次录屏降级为纯视频");
+    if mic.is_none() {
+        tracing::warn!("未找到可用麦克风设备,本次录屏为纯视频,中途无法开启麦克风");
+    }
+    // 摄像头:开启且检测到设备才弹「摄像头预览窗」——预览窗是普通置顶桌面窗口,画面直接被
+    // 录进视频,用户可拖拽摆放(拖到哪视频里就在哪);不通过 ffmpeg 采摄像头(dshow 独占,
+    // 会跟预览窗抢设备,也抢不了别的应用)。指定设备名失效回退列表首个;未检测到设备则
+    // 忽略画中画继续录制(外设缺失不拦路)。
+    let (cam_open, cam_device_name) = if cam_on {
+        let p = program.clone();
+        let cams = tauri::async_runtime::spawn_blocking(move || dshow_video_devices(&p))
+            .await
+            .unwrap_or_default();
+        let named = cam_device.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let hit = named
+            .filter(|n| cams.iter().any(|c| c == n))
+            .map(str::to_string);
+        let device = hit.or_else(|| cams.into_iter().next());
+        (device.is_some(), device)
+    } else {
+        (false, None)
+    };
+    if cam_on && !cam_open {
+        tracing::warn!("开启摄像头但未检测到可用设备,本次录屏无画中画");
     }
     // 编码器 / 抓屏方式走启动预热缓存(实测初始化探测要起几个小子进程);
     // 缓存未就绪(启动后立刻点录屏)才现场探测并回填
-    let (encoder, ddagrab) = match state.recording.probed_video() {
+    let (encoder, grabber) = match state.recording.probed_video() {
         Some(probed) => probed,
         None => {
             let p = program.clone();
             let probed = tauri::async_runtime::spawn_blocking(move || {
-                (probe_video_encoder(&p), probe_ddagrab(&p))
+                (probe_video_encoder(&p), probe_grabber(&p))
             })
             .await
-            .unwrap_or((VideoEncoder::Software, false));
+            .unwrap_or((VideoEncoder::Software, Grabber::Gdi));
             state.recording.set_video_probe(probed.0, probed.1);
             probed
         }
     };
-    tracing::info!("录屏参数:编码器={} 抓屏={}", encoder.label(), if ddagrab { "ddagrab" } else { "gdigrab" });
+    tracing::info!("录屏参数:编码器={} 抓屏={}", encoder.label(), grabber.label());
+    // 强制 GDI 兼容模式:DDA 会话建立 / 释放的驱动级闪屏可由此规避,代价是 CPU 占用略高
+    let grabber = if grabber_override.as_deref() == Some("gdi") {
+        Grabber::Gdi
+    } else {
+        grabber
+    };
     let mut spec = RecordSpec {
         output: output_path.clone(),
         mic,
         region,
         screen_index,
         encoder,
-        ddagrab,
+        grabber,
     };
     let mut child = spawn_ffmpeg(&program, &spec)?;
     let mut stderr_tail = drain_stderr(&mut child);
 
-    // 启动后短暂确认 ffmpeg 存活:输入设备打开失败等会让它立即退出,
-    // 不检查就会「假录制」——计时在走、实际无产出,最终视频 0:00。
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    if let Ok(Some(_)) | Err(_) = child.try_wait() {
-        // 麦克风设备打开失败(被占用 / 系统隐私设置拦截)不应拖垮录屏:降级纯视频重试一次
+    // 启动确认(轮询代替固定 1s):输出文件开始增长即确认真出帧,「开始」能提前约半秒返回;
+    // 满 1s 未增长但进程存活也放行(静态画面文件长得慢);已退出则走下方降级 / 失败
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if std::fs::metadata(&output_path)
+            .map(|m| m.len() > 4096)
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
+    loop {
+        if !matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            break;
+        }
+        let detail = stderr_last_line(&stderr_tail);
+        let _ = child.kill();
+        let _ = child.wait();
         if spec.mic.take().is_some() {
-            tracing::warn!("麦克风采集启动失败,降级纯视频重试: {}", stderr_last_line(&stderr_tail));
+            tracing::warn!("麦克风采集启动失败,降级纯视频重试: {detail}");
             // 缓存的设备名可能已失效(热插拔 / 被占用):后台重新探测刷新,避免下次还踩同一设备
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 warm_recording_probes(app).await;
             });
-            let _ = child.kill();
-            let _ = child.wait();
             child = spawn_ffmpeg(&program, &spec)?;
             stderr_tail = drain_stderr(&mut child);
             tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
         }
-    }
-    if let Ok(Some(_)) | Err(_) = child.try_wait() {
-        let detail = stderr_last_line(&stderr_tail);
-        let _ = child.kill();
-        let _ = child.wait();
         restore_main(&app);
         close_overlay(&app);
+        close_cam_preview(&app);
         let msg = if detail.is_empty() {
             "ffmpeg 启动后立即退出,录屏未开始".to_string()
         } else {
@@ -561,12 +691,17 @@ pub async fn start_screen_recording(
             next_part: 2, // 首段无后缀已占用,后续分段从 .part2 起
             started_at,
             with_mic: spec.mic.is_some(),
+            mic_on: mic_on && spec.mic.is_some(),
+            segment_since: Instant::now(),
+            // 以「关闭」起步且音轨存在:从 0 开始就是一段静音区间
+            mute_open_at: (!mic_on && spec.mic.is_some()).then_some(0.0),
+            mute_windows: Vec::new(),
             screen_index: spec.screen_index,
             program,
             mic: spec.mic.clone(),
             region: spec.region,
             encoder: spec.encoder,
-            ddagrab: spec.ddagrab,
+            grabber: spec.grabber,
             active_elapsed: Duration::ZERO,
             active_since: Some(Instant::now()),
             stderr_tail,
@@ -581,10 +716,28 @@ pub async fn start_screen_recording(
         let _ = w.set_size(tauri::LogicalSize::new(OVERLAY_W, OVERLAY_H));
         position_overlay(&w, OVERLAY_W);
     }
+    // 摄像头预览窗:摆到录制屏幕的所选角落;窗口本身会被录进视频(拖到哪视频里就在哪)
+    if cam_open {
+        let screens = enumerate_screens(&app);
+        let target = screens
+            .iter()
+            .find(|s| Some(s.index) == screen_index)
+            .or_else(|| screens.iter().find(|s| s.primary))
+            .or_else(|| screens.first());
+        if let Some(s) = target {
+            open_cam_preview(
+                &app,
+                CamPosition::parse(cam_position.as_deref()),
+                cam_device_name.as_deref(),
+                s,
+            );
+        }
+    }
 
     Ok(RecordingStatus {
         recording: true,
         with_mic: spec.mic.is_some(),
+        mic_on: mic_on && spec.mic.is_some(),
         screen_index: spec.screen_index,
         started_at: Some(started_at),
         output_path: Some(output_path.to_string_lossy().to_string()),
@@ -613,6 +766,7 @@ pub async fn stop_screen_recording(
 
     let Some(mut session) = session else {
         close_overlay(&app);
+        close_cam_preview(&app);
         restore_main(&app);
         return Ok(RecordingStatus::idle());
     };
@@ -623,14 +777,21 @@ pub async fn stop_screen_recording(
             .await
             .map_err(|e| format!("停止录屏异常: {e}"))?;
     }
+    // 当前段静音区间收尾并出列材料(应用放后台任务链,「停止」不被拖慢);
     // 当前段校验入列:文件缺失 / 过小说明该段录制中途已失败(如 ffmpeg 崩溃),丢弃不拼接
+    let windows = session.take_mute_windows();
+    let mut mutes: Vec<(std::path::PathBuf, Vec<(f64, f64)>)> = Vec::new();
     if valid_segment(&session.current_path) {
+        if let Some(w) = windows.filter(|_| session.mic.is_some()) {
+            mutes.push((session.current_path.clone(), w));
+        }
         session.segments.push(session.current_path.clone());
     } else {
         let _ = std::fs::remove_file(&session.current_path);
     }
 
     close_overlay(&app);
+    close_cam_preview(&app);
     restore_main(&app);
 
     if session.segments.is_empty() {
@@ -664,6 +825,20 @@ pub async fn stop_screen_recording(
         let app = app.clone();
         let path = final_path.clone();
         tauri::async_runtime::spawn(async move {
+            // 有静音区间的段先把区间应用到音轨(仅音频重编码,视频直拷)
+            for (p, w) in &mutes {
+                let ok = tauri::async_runtime::spawn_blocking({
+                    let program = program.clone();
+                    let p = p.clone();
+                    let w = w.clone();
+                    move || apply_mute_windows(&program, &p, &w)
+                })
+                .await
+                .unwrap_or(false);
+                if !ok {
+                    tracing::warn!("分段静音应用失败,该段保留原始音频: {}", p.display());
+                }
+            }
             // 多段先 -c copy 拼接(不重编码,很快);拼接失败退化为第一段,不丢全部内容
             let merged = if segments.len() > 1 {
                 concat_segments(&program, &segments, &path).await
@@ -722,7 +897,7 @@ pub async fn toggle_recording_pause(
                 region: session.region,
                 screen_index: session.screen_index,
                 encoder: session.encoder,
-                ddagrab: session.ddagrab,
+                grabber: session.grabber,
             };
             Pending::Resume(spec, session.program.clone())
         }
@@ -733,8 +908,33 @@ pub async fn toggle_recording_pause(
             tauri::async_runtime::spawn_blocking(move || finalize_child(child))
                 .await
                 .map_err(|e| format!("暂停录屏异常: {e}"))?;
-            // 分段校验入列;无效段(刚开始就暂停 / ffmpeg 已崩)丢弃,不让坏文件混进拼接
+            // 收走本分段的静音区间并重置分段内状态(暂停态切麦克风只影响下一段的初始状态)
+            let (mic_track, windows, program) = {
+                let mut guard = state
+                    .recording
+                    .inner
+                    .lock()
+                    .map_err(|_| "录屏状态锁异常".to_string())?;
+                match guard.as_mut() {
+                    Some(s) => (s.mic.is_some(), s.take_mute_windows(), s.program.clone()),
+                    None => (false, None, String::new()),
+                }
+            };
+            // 分段校验入列;无效段(刚开始就暂停 / ffmpeg 已崩)丢弃,不让坏文件混进拼接。
+            // 入列前把静音区间应用到音轨(仅音频重编码,视频直拷,通常一秒内):
+            // 入列段必须是最终形态,否则停止时的 -c copy 拼接会把未静音音轨带进成片
             if valid_segment(&path) {
+                if let Some(windows) = windows.filter(|_| mic_track) {
+                    let p = path.clone();
+                    let ok = tauri::async_runtime::spawn_blocking(move || {
+                        apply_mute_windows(&program, &p, &windows)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !ok {
+                        tracing::warn!("分段静音应用失败,该段保留原始音频: {}", path.display());
+                    }
+                }
                 let mut guard = state
                     .recording
                     .inner
@@ -797,9 +997,41 @@ pub async fn toggle_recording_pause(
             session.current_path = path;
             session.stderr_tail = stderr_tail;
             session.active_since = Some(Instant::now());
+            // 新分段重置媒体时间与静音区间:以静音态继续则从 0 起开放区间
+            session.segment_since = Instant::now();
+            session.mute_windows.clear();
+            session.mute_open_at = (!session.mic_on && session.mic.is_some()).then_some(0.0);
             Ok(session.status())
         }
     }
+}
+
+/// 录制中随时开 / 关麦克风(悬浮条麦克风按钮):ffmpeg 输入已固定,不重启进程,
+/// 翻转的是静音区间标记——关 = 从当前媒体时间起记入静音,开 = 闭合区间;
+/// 各分段收尾(暂停 / 停止)时把区间应用到音轨(仅音频重编码,视频直拷)。
+/// 界面瞬时生效、录制不中断,成片声音与开关时间线一致。
+#[tauri::command]
+pub fn toggle_recording_mic(
+    state: State<'_, AppState>,
+) -> std::result::Result<RecordingStatus, String> {
+    let mut guard = state
+        .recording
+        .inner
+        .lock()
+        .map_err(|_| "录屏状态锁异常".to_string())?;
+    let Some(session) = guard.as_mut() else {
+        return Err("当前没有进行中的录制".to_string());
+    };
+    let now = session.segment_elapsed();
+    session.mic_on = !session.mic_on;
+    if session.mic_on {
+        if let Some(at) = session.mute_open_at.take() {
+            session.mute_windows.push((at, now.max(at)));
+        }
+    } else if session.mute_open_at.is_none() {
+        session.mute_open_at = Some(now);
+    }
+    Ok(session.status())
 }
 
 /// 开 / 关录屏悬浮控制条(**不立即开始录制**):录制由悬浮条上的「开始」按钮手动触发。
@@ -867,21 +1099,6 @@ pub fn get_recording_status(state: State<'_, AppState>) -> RecordingStatus {
     }
 }
 
-/// 切换录屏悬浮窗尺寸:小控制条 ↔ 预览确认(大窗),并重摆到顶部居中。
-/// 窗口缩放走后端:悬浮窗按最小授权没有任何窗口控制类 capability,前端自己改不了尺寸。
-#[tauri::command]
-pub fn set_recording_overlay_preview(app: AppHandle, preview: bool) {
-    if let Some(w) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
-        let (width, height) = if preview {
-            (PREVIEW_W, PREVIEW_H)
-        } else {
-            (OVERLAY_W, OVERLAY_H)
-        };
-        let _ = w.set_size(tauri::LogicalSize::new(width, height));
-        position_overlay(&w, width);
-    }
-}
-
 /// 语音滤镜链(正式录制与音频测试共用,保证试听到的就是成品听感):
 /// 高通滤掉低频轰隆/电流声 → afftdn FFT 降噪 → dynaudnorm 动态归一(轻声自动抬升)→
 /// 限幅防爆音削顶 → 统一采样率
@@ -928,6 +1145,36 @@ pub async fn list_audio_devices(
             let recommended = score > 0 && !marked;
             marked |= recommended;
             AudioDeviceInfo { name, recommended }
+        })
+        .collect())
+}
+
+/// 摄像头设备信息(回传前端 camelCase 对齐 TS CameraDeviceInfo)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraDeviceInfo {
+    /// dshow 设备名(开始录制按它回选)。
+    pub name: String,
+    /// 是否推荐设备(列表首个;混入虚拟摄像头时用户可自行切换)。
+    pub recommended: bool,
+}
+
+/// 列出可用摄像头(配置面板摄像头开关与设备选择用;空数组 = 未检测到摄像头)。
+#[tauri::command]
+pub async fn list_cameras(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<CameraDeviceInfo>, String> {
+    let program = resolve_ffmpeg_program(&state)?;
+    // 枚举要起一次 ffmpeg 子进程,阻塞调用放 blocking 线程
+    let cams = tauri::async_runtime::spawn_blocking(move || dshow_video_devices(&program))
+        .await
+        .map_err(|e| format!("枚举摄像头异常: {e}"))?;
+    Ok(cams
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| CameraDeviceInfo {
+            recommended: i == 0,
+            name,
         })
         .collect())
 }
@@ -1007,14 +1254,19 @@ fn record_audio_sample(_program: &str, _mic: &str) -> std::result::Result<String
     Err("当前平台暂不支持音频测试".to_string())
 }
 
-/// 展开 / 收起设置面板(小条正下方):窗口加高容纳面板;悬浮窗无窗口控制权限,缩放走后端。
-/// 预览态窗口本身够大,前端在预览态内联渲染面板,不调本命令。
+/// 切换录屏悬浮窗尺寸:小控制条 ↔ 配置面板(左右结构:左设备配置/选屏、右所选屏预览),
+/// 并重摆到顶部居中。小条 ↔ 面板是一次性整体切换,前端不再有在原窗口上继续加高的中间态。
+/// 窗口缩放走后端:悬浮窗按最小授权没有任何窗口控制类 capability,前端自己改不了尺寸。
 #[tauri::command]
-pub fn set_recording_overlay_panel(app: AppHandle, open: bool) {
+pub fn set_recording_overlay_preview(app: AppHandle, preview: bool) {
     if let Some(w) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
-        let height = if open { OVERLAY_H + PANEL_H } else { OVERLAY_H };
-        let _ = w.set_size(tauri::LogicalSize::new(OVERLAY_W, height));
-        position_overlay(&w, OVERLAY_W);
+        let (width, height) = if preview {
+            (PREVIEW_W, PREVIEW_H)
+        } else {
+            (OVERLAY_W, OVERLAY_H)
+        };
+        let _ = w.set_size(tauri::LogicalSize::new(width, height));
+        position_overlay(&w, width);
     }
 }
 
@@ -1107,6 +1359,27 @@ struct ScreenRegion {
     height: u32,
 }
 
+/// 摄像头画中画的落位(面板四角选择;解析自前端的位置标识)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CamPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CamPosition {
+    /// 解析前端传来的位置标识,未知值回退右上(画中画的常见落位)。
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("topLeft") => Self::TopLeft,
+            Some("bottomLeft") => Self::BottomLeft,
+            Some("bottomRight") => Self::BottomRight,
+            _ => Self::TopRight,
+        }
+    }
+}
+
 /// 一次录制的参数打包(spawn / build 共用,遵守函数参数 ≤4 的约定)。
 struct RecordSpec {
     /// 输出 MP4 绝对路径。
@@ -1119,8 +1392,46 @@ struct RecordSpec {
     screen_index: Option<u32>,
     /// 视频编码器(硬编优先,软编兜底);分段间必须一致才能 -c copy 拼接。
     encoder: VideoEncoder,
-    /// 抓屏方式:true = ddagrab(DDA,省 CPU);false = gdigrab(GDI 兜底)。
-    ddagrab: bool,
+    /// 抓屏方式(DDA 优先,GDI 兜底);分段间必须一致。
+    grabber: Grabber,
+}
+
+/// 抓屏方式。ddagrab(DDA 桌面复制,GPU 侧拷贝、能抓到分层 / DirectComposition 弹窗,
+/// 比 gdigrab 的 GDI BitBlt 省 CPU 且所见即所得)优先,不可用回退 gdigrab。
+/// 注意 ddagrab 的形态随 ffmpeg 版本变化:ffmpeg 5.1~7.x 是输入设备(-f ddagrab -i desktop),
+/// ffmpeg ≥8 起改为 lavfi 源滤镜(-f lavfi -i ddagrab=...),两者参数面一致,拼命令时区分。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Grabber {
+    Gdi,
+    DdaIndev,
+    DdaFilter,
+}
+
+impl Grabber {
+    fn label(self) -> &'static str {
+        match self {
+            Grabber::Gdi => "gdigrab",
+            Grabber::DdaIndev => "ddagrab",
+            Grabber::DdaFilter => "ddagrab(lavfi)",
+        }
+    }
+
+    /// AtomicU8 存储编解码(探测结果挂在 RecordingState 上跨命令共享)。
+    fn to_stored(self) -> u8 {
+        match self {
+            Grabber::Gdi => 0,
+            Grabber::DdaIndev => 1,
+            Grabber::DdaFilter => 2,
+        }
+    }
+
+    fn from_stored(v: u8) -> Self {
+        match v {
+            1 => Grabber::DdaIndev,
+            2 => Grabber::DdaFilter,
+            _ => Grabber::Gdi,
+        }
+    }
 }
 
 /// 起 ffmpeg 录屏进程(stdin 接管用于优雅停止,stderr 接管供诊断)。
@@ -1149,9 +1460,10 @@ impl VideoEncoder {
         match self {
             // p3 预设 + vbr cq:质量接近 x264 medium,GPU 完成,CPU 几乎零开销
             VideoEncoder::Nvenc => &["-c:v", "h264_nvenc", "-preset", "p3", "-rc", "vbr", "-cq", "26"],
-            // 关 look_ahead 省 CPU(前瞻分析在 CPU 侧跑)
-            VideoEncoder::Qsv => &["-c:v", "h264_qsv", "-b:v", "8M", "-look_ahead", "0"],
-            VideoEncoder::Amf => &["-c:v", "h264_amf", "-quality", "speed", "-b:v", "8M"],
+            // 关 look_ahead 省 CPU(前瞻分析在 CPU 侧跑);12M:2560x1600 屏幕文字在
+            // 运动/滚动瞬间 8M 会有涂抹,12M 明显更清晰——静态画面 VBR 用不满,体积几乎不变
+            VideoEncoder::Qsv => &["-c:v", "h264_qsv", "-b:v", "12M", "-look_ahead", "0"],
+            VideoEncoder::Amf => &["-c:v", "h264_amf", "-quality", "speed", "-b:v", "12M"],
             VideoEncoder::Software => &["-c:v", "libx264", "-preset", "ultrafast"],
         }
     }
@@ -1200,26 +1512,33 @@ fn probe_video_encoder(program: &str) -> VideoEncoder {
     VideoEncoder::Software
 }
 
-/// 探测 ddagrab(DDA 桌面复制抓屏)是否可用:编译级探测即可(DDA 在 Win8+ 系统上都可用)。
-/// ddagrab 走 GPU 侧复制,比 gdigrab 的 GDI BitBlt 省 CPU,4K 屏差距明显。
+/// 探测抓屏方式:优先 ddagrab(DDA 桌面复制,GPU 侧拷贝、所见即所得),编译级探测即可
+/// (DDA 在 Win8+ 系统上都可用)。ddagrab 在 ffmpeg 5.1~7.x 是输入设备(查 -demuxers),
+/// ffmpeg ≥8 起改为 lavfi 源滤镜(查 -filters),两种形态都认;皆无回退 gdigrab。
 #[cfg(windows)]
-fn probe_ddagrab(program: &str) -> bool {
-    let mut cmd = std::process::Command::new(program);
-    crate::media::hide_console_window(&mut cmd);
-    let output = cmd
-        .args(["-hide_banner", "-demuxers"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(" ddagrab"),
-        Err(_) => false,
+fn probe_grabber(program: &str) -> Grabber {
+    let list = |flag: &str| {
+        let mut cmd = std::process::Command::new(program);
+        crate::media::hide_console_window(&mut cmd);
+        cmd.args(["-hide_banner", flag])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    if list("-demuxers").contains(" ddagrab") {
+        Grabber::DdaIndev
+    } else if list("-filters").contains(" ddagrab") {
+        Grabber::DdaFilter
+    } else {
+        Grabber::Gdi
     }
 }
 
 #[cfg(not(windows))]
-fn probe_ddagrab(_program: &str) -> bool {
-    false
+fn probe_grabber(_program: &str) -> Grabber {
+    Grabber::Gdi
 }
 
 /// 解析 ffmpeg dshow 设备清单文本,返回 (设备名, 评分) 按评分降序。
@@ -1269,6 +1588,42 @@ fn dshow_audio_devices(ffmpeg: &str) -> Vec<(String, i32)> {
     }
 }
 
+/// 起一次 ffmpeg 子进程枚举 dshow 视频设备(摄像头;与音频枚举同一份清单,解析 (video) 行)。
+#[cfg(windows)]
+fn dshow_video_devices(ffmpeg: &str) -> Vec<String> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    crate::media::hide_console_window(&mut cmd);
+    let output = cmd
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .output();
+    match output {
+        Ok(o) => parse_dshow_video_devices(&String::from_utf8_lossy(&o.stderr)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 解析 ffmpeg dshow 设备清单中的视频设备行(形如:"集成摄像头" (video)),按枚举顺序返回。
+#[cfg(windows)]
+fn parse_dshow_video_devices(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.contains("(video)"))
+        .filter_map(|l| l.split('"').nth(1).map(str::to_string))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn dshow_video_devices(_ffmpeg: &str) -> Vec<String> {
+    Vec::new()
+}
+
 /// 挑「最像真实麦克风」的默认设备:评分最高且为正;找不到返回 None,调用方降级纯视频。
 /// 结果被 RecordingState 缓存(启动预热 + 设备失效后刷新),不随每次开始录制重复枚举。
 #[cfg(windows)]
@@ -1305,22 +1660,42 @@ fn build_ffmpeg_command(program: &str, spec: &RecordSpec) -> std::process::Comma
         // thread_queue_size:每个输入的抓取线程队列默认只有 8 帧,慢机上处理跟不上就阻塞掉帧
         // (ffmpeg 打 "Thread message queue blocking"),加大到 512 帧缓冲吸收抖动
         cmd.args(["-thread_queue_size", "512"]);
-        // ddagrab 与 gdigrab 参数面一致(offset/video_size 圈单屏区域;draw_mouse 显式开)
-        cmd.args(["-f", if spec.ddagrab { "ddagrab" } else { "gdigrab" }]);
-        cmd.args(["-framerate", FRAMERATE, "-draw_mouse", "1"]);
-        if let Some(r) = &spec.region {
-            // 区域采集:offset 定位到目标显示器左上角(可为负),video_size 圈定该屏。
-            // 奇数尺寸由后面的 scale 滤镜裁偶,yuv420p 才能编码
-            cmd.args([
-                "-offset_x",
-                &r.x.to_string(),
-                "-offset_y",
-                &r.y.to_string(),
-                "-video_size",
-                &format!("{}x{}", r.width, r.height),
-            ]);
+        match spec.grabber {
+            // ddagrab 滤镜形态(ffmpeg ≥8):lavfi 源滤镜,参数写在滤镜串里
+            Grabber::DdaFilter => {
+                let mut graph = format!("ddagrab=framerate={FRAMERATE}:draw_mouse=1");
+                if let Some(r) = &spec.region {
+                    graph.push_str(&format!(
+                        ":offset_x={}:offset_y={}:video_size={}x{}",
+                        r.x, r.y, r.width, r.height
+                    ));
+                }
+                cmd.args(["-f", "lavfi", "-i", &graph]);
+            }
+            // ddagrab 输入设备形态(ffmpeg 5.1~7.x)与 gdigrab 参数面一致
+            // (offset/video_size 圈单屏区域;draw_mouse 显式开)
+            Grabber::DdaIndev | Grabber::Gdi => {
+                let format = if spec.grabber == Grabber::DdaIndev {
+                    "ddagrab"
+                } else {
+                    "gdigrab"
+                };
+                cmd.args(["-f", format, "-framerate", FRAMERATE, "-draw_mouse", "1"]);
+                if let Some(r) = &spec.region {
+                    // 区域采集:offset 定位到目标显示器左上角(可为负),video_size 圈定该屏。
+                    // 奇数尺寸由后面的 scale 滤镜裁偶,yuv420p 才能编码
+                    cmd.args([
+                        "-offset_x",
+                        &r.x.to_string(),
+                        "-offset_y",
+                        &r.y.to_string(),
+                        "-video_size",
+                        &format!("{}x{}", r.width, r.height),
+                    ]);
+                }
+                cmd.args(["-i", "desktop"]);
+            }
         }
-        cmd.args(["-i", "desktop"]);
         if let Some(mic) = &spec.mic {
             // dshow 音频输入:buffer 加大到 80ms,默认缓冲偏小易断续/爆音;
             // 同样加大线程队列,慢机上音频打开慢不至于堵住视频输入线程
@@ -1338,7 +1713,7 @@ fn build_ffmpeg_command(program: &str, spec: &RecordSpec) -> std::process::Comma
     #[cfg(target_os = "macos")]
     {
         let _ = &spec.region; // macOS 暂不支持单屏选择
-        let _ = spec.ddagrab;
+        let _ = spec.grabber;
         // avfoundation:屏幕 0,音频置 none(只录画面)。索引可能因机器而异。
         cmd.args([
             "-f",
@@ -1352,12 +1727,26 @@ fn build_ffmpeg_command(program: &str, spec: &RecordSpec) -> std::process::Comma
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = &spec.region; // Linux 暂不支持单屏选择
-        let _ = spec.ddagrab;
+        let _ = spec.grabber;
         cmd.args(["-f", "x11grab", "-framerate", FRAMERATE, "-i", ":0.0"]);
     }
 
-    // 视频滤镜:仅把奇数尺寸裁偶(yuv420p 要求);不加任何水印
-    cmd.args(["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]);
+    // 视频滤镜:ddagrab 滤镜形态输出的是 D3D11 GPU 帧,先 hwdownload 回系统内存转 BGRA
+    // 才能进软件滤镜链;其余路径输入已是 CPU 帧。scale 仅把奇数尺寸裁偶(yuv420p 要求);不加任何水印
+    #[cfg(windows)]
+    let vf = if spec.grabber == Grabber::DdaFilter {
+        "hwdownload,format=bgra,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    } else {
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    };
+    #[cfg(not(windows))]
+    let vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+    cmd.args(["-vf", vf]);
+    // 强制视频 CFR 定格到 15fps 网格:dshow 实时音轨会让 CLI 调度器间歇性停拉视频输入,
+    // 抓屏帧整段缺席(成片 pts 出现 1~2s 空洞),播放器在空洞里只能重复上一帧——
+    // 表现为开头几秒(乃至中途)画面冻住。cfr 让输出侧每个 1/15s 时隙都有帧(缺口补上一帧),
+    // 管线保持热轮转;实测 10s 样本从 36 帧/3.8fps(7 处空洞)恢复到 150 帧/15.1fps(零空洞)。
+    cmd.args(["-fps_mode:v", "cfr"]);
     // 编码:硬编(探测选定)把 4K 编码从 CPU 挪到 GPU;软编兜底用 ultrafast 降 CPU
     cmd.args(spec.encoder.encode_args());
     cmd.args(["-pix_fmt", spec.encoder.pix_fmt()]);
@@ -1391,6 +1780,41 @@ fn valid_segment(path: &std::path::Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() >= 4096)
         .unwrap_or(false)
+}
+
+/// 把静音区间应用到分段音轨(录制中麦克风开关的落地步骤):
+/// 视频 `-c copy` 直拷,仅音频快速重编码,在原滤镜链后串联按时间线启停的 volume 滤镜
+/// (区间内置 0,与正式录制同一条链,前后听感一致)。重编码结果先写临时文件再原位替换;
+/// 失败保留原文件(该段降级为不静音),不让暂停 / 停止 / 拼接因此失败。
+fn apply_mute_windows(
+    program: &str,
+    path: &std::path::Path,
+    windows: &[(f64, f64)],
+) -> bool {
+    let mut af = AUDIO_FILTER_CHAIN.to_string();
+    for (a, b) in windows {
+        af.push_str(&format!(",volume=0:enable='between(t,{a:.3},{b:.3})'"));
+    }
+    let tmp = path.with_extension("mute.mp4");
+    let mut cmd = std::process::Command::new(program);
+    crate::media::hide_console_window(&mut cmd);
+    let ok = cmd
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .arg("-i")
+        .arg(path)
+        .args(["-c:v", "copy"])
+        .args(["-af", &af])
+        .args(["-c:a", "aac", "-b:a", "128k"])
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && std::fs::rename(&tmp, path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
 }
 
 /// 优雅收尾一个 ffmpeg 分段进程:向 stdin 写 `q` 让其写完 MP4 moov;超时未退则强杀。
@@ -1552,24 +1976,24 @@ pub async fn warm_recording_probes(app: AppHandle) {
         .to_string();
     // 探测全是阻塞子进程调用,放 blocking 线程一次做完
     let prog = program.clone();
-    let (mic, encoder, ddagrab) = tauri::async_runtime::spawn_blocking(move || {
+    let (mic, encoder, grabber) = tauri::async_runtime::spawn_blocking(move || {
         (
             default_microphone(&prog),
             probe_video_encoder(&prog),
-            probe_ddagrab(&prog),
+            probe_grabber(&prog),
         )
     })
     .await
-    .unwrap_or((None, VideoEncoder::Software, false));
+    .unwrap_or((None, VideoEncoder::Software, Grabber::Gdi));
     tracing::info!(
         "录屏预热:麦克风={} 编码器={} 抓屏={}",
         mic.as_deref().unwrap_or("(无可用设备,将降级纯视频)"),
         encoder.label(),
-        if ddagrab { "ddagrab" } else { "gdigrab" },
+        grabber.label(),
     );
     let state = app.state::<AppState>();
     state.recording.set_default_mic(mic);
-    state.recording.set_video_probe(encoder, ddagrab);
+    state.recording.set_video_probe(encoder, grabber);
 }
 
 /// 创建(或显示)录屏悬浮窗:无边框 / 透明 / 不进任务栏 / 置顶,放主显示器顶部居中。
@@ -1610,16 +2034,114 @@ fn position_overlay(overlay: &tauri::WebviewWindow, logical_w: f64) {
         let pos = *monitor.position();
         let size = *monitor.size();
         let x = pos.x as f64 + (size.width as f64 - w) / 2.0;
-        let y = pos.y as f64 + 16.0 * scale;
+        let y = pos.y as f64 + OVERLAY_TOP_OFFSET * scale;
         let _ = overlay.set_position(tauri::PhysicalPosition::new(x, y));
     }
 }
 
 /// 关闭录屏悬浮窗(不存在则忽略)。
+/// 先隐藏再销毁:close() 会先拆 WebView2 合成层、后销毁 Win32 窗口,这个间隙里
+/// 透明属性已失效,会露出原生窗口的白色底色(肉眼可见的「结尾白闪」);隐藏后销毁则不可见。
 fn close_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
+        let _ = w.hide();
         let _ = w.close();
     }
+}
+
+/// 摄像头预览窗尺寸(逻辑像素;4:3 对齐常见摄像头的 640x480 基线档)。
+const CAM_PREVIEW_W: f64 = 320.0;
+const CAM_PREVIEW_H: f64 = 240.0;
+
+/// 打开 / 显示摄像头预览窗:无边框 / 置顶 / 可整窗拖拽,窗口不排除出捕获(与悬浮条相反)——
+/// 它本身就是画中画,桌面抓屏连人带窗录进视频,拖到哪视频里就在哪。
+/// device 传给页面做 getUserMedia 设备匹配;取流失败由页面调 dismiss_cam_preview 自关闭。
+fn open_cam_preview(
+    app: &AppHandle,
+    pos: CamPosition,
+    device: Option<&str>,
+    screen: &ScreenEntry,
+) {
+    if let Some(w) = app.get_webview_window(CAM_PREVIEW_LABEL) {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    // 设备名经查询串传给页面(仅做包含匹配,够用;特殊字符先转义百分号与空格)
+    let query = device
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("?device={}", d.replace('%', "%25").replace(' ', "%20")))
+        .unwrap_or_default();
+    let preview = WebviewWindowBuilder::new(
+        app,
+        CAM_PREVIEW_LABEL,
+        WebviewUrl::App(format!("cam-preview.html{query}").into()),
+    )
+    .title("摄像头")
+    .inner_size(CAM_PREVIEW_W, CAM_PREVIEW_H)
+    .decorations(false)
+    // 保持不透明:透明窗口会迫使 WebView2 视频走软件合成,预览与成片都会掉帧卡顿
+    .skip_taskbar(true)
+    .always_on_top(true)
+    .resizable(false)
+    .shadow(false)
+    .focused(false)
+    .visible(true)
+    .build();
+    match preview {
+        Ok(w) => {
+            position_cam_preview(&w, pos, screen);
+        }
+        Err(e) => {
+            // 预览窗失败不影响录制本身,仅记日志(成片无画中画)
+            tracing::warn!("创建摄像头预览窗失败: {e}");
+        }
+    }
+}
+
+/// 把预览窗摆到录制屏幕的所选角落(屏幕坐标为物理像素,四边留 24 逻辑像素边距)。
+fn position_cam_preview(
+    preview: &tauri::WebviewWindow,
+    pos: CamPosition,
+    screen: &ScreenEntry,
+) {
+    let scale = preview.scale_factor().unwrap_or(1.0);
+    let w = CAM_PREVIEW_W * scale;
+    let h = CAM_PREVIEW_H * scale;
+    let margin = 24.0 * scale;
+    let (right, bottom) = match pos {
+        CamPosition::TopLeft => (false, false),
+        CamPosition::TopRight => (true, false),
+        CamPosition::BottomLeft => (false, true),
+        CamPosition::BottomRight => (true, true),
+    };
+    let x = screen.x as f64
+        + if right {
+            screen.width as f64 - w - margin
+        } else {
+            margin
+        };
+    let y = screen.y as f64
+        + if bottom {
+            screen.height as f64 - h - margin
+        } else {
+            margin
+        };
+    let _ = preview.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// 关闭摄像头预览窗(不存在则忽略)。
+fn close_cam_preview(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(CAM_PREVIEW_LABEL) {
+        let _ = w.hide();
+        let _ = w.close();
+    }
+}
+
+/// 摄像头预览窗自关闭(页面内 getUserMedia 取流失败时调用):录制继续,成片无画中画。
+#[tauri::command]
+pub fn dismiss_cam_preview(app: AppHandle) {
+    close_cam_preview(&app);
 }
 
 /// 还原并聚焦主窗口(录屏结束回到应用)。

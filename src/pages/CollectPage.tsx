@@ -179,9 +179,15 @@ function CountdownCell({ t }: { t: TaskItem }) {
 
 export function CollectPage({
   onNavigate,
+  detailId,
+  onDetailChange,
 }: {
   // 数据穿透:跳全量库查看本任务采集的内容(总任务 / 单次运行)
   onNavigate?: (key: PageKey, ctx?: TaskContentFilter) => void;
+  // 详情页任务 id:状态提升到 App(CollectPage 穿透跳走会卸载,本地 state 丢失,
+  // 从详情穿透再返回时会掉回列表);null = 显示任务列表
+  detailId: string | null;
+  onDetailChange: (id: string | null) => void;
 }) {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [industries, setIndustries] = useState<IndustryView[]>([]);
@@ -346,8 +352,6 @@ export function CollectPage({
   const [industryFilter, setIndustryFilter] = useState<string>("__all");
   const [sidebarCollapsed, setSidebarCollapsed] = useResponsiveCollapse();
   const [formOpen, setFormOpen] = useState(false);
-  // 详情页 task id;非空时整页切到 TaskDetailPage
-  const [detailId, setDetailId] = useState<string | null>(null);
   const [editingTask, setEditingTask] = useState<TaskItem | null>(null);
   // 表单模式:keyword=关键词采集(默认);targeted=定向采集(按账号主页/内容链接)
   const [formMode, setFormMode] = useState<"keyword" | "targeted">("keyword");
@@ -465,6 +469,17 @@ export function CollectPage({
       .catch((e) => toast.error(`删除失败: ${e}`));
   }
 
+  // 只删任务本体:采集数据 / 执行历史 / 媒体文件全部保留
+  function deleteTaskOnly(id: string) {
+    api
+      .removeTaskOnly(id)
+      .then(() => {
+        toast.success("任务已删除,采集数据保留");
+        reload();
+      })
+      .catch((e) => toast.error(`删除失败: ${e}`));
+  }
+
   function handleSaveTask(input: TaskInput) {
     api
       .upsertTask(input)
@@ -492,7 +507,7 @@ export function CollectPage({
     setFormOpen(true);
   }
   function onDetail(t: TaskItem) {
-    setDetailId(t.id);
+    onDetailChange(t.id);
   }
 
   // 列工厂:active / archive 共用大部分列,进度列仅 active 显示
@@ -963,6 +978,7 @@ export function CollectPage({
           isArchive={isArchive}
           onUpdate={updateTask}
           onDelete={deleteTask}
+          onDeleteTask={deleteTaskOnly}
           onEdit={onEdit}
           onDetail={onDetail}
           onNavigate={onNavigate}
@@ -988,8 +1004,9 @@ export function CollectPage({
       <TaskDetailPage
         task={detailTask}
         platformName={platformName}
-        onBack={() => setDetailId(null)}
+        onBack={() => onDetailChange(null)}
         onNavigate={onNavigate}
+        onRefresh={reload}
       />
     );
   }
@@ -1397,6 +1414,7 @@ const TaskActionsCell = memo(function TaskActionsCell({
   isArchive,
   onUpdate,
   onDelete,
+  onDeleteTask,
   onEdit,
   onDetail,
   onNavigate,
@@ -1406,6 +1424,7 @@ const TaskActionsCell = memo(function TaskActionsCell({
   isArchive: boolean;
   onUpdate: (id: string, patch: Partial<TaskItem>) => void;
   onDelete: (id: string) => void;
+  onDeleteTask: (id: string) => void;
   onEdit: (t: TaskItem) => void;
   onDetail: (t: TaskItem) => void;
   // 数据穿透:跳全量库按本任务过滤,仅有采集内容时可用
@@ -1414,6 +1433,7 @@ const TaskActionsCell = memo(function TaskActionsCell({
 }) {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteTaskOpen, setDeleteTaskOpen] = useState(false);
   // 导出进行中(防重复点击)
   const [exporting, setExporting] = useState(false);
 
@@ -1519,7 +1539,15 @@ const TaskActionsCell = memo(function TaskActionsCell({
             onClick={() => setDeleteOpen(true)}
           >
             <Trash2 className="size-3.5" />
-            删除
+            删除数据
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="cursor-pointer text-destructive focus:text-destructive"
+            title="仅删除任务定义,已采集的内容、评论与媒体文件全部保留"
+            onClick={() => setDeleteTaskOpen(true)}
+          >
+            <Trash2 className="size-3.5" />
+            删除任务
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -1553,9 +1581,10 @@ const TaskActionsCell = memo(function TaskActionsCell({
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>删除任务</AlertDialogTitle>
+            <AlertDialogTitle>删除数据</AlertDialogTitle>
             <AlertDialogDescription>
-              将永久删除任务「{task.name}」及其采集记录,此操作不可恢复。
+              将永久删除任务「{task.name}」及其全部采集内容、评论与已下载的媒体文件(封面
+              / 音频 / 视频 / 图集),此操作不可恢复。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1565,6 +1594,29 @@ const TaskActionsCell = memo(function TaskActionsCell({
               onClick={() => {
                 onDelete(task.id);
                 setDeleteOpen(false);
+              }}
+            >
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={deleteTaskOpen} onOpenChange={setDeleteTaskOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除任务</AlertDialogTitle>
+            <AlertDialogDescription>
+              仅删除任务「{task.name}」本身,已采集的内容、评论、执行历史与已下载的媒体文件全部保留。此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer">取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="cursor-pointer bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => {
+                onDeleteTask(task.id);
+                setDeleteTaskOpen(false);
               }}
             >
               确认删除
