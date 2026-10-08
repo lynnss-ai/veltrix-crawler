@@ -17,7 +17,7 @@ use veltrix_core::config::{AppConfig, PlatformConfig};
 use crate::cookie::{Account, AccountStatus, CookiePool};
 use veltrix_core::error::{CrawlerError, Result};
 use crate::webview::pool::WebviewPool;
-use crate::webview::{CollectControl, InterceptChannel, RpaChannel};
+use crate::webview::{CollectControl, InterceptChannel};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
@@ -48,8 +48,6 @@ pub struct AppState {
     pub publish: Arc<crate::publish::PublishAccounts>,
     pub webviews: Arc<WebviewPool>,
     pub intercept_channel: Arc<InterceptChannel>,
-    /// 拟人 RPA 运行结果回传通道(`rpa_done` 命令写入,采集端等待)。
-    pub rpa_channel: Arc<RpaChannel>,
     /// 采集中断控制(`stop_collect` 命令写入,采集循环读取以优雅停止)。
     pub collect_control: Arc<CollectControl>,
     /// 当前登录用户会话态;登录前为 None。
@@ -87,6 +85,16 @@ pub struct AppState {
 /// 全局同时进行的采集任务数上限(占用 WebView 窗口的阶段)。取 3:兼顾吞吐与资源占用,
 /// 不同账号 / 平台仍可并行,但不会因调度同点拉起一堆任务而一次性弹出过多窗口。
 pub const MAX_CONCURRENT_COLLECT: usize = 3;
+
+/// 实际生效的采集并发上限:低配设备降到 2——每个采集 WebView 都是独立进程树,
+/// 弱 CPU / 小内存机器三窗同开会把整窗渲染和 RPA 响应全部拖垮(低配判定见 hardware)。
+pub fn max_concurrent_collect() -> usize {
+    if crate::hardware::is_low_spec() {
+        2
+    } else {
+        MAX_CONCURRENT_COLLECT
+    }
+}
 
 /// 账号采集锁的 key 口径(平台-账号):全工程统一从这生成,防手写 format! 漂移
 pub(crate) fn account_lock_key(platform: &str, account_id: &str) -> String {

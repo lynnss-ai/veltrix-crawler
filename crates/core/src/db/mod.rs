@@ -415,6 +415,8 @@ pub async fn init_schema(db: &DatabaseConnection) -> Result<()> {
     // (布尔默认值必须用 FALSE 而非 0:PG 布尔列不接受整数默认值,SQLite ≥3.23 两种写法都认)
     for (col, ddl) in [
         ("collect_comments", "ALTER TABLE tasks ADD COLUMN collect_comments BOOLEAN NOT NULL DEFAULT FALSE"),
+        // 轻载模式默认 TRUE:存量任务也享受省流/弱机降载,需要看画面的任务可单独关
+        ("light_load", "ALTER TABLE tasks ADD COLUMN light_load BOOLEAN NOT NULL DEFAULT TRUE"),
         ("comment_time_range", "ALTER TABLE tasks ADD COLUMN comment_time_range TEXT NOT NULL DEFAULT 'any'"),
         ("comment_limit", "ALTER TABLE tasks ADD COLUMN comment_limit INTEGER NOT NULL DEFAULT 0"),
         ("analyze_comment_intent", "ALTER TABLE tasks ADD COLUMN analyze_comment_intent BOOLEAN NOT NULL DEFAULT FALSE"),

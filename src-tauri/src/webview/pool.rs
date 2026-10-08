@@ -21,10 +21,10 @@ use crate::webview::jev_risk;
 use crate::webview::{
     build_comment_scroll_eval, build_detail_eval, build_hud_init_script, build_hud_keyword_eval,
     build_hud_log_eval, build_hud_session_eval, build_hud_status_eval, build_hud_status_eval_state,
-    build_hud_task_eval, build_human_rpa_script, build_intercept_init_script, build_scroll_eval,
-    build_search_eval, build_select_eval, build_set_session_eval, build_ssr_first_screen_eval,
-    emit_collect_log, CollectControl, InterceptChannel, InterceptedResponse, RpaChannel,
-    SSR_FALLBACK_URL_PREFIX,
+    build_hud_task_eval, build_intercept_init_script, build_locate_point_eval, build_scroll_eval,
+    build_search_eval, build_select_eval, build_select_point_eval, build_set_session_eval,
+    build_set_value_eval, build_ssr_first_screen_eval, emit_collect_log, CollectControl,
+    InterceptChannel, InterceptedResponse, SSR_FALLBACK_URL_PREFIX,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,15 +55,20 @@ const COMMENT_STAGNANT_STOP: u32 = 2;
 /// 慢网络请求往返久,容忍更大轮数,避免网络抖动被误判成「没数据」而提前结束。
 /// 取 20:每轮连滚动带停顿约 3~6 秒,≈ 1~2 分钟等待上限,覆盖弱网首屏慢加载。
 const NO_RESPONSE_STOP: u32 = 20;
+/// RPA 真实滚轮路径的停滞阈值:单轮无新增是常态——滚轮未触发新页请求、翻页边界
+/// 重复回包、响应迟到下一轮才计入,旧路径 1/3 的阈值会把这类正常节奏误报成风控
+/// (实际没有弹窗)。连续 3 轮才预警(且不再直接喊风控)、6 轮才判到底。
+const RPA_STAGNANT_WARN: u32 = 3;
+const RPA_STAGNANT_STOP: u32 = 6;
 /// 检测到安全验证弹窗后,等待用户手动完成的最长时长:超时仍未完成则结束本次采集(已采数据已保留)。
 const VERIFY_WAIT_MAX: Duration = Duration::from_secs(180);
 /// 验证弹窗等待期间的轮询间隔。
 const VERIFY_POLL: Duration = Duration::from_secs(2);
-/// 每次滚动后的拟人停顿区间(毫秒):2~4 秒随机,避免匀速快速滚动触发风控。
-/// 下限取 2s:信息流接口往返常需 ~2s,停顿过短会在数据返回前就读快照,
-/// 误报「无新增」导致提前结束;上限 4s:兼顾采集效率与拟人。
-const SCROLL_PAUSE_MIN_MS: u64 = 2000;
-const SCROLL_PAUSE_SPAN_MS: u64 = 2000;
+/// 每次滚动后的拟人停顿区间(毫秒):1.5~3 秒随机,避免匀速快速滚动触发风控。
+/// 曾取 2~4s(顾虑信息流接口往返 ~2s,停顿过短会在数据返回前读快照误报「无新增」);
+/// 实测停滞有 3/6 轮缓冲且迟到响应下轮仍会计数,1.5s 下限安全,采集节奏快 ~30%。
+const SCROLL_PAUSE_MIN_MS: u64 = 1500;
+const SCROLL_PAUSE_SPAN_MS: u64 = 1500;
 /// 评论区滚动停顿区间:1~2 秒随机,比内容滚动(2~6s)更短(评论分页更轻、需更快翻完)。
 const COMMENT_PAUSE_MIN_MS: u64 = 1000;
 const COMMENT_PAUSE_SPAN_MS: u64 = 1000;
@@ -78,6 +83,17 @@ const COMMENT_TAB_SETTLE_MS: u64 = 800;
 const COMMENT_WHEEL_RIGHT_X_RATIO: f32 = 0.85;
 #[cfg(windows)]
 const COMMENT_WHEEL_RIGHT_Y_RATIO: f32 = 0.55;
+
+/// 停滞期额外停顿:每多停滞一轮 +3s、封顶 +9s。
+/// 旧版每轮 +15s 无封顶,停滞 3 轮就累计 +90s——实测停滞多为翻页边界/懒加载延迟
+/// (数秒内自愈,内容恢复与长停顿无因果),长等不加速恢复、纯拖慢采集。
+fn stagnation_extra(stagnant: u32, warn_at: u32) -> Duration {
+    if stagnant < warn_at {
+        return Duration::ZERO;
+    }
+    let steps = (stagnant - warn_at + 1) as u64;
+    Duration::from_secs(3 * steps.min(3))
+}
 
 /// 生成 2~4 秒的随机滚动停顿。无 rand 依赖,用系统时间纳秒做廉价熵源,拟人足够。
 fn random_scroll_pause() -> Duration {
@@ -95,6 +111,65 @@ fn random_comment_scroll_pause() -> Duration {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     Duration::from_millis(COMMENT_PAUSE_MIN_MS + nanos % COMMENT_PAUSE_SPAN_MS)
+}
+
+/// 生成 [min_ms, max_ms) 区间的随机毫秒数(拟人节奏用;无 rand 依赖,同上用时间熵)。
+fn rand_ms(min_ms: u64, max_ms: u64) -> u64 {
+    if max_ms <= min_ms {
+        return min_ms;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    min_ms + nanos % (max_ms - min_ms)
+}
+
+/// 轮询定位元素到视口坐标:单发同步脚本(`build_locate_point_eval`,ExecuteScript 不
+/// await Promise)按拟人节奏 180~360ms 一轮,直到命中或超时。命中返回视口 CSS 像素
+/// 中心坐标(与 CDP Input 同坐标系),供受信点击/输入;超时返回 None。
+/// 非 Windows:eval_json_window 恒 None,等待期后判败,由上层退页内合成路径。
+async fn locate_point(
+    window: &WebviewWindow,
+    selector: &str,
+    timeout_ms: u64,
+) -> Option<(i32, i32)> {
+    let script = build_locate_point_eval(selector);
+    let start = std::time::Instant::now();
+    loop {
+        let hit = crate::webview::script_eval::eval_json_window(window, &script)
+            .await
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|v| {
+                let x = v.get("x")?.as_i64()? as i32;
+                let y = v.get("y")?.as_i64()? as i32;
+                Some((x, y))
+            });
+        if hit.is_some() {
+            return hit;
+        }
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(rand_ms(180, 360))).await;
+    }
+}
+
+/// 单发按文案定位(匹配口径与 build_select_eval 一致):命中返回坐标,未命中返回 None。
+/// 与轮询版不同,不重试——「没有可点的」本身就是结论(翻页按钮不存在 / 已置灰)。
+async fn select_point(window: &WebviewWindow, labels: &[String]) -> Option<(i32, i32)> {
+    if labels.is_empty() {
+        return None;
+    }
+    let script = build_select_point_eval(labels);
+    crate::webview::script_eval::eval_json_window(window, &script)
+        .await
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|v| {
+            let x = v.get("x")?.as_i64()? as i32;
+            let y = v.get("y")?.as_i64()? as i32;
+            Some((x, y))
+        })
 }
 
 /// 排序方式 → 结果页排序按钮文案候选(多候选覆盖平台差异)。synthetic(综合)默认不点。
@@ -299,7 +374,12 @@ async fn click_filter_labels(
             }
         }
     }
-    // 合成点击(非 secsdk 平台如小红书,或真实点击不可用时兜底);定位已命中,文案存在。
+    // CDP 受信点击(次选):经浏览器输入管线产生 pointer+mouse 全链受信事件,
+    // 页内 dispatchEvent 合成事件 isTrusted=false 平台可辨,能受信就不合成
+    if crate::webview::cdp::trusted_click(window, cx, cy).await.is_ok() {
+        return true;
+    }
+    // 合成点击(最后兜底:CDP 亦不可用的非 Windows 等);定位已命中,文案存在。
     // 返回 false:本次走的是合成点击(非真实/消息点击),供上层日志正确标注「合成点击」。
     let _ = window.eval(build_select_eval(labels));
     false
@@ -307,13 +387,86 @@ async fn click_filter_labels(
 
 /// 在结果页按任务排序/时间做 RPA 文案点击(综合/不限默认不点)。点击后留停顿等结果刷新。
 /// 抖音等选项藏在「筛选」浮层里的平台,先展开面板再点;面板同时含排序与时间两段,展开一次即可。
-async fn apply_sort_time(
+struct FilterApply<'a> {
+    window: &'a WebviewWindow,
+    platform_id: &'a str,
+    sort_mode: &'a str,
+    time_range: &'a str,
+    extra_filters: &'a [String],
+    sink: Option<&'a ResponseSink>,
+}
+
+fn xhs_search_response_count(sink: Option<&ResponseSink>) -> usize {
+    sink.and_then(|s| s.lock().ok())
+        .map(|buf| buf.iter().filter(|response| {
+            response.url.contains("/search/notes")
+                && serde_json::from_str::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|body| body.pointer("/data/items").and_then(|items| items.as_array()).map(|_| ()))
+                    .is_some()
+        }).count())
+        .unwrap_or(0)
+}
+
+fn clear_xhs_filter_buffer(ctx: &FilterApply<'_>) {
+    if ctx.platform_id != "xhs" {
+        return;
+    }
+    if let Some(sink) = ctx.sink {
+        if let Ok(mut buf) = sink.lock() {
+            buf.clear();
+        }
+    }
+    let _ = ctx.window.eval(
+        "(function(){ if (window.__veltrixBuf) window.__veltrixBuf.length = 0; })();",
+    );
+}
+
+async fn confirm_xhs_filter(ctx: &FilterApply<'_>, before: usize, label: &str) -> bool {
+    if ctx.platform_id != "xhs" {
+        return true;
+    }
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if xhs_search_response_count(ctx.sink) > before {
+            return true;
+        }
+        if collect_window_gone(ctx.window) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let _ = ctx.window.eval(build_hud_log_eval(
+        "error",
+        &format!("筛选「{label}」后未收到新的笔记结果 · 停止本轮采集"),
+    ));
+    false
+}
+
+async fn wait_xhs_search_response(
     window: &WebviewWindow,
-    platform_id: &str,
-    sort_mode: &str,
-    time_range: &str,
-    extra_filters: &[String],
-) {
+    sink: Option<&ResponseSink>,
+    before: usize,
+    timeout_ms: u64,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if xhs_search_response_count(sink) > before {
+            return true;
+        }
+        if collect_window_gone(window) || start.elapsed().as_millis() as u64 >= timeout_ms {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn apply_sort_time(ctx: FilterApply<'_>) -> bool {
+    let window = ctx.window;
+    let platform_id = ctx.platform_id;
+    let sort_mode = ctx.sort_mode;
+    let time_range = ctx.time_range;
+    let extra_filters = ctx.extra_filters;
     let sort_lbls = sort_labels(sort_mode);
     let time_lbls = time_labels(time_range);
     // 诊断:打印本次筛选入参,便于核对「为何没点筛选」(默认态会跳过)
@@ -330,7 +483,7 @@ async fn apply_sort_time(
             "info",
             "🎛️ 综合 + 不限 + 无额外筛选 = 默认态,跳过筛选点击(要应用筛选请在任务里改排序/时间)",
         ));
-        return;
+        return true;
     }
     // 抖音/TikTok(secsdk)用真实鼠标点击,合成点击会被 isTrusted 校验判伪("点了又还原")
     let real = needs_real_click(platform_id);
@@ -339,26 +492,34 @@ async fn apply_sort_time(
     open_filter_panel(window, platform_id, real).await;
     let tag = |ok: bool| if ok { "真实点击" } else { "合成点击" };
     if !sort_lbls.is_empty() {
+        clear_xhs_filter_buffer(&ctx);
+        let before = xhs_search_response_count(ctx.sink);
         let ok = click_filter_with_retry(window, platform_id, &sort_lbls, real).await;
         let _ = window.eval(build_hud_log_eval(
             "info",
             &format!("应用排序:{sort_mode} · {}", tag(ok)),
         ));
         tokio::time::sleep(Duration::from_millis(FILTER_APPLY_WAIT_MS)).await;
+        if !confirm_xhs_filter(&ctx, before, sort_mode).await { return false; }
     }
     if !time_lbls.is_empty() {
+        clear_xhs_filter_buffer(&ctx);
+        let before = xhs_search_response_count(ctx.sink);
         let ok = click_filter_with_retry(window, platform_id, &time_lbls, real).await;
         let _ = window.eval(build_hud_log_eval(
             "info",
             &format!("应用时间筛选:{time_range} · {}", tag(ok)),
         ));
         tokio::time::sleep(Duration::from_millis(FILTER_APPLY_WAIT_MS)).await;
+        if !confirm_xhs_filter(&ctx, before, time_range).await { return false; }
     }
     // 平台专属额外筛选:在已展开的同一浮层里按选中文案逐个点击(抖音视频时长/搜索范围/内容形式)
     for text in extra_filters {
         if text.is_empty() {
             continue;
         }
+        clear_xhs_filter_buffer(&ctx);
+        let before = xhs_search_response_count(ctx.sink);
         let ok =
             click_filter_with_retry(window, platform_id, std::slice::from_ref(text), real).await;
         let _ = window.eval(build_hud_log_eval(
@@ -366,7 +527,9 @@ async fn apply_sort_time(
             &format!("应用筛选:{text} · {}", tag(ok)),
         ));
         tokio::time::sleep(Duration::from_millis(FILTER_APPLY_WAIT_MS)).await;
+        if !confirm_xhs_filter(&ctx, before, text).await { return false; }
     }
+    true
 }
 
 /// 采集窗口是否已被关闭(销毁):用 Tauri 权威句柄判断,关窗后 get_webview_window 返回 None。
@@ -530,14 +693,21 @@ fn build_search_query(collect: &CollectConfig, sort_mode: &str, time_range: &str
 /// 给页面完成导航 + 挂载 hook 留时间;此前命中的首屏请求由页内缓冲兜底,不会漏抓。
 const NAV_SETTLE_MS: u64 = 2500;
 /// 导航后等「首个拦截响应」的上限(毫秒):健康页面通常几百毫秒内回包,
-/// 此上限主要兜底弱网 / 页面无响应场景,超时后按旧行为继续,不阻断采集。
-const NAV_RESPONSE_WAIT_MS: u64 = 8000;
+/// 此上限主要兜底弱网 / 电脑卡顿导致页面迟迟不出响应的场景,超时后按旧行为继续,不阻断采集。
+/// 取 20s(2026-09-23 由 8s 调大):开机冷启动 + 弱网下 8s 常不够,误走「固定等待继续」
+/// 分支后注入的 RPA 脚本可能被仍在途的页面加载冲掉;有响应即提前返回,只拖慢病态路径。
+const NAV_RESPONSE_WAIT_MS: u64 = 20_000;
 
 /// 拟人 RPA(仅"输入关键词 + 点搜索",滚动已独立由 Rust 真实滚轮跑)的最长等待(毫秒)。
 /// 不能太长:点搜索常触发页面跳转 → RPA 脚本上下文被销毁、done() 回不来,死等就会白卡到超时
 /// (曾设 180s,实测整轮采集"中间卡 ~3 分钟"即源于此)。20s 足够输入+点击+搜索结果返回;
 /// 真正"结果就绪"由「拦到 /search/notes」判定,先到即走。
 const RPA_RUN_TIMEOUT_MS: u64 = 20_000;
+
+/// 重试轮 RPA 的整体预算(毫秒)。首轮 20s 是健康页面的值;卡顿机器上重试轮此前也在 20s 内
+/// 被总超时砍掉(逐字输入 / hover 停顿在冷机器上都可能秒级卡顿),给到 30s。
+/// 只作用于首轮失败后的原地重试,健康路径零影响。
+const RPA_RETRY_RUN_TIMEOUT_MS: u64 = 30_000;
 
 /// RPA 跑完注入 session 回放页内缓冲后的收尾等待(毫秒),让回放的 `intercept_push` 到齐再取走。
 const REPLAY_SETTLE_MS: u64 = 1500;
@@ -582,8 +752,12 @@ const COMMENT_API_STALL_SECS: u64 = 90;
 /// 会话,只需等一次;2s 仅覆盖「生成得慢」的极小概率,阶段内其余视频不再等待。
 const MS_TOKEN_GEN_WAIT_MS: u64 = 2000;
 
+/// 小红书详情批量直采的并发 lanes(用户指定 5~10 区间,取中偏保守值;页内另钳 1~10)。
+/// 调节数值即改变请求密度,无需动脚本结构。
+const XHS_DETAIL_BATCH_LANES: usize = 6;
+
 /// 评论 API 直采(抖音)的尝试结果。
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum CommentApiOutcome {
     /// 直采完成:评论响应已进会话缓冲(与滚动路径同轨),调用方直接收尾。
     Done,
@@ -612,6 +786,7 @@ impl XhsApiKind {
 /// 小红书页内直采调用参数,集中封装以保持函数参数简洁。
 struct XhsApiRun<'a> {
     window: &'a WebviewWindow,
+    cfg: &'a PlatformConfig,
     session_id: u64,
     content_id: &'a str,
     xsec_token: &'a str,
@@ -622,6 +797,42 @@ struct XhsApiRun<'a> {
     /// 原生拦截缓冲:与 session 通道(session_len)一起作为停滞看门狗的增长信号,
     /// 只探一边会漏判(响应到底走哪条通道取决于窗口是否开了原生拦截)。
     sink: Option<&'a Arc<Mutex<Vec<InterceptedResponse>>>>,
+}
+
+struct XhsApiAttempt {
+    outcome: CommentApiOutcome,
+    kind: &'static str,
+    pages: usize,
+}
+
+fn xhs_api_error_kind(error: &str) -> &'static str {
+    if error.starts_with("signer-unavailable") {
+        "signer-unavailable"
+    } else if error.starts_with("non-json") {
+        "blocked-or-non-json"
+    } else if error.starts_with("api-rejected") || error.starts_with("official-api-rejected") {
+        "platform-rejected"
+    } else if error.starts_with("page-fetch-failed") {
+        "page-fetch-failed"
+    } else if error.starts_with("detail-not-found") || error.starts_with("missing-note-id") {
+        "invalid-note"
+    } else if error.is_empty() {
+        "none"
+    } else {
+        "network-error"
+    }
+}
+
+struct CommentScrollRun<'a> {
+    window: &'a WebviewWindow,
+    cfg: &'a PlatformConfig,
+    content_id: &'a str,
+    xsec_token: &'a str,
+    session_id: u64,
+    sink: Option<&'a ResponseSink>,
+    adapter: &'a Arc<dyn PlatformAdapter>,
+    limit: usize,
+    skip_xhs_api: bool,
 }
 
 /// 画像补采(抖音):主页导航后等画像接口响应的轮询上限(秒)。画像接口加载即发、
@@ -806,7 +1017,8 @@ mod win_wheel {
     }
 
     /// 给 `parent`(Tauri 窗口)下的 WebView2 渲染子窗口投递一次滚轮。notches 负值下滚。
-    /// 落点取窗口中心(适配整页滚动 / 评论在下方的布局)。
+    /// 落点取窗口中心——注意默认 HUD(左下 50vw×55vh)恰好覆盖中心,滚动采集路径
+    /// 应优先用 `wheel_page`(动态避让 HUD),仅无 HUD 覆盖风险的固定落点场景直接用本函数。
     pub fn real_wheel(parent: HWND, notches: i32) -> Result<()> {
         real_wheel_at(parent, notches, 0.5, 0.5)
     }
@@ -884,6 +1096,59 @@ fn scroll_once(window: &WebviewWindow, notches: i32) {
     let _ = window.eval(&build_wheel_eval());
 }
 
+/// 探测一个不被 HUD 遮挡的滚轮落点(返回视口比例 [fx, fy])。HUD 覆盖在页面上
+/// (pointer-events:auto)且日志区自身是可滚容器,滚轮落点若压进 HUD 会被日志区吃掉、
+/// 页面收不到真实滚轮——表现为「翻页日志在刷、页面纹丝不动、懒加载不触发」。
+/// 候选优先右侧与中上(默认 HUD 在左下 50vw×55vh,正中心已被其覆盖),HUD 被拖走后
+/// 按候选序自动退让到空位。
+#[cfg(windows)]
+const FREE_WHEEL_POINT_JS: &str = r#"(function () {
+  var hud = document.getElementById('veltrix-hud');
+  var r = hud && hud.getBoundingClientRect();
+  var m = 32;
+  var cands = [
+    [0.62, 0.45], [0.72, 0.42], [0.55, 0.32], [0.82, 0.50],
+    [0.72, 0.64], [0.50, 0.22], [0.35, 0.35], [0.22, 0.45], [0.15, 0.55]
+  ];
+  function free(p) {
+    if (!r || r.width <= 0 || r.height <= 0) return true;
+    var x = p[0] * innerWidth, y = p[1] * innerHeight;
+    return x < r.left - m || x > r.right + m || y < r.top - m || y > r.bottom + m;
+  }
+  for (var i = 0; i < cands.length; i++) if (free(cands[i])) return cands[i];
+  return [0.62, 0.45];
+})()"#;
+
+/// 给页面投递一次真实滚轮,落点每轮重新探测以避开 HUD(HUD 可被用户随时拖动)。
+/// `hud_log` 非 None 时进度日志与落点探测合并为单次往返——滚动每轮都打进度日志,
+/// 合并后每轮省一次 ExecuteScript。Windows 走 WM_MOUSEWHEEL(小红书等只认真滚轮事件);
+/// 其它平台退化为合成 WheelEvent。
+async fn wheel_page(window: &WebviewWindow, notches: i32, hud_log: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let script = match hud_log {
+            Some(msg) => format!("{}{FREE_WHEEL_POINT_JS}", build_hud_log_eval("info", &msg)),
+            None => FREE_WHEEL_POINT_JS.to_string(),
+        };
+        let (fx, fy) = crate::webview::script_eval::eval_json_window(window, &script)
+            .await
+            .and_then(|json| serde_json::from_str::<[f32; 2]>(&json).ok())
+            .map(|p| (p[0], p[1]))
+            .unwrap_or((0.62, 0.45));
+        // HWND 非 Send:在 await 之后才获取,不跨 await 持有
+        let parent = window
+            .hwnd()
+            .map_err(|e| CrawlerError::Config(format!("获取窗口 HWND 失败: {e}")))?;
+        win_wheel::real_wheel_at(parent, notches, fx, fy)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (notches, hud_log);
+        let _ = window.eval(&crate::webview::build_wheel_eval());
+        Ok(())
+    }
+}
+
 /// 创建 / 复用窗口所需的描述。集中成结构体以遵守「参数 ≤ 4」。
 struct WindowSpec<'a> {
     platform: &'a str,
@@ -913,6 +1178,9 @@ pub struct WebviewPool {
     windows: Mutex<HashMap<String, WebviewWindow>>,
     /// label -> 原生网络拦截缓冲。每窗口装一次拦截器,采集时清空/取走。
     sinks: Mutex<HashMap<String, ResponseSink>>,
+    /// label -> 轻载模式开关(请求层拦截页面视频/字体,图片放行)。
+    /// 创建窗口时装一次拦截器,任务开窗前按任务配置拨动(默认开,见 set_light_load)。
+    media_block: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     /// 被用户手动关闭的「采集窗口」label 集合(窗口创建时挂 Destroyed 监听写入)。
     /// 采集主循环据此终止整个任务,而非重建新窗口继续采集;任务开始时由调用方清除。
     user_closed_collect: Arc<Mutex<HashSet<String>>>,
@@ -1041,6 +1309,11 @@ impl WebviewPool {
         self.remember(&label, window.clone())?;
         // 采集窗口(with_hud)缓冲不限长;登录/访问平台窗口长期开着,限长防内存膨胀
         self.ensure_intercept(&label, window.as_ref(), spec.patterns, None, !spec.with_hud);
+        // 轻载模式:采集窗口装请求层媒体拦截器(视频/字体,图片放行),开关由任务拨动(默认开)
+        if spec.with_hud {
+            let flag = self.media_block_flag(&label);
+            crate::webview::media_block::install(window.as_ref(), flag);
+        }
         // 采集窗口挂关闭监听:用户手动关闭窗口 → 记下该 label,采集主循环据此终止任务,
         // 而非为后续关键词 / 评论重建新窗口继续采集。仅采集窗口(with_hud)需要。
         if spec.with_hud {
@@ -1152,6 +1425,24 @@ impl WebviewPool {
     /// 取某窗口的原生拦截缓冲(collect 用于清空/取走本轮命中响应)。
     fn window_sink(&self, label: &str) -> Option<ResponseSink> {
         self.sinks.lock().ok().and_then(|m| m.get(label).cloned())
+    }
+
+    /// 取某窗口的轻载模式开关(Arc 句柄,拦截器与拨动方共享);没有则建一把(默认开)。
+    fn media_block_flag(
+        &self,
+        label: &str,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let mut map = self.media_block.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(label.to_string())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .clone()
+    }
+
+    /// 拨动某采集窗口的轻载模式开关(页面视频/字体请求层拦截,图片放行,默认开)。
+    /// 任务在开窗前按任务配置调用;窗口未建时先记下值,创建时按此值生效。
+    pub fn set_light_load(&self, label: &str, on: bool) {
+        use std::sync::atomic::Ordering;
+        self.media_block_flag(label).store(on, Ordering::Relaxed);
     }
 
     /// 解析某账号的 WebView 独立数据目录并确保存在。
@@ -1553,8 +1844,6 @@ impl WebviewPool {
 pub struct CollectBridge {
     pool: Arc<WebviewPool>,
     channel: Arc<InterceptChannel>,
-    /// 拟人 RPA 运行结果通道;旧的「改 URL + 盲滚」路径不用,仅节点级 RPA 用。
-    rpa: Arc<RpaChannel>,
     /// 采集中断控制:HUD「结束」按钮触发后,采集循环据此优雅停止。
     control: Arc<CollectControl>,
 }
@@ -1626,6 +1915,31 @@ pub struct CollectRequest<'a> {
     /// 黑名单作者 uid 集合(owner+platform 维度):命中的内容直接排除——不计目标数、不增量发出、不落库。
     /// None=不过滤。
     pub blacklisted_uids: Option<&'a std::collections::HashSet<String>>,
+}
+
+/// RPA 搜索路径的智能滚动判定上下文:把旧路径 run_legacy_scroll 的
+/// 「达标即停 / 底部停滞 / 首屏等待 / 验证暂停」语义搬进真实滚轮循环。
+/// 此前 RPA 路径固定滚 segments 轮(40),重跑去重后新内容藏在更深处也不加滚,
+/// 目标数与轮数完全脱钩——本结构让滚动由「新内容是否还在增长」驱动。
+struct SmartScrollCtx<'a> {
+    /// 平台配置:验证特征(滚动期间命中风控要暂停等人工解除)等
+    cfg: &'a PlatformConfig,
+    /// 原生拦截缓冲:与 session 通道一起作为增量解析的数据源
+    sink: Option<&'a ResponseSink>,
+    /// 适配器:增量解析本轮响应、按去重 content_id 计数(只为判定进度,不落库)
+    adapter: Option<&'a Arc<dyn PlatformAdapter>>,
+    keyword: &'a str,
+    /// 目标采集条数;0(或无适配器)= 退回固定轮数盲滚(max_rounds)
+    target_count: usize,
+    /// 数据库已有 content_id 快照:命中者不计「新增」配额——重跑时旧内容不占目标,
+    /// 滚动会继续向更深处找未采内容,这正是固定 40 轮修不掉的问题
+    existing_ids: Option<&'a HashSet<String>>,
+    /// 最低点赞数:低于阈值不计目标(0=不限;点赞数缺失放行)
+    min_likes: i32,
+    /// 黑名单作者 uid 集合;None=不过滤
+    blacklisted_uids: Option<&'a HashSet<String>>,
+    /// 固定轮数上限(RPA 步骤 Scroll.segments):非智能模式的轮数;智能模式不设上限
+    max_rounds: u32,
 }
 
 /// 一次「单视频评论采集」调用的参数。集中成结构体以遵守「参数 ≤ 4」。
@@ -1723,7 +2037,6 @@ impl CollectBridge {
     pub fn new(
         pool: Arc<WebviewPool>,
         channel: Arc<InterceptChannel>,
-        rpa: Arc<RpaChannel>,
         control: Arc<CollectControl>,
     ) -> Self {
         // 注入页内信号桥用的控制句柄(重复注入忽略,首个生效)
@@ -1731,7 +2044,6 @@ impl CollectBridge {
         Self {
             pool,
             channel,
-            rpa,
             control,
         }
     }
@@ -1771,6 +2083,18 @@ impl CollectBridge {
     /// 任务开始前重置该任务的「结束」停止标记,避免上次运行的点击影响本次重跑。
     pub fn reset_task_stop(&self, task_id: &str) {
         self.control.clear_task(task_id);
+    }
+
+    /// 任务开窗前拨动该任务窗口的轻载模式开关(页面视频/字体请求层拦截,图片放行,默认开)。
+    pub fn set_light_load(
+        &self,
+        platform: &str,
+        account_id: &str,
+        task_id: Option<&str>,
+        on: bool,
+    ) {
+        self.pool
+            .set_light_load(&task_window_label(platform, account_id, task_id), on);
     }
 
     /// 该任务是否被 HUD「结束」按钮请求停止(按 task_id 登记,跨关键词稳定)。
@@ -1842,6 +2166,21 @@ impl CollectBridge {
         let mut responses = self.channel.take_session(session_id);
         if let Some(s) = sink {
             if let Ok(mut buf) = s.lock() {
+                responses.append(&mut buf);
+            }
+        }
+        responses
+    }
+
+    /// 批量评论回退时保留已采响应,同时继续复用当前会话接收下一条。
+    fn drain_collected_responses(
+        &self,
+        session_id: u64,
+        sink: Option<&ResponseSink>,
+    ) -> Vec<InterceptedResponse> {
+        let mut responses = self.channel.drain_session(session_id);
+        if let Some(sink) = sink {
+            if let Ok(mut buf) = sink.lock() {
                 responses.append(&mut buf);
             }
         }
@@ -2051,17 +2390,29 @@ impl CollectBridge {
             )
             .await
         } else {
+            let smart_ctx = SmartScrollCtx {
+                cfg,
+                sink: sink.as_ref(),
+                adapter: req.adapter.as_ref(),
+                keyword: req.keyword,
+                target_count: req.target_count,
+                existing_ids: req.existing_ids,
+                min_likes: req.min_likes,
+                blacklisted_uids: req.blacklisted_uids,
+                // 兜底值:RPA 步骤里的 Scroll.segments(小红书为 40)会覆盖;
+                // 智能模式下不再作为轮数上限,仅无适配器/无目标时作固定轮数
+                max_rounds: cfg.collect.scroll_rounds,
+            };
             self.run_human_rpa(
                 &window,
-                &cfg.id,
                 &cfg.collect.rpa_steps,
                 req.keyword,
                 session_id,
                 req.sort_mode,
                 req.time_range,
                 req.extra_filters,
-                &cfg.collect.search_url_template,
                 sink.as_ref(),
+                smart_ctx,
             )
             .await
         };
@@ -2417,13 +2768,8 @@ impl CollectBridge {
                         + self.channel.session_len(session_id);
                 }
                 let _ = window.eval(build_scroll_eval());
-                #[cfg(windows)]
-                if let Ok(parent) = window.hwnd() {
-                    // 每轮 10 个滚轮格:加大单轮滚动距离,更快触发分页加载
-                    let _ = win_wheel::real_wheel(parent, -10);
-                }
-                #[cfg(not(windows))]
-                let _ = window.eval(&crate::webview::build_wheel_eval());
+                // 每轮 10 个滚轮格:加大单轮滚动距离,更快触发分页加载
+                let _ = wheel_page(&window, -10, None).await;
                 // 每轮最长等 PROFILE_POSTS_ROUND_MS:期间每 PROFILE_POSTS_POLL_MS 检查一次
                 // 拦截总数,有新响应到达即提前进入下一轮(快时不空等);慢接口则等满整轮
                 let wait_start = std::time::Instant::now();
@@ -2855,7 +3201,14 @@ impl CollectBridge {
                 }
             }
         }
-        apply_sort_time(window, &cfg.id, eff_sort, eff_time, extra_filters).await;
+        let _ = apply_sort_time(FilterApply {
+            window,
+            platform_id: &cfg.id,
+            sort_mode: eff_sort,
+            time_range: eff_time,
+            extra_filters,
+            sink,
+        }).await;
 
         // 智能停止:有适配器 + 原生缓冲 + 目标数量时,边滚边按「去重 content_id」计数,
         // 达标即停;若连续无新增疑似风控,则预警并继续重试,达 STAGNANT_STOP 轮仍无新增则自动结束,
@@ -2919,26 +3272,21 @@ impl CollectBridge {
             })?;
             // 真实滚轮(WM_MOUSEWHEEL)兜底:快手/小红书等页面的结果列表在内部滚动容器里、
             // 且只认真实滚轮事件,程序 scrollTo 滚不动 document.body → 不触发翻页懒加载(卡在首屏)。
-            // 必须额外投递真实滚轮才会加载下一页。HWND 非 Send,即取即用,不跨 await 持有。
-            #[cfg(windows)]
-            if let Ok(parent) = window.hwnd() {
-                let _ = win_wheel::real_wheel(parent, -3);
-            }
-            // 非 Windows(mac 等):用合成 WheelEvent 触发懒加载,作为真实滚轮的对等实现
-            #[cfg(not(windows))]
-            let _ = window.eval(&crate::webview::build_wheel_eval());
+            // 必须额外投递真实滚轮才会加载下一页;落点避开 HUD(wheel_page 内部探测)。
+            let _ = wheel_page(window, -3, None).await;
             // 分页型结果页(B站等):滚动不触发翻页,滚到底后按文案点「下一页」请求下一页数据;
             // 按钮不存在 / 置灰(最后一页)时点击为空操作,由下方停滞判定兜底结束
             if !cfg.collect.next_page_texts.is_empty() {
-                let _ = window.eval(build_select_eval(&cfg.collect.next_page_texts));
+                // 文案定位 → 受信点击(trusted_click_at 内部 CDP 失败已退页内合成,匹配口径
+                // 与合成版一致);定位不到(按钮不存在/已置灰=最后一页)即空操作,由停滞判定兜底结束
+                if let Some((px, py)) = select_point(window, &cfg.collect.next_page_texts).await {
+                    self.trusted_click_at(window, px, py).await;
+                }
             }
             // 拟人:每次滚动后随机停顿 2~6 秒,不匀速快速滚动
             let mut pause = random_scroll_pause();
-            // 风控等待期间:每多等一轮,停顿额外 +15s 逐轮拉长,降低请求频率给手动验证留时间
-            if stagnant >= STAGNANT_LIMIT {
-                let extra_s = (stagnant - STAGNANT_LIMIT + 1) as u64 * 15;
-                pause += Duration::from_secs(extra_s);
-            }
+            // 停滞期逐轮拉长(+3s/轮,封顶 +9s):给懒加载喘息,不过度拖慢采集
+            pause += stagnation_extra(stagnant, STAGNANT_LIMIT);
             // 首屏尚未出内容:多为搜索接口还没返回,额外多等,避免「没等数据就空滚」漏抓(首次采集常见)
             if smart && seen.is_empty() {
                 pause += Duration::from_secs(3);
@@ -3159,21 +3507,248 @@ impl CollectBridge {
         Ok(())
     }
 
-    /// 节点级拟人 RPA 路径:注入步骤执行器(在搜索框逐字输入、点击、等待、分段滚动),
-    /// 全程在页面内拟人自驱动,跑完经 `rpa_done` 回传 ack。
+    /// 执行拟人搜索步骤(输入关键词 + 点搜索)并等「搜索结果响应」落地,返回是否拦到笔记结果。
+    /// 开跑前先等 document readyState=complete(≤10s):卡顿机器上页面加载中操作会被
+    /// 随后的导航提交冲掉(表现为全空、页面反复闪)。成败以「拦到 /search/notes(含数据)」
+    /// 为准;步骤完成早于接口响应时给 3s 短收尾窗。
+    ///
+    /// 步骤由 **Rust 驱动**(旧版为页内脚本自驱动 + rpa_done ack,已废弃):定位用单发
+    /// 脚本轮询(慢页面在页内等,节奏与旧版一致),点击/输入走 CDP 受信事件——页内
+    /// dispatchEvent 合成事件 isTrusted=false 平台可辨(字节系 secsdk 已实锤校验),受信
+    /// 事件经浏览器输入管线产生、不抢焦点、多窗并行安全,逐字 insertText 保留拟人节奏;
+    /// CDP 不可用(非 Windows)时点击/打字退回页内合成脚本(旧行为等价),仍失败判败
+    /// 交由上层重试 / Jev 兜底(与旧版「脚本被冲掉判败」同语义)。
+    async fn rpa_search_once(
+        &self,
+        window: &WebviewWindow,
+        pre_steps: &[RpaStep],
+        keyword: &str,
+        session_id: u64,
+        platform_id: &str,
+        sink: Option<&ResponseSink>,
+        attempt: u32,
+    ) -> bool {
+        // 卡顿机器上页面可能仍在加载:此时注入的脚本会被随后的导航提交整页冲掉
+        // (表现为打字没发生、页面反复闪)。首轮等 readyState=complete(≤10s,超时照跑,
+        // 由上层重试兜底);重试轮改等「readyState + 搜索框出现在 DOM」并加长预算——
+        // 冷机器实测(整页加载 20s+)readyState 完成时 React 可能还没挂载搜索组件,
+        // 只看 readyState 会让定位在空页面上空转到超时。健康页面秒过,几乎零开销
+        if attempt == 0 {
+            let _ = self.wait_document_ready(window, session_id).await;
+        } else {
+            let node_selector = pre_steps.iter().find_map(|s| match s {
+                RpaStep::WaitFor { selector, .. } => Some(selector.as_str()),
+                _ => None,
+            });
+            let _ = self
+                .wait_search_page_interactive(window, session_id, node_selector, true)
+                .await;
+        }
+        for step in pre_steps {
+            // 手动结束 / 窗口已关:中止后续步骤(旧页内版经 __veltrixAbort,现 Rust 侧直判)
+            if self.control.is_stopping(session_id) || collect_window_gone(window) {
+                return false;
+            }
+            let ok = match step {
+                RpaStep::Pause { min_ms, max_ms } => {
+                    tokio::time::sleep(Duration::from_millis(rand_ms(*min_ms, *max_ms))).await;
+                    true
+                }
+                RpaStep::WaitFor { selector, timeout_ms } => {
+                    let sel = selector.replace("{keyword}", keyword);
+                    match locate_point(window, &sel, *timeout_ms).await {
+                        Some(_) => true,
+                        None => {
+                            let _ = window.eval(build_hud_log_eval(
+                                "warn",
+                                &format!("⚠️ RPA 等待节点超时({timeout_ms}ms): {sel}"),
+                            ));
+                            false
+                        }
+                    }
+                }
+                RpaStep::Click { selector } => {
+                    let sel = selector.replace("{keyword}", keyword);
+                    match locate_point(window, &sel, 10_000).await {
+                        None => {
+                            let _ = window.eval(build_hud_log_eval(
+                                "warn",
+                                &format!("⚠️ RPA 定位点击目标失败: {sel}"),
+                            ));
+                            false
+                        }
+                        Some((x, y)) => {
+                            // hover → 停顿 → 按下(旧页内版同款节奏)
+                            tokio::time::sleep(Duration::from_millis(rand_ms(120, 350))).await;
+                            if self.trusted_click_at(window, x, y).await {
+                                true
+                            } else {
+                                let _ = window.eval(build_hud_log_eval(
+                                    "warn",
+                                    &format!("⚠️ RPA 点击未生效: {sel}"),
+                                ));
+                                false
+                            }
+                        }
+                    }
+                }
+                RpaStep::Type { selector, text } => {
+                    let sel = selector.replace("{keyword}", keyword);
+                    let filled = text.replace("{keyword}", keyword);
+                    // 定位到可见输入框 → 受信打字;定位不到也**不放弃**——退「存在即写入」
+                    // 的原生 setter(旧页内版只要求元素存在,可见性要求更松),仍失败才判败
+                    let typed = match locate_point(window, &sel, 10_000).await {
+                        Some((x, y)) => {
+                            tokio::time::sleep(Duration::from_millis(rand_ms(150, 400))).await;
+                            self.type_text_at(window, &sel, &filled, x, y).await
+                        }
+                        None => false,
+                    };
+                    if typed {
+                        true
+                    } else {
+                        let ok = crate::webview::script_eval::eval_json_window(
+                            window,
+                            &build_set_value_eval(&sel, &filled),
+                        )
+                        .await
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                        let _ = window.eval(build_hud_log_eval(
+                            if ok { "info" } else { "warn" },
+                            &(if ok {
+                                format!("⌨️ 已写入关键词(定位不可见,经原生 setter 兜底)")
+                            } else {
+                                format!("⚠️ RPA 关键词写入失败: {sel}")
+                            }),
+                        ));
+                        ok
+                    }
+                }
+                RpaStep::PressEnter { selector } => {
+                    let sel = selector.replace("{keyword}", keyword);
+                    match locate_point(window, &sel, 10_000).await {
+                        None => {
+                            let _ = window.eval(build_hud_log_eval(
+                                "warn",
+                                &format!("⚠️ RPA 定位回车目标失败: {sel}"),
+                            ));
+                            false
+                        }
+                        Some((x, y)) => {
+                            // 点击聚焦后受信回车;聚焦失败即判败(该步无页内兜底,当前无平台配置使用)
+                            self.trusted_click_at(window, x, y).await
+                                && crate::webview::cdp::press_enter(window).await.is_ok()
+                        }
+                    }
+                }
+                // 滚动由调用方 Rust 真实滚轮驱动(run_human_rpa 拆出),此处跳过
+                RpaStep::Scroll { .. } => true,
+            };
+            if !ok {
+                return false;
+            }
+            // 步骤间自然间隔(旧页内版同款)
+            tokio::time::sleep(Duration::from_millis(rand_ms(200, 600))).await;
+        }
+        // 步骤全部执行完:给 HUD 一条确认行(远程诊断「关键词没填入」的关键观测点——
+        // 看到这行说明输入/点击都走通了,问题在结果接口;没看到则上面有具体失败步骤告警)
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            "⌨️ 关键词已输入 · 已触发搜索 · 等待结果接口…",
+        ));
+        // 等搜索结果响应(预算同旧版;重试轮放宽到 30s 见 RPA_RETRY_RUN_TIMEOUT_MS)
+        let run_wait_ms = if attempt == 0 {
+            RPA_RUN_TIMEOUT_MS
+        } else {
+            RPA_RETRY_RUN_TIMEOUT_MS
+        };
+        let mut hit = if platform_id == "xhs" {
+            wait_xhs_search_response(window, sink, 0, run_wait_ms).await
+        } else {
+            wait_intercepted(window, sink, "/search/notes", run_wait_ms).await
+        };
+        // 提交后接口响应可能略滞后于步骤完成;给页面一次短暂的异步收尾窗口。
+        if platform_id == "xhs" && !hit {
+            hit = wait_xhs_search_response(window, sink, 0, 3_000).await;
+        }
+        hit
+    }
+
+    /// 受信点击:CDP Input 域(Windows);失败退页内合成点击(非 Windows / 页面无响应)。
+    async fn trusted_click_at(&self, window: &WebviewWindow, x: i32, y: i32) -> bool {
+        if crate::webview::cdp::trusted_click(window, x, y).await.is_ok() {
+            return true;
+        }
+        crate::webview::script_eval::eval_json_window(
+            window,
+            &crate::webview::build_click_point_eval(x, y),
+        )
+        .await
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    }
+
+    /// 受信打字:点击聚焦后逐字 insertText(随机节奏,拟人),**回读校验值确实落上**
+    /// (聚焦落到覆盖层时文本不进框,误报成功比失败更难排查);校验不过或 CDP 不可用
+    /// 退原生 setter 一次写入(无合成键盘事件——假 keydown 的 isTrusted=false 属可辨特征)。
+    async fn type_text_at(
+        &self,
+        window: &WebviewWindow,
+        selector: &str,
+        text: &str,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        if self.trusted_click_at(window, x, y).await {
+            let mut typed = true;
+            for ch in text.chars() {
+                if crate::webview::cdp::insert_text(window, &ch.to_string())
+                    .await
+                    .is_err()
+                {
+                    typed = false;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(rand_ms(60, 160))).await;
+            }
+            if typed {
+                // 回读确认值已落上(聚焦漂移时 insertText 会静默丢失)
+                let ok = crate::webview::script_eval::eval_json_window(
+                    window,
+                    &crate::webview::build_verify_value_eval(selector, text),
+                )
+                .await
+                .map(|v| v == "true")
+                .unwrap_or(false);
+                if ok {
+                    return true;
+                }
+                tracing::warn!("insertText 后回读输入框值不符,退原生 setter 重写");
+            }
+        }
+        crate::webview::script_eval::eval_json_window(
+            window,
+            &build_set_value_eval(selector, text),
+        )
+        .await
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    }
+
+    /// 节点级拟人 RPA 路径:Rust 驱动步骤执行(搜索框受信输入、CDP 受信点击、分段真实滚动),
+    /// 定位等待在页面内轮询,成败以「拦到搜索结果接口」为准。
     ///
     /// session 时机:RPA 跑完(结果页已渲染、hook 必已挂)后才注入 session,回放滚动期间
     /// 命中的页内缓冲,避免依赖新窗口首页 hook 是否就绪。
     ///
-    /// ⚠️ 联调假设:RPA 步骤在单个页面上下文内一段跑完。若平台「点搜索」触发**整页导航**
-    /// 会销毁脚本上下文导致 ack 永不回传(超时降级)——届时需把步骤按导航点拆分多段注入,
-    /// 或改用 sessionStorage 持久化 session + initialization_script 续跑。小红书搜索为
+    /// ⚠️ 联调假设:步骤在单个页面上下文内一段跑完。若平台「点搜索」触发**整页导航**,
+    /// 后续定位会拿不到元素(判败降级)——届时需把步骤按导航点拆段。小红书搜索为
     /// 客户端路由(SPA),预期不整页刷新,先按一段式跑通。
     #[allow(clippy::too_many_arguments)]
     async fn run_human_rpa(
         &self,
         window: &WebviewWindow,
-        platform_id: &str,
         steps: &[RpaStep],
         keyword: &str,
         session_id: u64,
@@ -3181,30 +3756,32 @@ impl CollectBridge {
         time_range: &str,
         // 平台专属额外筛选待点击文案(小红书:笔记类型/搜索范围/位置距离),展开筛选浮层后逐个点击
         extra_filters: &[String],
-        // 搜索结果页 URL 模板:非空则 RPA 先导航到此页(keyword 进 URL)再执行步骤;
-        // 为空的平台(小红书)保持在 login_url 首页,由步骤在首页搜索框输入 + 点搜索图标触发跳转。
-        search_url_template: &str,
         // 原生拦截缓冲:点完搜索后据此等「搜索结果接口已回」再点筛选(比 DOM 轮询准)。
         sink: Option<&ResponseSink>,
+        // 智能滚动判定上下文:平台配置 / 适配器 / 目标数 / 库内 ID 快照等(见 SmartScrollCtx)
+        mut smart: SmartScrollCtx<'_>,
     ) -> Result<()> {
+        let platform_id = smart.cfg.id.as_str();
         // 搜索 URL 模板非空时先导航到该页;build_search_eval 把 {keyword} encodeURIComponent 后替换。
+        // 为空的平台(小红书)保持在 login_url 首页,由步骤在首页搜索框输入 + 点搜索图标触发跳转。
+        let search_url_template = smart.cfg.collect.search_url_template.clone();
         if !search_url_template.is_empty() {
             let _ = window.eval(crate::webview::build_search_eval(
-                search_url_template,
+                &search_url_template,
                 keyword,
                 "",
             ));
         }
         // 窗口可能刚创建 / 刚导航,页面仍在加载;此时 eval 的脚本会随导航被清除 = 等于没注入,
         // 表现为不打字也不滚动。故先等加载稳定再注入。判断标准从「固定睡 2.5s」改为
-        // 「页面已开始产出拦截响应」:有响应说明新页面上下文已运行、hook 已挂,此时注入的
-        // RPA 脚本不会被随后到达的导航清除;无响应时退回固定等待,RPA 首步 waitFor 仍会兜底轮询。
+        // 「页面已开始产出拦截响应」:有响应说明新页面上下文已运行、hook 已挂,此时
+        // 执行的 RPA 步骤不会被随后到达的导航冲掉;无响应时退回固定等待,首步 waitFor 仍会兜底轮询。
         let nav_ready =
             wait_nav_response(window, sink, None, NAV_RESPONSE_WAIT_MS, NAV_SETTLE_MS).await;
         let _ = window.eval(build_hud_log_eval(
             "info",
             if nav_ready {
-                "🌐 页面已开始响应 · 注入拟人 RPA"
+                "🌐 页面已开始响应 · 执行拟人搜索"
             } else {
                 "⏳ 页面暂未响应 · 按固定等待继续"
             },
@@ -3222,21 +3799,41 @@ impl CollectBridge {
             .cloned()
             .collect();
 
-        let (run_id, rx) = self.rpa.open_run()?;
-        window
-            .eval(build_human_rpa_script(&pre_steps, keyword, run_id))
-            .map_err(|e| CrawlerError::Config(format!("注入拟人 RPA 脚本失败: {e}")))?;
-
-        // 等"搜索已执行":RPA done() 回传 或 拦到搜索结果 /search/notes,二者先到即走。
-        // 关键:点搜索常触发页面跳转 → RPA 脚本上下文被销毁、done() 永远回不来;不能干等 RPA 超时
-        // (那正是"中间卡 ~180s"的根因)。拦到 /search/notes 即证明搜索成功,立即继续点筛选 + 滚动。
+        // 执行拟人搜索步骤并等搜索结果(rpa_search_once 内部:先等页面加载完成再动手,
+        // 步骤成败与拦到 /search/notes 双口径)
         let wait_t0 = std::time::Instant::now();
-        let hit_notes = tokio::select! {
-            _ = tokio::time::timeout(Duration::from_millis(RPA_RUN_TIMEOUT_MS), rx) => false,
-            got = wait_intercepted(window, sink, "/search/notes", RPA_RUN_TIMEOUT_MS) => got,
-        };
-        // 清理可能仍待回传的 RPA 条目,防泄漏(脚本被导航销毁时 ack 永不回来)
-        self.rpa.cancel(run_id);
+        let mut hit_notes = self
+            .rpa_search_once(window, &pre_steps, keyword, session_id, platform_id, sink, 0)
+            .await;
+        // 首轮无结果:Jev 定位搜索控件兜底一次(页面文案改版时固定选择器失灵)
+        if platform_id == "xhs" && !hit_notes && !self.control.is_stopping(session_id) {
+            let _ = window.eval("window.__veltrixAbort = true;");
+            let _ = window.eval(build_hud_log_eval(
+                "warn",
+                "⚠️ 未收到小红书搜索结果 · 尝试 Jev 定位搜索控件一次",
+            ));
+            if crate::webview::jev_search::retry(window, keyword).await {
+                hit_notes = wait_xhs_search_response(window, sink, 0, 10_000).await;
+            }
+        }
+        // 二次机会:网络/系统卡顿会让首轮 RPA 被仍在途的页面加载冲掉(表现为全空)。
+        // 此刻页面通常已加载完成,**原地**重跑一遍 RPA 即可恢复(重输关键词重点搜索);
+        // 不强制重载首页——重载在卡顿机器上又是一次整页闪烁,且已加载的页面重载纯属浪费。
+        // 冷机器实测(整页加载 20s+):首轮注入被冲掉后,按首轮预算重试时搜索框仍未挂载,
+        // 连续全空 → 任务误判失败。重试轮(attempt=1)改走「加长就绪等待 + 搜索框出现」再注入。
+        if platform_id == "xhs"
+            && !hit_notes
+            && !self.control.is_stopping(session_id)
+            && !collect_window_gone(window)
+        {
+            let _ = window.eval(build_hud_log_eval(
+                "info",
+                "🔄 首轮搜索无结果 · 延长等待页面就绪后原地重试一次(网络/电脑卡顿常见,非风控)",
+            ));
+            hit_notes = self
+                .rpa_search_once(window, &pre_steps, keyword, session_id, platform_id, sink, 1)
+                .await;
+        }
         let waited_ms = wait_t0.elapsed().as_millis();
         let _ = window.eval(build_hud_log_eval(
             "info",
@@ -3249,6 +3846,11 @@ impl CollectBridge {
                 }
             ),
         ));
+        if platform_id == "xhs" && !hit_notes {
+            return Err(CrawlerError::Config(
+                "小红书搜索未返回笔记结果,已停止本轮以避免采入其他页面数据".into(),
+            ));
+        }
         // 数据一致性:若要应用筛选(非综合/不限),先清掉"点筛选前"拦到的未筛选结果(综合页),
         // 只保留筛选生效后采到的数据。此刻 session 未注入,页面数据都缓在 __veltrixBuf,连同 native sink 一起清。
         let will_apply_filter = !sort_labels(sort_mode).is_empty()
@@ -3269,11 +3871,22 @@ impl CollectBridge {
             ));
         }
         // 结果页就绪后按任务排序/时间做 RPA 文案点击(综合/不限默认不点)
-        apply_sort_time(window, platform_id, sort_mode, time_range, extra_filters).await;
+        if !apply_sort_time(FilterApply {
+            window,
+            platform_id,
+            sort_mode,
+            time_range,
+            extra_filters,
+            sink,
+        }).await {
+            return Err(CrawlerError::Config("小红书筛选结果未确认,已停止本轮采集".into()));
+        }
 
-        // 真实滚轮翻页:逐轮投递 WM_MOUSEWHEEL,拟人间隔,触发分页懒加载
-        if let Some(rounds) = scroll_rounds {
-            self.scroll_with_real_wheel(window, rounds, session_id)
+        // 真实滚轮翻页:智能模式由「达标 / 底部停滞 / 手动停」决定何时结束
+        // (segments 只作非智能模式的固定轮数);逐轮投递 WM_MOUSEWHEEL,拟人间隔
+        if let Some(segments) = scroll_rounds {
+            smart.max_rounds = smart.max_rounds.max(segments);
+            self.scroll_with_real_wheel(window, &smart, session_id)
                 .await;
         }
 
@@ -3285,12 +3898,47 @@ impl CollectBridge {
         Ok(())
     }
 
-    /// 持续下滚 rounds 轮,拟人间隔。Windows 用真实滚轮(WM_MOUSEWHEEL),
+    /// 真实滚轮翻页 + 智能停止。Windows 用 WM_MOUSEWHEEL(小红书等只认真滚轮事件),
     /// 非 Windows(mac 等)用合成 WheelEvent 作对等实现。
-    async fn scroll_with_real_wheel(&self, window: &WebviewWindow, rounds: u32, session_id: u64) {
+    ///
+    /// 智能模式(有适配器 + 目标数>0)与旧路径 run_legacy_scroll 同一套停止语义:
+    /// 边滚边按「去重且库中不存在」的新内容计数,达标即停;连续无新增(到底/风控)
+    /// 自动结束;首屏无数据耐心等待;验证弹窗暂停等人工解除。**不设固定轮数上限**——
+    /// 重跑去重后新内容藏在更深处,固定 40 轮既不够数也不会加滚,正是本次修复的缺陷。
+    /// 非智能模式退回 segments 固定轮数盲滚。
+    async fn scroll_with_real_wheel(&self, window: &WebviewWindow, ctx: &SmartScrollCtx<'_>, session_id: u64) {
+        let smart = ctx.adapter.is_some() && ctx.target_count > 0;
+        let max_rounds = ctx.max_rounds.max(1);
         #[cfg(windows)]
         {
-            for i in 0..rounds {
+            // 计数状态与旧路径同口径:seen=会话内去重(含库中已有),new=有效新增(排除库中已有)
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut new_count: usize = 0;
+            let mut stagnant: u32 = 0;
+            let mut waiting: u32 = 0;
+            // 增量解析游标:两个缓冲会话内只追加,每轮只解析游标之后新到的响应
+            let mut sink_cursor: usize = 0;
+            let mut channel_cursor: usize = 0;
+            let verify_eval = crate::webview::build_verify_check_eval(
+                session_id,
+                &ctx.cfg.collect.verify_selectors,
+                &ctx.cfg.collect.verify_texts,
+                &ctx.cfg.collect.verify_url_patterns,
+            );
+            let _ = window.eval(build_hud_log_eval(
+                "info",
+                &if smart {
+                    format!(
+                        "🔍 翻页采集「{}」· 目标 {} 条新内容",
+                        ctx.keyword, ctx.target_count
+                    )
+                } else {
+                    format!("📄 固定翻页 {max_rounds} 轮")
+                },
+            ));
+            let mut round: u32 = 0;
+            loop {
+                round += 1;
                 // 手动结束:HUD「结束」按钮触发后停止真实滚轮翻页
                 if self.control.is_stopping(session_id) {
                     let _ = window.eval(build_hud_log_eval(
@@ -3299,32 +3947,217 @@ impl CollectBridge {
                     ));
                     break;
                 }
-                // HWND 非 Send,不能跨 await 持有:每轮即取即用,await 前作用域结束自动丢弃
-                match window.hwnd() {
-                    Ok(parent) => {
-                        // 每轮下滚 3 档
-                        if let Err(e) = win_wheel::real_wheel(parent, -3) {
-                            tracing::warn!("真实滚轮失败,停止滚动: {e}");
-                            break;
+                // 安全验证:检测到则暂停滚动等人工解除;超时未完成按到底收尾(已采保留)
+                if self.control.is_verifying(session_id)
+                    && !self
+                        .wait_verify_cleared(
+                            window,
+                            session_id,
+                            &verify_eval,
+                            &ctx.cfg.collect.verify_url_patterns,
+                            &ctx.cfg.id,
+                        )
+                        .await
+                {
+                    let _ = window.eval(build_hud_log_eval(
+                        "error",
+                        "⚠️ 安全验证未在限时内完成 · 结束翻页(已采内容保留)",
+                    ));
+                    break;
+                }
+                // 拟人停顿 1.5~3s;停滞期逐轮拉长(+3s/轮,封顶 +9s),首屏未出内容额外多等
+                let mut pause = random_scroll_pause();
+                pause += stagnation_extra(stagnant, RPA_STAGNANT_WARN);
+                if smart && seen.is_empty() {
+                    pause += Duration::from_secs(3);
+                }
+                let pause_ms = pause.as_millis();
+                // HUD 进度日志与落点探测合并单次往返(滚动每轮都打日志,省一半 eval)
+                let hud_msg = if smart {
+                    format!(
+                        "🖱 真实滚轮第 {round} 轮 · 新增 {new_count}/{} · 已浏览 {} 条 · 停顿 {pause_ms}ms",
+                        ctx.target_count, seen.len()
+                    )
+                } else {
+                    format!("真实滚轮翻页 {round}/{max_rounds} · 停顿 {pause_ms}ms")
+                };
+                // 每轮下滚 3 档;落点每轮探测避开 HUD——HUD 日志区会吃掉压在它上面的滚轮,
+                // 之前固定打窗口中心(恰在默认 HUD 覆盖范围内)导致「日志在刷、页面不动」。
+                if let Err(e) = wheel_page(window, -3, Some(hud_msg)).await {
+                    tracing::warn!("真实滚轮失败,停止滚动: {e}");
+                    break;
+                }
+                if abortable_pause(window, &self.control, session_id, pause).await {
+                    let _ = window.eval(build_hud_log_eval(
+                        "info",
+                        "🛑 检测到结束 / 采集窗口关闭 · 停止翻页(保留已采内容)",
+                    ));
+                    break;
+                }
+
+                // 非智能模式:固定轮数盲滚
+                if !smart {
+                    if round >= max_rounds {
+                        break;
+                    }
+                    continue;
+                }
+
+                // —— 智能计数(只为决定何时停,落库仍由调用方对全量响应兜底解析) ——
+                // 增量取两个缓冲(原生 sink / invoke 通道)自游标起新到的响应
+                let mut snapshot = ctx
+                    .sink
+                    .and_then(|s| {
+                        s.lock().ok().map(|buf| {
+                            let fresh = buf
+                                .get(sink_cursor..)
+                                .map(<[_]>::to_vec)
+                                .unwrap_or_default();
+                            sink_cursor = buf.len();
+                            fresh
+                        })
+                    })
+                    .unwrap_or_default();
+                let (channel_fresh, channel_total) =
+                    self.channel.peek_session_from(session_id, channel_cursor);
+                channel_cursor = channel_total;
+                snapshot.extend(channel_fresh);
+                // 响应侧风控检测:增量 URL 命中验证特征 → 置验证态,下一轮顶部暂停
+                if !self.control.is_verifying(session_id)
+                    && response_hits_verify(&snapshot, &ctx.cfg.collect.verify_url_patterns)
+                {
+                    tracing::info!("验证检测:响应侧 URL 命中验证特征 session={session_id}");
+                    self.control.set_verifying(session_id, true);
+                    let _ = window.eval(build_hud_log_eval(
+                        "warn",
+                        "⚠️ 接口返回命中安全验证 · 暂停采集等待手动验证",
+                    ));
+                }
+                let before_seen = seen.len();
+                let before_new = new_count;
+                if let Some(adapter) = ctx.adapter {
+                    let fetch_ctx = FetchContext {
+                        keyword: ctx.keyword.to_string(),
+                        responses: snapshot,
+                    };
+                    if let Ok(output) = adapter.parse(&TaskKind::Search, &fetch_ctx).await {
+                        for c in &output.contents {
+                            if !seen.insert(c.content_id.clone()) {
+                                continue;
+                            }
+                            // 黑名单作者 / 最低点赞数:不计入目标配额(口径与旧路径一致)
+                            let is_blacklisted = ctx
+                                .blacklisted_uids
+                                .map(|set| {
+                                    !c.author.uid.is_empty() && set.contains(&c.author.uid)
+                                })
+                                .unwrap_or(false);
+                            if is_blacklisted {
+                                continue;
+                            }
+                            let passes_likes = c
+                                .stats
+                                .like_count
+                                .map(|likes| likes >= ctx.min_likes as i64)
+                                .unwrap_or(true);
+                            if !passes_likes {
+                                continue;
+                            }
+                            // 库中已有的不占「新增」配额:重跑时滚动会继续找更深处的未采内容
+                            let is_new = ctx
+                                .existing_ids
+                                .map(|ids| !ids.contains(&c.content_id))
+                                .unwrap_or(true);
+                            if is_new {
+                                new_count += 1;
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("获取窗口 HWND 失败,跳过滚动: {e}");
-                        return;
-                    }
                 }
+                let seen_added = seen.len() - before_seen;
+                let added = new_count - before_new;
+
+                if seen_added > 0 && stagnant >= RPA_STAGNANT_WARN {
+                    let _ =
+                        window.eval(build_hud_log_eval("info", "✅ 内容恢复增长 · 继续采集"));
+                }
+                let dup_existing = seen_added - added;
                 let _ = window.eval(build_hud_log_eval(
                     "info",
-                    &format!("真实滚轮翻页 {}/{}", i + 1, rounds),
+                    &format!(
+                        "  📄 +{added} · 重复 {dup_existing} · 累计 {new_count}/{}({}%)",
+                        ctx.target_count,
+                        new_count * 100 / ctx.target_count.max(1)
+                    ),
                 ));
-                // 拟人间隔:无 rand 依赖,用下标做伪随机扰动(800~1700ms)
-                let ms = 800 + ((i as u64).wrapping_mul(263) % 900);
-                tokio::time::sleep(Duration::from_millis(ms)).await;
+
+                // 达标即停:落库由调用方对最终全部响应解析,多出的不重复内容也会一并存
+                if new_count >= ctx.target_count {
+                    let _ = window.eval(build_hud_log_eval(
+                        "info",
+                        &format!("✅ 已达到目标! 新增 {new_count} 条内容 · 停止翻页"),
+                    ));
+                    break;
+                }
+
+                // 停止判定与旧路径同分流:首屏未出内容耐心等;已出内容后连续无新增 = 到底/风控
+                if seen_added > 0 {
+                    stagnant = 0;
+                    waiting = 0;
+                } else if seen.is_empty() {
+                    waiting += 1;
+                    let _ = window.eval(build_hud_log_eval(
+                        "info",
+                        &format!("⏳ 首屏数据加载中 · 已等待 {waiting}/{NO_RESPONSE_STOP} 次"),
+                    ));
+                    if waiting >= NO_RESPONSE_STOP {
+                        let _ = window.eval(build_hud_log_eval(
+                            "warn",
+                            &format!(
+                                "⚠️ 连续多次未收到平台数据 · 可能未登录或无结果 · 自动结束(已采 {new_count} 条)"
+                            ),
+                        ));
+                        break;
+                    }
+                } else {
+                    stagnant += 1;
+                    if stagnant >= RPA_STAGNANT_STOP {
+                        let _ = window.eval(build_hud_log_eval(
+                            "warn",
+                            &format!(
+                                "⚠️ 连续 {stagnant} 轮翻页无新内容 · 可能已到底 · 自动结束(已采 {new_count} 条)"
+                            ),
+                        ));
+                        break;
+                    }
+                    if stagnant >= RPA_STAGNANT_WARN {
+                        let remaining = RPA_STAGNANT_STOP - stagnant;
+                        // 单轮空转是翻页常态(未触发新请求/边界重复回包),连续多轮才值得提醒;
+                        // 风控只是可能之一,不再一上来就喊「请手动验证」造成误报观感
+                        let _ = window.eval(build_hud_log_eval(
+                            "info",
+                            &format!(
+                                "⏳ 连续 {stagnant} 轮暂无新内容(翻页边界/加载延迟常见)· 再 {remaining} 轮仍无将结束;若窗口出现验证弹窗请手动完成"
+                            ),
+                        ));
+                    }
+                }
+            }
+            // 收尾汇总(仅智能模式有逐内容计数):直观看到新增 vs 重复占比
+            if smart {
+                let dup_total = seen.len().saturating_sub(new_count);
+                let _ = window.eval(build_hud_log_eval(
+                    "info",
+                    &format!(
+                        "📊 本次翻页统计 · 新增 {new_count} 条 · 已有 {dup_total} 条 · 共发现 {} 条 · 翻 {round} 轮",
+                        seen.len()
+                    ),
+                ));
             }
         }
         #[cfg(not(windows))]
         {
-            for i in 0..rounds {
+            for i in 0..max_rounds {
                 // 手动结束:HUD「结束」按钮触发后停止翻页
                 if self.control.is_stopping(session_id) {
                     let _ =
@@ -3335,7 +4168,7 @@ impl CollectBridge {
                 let _ = window.eval(&crate::webview::build_wheel_eval());
                 let _ = window.eval(&build_hud_log_eval(
                     "info",
-                    &format!("合成滚轮翻页 {}/{}", i + 1, rounds),
+                    &format!("合成滚轮翻页 {}/{}", i + 1, max_rounds),
                 ));
                 // 拟人间隔:用下标做伪随机扰动(800~1700ms)
                 let ms = 800 + ((i as u64).wrapping_mul(263) % 900);
@@ -3398,16 +4231,17 @@ impl CollectBridge {
 
         // 结果先存住不早退:与 collect 同理,失败路径也必须取走会话并清停止标志防泄漏
         let run_result = self
-            .run_comment_scroll(
-                &window,
+            .run_comment_scroll(CommentScrollRun {
+                window: &window,
                 cfg,
-                req.content_id,
-                req.xsec_token,
+                content_id: req.content_id,
+                xsec_token: req.xsec_token,
                 session_id,
-                sink.as_ref(),
-                &req.adapter,
-                req.limit,
-            )
+                sink: sink.as_ref(),
+                adapter: &req.adapter,
+                limit: req.limit,
+                skip_xhs_api: false,
+            })
             .await;
 
         let responses = self.take_collected_responses(session_id, sink.as_ref());
@@ -3522,6 +4356,7 @@ impl CollectBridge {
             };
             let request = XhsApiRun {
                 window: &window,
+                cfg,
                 session_id,
                 content_id: first.content_id,
                 xsec_token: first.xsec_token,
@@ -3532,13 +4367,40 @@ impl CollectBridge {
                 sink: sink.as_ref(),
             };
             let outcome = self.run_xhs_api_collect(&request).await;
-            if matches!(outcome, CommentApiOutcome::Fallback) {
+            let mut recovered = Vec::new();
+            if matches!(outcome, CommentApiOutcome::Fallback)
+                && !self.control.is_stopping(session_id)
+                && !self.control.is_verifying(session_id)
+                && !collect_window_gone(&window)
+            {
                 let _ = window.eval(build_hud_log_eval(
                     "warn",
-                    "⚠️ 小红书并发直采不可用 · 本批评论采集结束",
+                    "⚠️ 小红书并发直采不可用 · 逐条打开笔记回退页面采集",
                 ));
+                recovered.extend(self.drain_collected_responses(session_id, sink.as_ref()));
+                for item in &reqs {
+                    if self.control.is_stopping(session_id) || collect_window_gone(&window) {
+                        break;
+                    }
+                    let page_result = self.run_comment_scroll(CommentScrollRun {
+                        window: &window,
+                        cfg,
+                        content_id: item.content_id,
+                        xsec_token: item.xsec_token,
+                        session_id,
+                        sink: sink.as_ref(),
+                        adapter: &item.adapter,
+                        limit: item.limit,
+                        skip_xhs_api: true,
+                    }).await;
+                    recovered.extend(self.drain_collected_responses(session_id, sink.as_ref()));
+                    if let Err(error) = page_result {
+                        tracing::warn!(note_id = item.content_id, "小红书页面评论回退失败: {error}");
+                    }
+                }
             }
-            let responses = self.take_collected_responses(session_id, sink.as_ref());
+            recovered.extend(self.take_collected_responses(session_id, sink.as_ref()));
+            let responses = recovered;
             let was_stopped = self.control.is_stopping(session_id);
             let _ = window.eval(build_hud_status_eval(
                 if was_stopped {
@@ -3655,6 +4517,7 @@ impl CollectBridge {
             ));
             let request = XhsApiRun {
                 window: &window,
+                cfg,
                 session_id,
                 content_id: req.content_id,
                 xsec_token: req.xsec_token,
@@ -3683,6 +4546,11 @@ impl CollectBridge {
                     ));
                 }
                 CommentApiOutcome::Aborted => {
+                    let responses = self.take_collected_responses(session_id, sink.as_ref());
+                    self.control.clear(session_id);
+                    return Ok(responses);
+                }
+                CommentApiOutcome::Fallback if self.control.is_verifying(session_id) => {
                     let responses = self.take_collected_responses(session_id, sink.as_ref());
                     self.control.clear(session_id);
                     return Ok(responses);
@@ -3811,21 +4679,11 @@ impl CollectBridge {
 
     /// 评论采集滚动:导航详情页后滚动评论区,边滚边按去重 comment_id 计数,
     /// 达到 limit / 连续无新增到底 / 连续无响应 / 手动停 即停。复用 legacy 的智能停止骨架。
-    #[allow(clippy::too_many_arguments)]
-    async fn run_comment_scroll(
-        &self,
-        window: &WebviewWindow,
-        cfg: &PlatformConfig,
-        content_id: &str,
-        xsec_token: &str,
-        session_id: u64,
-        sink: Option<&ResponseSink>,
-        adapter: &Arc<dyn PlatformAdapter>,
-        limit: usize,
-    ) -> Result<()> {
+    async fn run_comment_scroll(&self, run: CommentScrollRun<'_>) -> Result<()> {
+        let CommentScrollRun { window, cfg, content_id, xsec_token, session_id, sink, adapter, limit, skip_xhs_api } = run;
         // 小红书优先在当前登录页内调用官方请求封装分页,无需逐条导航、点评论面板和滚动。
         // 官方封装缺失、接口拒绝或超时则继续执行下方原有 RPA 链路。
-        if cfg.id == "xhs" {
+        if cfg.id == "xhs" && !skip_xhs_api {
             let _ = self.wait_document_ready(window, session_id).await;
             window
                 .eval(build_set_session_eval(session_id))
@@ -3850,6 +4708,7 @@ impl CollectBridge {
             ));
             let request = XhsApiRun {
                 window,
+                cfg,
                 session_id,
                 content_id,
                 xsec_token,
@@ -3876,6 +4735,7 @@ impl CollectBridge {
                     ));
                 }
                 CommentApiOutcome::Aborted => return Ok(()),
+                CommentApiOutcome::Fallback if self.control.is_verifying(session_id) => return Ok(()),
                 CommentApiOutcome::Fallback => {}
             }
         }
@@ -4099,12 +4959,12 @@ impl CollectBridge {
             // 评论区滚动,两种布局都要覆盖:
             // ① 页面侧定向滚动(build_comment_scroll_eval):按评论标记找可滚祖先容器滚到底,
             //    命中「评论在右侧面板」的内部滚动容器;内含整页 scrollTo 兜底(评论在下方的布局)。
-            // ② Windows 真实滚轮:中心落点(下方布局)+ 右侧落点(右侧面板布局,
+            // ② Windows 真实滚轮:动态落点(下方布局,自动避开 HUD)+ 右侧落点(右侧面板布局,
             //    WM_MOUSEWHEEL 按落点路由,落进面板即驱动其内部滚动)。落点比例待真机实测校准。
             let _ = window.eval(build_comment_scroll_eval());
+            let _ = wheel_page(window, -3, None).await;
             #[cfg(windows)]
             if let Ok(parent) = window.hwnd() {
-                let _ = win_wheel::real_wheel(parent, -3);
                 let _ = win_wheel::real_wheel_at(
                     parent,
                     -3,
@@ -4116,12 +4976,9 @@ impl CollectBridge {
             #[cfg(not(windows))]
             let _ = window.eval(&crate::webview::build_wheel_eval());
 
-            // 拟人停顿(评论区用更短的 1~2s);疑似风控时逐轮拉长,给手动验证留时间
+            // 拟人停顿(评论区用更短的 1~2s);停滞期逐轮拉长(+3s/轮,封顶 +9s)
             let mut pause = random_comment_scroll_pause();
-            if stagnant >= STAGNANT_LIMIT {
-                let extra_s = (stagnant - STAGNANT_LIMIT + 1) as u64 * 5;
-                pause += Duration::from_secs(extra_s);
-            }
+            pause += stagnation_extra(stagnant, STAGNANT_LIMIT);
             // 首屏尚未出评论:多为评论接口还没返回,额外多等,避免没等数据就空滚
             if smart && seen.is_empty() {
                 pause += Duration::from_secs(3);
@@ -4164,6 +5021,12 @@ impl CollectBridge {
                 self.channel.peek_session_from(session_id, channel_cursor);
             channel_cursor = channel_total;
             snapshot.extend(channel_fresh);
+            if cfg.id == "xhs" {
+                snapshot.retain(|response| {
+                    response.url.contains(&format!("note_id={content_id}"))
+                        || response.url.contains(&format!("noteId={content_id}"))
+                });
+            }
             // 响应侧风控检测(同搜索路径):评论接口 URL 命中验证特征即置验证态,下一轮顶部暂停
             if !self.control.is_verifying(session_id)
                 && response_hits_verify(&snapshot, &cfg.collect.verify_url_patterns)
@@ -4254,7 +5117,7 @@ impl CollectBridge {
         window: &WebviewWindow,
         req: &XhsApiRun<'_>,
         result: &str,
-    ) -> Option<CommentApiOutcome> {
+    ) -> Option<XhsApiAttempt> {
         let value: serde_json::Value = serde_json::from_str(result).ok()?;
         if value.get("platform").and_then(|item| item.as_str()) != Some("xhs")
             || value.get("kind").and_then(|item| item.as_str()) != Some(req.kind.as_str())
@@ -4282,39 +5145,155 @@ impl CollectBridge {
             .get("comments")
             .and_then(|item| item.as_u64())
             .unwrap_or(0);
+        let jobs_ok = value.get("jobs").and_then(|jobs| jobs.as_array())
+            .map(|jobs| jobs.iter().all(|job| {
+                job.get("used").and_then(|used| used.as_bool()) == Some(true)
+                    && job.get("error").and_then(|error| error.as_str()).unwrap_or("").is_empty()
+            }))
+            .unwrap_or(true);
+        let job_error = value.get("jobs").and_then(|jobs| jobs.as_array())
+            .and_then(|jobs| jobs.iter().find_map(|job| job.get("error").and_then(|error| error.as_str()).filter(|error| !error.is_empty())));
+        let error_kind = if !jobs_ok { xhs_api_error_kind(job_error.unwrap_or("page-fetch-failed")) } else { xhs_api_error_kind(error) };
+        // 详情批量:部分成功即算 Done——响应随 hook 全部回传,未命中的篇目由调用方
+        // 走逐条串行兜底;评论批量维持「全成功才算」(部分成功回退页面重采,防漏)。
+        let detail_batch = matches!(req.kind, XhsApiKind::Detail) && req.comment_jobs.is_some();
+        let (batch_ok, batch_total) = value.get("jobs").and_then(|jobs| jobs.as_array())
+            .map(|jobs| (
+                jobs.iter().filter(|job| job.get("used").and_then(|used| used.as_bool()) == Some(true)).count(),
+                jobs.len(),
+            ))
+            .unwrap_or((0, 0));
         tracing::info!(
             note_id = req.content_id,
             kind = req.kind.as_str(),
             used,
             pages,
             comments,
-            error,
+            error_kind,
             "小红书页内直采完成"
         );
         if aborted {
-            return Some(CommentApiOutcome::Aborted);
+            return Some(XhsApiAttempt { outcome: CommentApiOutcome::Aborted, kind: "aborted", pages: pages as usize });
         }
-        if used && error.is_empty() {
+        if used && error.is_empty() && (jobs_ok || detail_batch) {
             let message = match req.kind {
-                XhsApiKind::Detail => "✅ 小红书详情直采完成".to_string(),
+                XhsApiKind::Detail => {
+                    if detail_batch {
+                        format!("✅ 小红书详情批量直采完成 · {batch_ok}/{batch_total} 篇")
+                    } else {
+                        "✅ 小红书详情直采完成".to_string()
+                    }
+                }
                 XhsApiKind::Comments => {
                     format!("✅ 小红书评论直采完成 · {pages} 页 {comments} 条")
                 }
             };
             let _ = window.eval(build_hud_log_eval("info", &message));
-            Some(CommentApiOutcome::Done)
+            Some(XhsApiAttempt { outcome: CommentApiOutcome::Done, kind: "none", pages: pages as usize })
         } else {
             let _ = window.eval(build_hud_log_eval(
                 "warn",
-                &format!("⚠️ 小红书页内直采不可用({error})· 回退页面采集"),
+                &format!("⚠️ 小红书页内直采不可用({error_kind})· 回退页面采集"),
             ));
-            Some(CommentApiOutcome::Fallback)
+            Some(XhsApiAttempt { outcome: CommentApiOutcome::Fallback, kind: error_kind, pages: pages as usize })
         }
+    }
+
+    /// 小红书详情**批量**页内直采:一次脚本运行内并发拉取多篇笔记详情(并发度
+    /// `XHS_DETAIL_BATCH_LANES`,页内钳制 1~10),绕开逐条导航的串行瓶颈。
+    /// 无论整体 Done / 回退 / 中止,已到手的部分响应都返回给调用方解析合并;
+    /// 未命中的篇目由调用方走逐条串行兜底(fetch_content_detail)。
+    pub async fn fetch_xhs_detail_batch(
+        &self,
+        app: &AppHandle,
+        cfg: &PlatformConfig,
+        account_id: &str,
+        task_id: &str,
+        jobs: &[(&str, &str)],
+    ) -> Result<Vec<InterceptedResponse>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (window, session_id, sink) =
+            self.setup_collect_session(app, cfg, account_id, "", Some(task_id), "")?;
+        let _ = self.wait_document_ready(&window, session_id).await;
+        let _ = window.eval(build_set_session_eval(session_id));
+        let _ = window.eval(build_hud_log_eval(
+            "info",
+            &format!(
+                "⚡ 详情批量直采 · {} 篇 · 并发 {}",
+                jobs.len(),
+                XHS_DETAIL_BATCH_LANES
+            ),
+        ));
+        let request = XhsApiRun {
+            window: &window,
+            cfg,
+            session_id,
+            content_id: "",
+            xsec_token: "",
+            comment_jobs: Some(jobs),
+            limit: 0,
+            max_pages: 1,
+            kind: XhsApiKind::Detail,
+            sink: sink.as_ref(),
+        };
+        let _ = self.run_xhs_api_collect(&request).await;
+        let responses = self.take_collected_responses(session_id, sink.as_ref());
+        self.control.clear(session_id);
+        Ok(responses)
+    }
+
+    /// 仅在模糊故障且 Jev 高置信度建议时,导航同一笔记后重试一次。
+    /// 明确的平台拒绝/签名缺失/验证超时直接交给页面回退。
+    async fn run_xhs_api_collect(&self, req: &XhsApiRun<'_>) -> CommentApiOutcome {
+        let first = self.run_xhs_api_collect_once(req).await;
+        if !matches!(first.outcome, CommentApiOutcome::Fallback)
+            || !matches!(req.kind, XhsApiKind::Comments)
+            || self.control.is_stopping(req.session_id)
+            || self.control.is_verifying(req.session_id)
+            || collect_window_gone(req.window)
+            || !jev_risk::should_retry("xhs", first.kind, first.pages).await
+        {
+            return first.outcome;
+        }
+        if req.cfg.collect.detail_url_template.is_empty()
+            || req.window.eval(build_detail_eval(
+                &req.cfg.collect.detail_url_template,
+                req.content_id,
+                req.xsec_token,
+            )).is_err()
+        {
+            return first.outcome;
+        }
+        let _ = req.window.eval(build_hud_log_eval(
+            "info",
+            "🔄 小红书评论环境可能失效 · 打开笔记后重试一次",
+        ));
+        if !self.wait_document_ready(req.window, req.session_id).await {
+            return first.outcome;
+        }
+        let _ = req.window.eval(build_set_session_eval(req.session_id));
+        let verify_eval = crate::webview::build_verify_check_eval(
+            req.session_id,
+            &req.cfg.collect.verify_selectors,
+            &req.cfg.collect.verify_texts,
+            &req.cfg.collect.verify_url_patterns,
+        );
+        if !verify_eval.is_empty() {
+            let _ = req.window.eval(&verify_eval);
+        }
+        if self.control.is_verifying(req.session_id)
+            || self.control.is_stopping(req.session_id)
+        {
+            return first.outcome;
+        }
+        self.run_xhs_api_collect_once(req).await.outcome
     }
 
     /// 小红书详情/评论共用的页内直采执行器。页面官方请求封装负责签名,
     /// 完成信号走原生消息桥;信号桥异常时用 ExecuteScript 回读兜底。
-    async fn run_xhs_api_collect(&self, req: &XhsApiRun<'_>) -> CommentApiOutcome {
+    async fn run_xhs_api_collect_once(&self, req: &XhsApiRun<'_>) -> XhsApiAttempt {
         let _ = self.control.take_api_done(req.session_id);
         let script = if let Some(jobs) = req.comment_jobs {
             let jobs = jobs
@@ -4324,12 +5303,20 @@ impl CollectBridge {
                     xsec_token,
                 })
                 .collect::<Vec<_>>();
-            crate::webview::build_xhs_comment_batch_eval(
-                req.session_id,
-                &jobs,
-                req.limit,
-                req.max_pages,
-            )
+            if matches!(req.kind, XhsApiKind::Detail) {
+                crate::webview::build_xhs_detail_batch_eval(
+                    req.session_id,
+                    &jobs,
+                    XHS_DETAIL_BATCH_LANES,
+                )
+            } else {
+                crate::webview::build_xhs_comment_batch_eval(
+                    req.session_id,
+                    &jobs,
+                    req.limit,
+                    req.max_pages,
+                )
+            }
         } else {
             let spec = crate::webview::XhsApiCollectSpec {
                 session_id: req.session_id,
@@ -4346,13 +5333,17 @@ impl CollectBridge {
                 note_id = req.content_id,
                 "注入小红书页内直采脚本失败: {error}"
             );
-            return CommentApiOutcome::Fallback;
+            return XhsApiAttempt { outcome: CommentApiOutcome::Fallback, kind: "script-injection", pages: 0 };
         }
         let timeout = match req.kind {
+            // 批量详情:20s 基线 + 每篇 5s 余量(并发摊薄实际耗时),封顶 5 分钟
+            XhsApiKind::Detail if req.comment_jobs.is_some() => Duration::from_secs(
+                (20 + req.comment_jobs.map_or(0, |jobs| jobs.len() as u64) * 5).min(300),
+            ),
             XhsApiKind::Detail => Duration::from_secs(15),
             XhsApiKind::Comments => Duration::from_secs(COMMENT_API_MAX_WAIT_SECS),
         };
-        let deadline = std::time::Instant::now() + timeout;
+        let mut deadline = std::time::Instant::now() + timeout;
         // 停滞看门狗(与抖音路径同口径):页内脚本被导航销毁 / 风控静默吞请求时,
         // 完成信号永远不会来,只能死等整体超时。以注入时的响应数为基准,之后按增长
         // 判定;session 通道(页面 hook)与原生拦截缓冲都探,漏一边会误判停滞。
@@ -4372,13 +5363,34 @@ impl CollectBridge {
         loop {
             if self.control.is_stopping(req.session_id) {
                 let _ = req.window.eval("window.__veltrixXhsApiAbort = true;");
-                return CommentApiOutcome::Aborted;
+                return XhsApiAttempt { outcome: CommentApiOutcome::Aborted, kind: "aborted", pages: 0 };
             }
             // 采集窗口被用户关闭:HUD 随之销毁,is_stopping 永远不会置位,eval 回读也
             // 快速返回 None,不主动探测会每批评论空转满超时才 Fallback(与超时同口径)。
             if collect_window_gone(req.window) {
                 tracing::info!(session_id = req.session_id, "小红书页内直采:采集窗口已关闭,立即结束等待");
-                return CommentApiOutcome::Fallback;
+                return XhsApiAttempt { outcome: CommentApiOutcome::Fallback, kind: "window-closed", pages: 0 };
+            }
+            if self.control.is_verifying(req.session_id) {
+                let verify_eval = crate::webview::build_verify_check_eval(
+                    req.session_id,
+                    &req.cfg.collect.verify_selectors,
+                    &req.cfg.collect.verify_texts,
+                    &req.cfg.collect.verify_url_patterns,
+                );
+                if !self.wait_verify_cleared(
+                    req.window,
+                    req.session_id,
+                    &verify_eval,
+                    &req.cfg.collect.verify_url_patterns,
+                    &req.cfg.id,
+                ).await {
+                    let _ = req.window.eval("window.__veltrixXhsApiAbort = true;");
+                    return XhsApiAttempt { outcome: if self.control.is_stopping(req.session_id) { CommentApiOutcome::Aborted } else { CommentApiOutcome::Fallback }, kind: "verify-timeout", pages: 0 };
+                }
+                last_growth = std::time::Instant::now();
+                deadline = std::time::Instant::now() + timeout;
+                continue;
             }
             if let Some(result) = self.control.take_api_done(req.session_id) {
                 if let Some(outcome) = self.handle_xhs_api_result(req.window, req, &result) {
@@ -4405,9 +5417,12 @@ impl CollectBridge {
                     }
                 }
             }
-            // 响应数停滞看门狗:评论路径才需要(详情只发一个请求、15s 超时本就够短)。
-            // 判停即中止页内脚本并 Fallback,由调用方收尾,不死等 COMMENT_API_MAX_WAIT_SECS。
-            if matches!(req.kind, XhsApiKind::Comments) {
+            // 响应数停滞看门狗:评论路径与详情批量需要(批量化请求靠持续增长证明活着,
+            // 脚本被导航销毁 / 风控静默吞请求时完成信号永不到来,只能靠停滞判定回退)。
+            // 单条详情只发一个请求、15s 超时本就够短,不看停。
+            let watch_stall = matches!(req.kind, XhsApiKind::Comments)
+                || (matches!(req.kind, XhsApiKind::Detail) && req.comment_jobs.is_some());
+            if watch_stall {
                 let probe = probe_len();
                 if probe > last_hits {
                     last_hits = probe;
@@ -4420,7 +5435,7 @@ impl CollectBridge {
                             "⚠️ 小红书页内直采停滞({COMMENT_API_STALL_SECS} 秒无新响应)· 回退页面采集(已采部分保留)"
                         ),
                     ));
-                    return CommentApiOutcome::Fallback;
+                    return XhsApiAttempt { outcome: CommentApiOutcome::Fallback, kind: "stall", pages: last_hits };
                 }
             }
             if std::time::Instant::now() >= deadline {
@@ -4429,7 +5444,7 @@ impl CollectBridge {
                     "warn",
                     "⚠️ 小红书页内直采超时 · 回退页面采集",
                 ));
-                return CommentApiOutcome::Fallback;
+                return XhsApiAttempt { outcome: CommentApiOutcome::Fallback, kind: "timeout", pages: last_hits };
             }
             poll_tick += 1;
             tokio::time::sleep(Duration::from_millis(COMMENT_API_POLL_MS)).await;
@@ -4448,6 +5463,65 @@ impl CollectBridge {
                 .map(|value| value.contains("true"))
                 .unwrap_or(false);
             if ready {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// 等搜索页真正可交互:readyState=complete 之后,再等 RPA 首个 WaitFor 步骤的目标节点
+    /// (小红书即搜索框)出现在 DOM。卡顿机器上 readyState 完成时 React 可能还没挂载搜索
+    /// 组件,只看 readyState 就注入 RPA,页内 waitFor 会在空页面上空转到超时(2026-09-23
+    /// 卡顿设备三连败的根因)。`extended=false` 预算对齐健康页面(秒过,几乎零开销);
+    /// `extended=true` 用于首轮失败后的重试轮:ready ≤40s + 节点 ≤20s。手动停 / 关窗立即
+    /// 中止;超时返回 false,调用方照常注入(页内 waitFor 兜底),不因探测失败直接放弃。
+    async fn wait_search_page_interactive(
+        &self,
+        window: &WebviewWindow,
+        session_id: u64,
+        node_selector: Option<&str>,
+        extended: bool,
+    ) -> bool {
+        let (ready_budget_ms, node_budget_ms) = if extended {
+            (40_000_u64, 20_000_u64)
+        } else {
+            (10_000, 5_000)
+        };
+        let ready_js = "(function(){ return document.readyState === 'complete'; })()";
+        let start = std::time::Instant::now();
+        while (start.elapsed().as_millis() as u64) < ready_budget_ms {
+            if self.control.is_stopping(session_id) || collect_window_gone(window) {
+                return false;
+            }
+            let ready = crate::webview::script_eval::eval_json(window.as_ref(), ready_js)
+                .await
+                .map(|value| value.contains("true"))
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let Some(selector) = node_selector else {
+            return true;
+        };
+        // 选择器经 JSON 转义后内插进 JS(候选列表含逗号与单引号,不能裸拼)
+        let Ok(sel_json) = serde_json::to_string(selector) else {
+            return true;
+        };
+        let probe_js =
+            format!("(function(){{ return !!document.querySelector({sel_json}); }})()");
+        let node_start = std::time::Instant::now();
+        while (node_start.elapsed().as_millis() as u64) < node_budget_ms {
+            if self.control.is_stopping(session_id) || collect_window_gone(window) {
+                return false;
+            }
+            let present = crate::webview::script_eval::eval_json(window.as_ref(), &probe_js)
+                .await
+                .map(|value| value.contains("true"))
+                .unwrap_or(false);
+            if present {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4990,7 +6064,7 @@ impl CollectBridge {
         }
         if !refreshed
             && matches!(outcome, CommentApiOutcome::Fallback)
-            && jev_risk::should_retry(kind, last_hits).await
+            && jev_risk::should_retry("douyin", kind, last_hits).await
         {
             refreshed = true;
             let (nav_id, nav_token) = (batch[0].0, batch[0].1);
@@ -5175,12 +6249,7 @@ impl CollectBridge {
                 break;
             }
             let _ = window.eval(build_scroll_eval());
-            #[cfg(windows)]
-            if let Ok(parent) = window.hwnd() {
-                let _ = win_wheel::real_wheel(parent, -2);
-            }
-            #[cfg(not(windows))]
-            let _ = window.eval(&crate::webview::build_wheel_eval());
+            let _ = wheel_page(window, -2, None).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             // 已拦到画像响应即可提前收尾(sink 或 channel 任一有数据);

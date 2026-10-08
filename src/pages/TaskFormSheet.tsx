@@ -170,6 +170,10 @@ export function TaskFormSheet({
   const [keepVideo, setKeepVideo] = useState(
     initial?.keepVideo ?? DEFAULT_STRATEGY.keepVideo,
   );
+  // 轻载模式:页面不加载图片/视频(请求层拦截),新建默认开;需要人工盯页面过验证时可关
+  const [lightLoad, setLightLoad] = useState(
+    initial?.lightLoad ?? DEFAULT_STRATEGY.lightLoad,
+  );
   // 封面文字识别:全平台开放,新建任务默认开;与其他开关独立、无联动
   const [coverOcr, setCoverOcr] = useState(initial?.coverOcr ?? true);
   const [aiExtract, setAiExtract] = useState(
@@ -318,6 +322,7 @@ export function TaskFormSheet({
       // AI 文案提取依赖音频提取:开文案提取时强制带上音频提取(后端 upsert 同样兜底)
       audioExtract: audioExtract || aiExtract,
       keepVideo,
+      lightLoad,
       coverOcr,
       aiExtract,
       autoSyncObsidian,
@@ -364,6 +369,7 @@ export function TaskFormSheet({
     minLikes,
     audioExtract,
     keepVideo,
+    lightLoad,
     coverOcr,
     aiExtract,
     autoSyncObsidian,
@@ -736,6 +742,24 @@ export function TaskFormSheet({
               id="task-keep-video"
               checked={keepVideo}
               onCheckedChange={setKeepVideo}
+              className="scale-125"
+            />
+          </div>
+          {/* 轻载模式:采集窗口页面不加载视频/字体(请求层拦截),图片正常显示(验证码可人工完成);
+              需要页面完整播放视频时临时关 */}
+          <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+            <div className="space-y-0.5">
+              <Label htmlFor="task-light-load" className="cursor-pointer">
+                轻载模式
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                采集窗口不加载视频/字体,省流量、低配电脑更流畅(图片正常显示,素材下载与封面 OCR 不受影响)
+              </p>
+            </div>
+            <Switch
+              id="task-light-load"
+              checked={lightLoad}
+              onCheckedChange={setLightLoad}
               className="scale-125"
             />
           </div>

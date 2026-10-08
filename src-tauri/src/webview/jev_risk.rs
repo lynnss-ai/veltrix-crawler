@@ -42,25 +42,22 @@ pub fn error_kind(error: &str) -> &'static str {
 pub fn is_ambiguous(kind: &str) -> bool {
     matches!(
         kind,
-        "timeout" | "stall" | "retry-exhausted" | "empty-first-page"
+        "timeout" | "stall" | "retry-exhausted" | "empty-first-page" | "network-error" | "page-fetch-failed"
     )
 }
 
 /// 高置信度且模型明确建议恢复页面环境时才重试;其余情况保留已采数据并结束本批。
-pub async fn should_retry(kind: &str, response_pages: usize) -> bool {
+pub async fn should_retry(platform: &str, kind: &str, response_pages: usize) -> bool {
     if !is_ambiguous(kind) {
         return false;
     }
-    let Some(key) = std::env::var("TYPESAFE_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    else {
+    let Some(key) = super::jev_common::load_api_key() else {
         return false;
     };
     let request = json!({
         "model": JEV_MODEL,
         "state": {
-            "platform": "douyin",
+            "platform": platform,
             "phase": "comment_api",
             "error_kind": kind,
             "response_pages": response_pages.min(500),
@@ -68,9 +65,9 @@ pub async fn should_retry(kind: &str, response_pages: usize) -> bool {
         },
         "questions": {"action": {
             "type": "choice",
-            "instructions": "判断这次评论接口失败是否可能通过导航到同一视频详情页、刷新页面环境后重试一次恢复。只有证据充分才选 retry_once;网络或平台限制无法判断时选 stop。不可建议绕过验证码、改变身份或继续批量重试。",
+            "instructions": "判断这次评论接口失败是否可能通过导航到同一内容详情页、刷新页面环境后重试一次恢复。只有证据充分才选 retry_once;网络或平台限制无法判断时选 stop。不可建议绕过验证码、改变身份或继续批量重试。",
             "criteria": {
-                "retry_once": "可能是当前页面环境失效,允许导航到同一视频详情页后重试一次",
+                "retry_once": "可能是当前页面环境失效,允许导航到同一内容详情页后重试一次",
                 "stop": "结束本批,保留已经采到的评论;后续由用户处理或重新运行任务"
             }
         }}

@@ -245,10 +245,12 @@ export function CollectPage({
   const [initialLoading, setInitialLoading] = useState(true);
   // 最近一次 task-progress 事件时刻:轮询只在事件静默超过 EVENT_STALE_MS 时兜底补拉
   const lastEventAt = useRef(0);
-  // 加载任务列表;每次 mutate 后重拉(简单粗暴,数据量不大时 OK)
-  const reload = (): Promise<void> => {
+  // 加载任务列表;每次 mutate 后重拉(简单粗暴,数据量不大时 OK)。
+  // includeStats:首载/操作后刷新传 true——连已完成任务的「采集明细」(最后一次运行的数量)
+  // 一起统计;轮询兜底传 false,只刷新活跃任务,避免每 tick 对全部任务做 GROUP BY
+  const reload = (includeStats = true): Promise<void> => {
     return api
-      .listTasks()
+      .listTasks(includeStats)
       .then(setTasks)
       .catch((e) => { toast.error(`加载任务失败: ${e}`); });
   };
@@ -300,9 +302,9 @@ export function CollectPage({
     if (!hasActiveTask) return;
     const timer = setInterval(() => {
       if (Date.now() - lastEventAt.current >= EVENT_STALE_MS) {
-        // 兜底触发后立即重置,避免后续每个 tick 都满足条件连拉
+        // 兜底触发后立即重置,避免后续每个 tick 都满足条件连拉;不带明细统计(见 reload 注释)
         lastEventAt.current = Date.now();
-        reload();
+        reload(false);
       }
     }, POLL_TICK_MS);
     return () => clearInterval(timer);
@@ -332,6 +334,18 @@ export function CollectPage({
             : t,
         ),
       );
+      // 任务进入终态:带明细统计全量重拉一次,让「最后一次采集的数量」定格为最终值
+      // (事件不含统计,最后一次轮询可能早于收尾几百毫秒)
+      if (
+        view.status === "completed" ||
+        view.status === "failed" ||
+        view.status === "cancelled"
+      ) {
+        api
+          .listTasks(true)
+          .then(setTasks)
+          .catch(() => {});
+      }
     })
       .then((fn) => {
         if (cancelled) fn();
@@ -431,7 +445,7 @@ export function CollectPage({
         finishedAt: patch.finishedAt ?? null,
         archived: patch.archived ?? null,
       })
-      .then(reload)
+      .then(() => reload())
       .catch((e) => toast.error(`更新失败: ${e}`));
   }
 

@@ -37,6 +37,9 @@ pub struct Model {
     pub audio_extract: bool,
     /// 是否保留视频文件(下载后落盘不清理,供发布服务复用素材;默认 false,发布后源文件由发布侧管理)
     pub keep_video: bool,
+    /// 轻载模式:采集窗口页面不加载视频/字体(请求层拦截,图片放行保验证码可见),省流+弱机降载;
+    /// 素材下载走 Rust 独立 HTTP 客户端不经页面,不受影响
+    pub light_load: bool,
     /// 是否启用 AI 文案提取(依赖音频提取:转音频后做语音转写)
     pub ai_extract: bool,
     /// 是否启用封面文字识别(采集后对封面图做 OCR,结果存 contents.cover_ocr_text)

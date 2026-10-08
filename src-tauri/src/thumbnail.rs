@@ -126,7 +126,10 @@ pub async fn backfill_missing(root: PathBuf) {
         return;
     }
     let total = sources.len();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    // 回填与采集窗口 / 前端解码抢 CPU:高配 4 路,低配 2 路拉长回填时长换流畅度
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        if crate::hardware::is_low_spec() { 2 } else { 4 },
+    ));
     let mut set = tokio::task::JoinSet::new();
     for source in sources {
         // 入队前取信号量形成背压:JoinSet 不会随素材量无限膨胀

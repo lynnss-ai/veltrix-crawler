@@ -527,6 +527,8 @@ export const DEFAULT_STRATEGY = {
   minLikes: 0,
   audioExtract: false,
   keepVideo: false,
+  // 轻载模式默认开:页面不加载图片/视频,省流 + 弱机提速(素材下载不受影响)
+  lightLoad: true,
   aiExtract: false,
   collectComments: false,
   commentTimeRange: "any" as CommentTimeRange,

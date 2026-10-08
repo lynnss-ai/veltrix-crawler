@@ -65,6 +65,87 @@ pub async fn set_file_input_files(
     Err(anyhow!("仅 Windows 支持"))
 }
 
+// ---- 受信输入原语(CDP Input 域) ----
+//
+// 页内 dispatchEvent 合成事件的 isTrusted=false 平台可辨(字节系 secsdk 已实锤校验),
+// CDP Input 域事件经浏览器输入管线产生:isTrusted=true、自动带完整 pointer+mouse 事件链,
+// 不抢焦点、不要求前台、多窗并行安全——与 Playwright 的点击/输入同机制。
+// 坐标为视口 CSS 像素(与页内 getBoundingClientRect 同坐标系),无需 DPI 换算。
+
+/// 受信点击:3 步 mouseMoved 轨迹趋近落点(瞬移点击在行为轨迹上同样可辨),
+/// 再 mousePressed → mouseReleased。点击会顺带聚焦元素,可直接接 `insert_text`。
+#[cfg(windows)]
+pub async fn trusted_click(window: &WebviewWindow, x: i32, y: i32) -> Result<()> {
+    // 轨迹从落点左上方向两步趋近;负坐标无妨(视口外移动 harmless)
+    for (mx, my) in [(x - 36, y - 27), (x - 9, y - 7), (x, y)] {
+        let params = serde_json::json!({
+            "type": "mouseMoved", "x": mx, "y": my, "buttons": 0, "pointerType": "mouse"
+        })
+        .to_string();
+        cdp_call(window, "Input.dispatchMouseEvent", &params).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let press = serde_json::json!({
+        "type": "mousePressed", "x": x, "y": y, "button": "left",
+        "buttons": 1, "clickCount": 1, "pointerType": "mouse"
+    })
+    .to_string();
+    cdp_call(window, "Input.dispatchMouseEvent", &press).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    let release = serde_json::json!({
+        "type": "mouseReleased", "x": x, "y": y, "button": "left",
+        "buttons": 0, "clickCount": 1, "pointerType": "mouse"
+    })
+    .to_string();
+    cdp_call(window, "Input.dispatchMouseEvent", &release).await?;
+    Ok(())
+}
+
+/// 受信文本输入:向当前聚焦元素提交一段文本(产生受信 input 事件,React/Vue 受控组件
+/// 均可感知)。要求元素已聚焦(先 `trusted_click`);逐字调用可保留拟人输入节奏。
+#[cfg(windows)]
+pub async fn insert_text(window: &WebviewWindow, text: &str) -> Result<()> {
+    let params = serde_json::json!({ "text": text }).to_string();
+    cdp_call(window, "Input.insertText", &params).await?;
+    Ok(())
+}
+
+/// 受信回车:对聚焦元素派发 Enter 的 keyDown/keyUp(触发搜索提交类默认行为)。
+#[cfg(windows)]
+pub async fn press_enter(window: &WebviewWindow) -> Result<()> {
+    let down = serde_json::json!({
+        "type": "keyDown", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"
+    })
+    .to_string();
+    cdp_call(window, "Input.dispatchKeyEvent", &down).await?;
+    let up = serde_json::json!({
+        "type": "keyUp", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+    })
+    .to_string();
+    cdp_call(window, "Input.dispatchKeyEvent", &up).await?;
+    Ok(())
+}
+
+/// 非 Windows:受信输入原语不可用(调用方走页内脚本兜底路径)。
+#[cfg(not(windows))]
+pub async fn trusted_click(_window: &WebviewWindow, _x: i32, _y: i32) -> Result<()> {
+    Err(anyhow!("仅 Windows 支持"))
+}
+
+/// 非 Windows:同上。
+#[cfg(not(windows))]
+pub async fn insert_text(_window: &WebviewWindow, _text: &str) -> Result<()> {
+    Err(anyhow!("仅 Windows 支持"))
+}
+
+/// 非 Windows:同上。
+#[cfg(not(windows))]
+pub async fn press_enter(_window: &WebviewWindow) -> Result<()> {
+    Err(anyhow!("仅 Windows 支持"))
+}
+
 /// 发起一次 CDP 调用并等待完成回调,返回响应 JSON 串。
 ///
 /// 三层错误都在此收敛:调度失败(窗口已销毁)/ 超时 / CDP 协议级错误

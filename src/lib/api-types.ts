@@ -468,6 +468,8 @@ export interface TaskView {
   audioExtract: boolean;
   // 保留视频文件:视频落盘到 video/ 目录供自动发布(与音频提取独立)
   keepVideo: boolean;
+  // 轻载模式:采集窗口页面不加载图片/音视频/字体(省流+弱机提速;素材下载不受影响)
+  lightLoad: boolean;
   // 封面文字识别:采集完成后对封面图做 OCR,结果回写内容的 coverOcrText
   coverOcr: boolean;
   // 评论采集:开启后按下列规则抓评论;关闭时其余字段无意义
@@ -557,6 +559,8 @@ export interface TaskInput {
   audioExtract: boolean;
   // 保留视频文件:视频落盘供自动发布;省略 = 关闭(与音频提取独立)
   keepVideo?: boolean;
+  // 轻载模式:采集窗口页面不加载图片/音视频/字体;省略 = 开启(素材下载不受影响)
+  lightLoad?: boolean;
   // 封面文字识别:采集完成后对封面图做 OCR;省略 = 关闭(需先在系统设置配置 OCR Key)
   coverOcr?: boolean;
   // 评论采集相关(见 TaskView 同名字段说明)

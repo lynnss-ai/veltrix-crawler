@@ -196,7 +196,7 @@ export function DashboardPage() {
   }
 
   return (
-    <div className="veltrix-no-scrollbar veltrix-dashboard-bg min-h-0 flex-1 space-y-2.5 overflow-y-auto p-1">
+    <div className="veltrix-no-scrollbar min-h-0 flex-1 space-y-2.5 overflow-y-auto p-1">
       <ErrorBanner message={error} onClose={() => setError(null)} />
 
       {/* 累计计数 + 平台细分 */}

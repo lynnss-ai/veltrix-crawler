@@ -20,6 +20,11 @@ use veltrix_core::error::{CrawlerError, Result};
 /// 前后端同口径限制(run_task 对存量超限任务同样拦截)。
 pub const MAX_TASK_KEYWORDS: usize = 10;
 
+/// 轻载模式默认值:旧前端 / 未传字段的任务默认开启(省流 + 弱机降载,素材下载不受影响)
+fn default_true() -> bool {
+    true
+}
+
 /// 任务下单个关键词的采集统计(内容数 / 实际入库评论数),供任务列表按关键词分行展示。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +58,8 @@ pub struct TaskView {
     pub audio_extract: bool,
     /// 保留视频文件开关(视频落盘供自动发布;与音频提取独立)
     pub keep_video: bool,
+    /// 轻载模式开关(采集窗口页面不加载图片/音视频/字体;素材下载不受影响)
+    pub light_load: bool,
     /// AI 文案提取开关(依赖音频提取)
     pub ai_extract: bool,
     /// 封面文字识别开关(采集后对封面图做 OCR)
@@ -125,6 +132,7 @@ impl From<task::Model> for TaskView {
             min_likes: m.min_likes,
             audio_extract: m.audio_extract,
             keep_video: m.keep_video,
+            light_load: m.light_load,
             ai_extract: m.ai_extract,
             cover_ocr: m.cover_ocr,
             collect_comments: m.collect_comments,
@@ -186,6 +194,9 @@ pub struct TaskInput {
     /// 保留视频文件开关(前端可能不传,默认关闭)
     #[serde(default)]
     pub keep_video: bool,
+    /// 轻载模式开关(前端可能不传,默认开启:省流 + 弱机降载,素材下载不受影响)
+    #[serde(default = "default_true")]
+    pub light_load: bool,
     pub ai_extract: bool,
     /// 封面文字识别开关(前端可能不传,默认关闭)
     #[serde(default)]
@@ -222,7 +233,10 @@ const LIST_HARD_CAP: u64 = 10000;
 const LOG_HARD_CAP: u64 = 2000;
 
 #[tauri::command]
-pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
+pub async fn list_tasks(
+    state: State<'_, AppState>,
+    include_stats: Option<bool>,
+) -> Result<Vec<TaskView>> {
     // 按 dataScope 过滤;self 仅看自己,all 看全部;假删除(deleted)的任务一律不出现
     let me = current_user(&state).ok_or_else(|| CrawlerError::Config("未登录".into()))?;
     let mut q = task::Entity::find()
@@ -241,7 +255,9 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
     // 从没运行过(started_at 为 None)的任务不参与统计,采集明细自然为 0。
     //
     // 仅对活跃任务(query 时前端正在轮询进度的)查询 per-keyword 统计;
-    // 已完成/失败任务的 keyword_stats 是静态数据,跳过查询直接给空。
+    // 已完成/失败任务的 keyword_stats 是静态数据,仅当调用方显式要求(include_stats,
+    // 首载/手动刷新)才计算——否则轮询兜底每 tick 都要对全部任务做 per-keyword GROUP BY,
+    // 任务多了轮询开销不可控。
     // 累计总量(total_contents/total_comments)直接用任务行的 content_count/comment_count,
     // 不再扫描全量 content+comment 表聚合(此前每次轮询都无条件 all(db) 全扫,库到十万行级后
     // 每次 IPC 搬运数十 MB 数据)。
@@ -259,9 +275,10 @@ pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskView>> {
         })
         .map(|m| m.id.clone())
         .collect();
+    let include_stats = include_stats.unwrap_or(false);
     let task_started: HashMap<String, i64> = rows
         .iter()
-        .filter(|m| active_ids.contains(&m.id))
+        .filter(|m| active_ids.contains(&m.id) || include_stats)
         .filter_map(|m| m.started_at.map(|s| (m.id.clone(), s)))
         .collect();
     let stats = keyword_stats_for_tasks(&state.db, &task_started).await;
@@ -426,6 +443,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
             am.min_likes = Set(input.min_likes);
             am.audio_extract = Set(audio_extract);
             am.keep_video = Set(input.keep_video);
+            am.light_load = Set(input.light_load);
             am.ai_extract = Set(input.ai_extract);
             am.cover_ocr = Set(input.cover_ocr);
             am.collect_comments = Set(input.collect_comments);
@@ -462,6 +480,7 @@ pub async fn upsert_task(state: State<'_, AppState>, input: TaskInput) -> Result
                 min_likes: Set(input.min_likes),
                 audio_extract: Set(audio_extract),
                 keep_video: Set(input.keep_video),
+                light_load: Set(input.light_load),
                 ai_extract: Set(input.ai_extract),
                 cover_ocr: Set(input.cover_ocr),
                 collect_comments: Set(input.collect_comments),

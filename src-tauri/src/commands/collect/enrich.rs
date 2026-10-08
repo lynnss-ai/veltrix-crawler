@@ -255,7 +255,6 @@ pub async fn enrich_authors(
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
-        state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
 

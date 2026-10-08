@@ -19,8 +19,11 @@
 pub mod cdp;
 pub mod cookies;
 pub mod filter_locate;
+pub mod jev_common;
 pub mod jev_filter;
 pub mod jev_risk;
+pub mod jev_search;
+pub mod media_block;
 pub mod native_intercept;
 pub mod pool;
 pub mod script_eval;
@@ -31,8 +34,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
-use veltrix_core::config::RpaStep;
 use veltrix_core::error::{CrawlerError, Result};
 
 /// 一条被拦截的接口响应。`body` 为响应文本(通常是 JSON),由适配器解析。
@@ -159,62 +160,20 @@ impl InterceptChannel {
             .and_then(|mut sessions| sessions.remove(&session_id))
             .unwrap_or_default()
     }
-}
 
-/// 一次 RPA 运行的执行结果,由页面脚本经 `rpa_done` 回传。
-#[derive(Debug, Clone)]
-pub struct RpaOutcome {
-    pub ok: bool,
-    /// 失败步骤下标;成功为 -1。
-    pub failed_step: i64,
-    pub message: String,
-}
-
-/// RPA 运行通道:为每次拟人 RPA 运行分配 run_id,并以 oneshot 等待页面回传结果。
-///
-/// 与持续推送的 [`InterceptChannel`] 不同,一次运行只回传一次结果(成功/失败),故用
-/// oneshot;接收端因超时被 drop 后,迟到的 `complete` 安全忽略。run_id 区分并发的多账号运行。
-#[derive(Default)]
-pub struct RpaChannel {
-    seq: AtomicU64,
-    /// run_id -> 结果发送端。
-    pending: Mutex<HashMap<u64, oneshot::Sender<RpaOutcome>>>,
-}
-
-impl RpaChannel {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 开启一次运行,返回 run_id 与结果接收端。
-    pub fn open_run(&self) -> Result<(u64, oneshot::Receiver<RpaOutcome>)> {
-        let run_id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending
+    /// 批量评论页面回退时逐条取走响应,但保持当前会话继续接收下一条。
+    pub fn drain_session(&self, session_id: u64) -> Vec<InterceptedResponse> {
+        self.sessions
             .lock()
-            .map_err(|_| CrawlerError::Sign("RPA 通道锁异常".into()))?
-            .insert(run_id, tx);
-        Ok((run_id, rx))
-    }
-
-    /// 页面回传一次运行结果。run_id 未登记或已完成(超时)则忽略。
-    pub fn complete(&self, run_id: u64, outcome: RpaOutcome) {
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(tx) = pending.remove(&run_id) {
-                // 接收端已 drop(超时)时 send 返回 Err,忽略即可
-                let _ = tx.send(outcome);
-            }
-        }
-    }
-
-    /// 放弃一次运行(等待方超时后调用):页面 ack 永不回传时,
-    /// 不清理会让发送端条目在表里永久残留,长期运行累积泄漏。
-    pub fn cancel(&self, run_id: u64) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&run_id);
-        }
+            .ok()
+            .and_then(|mut sessions| sessions.get_mut(&session_id).map(std::mem::take))
+            .unwrap_or_default()
     }
 }
+
+// 注:RPA 运行 ack 通道(RpaOutcome / RpaChannel / `rpa_done` 命令)已随拟人步骤
+// Rust 化移除——定位/点击/输入改由 Rust 侧 CDP 受信事件驱动(见 pool::rpa_search_once),
+// 不再依赖页内脚本经 invoke 回传成败。
 
 // 注:浏览器 Agent 早期的「动作 + 回读」请求-响应通道(AgentActionChannel / AgentActionOutcome)
 // 已废弃——回读改走 WebView2 ExecuteScript(见 webview::script_eval),不再依赖页面 invoke 回传。
@@ -1207,7 +1166,7 @@ pub struct XhsApiCollectSpec<'a> {
     pub kind: &'a str,
 }
 
-/// 小红书评论并发任务。每篇笔记内部仍按 cursor 串行翻页,仅不同笔记之间并行。
+/// 小红书页内直采任务(评论分批 / 详情分批共用同一 (noteId, xsecToken) 形态)。
 pub struct XhsCommentJob<'a> {
     pub content_id: &'a str,
     pub xsec_token: &'a str,
@@ -1257,6 +1216,35 @@ pub fn build_xhs_comment_batch_eval(
     build_xhs_api_collect_script(&cfg)
 }
 
+/// 小红书详情批量直采脚本:同一页面签名环境内按 lanes 并发拉取多篇笔记详情。
+/// 单篇失败只标记该篇;响应仍经 fetch hook 拦截回传,由 Rust 侧适配器统一解析。
+pub fn build_xhs_detail_batch_eval(
+    session_id: u64,
+    jobs: &[XhsCommentJob<'_>],
+    lanes: usize,
+) -> String {
+    let jobs = jobs
+        .iter()
+        .map(|job| {
+            serde_json::json!({
+                "noteId": job.content_id,
+                "xsecToken": job.xsec_token,
+            })
+        })
+        .collect::<Vec<_>>();
+    let cfg = serde_json::json!({
+        "sessionId": session_id,
+        "noteId": "",
+        "xsecToken": "",
+        "limit": 0,
+        "maxPages": 1,
+        "kind": "detail",
+        "jobs": jobs,
+        "lanes": lanes,
+    });
+    build_xhs_api_collect_script(&cfg)
+}
+
 fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
     let cfg_json = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
     format!(
@@ -1272,6 +1260,13 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
     try {{ if (window.__veltrixHud && window.__veltrixHud.log) window.__veltrixHud.log({{ level: level, message: message }}); }} catch (e) {{}}
   }}
   function sleep(ms) {{ return new Promise(function (resolve) {{ setTimeout(resolve, ms); }}); }}
+  function safeError(error) {{
+    var text=error&&error.message?String(error.message):'';
+    if(text==='aborted'||text==='missing-note-id'||text==='detail-not-found'||text==='signer-unavailable'||text==='page-fetch-failed')return text;
+    if(/^non-json-\d+$/.test(text))return text;
+    if(/^api-rejected-\d+-[-\w]*$/.test(text)||/^official-api-rejected-[-\w]*$/.test(text))return text;
+    return 'network-error';
+  }}
   // 可中断 sleep:拆 200ms 小段轮询中止/代际标志——退避与翻页节拍期间,
   // 手动停止或新一批脚本注入(代际接管)能立即响应,不闷头睡满整段。
   async function interruptibleSleep(ms) {{
@@ -1463,32 +1458,83 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
     }}
     return json;
   }}
-  async function fetchDetail() {{
+  async function fetchDetailJob(noteId, xsecToken) {{
     var path = '/api/sns/web/v1/feed';
     var officialData = {{
-      sourceNoteId: CFG.noteId,
+      sourceNoteId: noteId,
       imageFormats: ['jpg', 'webp', 'avif'],
       extra: {{ needBodyTopic: '1' }},
       xsecSource: 'pc_search',
-      xsecToken: CFG.xsecToken
+      xsecToken: xsecToken
     }};
     var body = JSON.stringify({{
-      source_note_id: CFG.noteId,
+      source_note_id: noteId,
       image_formats: ['jpg', 'webp', 'avif'],
       extra: {{ need_body_topic: '1' }},
       xsec_source: 'pc_search',
-      xsec_token: CFG.xsecToken
+      xsec_token: xsecToken
     }});
     var json = await signedFetch(path, {{ method: 'POST', officialKind: 'detail', officialData: officialData }}, body);
     var detailData = responseData(json);
     var items = detailData && detailData.items;
     var hit = Array.isArray(items) && items.some(function (item) {{
       var card = item && (item.note_card || item.noteCard || item);
-      return String((card && (card.note_id || card.noteId)) || item.id || '') === CFG.noteId;
+      return String((card && (card.note_id || card.noteId)) || item.id || '') === noteId;
     }});
     if (!hit) throw new Error('detail-not-found');
-    result.used = true;
-    result.pages = 1;
+  }}
+  // 详情批量:lanes 个 worker 从共享队列取笔记(单线程 JS 取号无竞态)。单篇一次轻退避
+  // (3s、最多重试 1 次)吸收风控抖动;篇间 400~1200ms 随机节拍 + 起跑按 lane 错峰 300ms,
+  // 压住瞬时请求密度。单篇失败只标记该篇,不拖垮整批。
+  async function fetchDetailBatch() {{
+    result.jobs = JOBS.map(function (job) {{
+      return {{ noteId: String(job.noteId || ''), used: false, error: null, pages: 0 }};
+    }});
+    var lanes = Math.max(1, Math.min(Number(CFG.lanes) || 6, 10));
+    var next = 0;
+    async function worker(lane) {{
+      if (lane > 1 && !(await interruptibleSleep((lane - 1) * 300))) return;
+      while (window.__veltrixXhsApiGen === GEN) {{
+        if (window.__veltrixXhsApiAbort) throw new Error('aborted');
+        var index = next;
+        next += 1;
+        if (index >= JOBS.length) return;
+        var job = JOBS[index], jobResult = result.jobs[index];
+        try {{
+          if (!jobResult.noteId) throw new Error('missing-note-id');
+          var done = false, lastError = null;
+          for (var attempt = 0; attempt <= 1 && !done; attempt++) {{
+            if (window.__veltrixXhsApiAbort || window.__veltrixXhsApiGen !== GEN) throw new Error('aborted');
+            try {{
+              await fetchDetailJob(job.noteId, job.xsecToken || '');
+              done = true;
+            }} catch (error) {{
+              lastError = error;
+              if (attempt < 1) {{
+                hud('warn', '⏳ 详情并发' + lane + ' 请求失败(' + safeError(error) + ')· 3s 后重试 1/1');
+                if (!(await interruptibleSleep(3000))) throw new Error('aborted');
+              }}
+            }}
+          }}
+          if (!done) throw lastError || new Error('page-fetch-failed');
+          jobResult.used = true;
+          jobResult.pages = 1;
+          hud('info', '📄 详情并发' + lane + ' ✓ ' + String(job.noteId).slice(-8));
+        }} catch (error) {{
+          jobResult.error = safeError(error);
+          if (jobResult.error === 'aborted') jobResult.aborted = true;
+        }}
+        if (next < JOBS.length && !(await interruptibleSleep(400 + Math.floor(Math.random() * 800)))) return;
+      }}
+    }}
+    await Promise.all(Array.from({{ length: lanes }}, function (unused, i) {{ return worker(i + 1); }}));
+    result.used = result.jobs.some(function (job) {{ return job.used; }});
+    result.aborted = result.jobs.some(function (job) {{ return job.aborted; }});
+    result.pages = result.jobs.reduce(function (sum, job) {{ return sum + job.pages; }}, 0);
+    if (!result.used) {{
+      var failed = result.jobs.find(function (job) {{ return job.error; }});
+      result.error = failed ? failed.error : 'empty';
+    }}
   }}
   async function fetchComments(job, jobResult, lane) {{
     var cursor = '';
@@ -1521,7 +1567,7 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
           lastError = e;
           if (attempt < 2) {{
             var backoff = (attempt + 1) * 3000;
-            hud('warn', '⏳ 并发' + lane + ' 第 ' + (page + 1) + ' 页请求失败(' + (e && e.message ? e.message : String(e)) + ')· ' + (backoff / 1000) + 's 后重试 ' + (attempt + 1) + '/2');
+            hud('warn', '⏳ 并发' + lane + ' 第 ' + (page + 1) + ' 页请求失败(' + safeError(e) + ')· ' + (backoff / 1000) + 's 后重试 ' + (attempt + 1) + '/2');
             if (!(await interruptibleSleep(backoff))) throw new Error('aborted');
           }}
         }}
@@ -1547,10 +1593,19 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
   }}
   async function main() {{
     try {{
-      // 官方评论页自身也允许 xsecToken 为空;只要有笔记 ID 就先尝试,失败再回退页面采集。
-      if (!CFG.noteId) throw new Error('missing-note-id');
-      if (CFG.kind === 'detail') await fetchDetail();
-      else {{
+      if (CFG.kind === 'detail') {{
+        // 批量模式(jobs 非空):worker 池并发;单篇模式沿用原行为
+        if (Array.isArray(CFG.jobs) && CFG.jobs.length) {{
+          await fetchDetailBatch();
+        }} else {{
+          // 官方接口允许 xsecToken 为空;只要有笔记 ID 就先尝试,失败再回退页面采集。
+          if (!CFG.noteId) throw new Error('missing-note-id');
+          await fetchDetailJob(CFG.noteId, CFG.xsecToken);
+          result.used = true;
+          result.pages = 1;
+        }}
+      }} else {{
+        if (!CFG.noteId) throw new Error('missing-note-id');
         result.jobs = JOBS.map(function (job) {{
           return {{ noteId: String(job.noteId || ''), used: false, error: null, pages: 0, comments: 0, noComments: false }};
         }});
@@ -1560,7 +1615,7 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
             if (!jobResult.noteId) throw new Error('missing-note-id');
             await fetchComments(job, jobResult, index + 1);
           }} catch (error) {{
-            jobResult.error = error && error.message ? error.message : String(error);
+            jobResult.error = safeError(error);
             if (jobResult.error === 'aborted') jobResult.aborted = true;
           }}
         }}));
@@ -1575,7 +1630,7 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
         }}
       }}
     }} catch (error) {{
-      result.error = error && error.message ? error.message : String(error);
+      result.error = safeError(error);
       if (result.error === 'aborted') result.aborted = true;
     }}
     // fetch hook 的 response.clone().text() 回传是异步任务,稍候再发完成信号防 Rust 先取空缓冲。
@@ -1591,8 +1646,8 @@ fn build_xhs_api_collect_script(cfg: &serde_json::Value) -> String {
 #[cfg(test)]
 mod xhs_api_tests {
     use super::{
-        build_xhs_api_collect_eval, build_xhs_comment_batch_eval, XhsApiCollectSpec,
-        XhsCommentJob,
+        build_xhs_api_collect_eval, build_xhs_comment_batch_eval, build_xhs_detail_batch_eval,
+        XhsApiCollectSpec, XhsCommentJob,
     };
 
     #[test]
@@ -1607,7 +1662,7 @@ mod xhs_api_tests {
         });
         assert!(script.contains("postApiSnsWebV1Feed"));
         assert!(script.contains("getApiSnsWebV2CommentPage"));
-        assert!(script.contains("sourceNoteId: CFG.noteId"));
+        assert!(script.contains("sourceNoteId: noteId"));
         assert!(script.contains("window._webmsxyw"));
         assert!(script.contains("/api/sns/web/v2/comment/page"));
         assert!(script.contains("\"noteId\":\"note-'quoted\""));
@@ -1635,6 +1690,31 @@ mod xhs_api_tests {
         assert!(script.contains("\"noteId\":\"note-a\""));
         assert!(script.contains("\"noteId\":\"note-b\""));
         assert!(script.contains("query.set('cursor', params.cursor)"));
+    }
+
+    #[test]
+    fn detail_batch_script_carries_jobs_lanes_and_worker_pool() {
+        let script = build_xhs_detail_batch_eval(
+            11,
+            &[
+                XhsCommentJob {
+                    content_id: "note-x",
+                    xsec_token: "token-x",
+                },
+                XhsCommentJob {
+                    content_id: "note-y",
+                    xsec_token: "",
+                },
+            ],
+            6,
+        );
+        // 批量模式:kind=detail + jobs 数组 + lanes 并发,worker 池而非单条直发
+        assert!(script.contains("\"kind\":\"detail\""));
+        assert!(script.contains("\"noteId\":\"note-x\""));
+        assert!(script.contains("\"noteId\":\"note-y\""));
+        assert!(script.contains("\"lanes\":6"));
+        assert!(script.contains("async function fetchDetailBatch()"));
+        assert!(script.contains("var lanes = Math.max(1, Math.min(Number(CFG.lanes) || 6, 10));"));
     }
 }
 
@@ -2181,184 +2261,119 @@ pub fn build_agent_read_eval(cap: usize) -> String {
 /// 注入脚本里回传 RPA 执行结果的命令名;与 Rust 端 `#[tauri::command] rpa_done` 对应。
 pub const RPA_DONE_COMMAND: &str = "rpa_done";
 
-/// 构造「拟人 RPA 步骤执行器」注入脚本。
-///
-/// `steps` 序列化为 JS 数组后,在页面内 async 自驱动执行:逐字输入、hover→点击、
-/// 轮询等待节点、分段随机滚动、随机停顿——节奏由节点状态 + 随机化驱动而非固定计时,
-/// 以贴近真人、降低风控。整段跑完(或某步失败)经 `rpa_done` 回传成败,Rust 据此编排。
-///
-/// 用占位替换而非 `format!`,规避脚本内大量 `{}` 的转义噪声;`__STEPS__` / `__KW__`
-/// 不会作为合法标识符出现在脚本中,替换安全。keyword 的 `{keyword}` 占位在页面侧替换。
-pub fn build_human_rpa_script(steps: &[RpaStep], keyword: &str, run_id: u64) -> String {
-    let steps_json = serde_json::to_string(steps).unwrap_or_else(|_| "[]".to_string());
-    let kw_json = serde_json::to_string(keyword).unwrap_or_else(|_| "\"\"".to_string());
-
-    const TEMPLATE: &str = r#"(function () {
-  var STEPS = __STEPS__;
-  var KW = __KW__;
-  // 手动结束中断标志:HUD「结束」按钮会置 window.__veltrixAbort=true(同窗口共享),
-  // 本脚本的步骤循环与滚动循环每轮检查它即时退出。开跑先复位,避免窗口复用/SPA 下残留上次的 true。
-  try { window.__veltrixAbort = false; } catch (e) {}
-
-  function rand(a, b) { return a + Math.random() * (b - a); }
-  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-  function subst(s) { return (s == null ? '' : String(s)).split('{keyword}').join(KW); }
-
-  // 轮询等待节点出现;命中或超时(返回 null)后 resolve
-  function waitFor(sel, timeout) {
-    return new Promise(function (resolve) {
-      var start = Date.now();
-      (function poll() {
-        var el = document.querySelector(sel);
-        if (el) return resolve(el);
-        if (Date.now() - start > timeout) return resolve(null);
-        setTimeout(poll, rand(180, 360));
-      })();
-    });
-  }
-
-  // React 受控组件:必须用原生 value setter 再派发 input,框架才感知到输入
-  function setNativeValue(el, value) {
-    var proto = el.tagName === 'TEXTAREA'
-      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-
-  async function typeHuman(el, text) {
-    el.focus();
-    for (var i = 0; i < text.length; i++) {
-      var ch = text[i];
-      el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
-      setNativeValue(el, text.slice(0, i + 1));
-      el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
-      await sleep(rand(80, 200)); // 逐字随机节奏,模拟打字
-    }
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  async function clickHuman(el) {
-    el.scrollIntoView({ block: 'center' });
-    await sleep(rand(150, 400));
+/// 构造「单发定位元素到视口坐标」的脚本(**同步** IIFE,ExecuteScript 不 await Promise):
+/// 用 querySelectorAll 取**第一个可见**(≥2px)的匹配——选择器列表是逗号候选,文档序
+/// 靠前的匹配可能是隐藏元素(如折叠弹层里的同名输入框),只看第一个会永远判不可见;
+/// 命中返回元素滚动到视口中心后的坐标 `{x,y}`(视口 CSS 像素,与 CDP Input 同坐标系),
+/// 未命中返回 null。「等元素出现」的 waitFor 语义由 Rust 侧轮询多次调用实现。
+/// 供 Rust 侧 CDP 受信点击/输入使用——页内 dispatchEvent 合成事件 isTrusted=false
+/// 平台可辨(字节系 secsdk 已实锤校验),受信输入必须经浏览器输入管线产生。
+pub fn build_locate_point_eval(selector: &str) -> String {
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function () {{
+  var nodes = document.querySelectorAll({sel_json});
+  for (var i = 0; i < nodes.length && i < 50; i++) {{
+    var el = nodes[i];
+    if (el.closest && el.closest('[aria-hidden="true"]')) continue;
     var r = el.getBoundingClientRect();
-    var o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    // 派发 pointer + mouse 全套:小红书等 Vue 组件的点击处理常挂在 pointer 事件上,
-    // 只发 mouse 合成事件触发不了搜索(表现为「关键词输入完没点击/点了没反应」)。
-    try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (e) {}
-    el.dispatchEvent(new MouseEvent('mouseover', o));
-    el.dispatchEvent(new MouseEvent('mousemove', o));
-    await sleep(rand(120, 350)); // hover 后短暂停顿再按下
-    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
-    el.dispatchEvent(new MouseEvent('mousedown', o));
-    try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
-    el.dispatchEvent(new MouseEvent('mouseup', o));
-    el.dispatchEvent(new MouseEvent('click', o));
-  }
+    if (r.width < 2 || r.height < 2) continue;
+    try {{ el.scrollIntoView({{ block: 'center' }}); }} catch (e) {{}}
+    var rr = el.getBoundingClientRect();
+    if (rr.width < 2 || rr.height < 2) continue;
+    return {{ x: Math.round(rr.left + rr.width / 2), y: Math.round(rr.top + rr.height / 2) }};
+  }}
+  return null;
+}})()"#
+    )
+}
 
-  function pressEnter(el) {
-    el.focus();
-    var ev = { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
-    el.dispatchEvent(new KeyboardEvent('keydown', ev));
-    el.dispatchEvent(new KeyboardEvent('keyup', ev));
-  }
+/// 构造「向视口坐标派发合成点击」的兜底脚本(CDP 受信点击不可用的最后手段):
+/// 对 elementFromPoint 命中元素派发 pointer+mouse 全链(isTrusted=false,平台可辨;
+/// 非 Windows 无 CDP Input 域,维持旧行为等价)。命中返回 true。
+pub fn build_click_point_eval(x: i32, y: i32) -> String {
+    format!(
+        r#"(function () {{
+  var el = document.elementFromPoint({x}, {y});
+  if (!el) return false;
+  var r = el.getBoundingClientRect();
+  var o = {{ bubbles: true, cancelable: true, clientX: {x}, clientY: {y} }};
+  try {{ el.dispatchEvent(new PointerEvent('pointerover', o)); }} catch (e) {{}}
+  el.dispatchEvent(new MouseEvent('mouseover', o));
+  el.dispatchEvent(new MouseEvent('mousemove', o));
+  try {{ el.dispatchEvent(new PointerEvent('pointerdown', o)); }} catch (e) {{}}
+  el.dispatchEvent(new MouseEvent('mousedown', o));
+  try {{ el.dispatchEvent(new PointerEvent('pointerup', o)); }} catch (e) {{}}
+  el.dispatchEvent(new MouseEvent('mouseup', o));
+  el.dispatchEvent(new MouseEvent('click', o));
+  return !!r.width || !!r.height;
+}})()"#
+    )
+}
 
-  // 找主滚动容器:整页 + 所有内部可滚容器里,取「内容最高」的那个(= 主内容区,
-  // 避免误选某个小的内部滚动容器导致很快「到底」)。
-  function findMainScroller() {
-    var docEl = document.scrollingElement || document.documentElement;
-    var best = docEl, bestH = docEl ? docEl.scrollHeight : 0;
-    var all = document.querySelectorAll('*');
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      var st = getComputedStyle(el);
-      if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 100) {
-        if (el.scrollHeight > bestH) { bestH = el.scrollHeight; best = el; }
-      }
-    }
-    return best;
-  }
+/// 构造「校验输入框当前值是否等于期望文本」的脚本(insertText 走通后回读确认:
+/// 若点击聚焦落在了覆盖层等元素上,文本没进输入框但流程会误报成功,回读兜住)。
+pub fn build_verify_value_eval(selector: &str, text: &str) -> String {
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function () {{
+  var el = document.querySelector({sel_json});
+  return !!el && el.value === {text_json};
+}})()"#
+    )
+}
 
-  // maxRounds 为最大轮数上限;持续滚动直到内容高度连续多轮不再增长(真·到底)才停。
-  // 多管齐下触发懒加载:scrollBy + 把末尾元素滚入视口(命中 IntersectionObserver 哨兵) + 派发 scroll 事件。
-  async function scrollHuman(maxRounds) {
-    var scroller = findMainScroller();
-    var lastHeight = 0, stagnant = 0;
-    for (var i = 0; i < maxRounds; i++) {
-      if (window.__veltrixAbort) break; // 手动结束:立即停止滚动翻页
-      scroller.scrollBy({ top: rand(600, 1100) });
-      var kids = scroller.children;
-      if (kids && kids.length) {
-        try { kids[kids.length - 1].scrollIntoView({ block: 'end' }); } catch (e) {}
-      }
-      // 兼容「监听 scroll 事件才加载」的页面
-      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-      window.dispatchEvent(new Event('scroll'));
-      await sleep(rand(1000, 2000)); // 等懒加载补内容
+/// 构造「按文案单发定位元素到视口坐标」的脚本(匹配口径与 [`build_select_eval`] 完全一致:
+/// textContent 精确等于任一 label,跳过 aria-hidden 装饰/诱饵层与零尺寸元素)。
+/// 命中返回 `{x,y}`,未命中返回 null——调用方无需再跑一遍合成点击去确认「没有可点的」。
+pub fn build_select_point_eval(labels: &[String]) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(function () {{
+  var LABELS = {labels_json};
+  if (!LABELS.length) return null;
+  var nodes = document.querySelectorAll('button,a,span,div,li,[role="tab"],[role="button"]');
+  for (var i = 0; i < nodes.length; i++) {{
+    var el = nodes[i];
+    var t = (el.textContent || '').trim();
+    var hit = false;
+    for (var j = 0; j < LABELS.length; j++) {{ if (t === LABELS[j]) {{ hit = true; break; }} }}
+    if (!hit) continue;
+    // 跳过 aria-hidden 的装饰/诱饵层(小红书在每个筛选项上叠了不可见同名代理 data-hp-*,点它无效)及零尺寸元素
+    if (el.closest && el.closest('[aria-hidden="true"]')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    try {{ el.scrollIntoView({{ block: 'center' }}); }} catch (e) {{}}
+    var rr = el.getBoundingClientRect();
+    if (rr.width < 1 || rr.height < 1) continue;
+    return {{ x: Math.round(rr.left + rr.width / 2), y: Math.round(rr.top + rr.height / 2) }};
+  }}
+  return null;
+}})()"#
+    )
+}
 
-      var h = scroller.scrollHeight;
-      if (h <= lastHeight + 10) {
-        stagnant++;
-        if (stagnant >= 6) break; // 更有耐心:连续 6 轮不涨才认为到底
-        await sleep(rand(1000, 2000)); // 没涨就多等,给慢加载机会
-      } else {
-        stagnant = 0;
-      }
-      lastHeight = h;
-      if (Math.random() < 0.2) { // 偶尔回滚一点,更像人
-        scroller.scrollBy({ top: -rand(80, 200) });
-        await sleep(rand(300, 700));
-      }
-    }
-  }
-
-  function done(ok, idx, msg) {
-    try {
-      // 失败时附带当前 URL,日志可看出卡在首页/登录页/结果页哪一步
-      var detail = ok ? (msg || '') : ((msg || '') + ' @ ' + location.href);
-      window.__TAURI_INTERNALS__.invoke('rpa_done', { runId: __RUNID__, ok: ok, failedStep: idx, message: detail });
-    } catch (e) { console.error('[veltrix] rpa_done bridge unavailable', e); }
-  }
-
-  (async function run() {
-    for (var i = 0; i < STEPS.length; i++) {
-      if (window.__veltrixAbort) return done(false, i, '已手动结束'); // 手动结束:中止后续步骤
-      var s = STEPS[i];
-      try {
-        if (s.action === 'waitFor') {
-          if (!await waitFor(subst(s.selector), s.timeoutMs || 8000)) {
-            return done(false, i, 'waitFor 超时: ' + s.selector);
-          }
-        } else if (s.action === 'click') {
-          var ec = await waitFor(subst(s.selector), 5000);
-          if (!ec) return done(false, i, 'click 节点缺失: ' + s.selector);
-          await clickHuman(ec);
-        } else if (s.action === 'type') {
-          var et = await waitFor(subst(s.selector), 5000);
-          if (!et) return done(false, i, 'type 节点缺失: ' + s.selector);
-          await typeHuman(et, subst(s.text));
-        } else if (s.action === 'pressEnter') {
-          var ep = await waitFor(subst(s.selector), 5000);
-          if (!ep) return done(false, i, 'pressEnter 节点缺失: ' + s.selector);
-          pressEnter(ep);
-        } else if (s.action === 'scroll') {
-          await scrollHuman(s.segments || 4);
-        } else if (s.action === 'pause') {
-          await sleep(rand(s.minMs || 300, s.maxMs || 800));
-        }
-        await sleep(rand(200, 600)); // 步骤间自然间隔
-      } catch (e) {
-        return done(false, i, String(e));
-      }
-    }
-    done(true, -1, '');
-  })();
-})();"#;
-
-    TEMPLATE
-        .replace("__STEPS__", &steps_json)
-        .replace("__KW__", &kw_json)
-        .replace("__RUNID__", &run_id.to_string())
+/// 构造「聚焦输入框并以原生 setter 写入文本」的兜底脚本(CDP insertText 不可用时)。
+/// 只派发 input/change 两个事件维持 React 受控组件兼容——原页内拟人打字的逐字
+/// keydown/keyup 是 isTrusted=false 合成事件,属可辨特征,已随受信输入改造移除。
+pub fn build_set_value_eval(selector: &str, text: &str) -> String {
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function () {{
+  var el = document.querySelector({sel_json});
+  if (!el) return false;
+  el.focus();
+  var proto = el.tagName === 'TEXTAREA'
+    ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) {{ desc.set.call(el, {text_json}); }} else {{ el.value = {text_json}; }}
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  return true;
+}})()"#
+    )
 }
 
 // ---- 采集日志:窗口内 HUD 浮层 + 前端事件 ----
@@ -2514,8 +2529,12 @@ pub fn build_hud_task_eval(task_id: &str) -> String {
 /// 因此 legacy 路径的整页导航不会清空 HUD。脚本对页面只读、`pointer-events:none`,
 /// 不干扰平台页面自身的交互与采集 hook。
 pub fn build_hud_init_script() -> String {
-    r#"(function () {
-  // 浮层只在顶层帧建:initialization_script 会注入所有帧,字节系页面沙箱 iframe 多,
+    // 低配设备走轻量渲染档(判定见 hardware::is_low_spec):HUD 去 backdrop 模糊与常驻动画、
+    // 暂停平台页自动播放视频。blur(14px) 盖住 50vw×55vh,下层页面又在持续重绘
+    // (自动播放视频),弱 GPU 每帧都要重算模糊,整窗渲染直接掉到个位数帧率。
+    let low_flag = if crate::hardware::is_low_spec() { "true" } else { "false" };
+    let mut script = format!("(function () {{\n  var LOW_SPEC = {low_flag};\n");
+    script.push_str(r#"  // 浮层只在顶层帧建:initialization_script 会注入所有帧,字节系页面沙箱 iframe 多,
   // 每个帧都解析执行整份 HUD 脚本纯属浪费
   if (window !== window.top) return;
   if (window.__veltrixHudReady) return;
@@ -2566,28 +2585,73 @@ pub fn build_hud_init_script() -> String {
     if (!document.body) return null;
     var root = document.getElementById('veltrix-hud');
     if (root) return root;
+    // 样式表集中注入一次:hover/滚动条/@keyframes 无法用内联 style 表达。
+    // 核心视觉全部走内联样式,极端情况下样式表被平台 CSP 拦截也只是少 hover/动画,不破版。
+    var styleEl = document.getElementById('veltrix-hud-style');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'veltrix-hud-style';
+      styleEl.textContent = '#veltrix-hud-logs::-webkit-scrollbar{width:6px}'
+        + '#veltrix-hud-logs::-webkit-scrollbar-track{background:transparent}'
+        + '#veltrix-hud-logs::-webkit-scrollbar-thumb{background:rgba(125,180,255,.22);border-radius:3px}'
+        + '#veltrix-hud-logs::-webkit-scrollbar-thumb:hover{background:rgba(125,180,255,.4)}'
+        + '.veltrix-hud-btn{transition:border-color .15s ease,color .15s ease,background .15s ease,box-shadow .15s ease}'
+        + '.veltrix-hud-btn:hover{border-color:rgba(125,211,252,.6)!important;color:#e2f2ff!important;background:rgba(125,211,252,.12)!important;box-shadow:0 0 10px rgba(56,189,248,.18)}'
+        + '#veltrix-hud-stop:hover{border-color:rgba(252,165,165,.75)!important;background:rgba(239,68,68,.16)!important;box-shadow:0 0 10px rgba(239,68,68,.25)!important;color:#fecaca!important}'
+        + '.veltrix-hud-line{display:flex;align-items:baseline;gap:8px;padding:2px 6px;border-radius:6px;white-space:nowrap}'
+        + '.veltrix-hud-line:hover{background:rgba(125,180,255,.07)}'
+        + '.veltrix-hud-meta{flex:0 0 auto;color:#546a8a;font-size:10.5px}'
+        + '.veltrix-hud-badge{flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:.6px;padding:0 5px;border-radius:4px;line-height:15px}'
+        + '.veltrix-hud-badge-info{color:#7dd3fc;background:rgba(56,189,248,.13);border:1px solid rgba(56,189,248,.22)}'
+        + '.veltrix-hud-badge-warn{color:#fbbf24;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.26)}'
+        + '.veltrix-hud-badge-error{color:#f87171;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.32)}'
+        + '.veltrix-hud-msg{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:#c3d2e8}'
+        + '.veltrix-hud-line-warn .veltrix-hud-msg{color:#fde68a}'
+        + '.veltrix-hud-line-error .veltrix-hud-msg{color:#fca5a5}'
+        + (LOW_SPEC ? '' : '.veltrix-hud-line-in{animation:veltrix-hud-in .28s ease-out}')
+        + (LOW_SPEC ? '' : '#veltrix-hud-dot.veltrix-hud-dot-run{animation:veltrix-hud-pulse 1.6s ease-out infinite}')
+        + '@keyframes veltrix-hud-in{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:translateX(0)}}'
+        + '@keyframes veltrix-hud-pulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}75%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}'
+        + '@keyframes veltrix-hud-flow{to{background-position:-200% 0}}'
+        // 系统开了「关闭动画效果」(无障碍)时所有档位都停掉常驻动画,尊重用户偏好
+        + '@media (prefers-reduced-motion:reduce){#veltrix-hud-topline,.veltrix-hud-line-in,#veltrix-hud-dot.veltrix-hud-dot-run{animation:none!important}}';
+      (document.head || document.body).appendChild(styleEl);
+    }
     root = document.createElement('div');
     root.id = 'veltrix-hud';
-    root.style.cssText = 'position:fixed;right:12px;bottom:12px;width:50vw;z-index:2147483647;height:33vh;background:rgba(17,24,39,.95);color:#e5e7eb;font:12px/1.55 system-ui,-apple-system,sans-serif;border:1px solid rgba(255,255,255,.14);border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
+    // 玻璃拟态(blur)只留给高配:轻量档用实底深色(提高不透明度补回层次)+ 小阴影
+    root.style.cssText = 'position:fixed;left:12px;bottom:12px;width:50vw;z-index:2147483647;height:55vh;'
+      + (LOW_SPEC
+        ? 'background:rgba(10,14,24,.96);box-shadow:0 10px 28px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);'
+        : 'background:rgba(10,14,24,.86);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3);box-shadow:0 12px 40px rgba(0,0,0,.55),0 0 24px rgba(56,189,248,.08),inset 0 1px 0 rgba(255,255,255,.06);')
+      + 'color:#dbe4f3;font:12px/1.6 ui-monospace,SFMono-Regular,Cascadia Code,Consolas,monospace;border:1px solid rgba(94,175,255,.22);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;pointer-events:auto;';
+    // 顶部流光线:青→紫渐变,一眼「在运行」的科技感;轻量档保留静态渐变、去掉无限流动动画
+    var topline = document.createElement('div');
+    topline.id = 'veltrix-hud-topline';
+    topline.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,transparent 0%,#38bdf8 30%,#a78bfa 50%,#38bdf8 70%,transparent 100%);'
+      + (LOW_SPEC ? '' : 'background-size:200% 100%;animation:veltrix-hud-flow 3.2s linear infinite;')
+      + 'pointer-events:none;';
     var head = document.createElement('div');
     head.id = 'veltrix-hud-head';
-    head.style.cssText = 'padding:8px 11px;font-weight:600;background:rgba(255,255,255,.06);display:flex;align-items:center;gap:7px;flex:0 0 auto;cursor:default;user-select:none;';
+    head.style.cssText = 'padding:9px 12px;font-weight:600;background:linear-gradient(180deg,rgba(148,197,255,.10),rgba(148,197,255,.03));display:flex;align-items:center;gap:8px;flex:0 0 auto;cursor:default;user-select:none;border-bottom:1px solid rgba(94,175,255,.14);';
     var dot = document.createElement('span');
     dot.id = 'veltrix-hud-dot';
-    dot.style.cssText = 'width:8px;height:8px;border-radius:50%;background:#9ca3af;flex:0 0 auto;';
+    dot.style.cssText = 'width:9px;height:9px;border-radius:50%;background:#9ca3af;flex:0 0 auto;';
     var title = document.createElement('span');
     title.textContent = 'HUD日志';
-    title.style.cssText = 'flex:0 0 auto;font-weight:600;';
+    // 渐变标题文字:青→紫,呼应主应用 veltrix-title 的科技感语系
+    title.style.cssText = 'flex:0 0 auto;font-weight:700;letter-spacing:.5px;background:linear-gradient(90deg,#7dd3fc,#c4b5fd);-webkit-background-clip:text;background-clip:text;color:transparent;';
     var status = document.createElement('span');
     status.id = 'veltrix-hud-status';
-    status.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400;font-size:11px;color:#9ca3af;';
+    status.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400;font-size:11px;color:#8ea3c0;';
     head.appendChild(dot); head.appendChild(title); head.appendChild(status);
 
     var toggleBtn = document.createElement('span');
     toggleBtn.id = 'veltrix-hud-toggle';
     toggleBtn.setAttribute('data-hud-btn', '1');
+    toggleBtn.className = 'veltrix-hud-btn';
     toggleBtn.textContent = '收起';
-    toggleBtn.style.cssText = 'cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(255,255,255,.18);border-radius:5px;color:#cbd5e1;flex:0 0 auto;';
+    toggleBtn.style.cssText = 'cursor:pointer;font-weight:500;font-size:11px;padding:2px 8px;border:1px solid rgba(148,197,255,.22);border-radius:6px;color:#b7c9e2;background:rgba(148,197,255,.06);flex:0 0 auto;';
     toggleBtn.addEventListener('click', function (e) {
       e.stopPropagation();
       setCollapsed(true);
@@ -2595,8 +2659,9 @@ pub fn build_hud_init_script() -> String {
 
     var copyBtn = document.createElement('span');
     copyBtn.setAttribute('data-hud-btn', '1');
+    copyBtn.className = 'veltrix-hud-btn';
     copyBtn.textContent = '复制';
-    copyBtn.style.cssText = 'cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(255,255,255,.18);border-radius:5px;color:#cbd5e1;flex:0 0 auto;';
+    copyBtn.style.cssText = 'cursor:pointer;font-weight:500;font-size:11px;padding:2px 8px;border:1px solid rgba(148,197,255,.22);border-radius:6px;color:#b7c9e2;background:rgba(148,197,255,.06);flex:0 0 auto;';
     copyBtn.addEventListener('click', function (e) {
       e.stopPropagation();
       // 统一单流:复制全部日志
@@ -2615,7 +2680,8 @@ pub fn build_hud_init_script() -> String {
     stopBtn.setAttribute('data-hud-btn', '1');
     stopBtn.textContent = '结束';
     stopBtn.title = '手动结束本次采集(保留已采内容)';
-    stopBtn.style.cssText = 'display:none;cursor:pointer;font-weight:400;font-size:11px;padding:1px 7px;border:1px solid rgba(239,68,68,.5);border-radius:5px;color:#fca5a5;flex:0 0 auto;';
+    stopBtn.className = 'veltrix-hud-btn';
+    stopBtn.style.cssText = 'display:none;cursor:pointer;font-weight:500;font-size:11px;padding:2px 8px;border:1px solid rgba(239,68,68,.5);border-radius:6px;color:#fca5a5;background:rgba(239,68,68,.08);flex:0 0 auto;';
     stopBtn.addEventListener('click', function (e) {
       e.stopPropagation();
       // 立即中断页面内 RPA 滚动(同窗口共享标志),不等 Rust 往返;Rust 停止信号另经 stop_collect 下发
@@ -2646,7 +2712,10 @@ pub fn build_hud_init_script() -> String {
 
     var body = document.createElement('div');
     body.id = 'veltrix-hud-logs';
-    body.style.cssText = 'padding:6px 11px 8px;overflow-y:auto;flex:1 1 auto;user-select:text;cursor:text;';
+    // 蓝图网格底纹(静态,零动画成本)+ 顶部渐隐蒙版:旧日志从「雾里」滚动浮现;
+    // 轻量档去蒙版——mask 会让日志区滚动时多一路离屏合成
+    body.style.cssText = 'padding:8px 10px 10px;overflow-y:auto;flex:1 1 auto;user-select:text;cursor:text;background-image:linear-gradient(rgba(148,197,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(148,197,255,.035) 1px,transparent 1px);background-size:26px 26px;'
+      + (LOW_SPEC ? '' : '-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 26px);mask-image:linear-gradient(180deg,transparent 0,#000 26px);');
 
     // 收起态:整个浮层缩成一个图标,点击展开;图标颜色随采集状态(绿=正常/红=问题/灰=空闲)
     var icon = document.createElement('div');
@@ -2656,10 +2725,10 @@ pub fn build_hud_init_script() -> String {
     icon.style.cssText = 'display:none;width:100%;height:100%;align-items:center;justify-content:center;cursor:pointer;background:#9ca3af;';
     icon.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg>';
 
-    root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
+    root.appendChild(topline); root.appendChild(head); root.appendChild(tabs); root.appendChild(body); root.appendChild(icon);
     document.body.appendChild(root);
 
-    // HUD 为右下角浮动面板(宽度 1/2、高 1/3),默认展开,不恢复拖动位置
+    // HUD 为左下角浮动面板(宽度 1/2、高 55vh),默认展开,不恢复拖动位置
 
     // 拖动:按住标题栏或收起图标移动浮层(按钮除外),松手把位置存入 sessionStorage。
     // dragMoved 供图标的 click 判断:刚拖动过的那次点击不应触发展开。
@@ -2729,8 +2798,8 @@ pub fn build_hud_init_script() -> String {
         icon.style.display = 'flex';
         icon.style.background = lastColor; // 收起即用当前状态色,绿/红/灰一眼可辨
       }
-      root.style.left = 'auto';
-      root.style.right = '12px';
+      root.style.right = 'auto';
+      root.style.left = '12px';
       root.style.top = 'auto';
       root.style.bottom = '12px';
       root.style.width = '46px';
@@ -2739,23 +2808,30 @@ pub fn build_hud_init_script() -> String {
       root.style.borderTop = 'none';
       root.style.border = 'none'; // 收起态不要边框线,整块纯色更干净
       root.style.boxShadow = (lastGlow ? '0 0 14px ' + lastColor + ',' : '') + '0 4px 16px rgba(0,0,0,.5)';
+      var toplineHide = document.getElementById('veltrix-hud-topline');
+      if (toplineHide) toplineHide.style.display = 'none'; // 收起态图标上不留流光线
     } else {
       if (head) head.style.display = 'flex';
       if (icon) icon.style.display = 'none';
       if (body) body.style.display = '';
       if (tabs) tabs.style.display = 'none'; // 统一单流:tab 条永不显示
-      // 展开:右下角浮动面板,宽度为窗口的一半、高 1/3,带圆角与四边边框
-      root.style.left = 'auto';
-      root.style.right = '12px';
+      // 展开:左下角浮动面板,宽度为窗口的一半、高 55vh,玻璃拟态 + 青色描边辉光
+      root.style.right = 'auto';
+      root.style.left = '12px';
       root.style.top = 'auto';
       root.style.bottom = '12px';
       root.style.width = '50vw';
-      root.style.height = '33vh';
+      root.style.height = '55vh';
       root.style.maxHeight = '';
-      root.style.border = '1px solid rgba(255,255,255,.14)';
-      root.style.borderTop = '1px solid rgba(255,255,255,.14)';
-      root.style.borderRadius = '10px';
-      root.style.boxShadow = '0 8px 28px rgba(0,0,0,.5)';
+      root.style.border = '1px solid rgba(94,175,255,.22)';
+      root.style.borderTop = '1px solid rgba(94,175,255,.22)';
+      root.style.borderRadius = '12px';
+      // 与初始 cssText 同口径:轻量档恢复小阴影,玻璃档恢复发光阴影
+      root.style.boxShadow = LOW_SPEC
+        ? '0 10px 28px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06)'
+        : '0 12px 40px rgba(0,0,0,.55),0 0 24px rgba(56,189,248,.08),inset 0 1px 0 rgba(255,255,255,.06)';
+      var toplineShow = document.getElementById('veltrix-hud-topline');
+      if (toplineShow) toplineShow.style.display = 'block';
     }
   }
   function setCollapsed(collapsed) {
@@ -2775,17 +2851,29 @@ pub fn build_hud_init_script() -> String {
     body.innerHTML = '';
     // 统一单流:不过滤关键字,全部日志按时间顺序一个列表
     var logs = getLogs();
-    for (var i = 0; i < logs.length; i++) appendLine(logs[i]);
+    for (var i = 0; i < logs.length; i++) appendLine(logs[i], false);
     body.scrollTop = body.scrollHeight;
   }
 
-  function appendLine(item) {
+  // 三段式日志行:暗色时间戳 + 级别徽章 + 消息(warn/error 消息着色)。
+  // animate 仅新日志为真——历史恢复时整屏重放滑入动画会闪成一片。
+  function appendLine(item, animate) {
     var body = document.getElementById('veltrix-hud-logs');
     if (!body) return;
+    var level = item.level === 'error' ? 'error' : (item.level === 'warn' ? 'warn' : 'info');
     var line = document.createElement('div');
-    var color = item.level === 'error' ? '#f87171' : (item.level === 'warn' ? '#fbbf24' : '#9ca3af');
-    line.style.cssText = 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:' + color + ';';
-    line.textContent = (item.seq ? '#' + item.seq + ' ' : '') + (item.time || '') + '  ' + (item.message || '');
+    line.className = 'veltrix-hud-line veltrix-hud-line-' + level + (animate ? ' veltrix-hud-line-in' : '');
+    var meta = document.createElement('span');
+    meta.className = 'veltrix-hud-meta';
+    // 序号固定 5 位补零,日志行首对齐不随位数跳动
+    meta.textContent = (item.seq ? '#' + String(item.seq).padStart(5, '0') + ' ' : '') + (item.time || '');
+    var badge = document.createElement('span');
+    badge.className = 'veltrix-hud-badge veltrix-hud-badge-' + level;
+    badge.textContent = level.toUpperCase();
+    var msg = document.createElement('span');
+    msg.className = 'veltrix-hud-msg';
+    msg.textContent = item.message || '';
+    line.appendChild(meta); line.appendChild(badge); line.appendChild(msg);
     body.appendChild(line);
     body.scrollTop = body.scrollHeight;
   }
@@ -2815,6 +2903,8 @@ pub fn build_hud_init_script() -> String {
     if (d) {
       d.style.background = m.color;
       d.style.boxShadow = m.glow ? '0 0 6px ' + m.color : 'none';
+      // 运行态叠加呼吸光环动画(类样式表提供 keyframes;被 CSP 拦截时退化为静态辉光)
+      d.classList.toggle('veltrix-hud-dot-run', state === 'running');
     }
     // 收起态:整块填色 + 对应图标(波形=运行 / 警告三角=异常 / 方块=停止)+ 悬浮文案
     var icon = document.getElementById('veltrix-hud-icon');
@@ -2935,7 +3025,7 @@ pub fn build_hud_init_script() -> String {
         if (saved.length > 400) saved = saved.slice(-400);
         sessionStorage.setItem(KEY, JSON.stringify(saved));
       } catch (e) {}
-      appendLine(item);
+      appendLine(item, true);
       // 收起态三态(运行/异常/停止)由后端 status() 显式驱动,单条日志不再改写状态色,
       // 避免一条 warn 把「正常运行中」误闪成异常、又被下一条 info 抹掉,导致状态不可信。
     },
@@ -2962,12 +3052,29 @@ pub fn build_hud_init_script() -> String {
     }
   };
 
+  if (LOW_SPEC) {
+    // 低配设备暂停平台页自动播放视频:视频解码是弱机 CPU/GPU 的最大单项开销,
+    // 而采集只消费拦截到的接口响应、不需要画面。只 pause + mute,不移除节点、
+    // 不劫持 play 属性,尽量不干扰页面自身逻辑;定时兜盖懒加载新挂的视频。
+    var hudPauseVideos = function () {
+      try {
+        var vs = document.querySelectorAll('video');
+        for (var i = 0; i < vs.length; i++) {
+          if (!vs[i].muted) vs[i].muted = true;
+          if (!vs[i].paused) vs[i].pause();
+        }
+      } catch (e) {}
+    };
+    hudPauseVideos();
+    setInterval(hudPauseVideos, 4000);
+  }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', ensureRoot);
   } else {
     ensureRoot();
   }
   startCaptchaAvoid();
-})();"#
-        .to_string()
+})();"#);
+    script
 }

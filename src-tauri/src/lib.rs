@@ -6,6 +6,7 @@ mod cloud;
 mod commands;
 mod cookie;
 mod file_server;
+mod hardware;
 mod llm;
 mod media;
 mod model;
@@ -536,13 +537,12 @@ pub fn run() {
                 publish,
                 webviews: Arc::new(webview::pool::WebviewPool::new()),
                 intercept_channel: Arc::new(webview::InterceptChannel::new()),
-                rpa_channel: Arc::new(webview::RpaChannel::new()),
                 collect_control: Arc::new(webview::CollectControl::new()),
                 current_user: std::sync::Mutex::new(None),
                 cloud,
                 collect_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 collect_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    commands::MAX_CONCURRENT_COLLECT,
+                    commands::max_concurrent_collect(),
                 )),
                 login_verdicts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 dev_server: Arc::new(std::sync::Mutex::new(
@@ -881,7 +881,6 @@ pub fn run() {
             commands::stop_collect,
             commands::cancel_library_extract,
             commands::report_collect_verify,
-            commands::rpa_done,
             commands::start_collect,
             commands::run_task,
             // 任务调度

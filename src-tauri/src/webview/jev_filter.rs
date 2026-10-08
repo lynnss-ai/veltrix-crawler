@@ -84,9 +84,7 @@ pub async fn locate(
     platform: &str,
     labels: &[String],
 ) -> Option<(i32, i32)> {
-    let key = std::env::var("TYPESAFE_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
+    let key = super::jev_common::load_api_key()?;
     let raw = eval_json_window(window, SNAPSHOT_JS).await?;
     let snapshot: Snapshot = serde_json::from_str(&raw).ok()?;
     if snapshot.items.is_empty() {

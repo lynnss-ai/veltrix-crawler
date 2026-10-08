@@ -965,21 +965,28 @@ export function ContentDetailDialog({
                         value={fmtCount(content.likeCount)}
                         accent="red"
                       />
-                      <StatCell
-                        label="监控状态"
-                        value={
-                          <span className="flex items-center gap-2">
-                            <span>
-                              {author.isMonitored ? "监控中" : "未监控"}
-                            </span>
-                            <Switch
-                              checked={author.isMonitored}
-                              disabled={monitoring}
-                              onCheckedChange={toggleMonitor}
-                            />
-                          </span>
-                        }
-                      />
+                    </div>
+                    {/* 监控状态独占一行:4 列格子里放不下「文字 + 开关」,挤成两行折行 */}
+                    <div className="mt-2 flex items-center justify-between rounded-md border bg-card px-3 py-2">
+                      <div className="text-[11px] text-muted-foreground">
+                        监控状态
+                      </div>
+                      <div className="flex items-center gap-2 text-sm font-semibold">
+                        <span
+                          className={
+                            author.isMonitored
+                              ? "text-emerald-600 dark:text-emerald-400"
+                              : "text-muted-foreground"
+                          }
+                        >
+                          {author.isMonitored ? "监控中" : "未监控"}
+                        </span>
+                        <Switch
+                          checked={author.isMonitored}
+                          disabled={monitoring}
+                          onCheckedChange={toggleMonitor}
+                        />
+                      </div>
                     </div>
                     {author.signature && (
                       <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm">

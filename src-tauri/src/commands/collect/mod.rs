@@ -12,7 +12,7 @@ use crate::webview::pool::{
     CollectBridge, CollectRequest, CollectStop, CommentCollectRequest, DetailFetchRequest,
     DirectCollectRequest, ProfilePostsCollectRequest,
 };
-use crate::webview::{emit_collect_entry, emit_collect_log, CollectEntry, RpaOutcome};
+use crate::webview::{emit_collect_entry, emit_collect_log, CollectEntry};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
@@ -203,26 +203,6 @@ pub async fn report_collect_verify(
     );
 }
 
-/// 拟人 RPA 执行器跑完(或某步失败)时回传结果。
-/// 字段与注入脚本一致(camelCase: runId/ok/failedStep/message)。
-#[tauri::command]
-pub async fn rpa_done(
-    app: AppHandle,
-    run_id: u64,
-    ok: bool,
-    failed_step: i64,
-    message: String,
-) {
-    app.state::<AppState>().rpa_channel.complete(
-        run_id,
-        RpaOutcome {
-            ok,
-            failed_step,
-            message,
-        },
-    );
-}
-
 /// 一次采集的结果。`urls` 暴露命中的接口便于联调核对 `intercept_patterns`。
 #[derive(Debug, Serialize)]
 pub struct CollectResult {
@@ -257,7 +237,6 @@ pub async fn start_collect(
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
-        state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
     let outcome = bridge
@@ -458,6 +437,8 @@ pub async fn run_task(
     let audio_extract = model.audio_extract || model.ai_extract;
     // 保留视频:开 → 视频落盘到 video/ 目录供自动发布;与音频提取独立
     let keep_video = model.keep_video;
+    // 轻载模式:开 → 采集窗口页面不加载视频/字体(请求层拦截,图片放行保验证码可见);素材下载不受影响
+    let light_load = model.light_load;
     // AI 文案提取:开 → 素材阶段结束后对音频做语音转写;关 → 只留音频不转写
     let ai_extract = model.ai_extract;
     // 封面文字识别:开 → 素材阶段结束后对封面图做 OCR(智谱);关 → 跳过
@@ -569,7 +550,6 @@ pub async fn run_task(
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
-        state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
     // panic 兜底所需:任务体 panic 时仍能把任务落终态(否则永久卡「运行中」)
@@ -608,6 +588,7 @@ pub async fn run_task(
             analyze_comment_intent,
             audio_extract,
             keep_video,
+            light_load,
             ai_extract,
             cover_ocr,
             auto_sync_obsidian,
@@ -667,6 +648,8 @@ struct RunTaskCtx {
     audio_extract: bool,
     /// 保留视频文件(自动发布素材);与音频提取独立
     keep_video: bool,
+    /// 轻载模式:采集窗口页面不加载视频/字体(请求层拦截,图片放行);素材下载不受影响
+    light_load: bool,
     /// AI 文案提取(语音转写);依赖 audio_extract
     ai_extract: bool,
     /// 封面文字识别(智谱 OCR);素材阶段落盘封面后统一识别
@@ -1973,6 +1956,7 @@ async fn run_task_body(ctx: RunTaskCtx) {
         analyze_comment_intent,
         audio_extract,
         keep_video,
+        light_load,
         ai_extract,
         cover_ocr,
         auto_sync_obsidian,
@@ -1987,14 +1971,16 @@ async fn run_task_body(ctx: RunTaskCtx) {
         run_started_at: now,
     } = ctx;
     {
-        // 全局采集并发闸:先占一个名额再开窗,超过上限的任务在此排队,避免调度同点拉起多任务时
-        // 同时弹出过多 WebView 把资源打满。permit 与 collect_guard 同寿命,WebView 阶段结束即释放。
-        let collect_permit = collect_semaphore.acquire().await.ok();
+        // 锁顺序固定为「先账号锁、后全局名额」:若反过来,同账号多任务同点拉起会先占满
+        // 全部 permit 再干等账号锁,名额空转在等锁上,把其他账号/平台的采集一起堵死。
         // 同账号采集互斥:占用 WebView 窗口的阶段(关键词采集 + 评论采集)串行,
         // 其他账号 / 平台的任务不受影响,可真正并行采集
         let account_lock =
             account_collect_lock(&collect_locks, &account_lock_key(&cfg.id, &account_id));
         let collect_guard = account_lock.lock().await;
+        // 全局采集并发闸:拿到账号后再领名额,超过上限的任务在此排队,避免调度同点拉起多任务时
+        // 同时弹出过多 WebView 把资源打满。permit 与 collect_guard 同寿命。
+        let collect_permit = collect_semaphore.acquire().await.ok();
 
         // 执行历史:本次运行先记一条 task_run(running);采集日志按 [started_at, finished_at]
         // 时间范围归到该次运行(见 list_run_logs)。run_id 用 task_id + 起始毫秒——此前用起始秒,
@@ -2065,6 +2051,16 @@ async fn run_task_body(ctx: RunTaskCtx) {
         bridge.reset_collect_window_closed(&cfg.id, &account_id, Some(&task_id));
         // 重置本任务的「结束」停止标记,避免上次运行点过结束影响本次重跑
         bridge.reset_task_stop(&task_id);
+        // 轻载模式:按任务配置拨动本窗口的页面媒体拦截开关(开窗前生效,默认开)
+        bridge.set_light_load(&cfg.id, &account_id, Some(&task_id), light_load);
+        if light_load {
+            emit_collect_log(
+                &app,
+                &task_id,
+                "info",
+                "🪶 轻载模式:页面不加载图片/视频(省流+提速;素材下载不受影响,任务设置可关)".to_string(),
+            );
+        }
 
         // 素材下载用的会话 Cookie:须在关闭采集窗口前解析留存(窗口销毁后实时 Cookie 不可取)
         let mut session_cookie: Option<String> = None;
@@ -2427,46 +2423,48 @@ async fn run_task_body(ctx: RunTaskCtx) {
         drop(collect_guard);
         drop(collect_permit);
 
-        // 阶段6:语音转写(AI 文案提取):素材音频已就绪,统一下载后转写;
-        // 失败仅告警不影响任务终态
-        if ai_extract && !audios.is_empty() && !bridge.is_task_stopping(&task_id) {
-            transcribe_for_contents(
-                &app,
-                &db,
-                &task_id,
-                &cfg.id,
-                &account_id,
-                &transcription_cfg,
-                media_cfg.ffmpeg_path.clone(),
-                Some(&bridge),
-                audios,
-            )
-            .await;
-        }
-
-        // 阶段6.5:封面文字识别(OCR,不占窗口):素材阶段已落盘封面,统一在转写后识别;
-        // 失败仅告警不影响任务终态
-        if cover_ocr && !task_failed && !bridge.is_task_stopping(&task_id) {
-            let ocr_root = crate::media::media_root(&config_dir, &media_cfg);
-            let items = pending_cover_ocr_items(&db, &task_id, &ocr_root).await;
-            ocr_for_contents(
-                &OcrPhaseParams {
-                    app: &app,
-                    db: &db,
-                    task_id: &task_id,
-                    platform: &cfg.id,
-                    account_id: &account_id,
-                    ocr_cfg: &ocr_cfg,
-                    bridge: Some(&bridge),
-                    skip_precheck: false,
-                },
-                items,
-            )
-            .await;
-        }
-
-        // 阶段7:评论意向分析(LLM,不占窗口):排在评论采集之后,分析本次最新采到的评论
-        analyze_intent_phase(
+        // 阶段6/6.5/7:转写 / 封面OCR / 评论意向分析——三者素材来源与落库列互不相干
+        // (音频→transcript、封面→cover_ocr_text、评论→intent_level),并行执行总耗时取最慢者;
+        // LLM/IO 等待重叠,DB 写本就经 db_write_lock 串行,并行无正确性影响。
+        // 失败均仅告警不影响任务终态。
+        let post_processing_stopped = bridge.is_task_stopping(&task_id);
+        let transcript_stage = async {
+            if ai_extract && !audios.is_empty() && !post_processing_stopped {
+                transcribe_for_contents(
+                    &app,
+                    &db,
+                    &task_id,
+                    &cfg.id,
+                    &account_id,
+                    &transcription_cfg,
+                    media_cfg.ffmpeg_path.clone(),
+                    Some(&bridge),
+                    audios,
+                )
+                .await;
+            }
+        };
+        let ocr_stage = async {
+            if cover_ocr && !task_failed && !post_processing_stopped {
+                let ocr_root = crate::media::media_root(&config_dir, &media_cfg);
+                let items = pending_cover_ocr_items(&db, &task_id, &ocr_root).await;
+                ocr_for_contents(
+                    &OcrPhaseParams {
+                        app: &app,
+                        db: &db,
+                        task_id: &task_id,
+                        platform: &cfg.id,
+                        account_id: &account_id,
+                        ocr_cfg: &ocr_cfg,
+                        bridge: Some(&bridge),
+                        skip_precheck: false,
+                    },
+                    items,
+                )
+                .await;
+            }
+        };
+        let intent_stage = analyze_intent_phase(
             &app,
             &db,
             &task_id,
@@ -2474,10 +2472,10 @@ async fn run_task_body(ctx: RunTaskCtx) {
             analyze_comment_intent,
             collect_comments,
             total_contents,
-        )
-        .await;
+        );
+        tokio::join!(transcript_stage, ocr_stage, intent_stage);
 
-        // Obsidian 同步:排在转写 / 意向之后,同步出去的文案与意向最全
+        // Obsidian 同步:仍收尾——同步出去的文案与意向依赖上面三者的产出,须等全部完成
         if auto_sync_obsidian {
             let obsidian_root = crate::media::media_root(&config_dir, &media_cfg);
             let synced = obsidian::sync_task_to_obsidian(&db, &task_id, &owner, &obsidian_root).await;
@@ -2858,6 +2856,122 @@ async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: 
         format!("📝 开始补全小红书正文、话题与完整素材 · 共 {total} 条"),
     );
 
+    // 批量直采优先:一次脚本并发拉取全部待补全笔记(并发度由池侧常量控制,5~10 区间),
+    // 命中的直接合并落库;未命中的(缺 token / 批量失败 / 解析未中)进下方逐条串行兜底。
+    let mut batch_hits = 0usize;
+    {
+        let mut seen = HashSet::new();
+        let pending: Vec<(&str, &str)> = contents
+            .iter()
+            .filter(|content| !xhs_detail_enriched(content))
+            .filter(|content| seen.insert(content.content_id.clone()))
+            .filter_map(|content| {
+                let token = content
+                    .extra
+                    .get("xsec_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if token.is_empty() {
+                    None
+                } else {
+                    Some((content.content_id.as_str(), token))
+                }
+            })
+            .collect();
+        let pending_count = pending.len();
+        let batch_run = pending_count > 0
+            && !params.bridge.is_task_stopping(params.task_id)
+            && !params.bridge.is_collect_window_closed(
+                &params.cfg.id,
+                params.account_id,
+                Some(params.task_id),
+            );
+        // pending 对 contents 的不可变借用止于这次 await,之后才能 iter_mut 合并结果
+        let responses = if batch_run {
+            match params
+                .bridge
+                .fetch_xhs_detail_batch(
+                    params.app,
+                    params.cfg,
+                    params.account_id,
+                    params.task_id,
+                    &pending,
+                )
+                .await
+            {
+                Ok(responses) => responses,
+                Err(error) => {
+                    tracing::warn!("小红书详情批量直采失败,退回逐条串行: {error}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        drop(pending);
+        let parsed = if responses.is_empty() {
+            Vec::new()
+        } else {
+            let ctx = FetchContext {
+                keyword: String::new(),
+                responses,
+            };
+            match adapter.parse(&TaskKind::ContentDetail, &ctx).await {
+                Ok(output) => output.contents,
+                Err(error) => {
+                    tracing::warn!("小红书详情批量响应解析失败: {error}");
+                    Vec::new()
+                }
+            }
+        };
+        let mut by_id: HashMap<String, Content> = parsed
+            .into_iter()
+            .map(|content| (content.content_id.clone(), content))
+            .collect();
+        if batch_run {
+            let mut batch_updated = 0usize;
+            for content in contents.iter_mut() {
+                let Some(detail) = by_id.remove(&content.content_id) else {
+                    continue;
+                };
+                merge_content_detail(content, detail);
+                if !content.extra.is_object() {
+                    content.extra = serde_json::json!({});
+                }
+                content.extra["detail_enriched"] = Value::Bool(true);
+                let row_id = format!(
+                    "{}-{}-{}",
+                    params.task_id, content.platform, content.content_id
+                );
+                update_content_detail(params.db, &row_id, content).await;
+                batch_updated += 1;
+            }
+            batch_hits = batch_updated;
+            let missed = pending_count.saturating_sub(batch_updated);
+            emit_collect_log(
+                params.app,
+                params.task_id,
+                "info",
+                format!(
+                    "⚡ 详情批量直采 · 命中 {}/{} 篇{}",
+                    batch_updated,
+                    pending_count,
+                    if missed > 0 {
+                        format!(" · 未命中 {missed} 篇转逐条兜底")
+                    } else {
+                        String::new()
+                    }
+                ),
+            );
+            // 批量刚打完一波请求,给串行兜底留个短暂收敛窗口,失败篇目多为风控抖动
+            if missed > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            }
+        }
+    }
+
+    // 串行兜底阶段只处理批量未命中的篇目,进度分母相应扣除批量命中数
+    let serial_total = total.saturating_sub(batch_hits);
     let mut visited = HashSet::new();
     let mut attempted = 0usize;
     let mut updated = 0usize;
@@ -2946,12 +3060,12 @@ async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: 
         );
         update_content_detail(params.db, &row_id, content).await;
         updated += 1;
-        if updated % 10 == 0 || attempted == total {
+        if updated % 10 == 0 || attempted == serial_total {
             emit_collect_log(
                 params.app,
                 params.task_id,
                 "info",
-                format!("📝 小红书详情补全进度 · {attempted}/{total}"),
+                format!("📝 小红书详情补全进度 · 批量 {batch_hits} + 兜底 {attempted}/{serial_total}"),
             );
         }
     }
@@ -2959,7 +3073,7 @@ async fn enrich_xhs_content_details(params: &StreamRefreshParams<'_>, contents: 
         params.app,
         params.task_id,
         "info",
-        format!("✅ 小红书完整详情补全完成 · 成功 {updated}/{attempted}"),
+        format!("✅ 小红书完整详情补全完成 · 批量 {batch_hits} 篇 · 兜底成功 {updated}/{attempted}"),
     );
 }
 
@@ -3479,35 +3593,43 @@ async fn download_media_core(
     let mut last_media_write =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
     // 并发下载(限 10 路并发,不再串行限速),边完成边回写结果与进度。
-    // 按批(=并发路数)推进:窗口保活时每批开工取一次窗口实时 Cookie——
-    // 会话令牌(tt_chain_token 等)随页面活动轮换,批与批之间自动切到最新一份;
-    // 窗口已关(补偿/重试路径)则整阶段用上面解析的兜底 Cookie
+    // 全程滚动补位:整张待下载列表一条流 + buffer_unordered——按批推进时每批最慢一条
+    // (如 600s 视频)会拖住整批,滚动窗口下谁完成谁补位。
+    // 窗口保活时的实时 Cookie 同步去批化:最新一份放共享槽(读锁即取),下载开工与
+    // 每完成一批(= 下载并发路数)后台异步刷新一次(不能阻塞消费循环刷新——
+    // buffer_unordered 的在飞下载只在被 poll 时推进,阻塞会让它们一起停摆);
+    // 窗口已关(补偿/重试路径)整阶段用上面解析的兜底 Cookie,不再刷新。
     let root_ref = &root;
     // 任务停止标志:停止时置位,在飞的 ffmpeg 拉流转码 500ms 内被强杀(见 media::extract_audio_from_url)
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 索引分批而非 chunks() 迭代器:批次切片(&[Content])借用跨 await 会让整个任务 future
-    // 触发 rustc「Send/FnOnce is not general enough」推断问题;chunk 取 owned 后无借用区域
-    'outer: for start in (0..targets.len()).step_by(MEDIA_DOWNLOAD_CONCURRENCY) {
-        let end = (start + MEDIA_DOWNLOAD_CONCURRENCY).min(targets.len());
-        let chunk: Vec<Content> = targets[start..end].to_vec();
-        // 窗口保活时每批开工取一次窗口实时 Cookie;窗口已关则整阶段用上面解析的兜底 Cookie
-        let batch_cookie: Option<String> = if params.window_open {
-            resolve_session_cookie_owned(
-                params.app.clone(),
-                params.db.clone(),
-                params.platform.to_string(),
-                params.account_id.to_string(),
-                Some(params.task_id.to_string()),
-            )
-            .await
-        } else {
-            None
-        };
-        let mut stream = futures_util::stream::iter(chunk.into_iter().map(|content| {
-            let cancel = cancel.clone();
-            // Cookie 取 owned(理由同上):闭包借用局部变量跨 await 会触发同类编译问题
-            let item_cookie = batch_cookie.clone().or_else(|| cookie.clone());
-            async move {
+    let cookie_cell = std::sync::Arc::new(std::sync::RwLock::new(cookie));
+    let mut cookie_refresh: Option<tokio::task::JoinHandle<()>> = None;
+    let mut completions_since_refresh = 0usize;
+    if params.window_open {
+        // owned 先提出再进 spawn:闭包按路径捕获 params 字段会带着函数生命周期逃逸(E0521)
+        let (app, db) = (params.app.clone(), params.db.clone());
+        let (platform, account, task) = (
+            params.platform.to_string(),
+            params.account_id.to_string(),
+            params.task_id.to_string(),
+        );
+        let cell = cookie_cell.clone();
+        cookie_refresh = Some(tokio::spawn(async move {
+            if let Some(fresh) =
+                resolve_session_cookie_owned(app, db, platform, account, Some(task)).await
+            {
+                *cell.write().unwrap() = Some(fresh);
+            }
+        }));
+    }
+    // targets 取 owned(into_iter)而非引用切片:引用跨 await 会让整个任务 future 触发
+    // rustc「Send/FnOnce is not general enough」推断问题
+    let mut stream = futures_util::stream::iter(targets.into_iter().map(|content| {
+        let cancel = cancel.clone();
+        // Cookie 从共享槽取 owned(读锁语句结束即释放,不跨 await):刷新落地后新启动条目自动用最新一份
+        let item_cookie_cell = cookie_cell.clone();
+        async move {
+            let item_cookie = item_cookie_cell.read().unwrap().clone();
             // 标题在下载前取;用于 HUD 逐条日志展示
             let title = log_content_title(&content);
             // 素材类型标签(实时日志按类型着色):视频按开关标 [视频]/[音频]/[视频+音频];图文 → [图片];其余(仅封面/头像)→ [封面]
@@ -3539,13 +3661,13 @@ async fn download_media_core(
             (id, title, tag, content, outcome)
             }
         }))
-        .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
+        .buffer_unordered(media_download_concurrency());
         while let Some((id, title, tag, content, outcome)) = stream.next().await {
             // 任务被手动结束:不再启动新下载(stream 随 break 丢弃,未开始的条目不执行;在飞 ≤10 条跑完即弃)
             if params.bridge.is_task_stopping(params.task_id) {
                 emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 已手动结束 · 停止素材下载(已完成 {count}/{total} 条保留)"));
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                break 'outer;
+                break;
             }
             // 窗口保活模式下用户手动关窗 = 终止素材下载(与采集阶段「关窗即终止」语义一致)
             if params.window_open
@@ -3557,7 +3679,7 @@ async fn download_media_core(
             {
                 emit_media_log(params.app, params.task_id, params.platform, params.account_id, "info", format!("🛑 采集窗口已被手动关闭 · 停止素材下载(已完成 {count}/{total} 条保留)"));
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                break 'outer;
+                break;
             }
         let ok = is_media_ok(&outcome);
         if !ok {
@@ -3611,7 +3733,35 @@ async fn download_media_core(
         if pending_outcomes.len() >= MEDIA_OUTCOME_FLUSH_SIZE {
             flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
         }
+        // 滚动 Cookie 刷新节拍:每完成一批量级条数、且上一轮刷新已落地时后台再刷一次
+        completions_since_refresh += 1;
+        if params.window_open && completions_since_refresh >= media_download_concurrency() {
+            completions_since_refresh = 0;
+            let refresh_idle = match &cookie_refresh {
+                Some(handle) => handle.is_finished(),
+                None => true,
+            };
+            if refresh_idle {
+                let (app, db) = (params.app.clone(), params.db.clone());
+                let (platform, account, task) = (
+                    params.platform.to_string(),
+                    params.account_id.to_string(),
+                    params.task_id.to_string(),
+                );
+                let cell = cookie_cell.clone();
+                cookie_refresh = Some(tokio::spawn(async move {
+                    if let Some(fresh) =
+                        resolve_session_cookie_owned(app, db, platform, account, Some(task)).await
+                    {
+                        *cell.write().unwrap() = Some(fresh);
+                    }
+                }));
+            }
         }
+    }
+    // 下载结束:中止可能仍在飞的后台 Cookie 刷新(它只写共享槽,无其他副作用)
+    if let Some(handle) = cookie_refresh.take() {
+        handle.abort();
     }
     // 收尾 flush 剩余素材回写
     flush_media_outcomes(params.db, &mut pending_outcomes, &root).await;
@@ -3793,7 +3943,7 @@ async fn refresh_and_retry_stale_media(
             (content, outcome)
         }
     }))
-    .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
+    .buffer_unordered(media_download_concurrency());
     while let Some((content, outcome)) = stream.next().await {
         // 任务被手动结束 / 用户关窗:不再启动新下载,在飞条目跑完即弃(与主下载循环同语义)
         if params.bridge.is_task_stopping(params.task_id)
@@ -4447,7 +4597,15 @@ const MEDIA_OUTCOME_FLUSH_SIZE: usize = 20;
 
 /// 素材下载并发路数;窗口保活时也作为「一批」的粒度——每批开工取一次实时 Cookie,
 /// 批间自动切到轮换后的新会话 Cookie(逐条取太密、整阶段取一次又可能全程用旧 Cookie)。
-const MEDIA_DOWNLOAD_CONCURRENCY: usize = 10;
+/// 高配固定 10 路;低配降到 4:弱 CPU / 机械盘上 10 路同飞(下载 + 落盘 + 缩略图 + 转码排队)
+/// 会把采集窗口渲染与 RPA 响应一起拖垮(判定见 hardware)。
+fn media_download_concurrency() -> usize {
+    if crate::hardware::is_low_spec() {
+        4
+    } else {
+        10
+    }
+}
 
 /// 构造素材处理结果回写的 ActiveModel(仅更新状态相关列,不触碰其它字段)。
 /// 本地路径列入库前经 to_media_rel 转相对 root 的相对路径(outcome 内存中为绝对路径)。
@@ -4720,7 +4878,6 @@ pub async fn retry_content_media(
                 let bridge = CollectBridge::new(
                     state.webviews.clone(),
                     state.intercept_channel.clone(),
-                    state.rpa_channel.clone(),
                     state.collect_control.clone(),
                 );
                 // 重置残留的「手动关窗」标记(理由同补偿路径)
@@ -5196,7 +5353,6 @@ pub async fn batch_collect_audios(
         let bridge = CollectBridge::new(
             state.webviews.clone(),
             state.intercept_channel.clone(),
-            state.rpa_channel.clone(),
             state.collect_control.clone(),
         );
         // 重置残留的「手动关窗」标记(理由同单条重试)
@@ -5258,7 +5414,7 @@ pub async fn batch_collect_audios(
                             (row, outcome)
                         }
                     })
-                    .buffer_unordered(MEDIA_DOWNLOAD_CONCURRENCY);
+                    .buffer_unordered(media_download_concurrency());
                 while let Some((row, outcome)) = stream.next().await {
                     // 取消或用户手动关窗:不再处理后续(在飞 ≤10 条跑完即弃)
                     if control_c.is_library_batch_stopping()
@@ -5504,7 +5660,6 @@ pub async fn compensate_task(
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
-        state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
     let cookies = state.cookies.clone();
@@ -5747,7 +5902,6 @@ pub async fn recollect_comments(
     let bridge = CollectBridge::new(
         state.webviews.clone(),
         state.intercept_channel.clone(),
-        state.rpa_channel.clone(),
         state.collect_control.clone(),
     );
     let intent_cfg = { lock_config(&state)?.intent.clone() };
@@ -7466,6 +7620,7 @@ mod tests {
             min_likes: 0,
             audio_extract: false,
             keep_video: false,
+            light_load: true,
             ai_extract: false,
             cover_ocr: false,
             collect_comments: false,

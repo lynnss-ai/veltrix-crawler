@@ -451,8 +451,9 @@ export const api = {
     invoke<void>("upsert_keyword", { keyword }),
   removeKeyword: (id: string) => invoke<void>("remove_keyword", { id }),
 
-  // 采集任务
-  listTasks: () => invoke<TaskView[]>("list_tasks"),
+  // 采集任务;includeStats=首载/手动刷新时连已完成任务的「采集明细」一起统计(轮询兜底不传)
+  listTasks: (includeStats?: boolean) =>
+    invoke<TaskView[]>("list_tasks", { includeStats: includeStats ?? false }),
   upsertTask: (input: TaskInput) => invoke<void>("upsert_task", { input }),
   updateTaskStatus: (patch: TaskStatusPatch) =>
     invoke<void>("update_task_status", { patch }),
